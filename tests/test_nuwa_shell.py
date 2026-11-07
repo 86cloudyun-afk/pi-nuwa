@@ -31,8 +31,8 @@ from _paths import LAYER_A, WORK, NUWA, EXT, INSTALL  # noqa: E402
 def sandbox_env(extra: dict | None = None) -> dict:
     env = dict(os.environ)
     env["PATH"] = f"{LAYER_A}:{env.get('PATH', '')}"
-    env["SAPPER_HOME"] = str(ROOT / "state" / "lab")
-    env["PI_AGENT_HOME"] = str(ROOT / "state" / "agent")
+    env["SAPPER_HOME"] = str(WORK / "state" / "lab")
+    env["PI_AGENT_HOME"] = str(WORK / "state" / "agent")
     env["NUWA_ENV"] = "/dev/null"
     env.pop("NUWA_LOOP", None)
     if extra:
