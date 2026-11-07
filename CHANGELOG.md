@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0 — 2026-11-08
+
+测试机制补齐。五套测试 + 两个替身 + 八类靶场 + 小长测，全部在沙盒机执行。
+
+### 新增测试
+
+- `tests/unit.test.ts`（18 项）：`findRoot` / `readGraph` / `buildDirective` / `revertCompletion` / `readCfg`。
+- `tests/test_chaos.py`（8 项）：损坏图、陈旧锁、活锁、SIGKILL 恢复、只读目录、1000 intent 性能、缺 python3。
+- `tests/test_concurrency.py`（5 项）：同项目单赢家、跨项目并行、锁清理（正常/SIGTERM）、无重复派发。
+- `tests/test_e2e_deterministic.py`（4 项）：零模型成本的完整链路、幻觉完成拦截、空 reason、非 JSON 引擎。
+- `tests/soak.py`：小长测采样器，判 RSS 斜率 / FD 增长 / 状态文件体积。
+
+### 新增替身
+
+- `tests/fake-sapper`：sapper-v2 协议级替身，逐字复刻输出与参数约束。
+- `tests/fake-claude`：确定性 claude 兼容引擎，模式 `normal` / `noop` / `hallucinate` / `malformed` / `slow`。
+
+### 靶场扩展（沙盒）
+
+从 4 类扩到 8 类：static / dvwa / slow / deny / redirect / basicauth / notfound / gzip。
+
+### 修复（测试驱动）
+
+- **完成闸门出口缺口**：frontier 为空时提前 break，绕过证据闸门 → 现在预算用尽、frontier 为空、循环末尾三个出口统一调 `completion_ok`。
+- **SIGTERM 不退出**：`trap ... INT TERM` 只清锁不退出 → 改为 `on_signal` 清锁 + 收子进程 + `exit 143`。
+- **损坏图未拦截**：`.sapper/project.json` 非法 JSON 时直接跑 → 现在前置校验并退出 2。
+- **项目目录语义**：有 `.sapper` 即复用，非空且无图才拒绝（退出 4）。
+
 ## 0.2.0 — 2026-11-08
 
 运行时正确性与可观测性大修。基于三层沙盒（协议仿真 / 真实靶场 / headless 会话）验证。

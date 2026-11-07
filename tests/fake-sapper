@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""
+fake-sapper — sapper-v2 CLI 的协议级测试替身。
+
+目标不是"像 sapper"，而是"在 nuwa 会调用的每个面上与 sapper 逐字一致"：
+  - 输出格式（frontier 的 tab 分隔、空图时的 "(no ready intents)"）
+  - 参数约束（claim 的 --worker 必填、done 的 --fact 必填）
+  - 状态流转（dispatch explore 自动 conclude + 写 fact）
+  - 退出码（缺参数 = 2 / 业务错误 = 1 / 正常 = 0）
+
+故障注入（环境变量）：
+  FAKE_EMPTY_FRONTIER=1      frontier 永远为空
+  FAKE_STALL=1               每轮 reason 都产出同一个 intent，且 dispatch 不推进
+  FAKE_ERROR=1               所有 dispatch/claim/done 退出 1
+  FAKE_SLOW=<sec>            dispatch 前睡眠
+  FAKE_COMPLETE_AFTER=<n>    第 n 次 reason 后 status=completed
+  FAKE_NOOP_DISPATCH=1       dispatch 不写 fact、不结案（模拟模型空转）
+  FAKE_DOC_HANG=1            doc 无 --set/--set-file 时睡眠（模拟 $EDITOR 挂起）
+  FAKE_CALL_LOG=<path>       调用日志路径（默认 <store>/calls.jsonl）
+  FAKE_FACT_KINDS=<csv>      覆盖 kind 枚举校验
+
+用法与 sapper 一致：sapper [--store DIR] <subcommand> ...
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_STORE = ".sapper"
+FACT_KINDS = ["host", "service", "cred", "vuln", "loot", "flag", "note"]
+
+
+# ---------------------------------------------------------------- 基础工具
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip() not in ("", "0", "false", "False")
+
+
+def env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def die(msg: str, code: int = 1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def usage_error(msg: str):
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def atomic_write(path: Path, data: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+class Store:
+    def __init__(self, root: Path):
+        self.root = root
+
+    # -- 路径
+    @property
+    def project_path(self) -> Path:
+        return self.root / "project.json"
+
+    @property
+    def intents_dir(self) -> Path:
+        return self.root / "intents"
+
+    @property
+    def facts_dir(self) -> Path:
+        return self.root / "facts"
+
+    @property
+    def calls_path(self) -> Path:
+        override = os.environ.get("FAKE_CALL_LOG", "").strip()
+        return Path(override) if override else self.root / "calls.jsonl"
+
+    # -- 生命周期
+    def require(self):
+        if not self.project_path.exists():
+            die(f"error: no graph at {self.root} (run `sapper setup` first)")
+
+    def exists(self) -> bool:
+        return self.project_path.exists()
+
+    def project(self) -> dict:
+        try:
+            return json.loads(self.project_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def save_project(self, p: dict):
+        atomic_write(self.project_path, json.dumps(p, ensure_ascii=False, indent=2))
+
+    def setup(self, goal: str, origin: str = "", agents: bool = False, force: bool = False):
+        if self.exists() and not force:
+            print(f"[sapper] graph already exists: {self.root}")
+            return 0
+        if force and self.root.exists():
+            shutil.rmtree(self.root)
+        self.intents_dir.mkdir(parents=True, exist_ok=True)
+        self.facts_dir.mkdir(parents=True, exist_ok=True)
+        self.save_project(
+            {
+                "schema": 1,
+                "status": "active",
+                "goal": goal,
+                "origin": origin,
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+        )
+        if agents:
+            atomic_write(
+                Path("AGENTS.md"),
+                "# AGENTS\n\n本目录是 sapper 事实-意图图项目。\n"
+                "用 `sapper status` 看全局，`sapper frontier` 看待办。\n",
+            )
+        # 模拟注册 .claude/settings.json hooks
+        claude = Path(".claude")
+        claude.mkdir(exist_ok=True)
+        sf = claude / "settings.json"
+        existing = {}
+        if sf.exists():
+            try:
+                existing = json.loads(sf.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                existing = {}
+        existing.setdefault("hooks", {})["SessionStart"] = [
+            {"hooks": [{"type": "command", "command": "sapper status >/dev/null 2>&1 || true"}]}
+        ]
+        atomic_write(sf, json.dumps(existing, ensure_ascii=False, indent=2))
+        print(f"[sapper] graph created at {self.root.resolve()}")
+        return 0
+
+    # -- id 分配
+    def next_id(self, prefix: str) -> str:
+        d = self.facts_dir if prefix == "f" else self.intents_dir
+        nums = []
+        if d.exists():
+            for p in d.glob(f"{prefix}[0-9]*.json"):
+                m = re.match(rf"^{prefix}(\d+)\.json$", p.name)
+                if m:
+                    nums.append(int(m.group(1)))
+        return f"{prefix}{(max(nums) + 1 if nums else 1):03d}"
+
+    # -- intents
+    def list_intents(self) -> list[dict]:
+        out = []
+        if self.intents_dir.exists():
+            for p in sorted(self.intents_dir.glob("*.json")):
+                try:
+                    out.append(json.loads(p.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        return out
+
+    def get_intent(self, iid: str) -> dict | None:
+        p = self.intents_dir / f"{iid}.json"
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def save_intent(self, it: dict):
+        atomic_write(self.intents_dir / f"{it['id']}.json", json.dumps(it, ensure_ascii=False, indent=2))
+
+    # -- facts
+    def list_facts(self) -> list[dict]:
+        out = []
+        if self.facts_dir.exists():
+            for p in sorted(self.facts_dir.glob("*.json")):
+                if p.name == "goal.json":
+                    continue
+                try:
+                    out.append(json.loads(p.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    continue
+        return out
+
+    def get_fact(self, fid: str) -> dict | None:
+        p = self.facts_dir / f"{fid}.json"
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def save_fact(self, f: dict):
+        atomic_write(self.facts_dir / f"{f['id']}.json", json.dumps(f, ensure_ascii=False, indent=2))
+
+    def add_fact(self, description: str, **kw) -> dict:
+        fid = self.next_id("f")
+        fact = {
+            "id": fid,
+            "description": description,
+            "title": kw.get("title") or description[:40],
+            "kind": kw.get("kind") or "note",
+            "data": kw.get("data") or {},
+            "doc": kw.get("doc") or "",
+            "creator": kw.get("creator") or "user",
+            "from_intent": kw.get("from_intent"),
+            "created_at": now_iso(),
+        }
+        self.save_fact(fact)
+        return fact
+
+    # -- 日志
+    def log_call(self, argv: list[str]):
+        rec = {"ts": now_iso(), "pid": os.getpid(), "argv": argv, "cwd": os.getcwd()}
+        try:
+            self.calls_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.calls_path, "a", encoding="utf-8") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- 图语义
+
+
+def is_open(it: dict) -> bool:
+    return it.get("status") == "open"
+
+
+def frontier(store: Store) -> list[dict]:
+    """与 sapper-v2 一致：from 里的 fact 全部存在，且 intent 未被 completed/阻塞。"""
+    facts = {f["id"] for f in store.list_facts()}
+    ready = []
+    for it in store.list_intents():
+        if it.get("status") not in ("open", "claimed"):
+            continue
+        if not all(str(x) in facts for x in it.get("from", [])):
+            continue
+        if it.get("requires_confirmation") and not it.get("confirmed_at"):
+            continue
+        ready.append(it)
+    # claimed 排前面，便于观察
+    ready.sort(key=lambda x: (0 if x.get("status") == "claimed" else 1, x["id"]))
+    return ready
+
+
+def render_status(store: Store) -> str:
+    p = store.project()
+    intents = store.list_intents()
+    facts = store.list_facts()
+    open_n = sum(1 for i in intents if i.get("status") == "open")
+    claimed_n = sum(1 for i in intents if i.get("status") == "claimed")
+    done_n = sum(1 for i in intents if i.get("status") == "done")
+    flags = sum(1 for f in facts if f.get("kind") == "flag")
+    lines = [
+        f"project: {store.root.resolve()}",
+        f"status:  {p.get('status', 'unknown')}",
+        f"goal:    {p.get('goal', '')}",
+        "",
+        f"facts:   {len(facts)} (flags: {flags})",
+        f"intents: {len(intents)} (open: {open_n}, claimed: {claimed_n}, done: {done_n})",
+    ]
+    fr = frontier(store)
+    if fr:
+        lines.append("")
+        lines.append("frontier:")
+        for i in fr[:12]:
+            lines.append(f"  {i['id']}  from={','.join(i.get('from', []))}  {i.get('description', '')}")
+    else:
+        lines.append("")
+        lines.append("frontier: (empty)")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 参数解析
+
+
+def take_flag(args: list[str], *names: str) -> bool:
+    for n in names:
+        if n in args:
+            args.remove(n)
+            return True
+    return False
+
+
+def take_opt(args: list[str], *names: str, default=None):
+    for n in names:
+        for idx, a in enumerate(args):
+            if a == n and idx + 1 < len(args):
+                v = args[idx + 1]
+                del args[idx: idx + 2]
+                return v
+            if a.startswith(n + "="):
+                v = a.split("=", 1)[1]
+                args.remove(a)
+                return v
+    return default
+
+
+def take_multi(args: list[str], *names: str) -> list[str]:
+    out = []
+    while True:
+        v = take_opt(args, *names)
+        if v is None:
+            break
+        out.append(v)
+    return out
+
+
+def parse_data(pairs: list[str]) -> dict:
+    d = {}
+    for p in pairs:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            d[k] = v
+    return d
+
+
+# ---------------------------------------------------------------- 子命令
+
+
+def cmd_setup(store: Store, args: list[str]) -> int:
+    goal = take_opt(args, "--goal") or ""
+    origin = take_opt(args, "--origin", default="") or ""
+    agents = take_flag(args, "--agents")
+    force = take_flag(args, "--force")
+    if not goal and not store.exists():
+        usage_error("error: --goal is required when no .sapper/ exists")
+    return store.setup(goal, origin, agents, force)
+
+
+def cmd_status(store: Store, args: list[str]) -> int:
+    store.require()
+    print(render_status(store))
+    return 0
+
+
+def cmd_graph(store: Store, args: list[str]) -> int:
+    store.require()
+    fmt = take_opt(args, "--format", default="text")
+    p = store.project()
+    intents = store.list_intents()
+    facts = store.list_facts()
+    if fmt == "json":
+        print(json.dumps({"project": p, "intents": intents, "facts": facts}, ensure_ascii=False, indent=2))
+    else:
+        print(f"project {p.get('goal', '')} [{p.get('status')}]")
+        for f in facts:
+            print(f"  {f['id']}  [{f.get('kind')}] {f.get('description', '')}")
+        for i in intents:
+            print(f"  {i['id']}  [{i.get('status')}] from={','.join(i.get('from', []))} {i.get('description', '')}")
+    return 0
+
+
+def cmd_frontier(store: Store, args: list[str]) -> int:
+    store.require()
+    if env_flag("FAKE_EMPTY_FRONTIER"):
+        print("(no ready intents)")
+        return 0
+    fr = frontier(store)
+    if not fr:
+        print("(no ready intents)")
+        return 0
+    for i in fr:
+        mark = ""
+        if i.get("status") == "claimed":
+            mark = f"  [claimed: {i.get('worker')}]"
+        elif i.get("requires_confirmation") and not i.get("confirmed_at"):
+            mark = "  [needs confirmation]"
+        print(f"{i['id']}\tfrom={','.join(i.get('from', []))}\t{i.get('description', '')}{mark}")
+    return 0
+
+
+def cmd_pick(store: Store, args: list[str]) -> int:
+    store.require()
+    claim = take_flag(args, "--claim")
+    any_ = take_flag(args, "--any")
+    worker = take_opt(args, "--worker")
+    fr = frontier(store)
+    pool = [i for i in fr if not claim or not i.get("worker") or i.get("worker") == worker]
+    if not pool and any_:
+        pool = [i for i in store.list_intents() if is_open(i)]
+    if not pool:
+        print("(nothing ready; pass --any to include unconfirmed/blocked open intents)")
+        return 0
+    chosen = pool[0]
+    if claim:
+        if not worker:
+            usage_error("error: --worker is required with --claim")
+        chosen["status"] = "claimed"
+        chosen["worker"] = worker
+        chosen["claimed_at"] = now_iso()
+        store.save_intent(chosen)
+    print(chosen["id"])
+    return 0
+
+
+def cmd_fact(store: Store, args: list[str]) -> int:
+    store.require()
+    title = take_opt(args, "-t", "--title")
+    kind = take_opt(args, "-k", "--kind", default="note")
+    data = parse_data(take_multi(args, "-d", "--data"))
+    doc = take_opt(args, "--doc") or ""
+    doc_file = take_opt(args, "--doc-file")
+    creator = take_opt(args, "--creator", default="user")
+    from_intent = take_opt(args, "--from-intent")
+    as_json = take_flag(args, "--json")
+    if doc_file:
+        try:
+            doc = Path(doc_file).read_text(encoding="utf-8")
+        except OSError:
+            die(f"error: cannot read --doc-file {doc_file}")
+    kinds = os.environ.get("FAKE_FACT_KINDS")
+    if kinds and kind not in kinds.split(","):
+        usage_error(f"error: argument -k/--kind: invalid choice: '{kind}'")
+    if not args:
+        usage_error("error: the following arguments are required: description")
+    desc = " ".join(args)
+    fact = store.add_fact(desc, title=title, kind=kind, data=data, doc=doc,
+                          creator=creator or "user", from_intent=from_intent)
+    if as_json:
+        print(json.dumps(fact, ensure_ascii=False))
+    else:
+        print(f"[sapper] {fact['id']} [{kind}] {desc}")
+    return 0
+
+
+def cmd_intent(store: Store, args: list[str]) -> int:
+    store.require()
+    from_ = take_opt(args, "--from")
+    title = take_opt(args, "-t", "--title")
+    doc = take_opt(args, "--doc") or ""
+    doc_file = take_opt(args, "--doc-file")
+    creator = take_opt(args, "--creator", default="user")
+    confirm = take_flag(args, "--confirm")
+    as_json = take_flag(args, "--json")
+    if not from_:
+        usage_error("error: the following arguments are required: --from")
+    if doc_file:
+        try:
+            doc = Path(doc_file).read_text(encoding="utf-8")
+        except OSError:
+            die(f"error: cannot read --doc-file {doc_file}")
+    if not args:
+        usage_error("error: the following arguments are required: description")
+    desc = " ".join(args)
+    iid = store.next_id("i")
+    it = {
+        "id": iid,
+        "from": [x for x in re.split(r"[,\s]+", from_.strip()) if x],
+        "description": desc,
+        "title": title or desc[:40],
+        "status": "open",
+        "worker": None,
+        "requires_confirmation": confirm,
+        "confirmed_at": None,
+        "doc": doc,
+        "creator": creator or "user",
+        "created_at": now_iso(),
+    }
+    store.save_intent(it)
+    if as_json:
+        print(json.dumps(it, ensure_ascii=False))
+    else:
+        print(f"[sapper] {iid} from={','.join(it['from'])} {desc}")
+    return 0
+
+
+def cmd_hint(store: Store, args: list[str]) -> int:
+    store.require()
+    list_only = take_flag(args, "--list")
+    creator = take_opt(args, "--creator", default="user")
+    hints_path = store.root / "hints.json"
+    try:
+        hints = json.loads(hints_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        hints = []
+    if list_only or not args:
+        if not hints:
+            print("(no hints)")
+        for h in hints:
+            print(f"- [{h.get('creator')}] {h.get('content')}")
+        return 0
+    content = " ".join(args)
+    hints.append({"content": content, "creator": creator, "created_at": now_iso()})
+    atomic_write(hints_path, json.dumps(hints, ensure_ascii=False, indent=2))
+    print(f"[sapper] hint recorded: {content}")
+    return 0
+
+
+def cmd_show(store: Store, args: list[str]) -> int:
+    store.require()
+    if not args:
+        usage_error("error: the following arguments are required: entity")
+    entity = args[0]
+    rid = args[1] if len(args) > 1 else None
+    if entity == "project":
+        print(json.dumps(store.project(), ensure_ascii=False, indent=2))
+    elif entity == "fact":
+        f = store.get_fact(rid or "")
+        if not f:
+            die(f"error: no fact {rid}")
+        print(json.dumps(f, ensure_ascii=False, indent=2))
+    elif entity == "intent":
+        i = store.get_intent(rid or "")
+        if not i:
+            die(f"error: no intent {rid}")
+        print(json.dumps(i, ensure_ascii=False, indent=2))
+    else:
+        usage_error(f"error: unknown entity {entity}")
+    return 0
+
+
+def cmd_doc(store: Store, args: list[str]) -> int:
+    store.require()
+    if not args:
+        usage_error("error: the following arguments are required: id")
+    rid = args.pop(0)
+    set_text = take_opt(args, "--set")
+    set_file = take_opt(args, "--set-file")
+    edit = take_flag(args, "--edit")
+    it = store.get_intent(rid)
+    f = store.get_fact(rid)
+    target = it or f
+    if not target:
+        die(f"error: no entity {rid}")
+    if set_file:
+        try:
+            set_text = Path(set_file).read_text(encoding="utf-8")
+        except OSError:
+            die(f"error: cannot read --set-file {set_file}")
+    if set_text is not None:
+        target["doc"] = set_text
+        (store.save_intent if it else store.save_fact)(target)
+        print(f"[sapper] {rid} doc updated ({len(set_text)} bytes)")
+        return 0
+    if edit:
+        if env_flag("FAKE_DOC_HANG"):
+            print(f"[sapper] opening $EDITOR for {rid} ...", flush=True)
+            time.sleep(3600)
+        die("error: $EDITOR is not available in this environment")
+    print(target.get("doc") or f"(empty doc for {rid})")
+    return 0
+
+
+def cmd_claim(store: Store, args: list[str]) -> int:
+    store.require()
+    worker = take_opt(args, "--worker")
+    if not args:
+        usage_error("error: the following arguments are required: id")
+    iid = args[0]
+    if not worker:
+        # 与 sapper-v2 一致：--worker required
+        usage_error("error: the following arguments are required: --worker")
+    if env_flag("FAKE_ERROR"):
+        die("error: claim failed (injected)")
+    it = store.get_intent(iid)
+    if not it:
+        die(f"error: no intent {iid}")
+    if it.get("status") == "done":
+        die(f"error: intent {iid} already done")
+    it["status"] = "claimed"
+    it["worker"] = worker
+    it["claimed_at"] = now_iso()
+    store.save_intent(it)
+    print(f"[sapper] {iid} claimed by {worker}")
+    return 0
+
+
+def cmd_release(store: Store, args: list[str]) -> int:
+    store.require()
+    worker = take_opt(args, "--worker")
+    if not args:
+        usage_error("error: the following arguments are required: id")
+    iid = args[0]
+    it = store.get_intent(iid)
+    if not it:
+        die(f"error: no intent {iid}")
+    it["status"] = "open"
+    it["worker"] = None
+    store.save_intent(it)
+    print(f"[sapper] {iid} released" + (f" (was {worker})" if worker else ""))
+    return 0
+
+
+def cmd_done(store: Store, args: list[str]) -> int:
+    store.require()
+    fact_text = take_opt(args, "--fact")
+    title = take_opt(args, "-t", "--title")
+    kind = take_opt(args, "-k", "--kind", default="note")
+    data = parse_data(take_multi(args, "-d", "--data"))
+    doc = take_opt(args, "--doc") or ""
+    doc_file = take_opt(args, "--doc-file")
+    worker = take_opt(args, "--worker", default="agent")
+    if not args:
+        usage_error("error: the following arguments are required: id")
+    iid = args[0]
+    if not fact_text:
+        usage_error("error: the following arguments are required: --fact")
+    if env_flag("FAKE_ERROR"):
+        die("error: done failed (injected)")
+    it = store.get_intent(iid)
+    if not it:
+        die(f"error: no intent {iid}")
+    if doc_file:
+        try:
+            doc = Path(doc_file).read_text(encoding="utf-8")
+        except OSError:
+            die(f"error: cannot read --doc-file {doc_file}")
+    fact = store.add_fact(fact_text, title=title, kind=kind, data=data, doc=doc,
+                          creator=worker or "agent", from_intent=iid)
+    it["status"] = "done"
+    it["to"] = fact["id"]
+    it["done_at"] = now_iso()
+    store.save_intent(it)
+    print(f"[sapper] {iid} -> {fact['id']}: {fact_text}")
+    return 0
+
+
+def cmd_complete(store: Store, args: list[str]) -> int:
+    store.require()
+    from_ = take_opt(args, "--from")
+    note = take_opt(args, "--note", default="")
+    take_opt(args, "--worker", default="reason")
+    if not from_:
+        usage_error("error: the following arguments are required: --from")
+    p = store.project()
+    p["status"] = "completed"
+    p["completed_at"] = now_iso()
+    p["completed_from"] = [x for x in re.split(r"[,\s]+", from_.strip()) if x]
+    p["completion_note"] = note or ""
+    p["updated_at"] = now_iso()
+    store.save_project(p)
+    print(f"[sapper] project completed from {','.join(p['completed_from'])}")
+    return 0
+
+
+def cmd_confirm(store: Store, args: list[str]) -> int:
+    store.require()
+    if not args:
+        usage_error("error: the following arguments are required: id")
+    it = store.get_intent(args[0])
+    if not it:
+        die(f"error: no intent {args[0]}")
+    it["confirmed_at"] = now_iso()
+    store.save_intent(it)
+    print(f"[sapper] {it['id']} confirmed")
+    return 0
+
+
+def _reason_round(store: Store, model: str) -> int:
+    """模拟一次 dispatch reason：基于最新 fact 产出 1-3 个 intent。"""
+    facts = store.list_facts()
+    if not facts:
+        die("error: reason requires at least one fact")
+    anchor = facts[-1]["id"]
+    round_no = int(store.root.joinpath(".reason_round").read_text().strip()) if (store.root / ".reason_round").exists() else 0
+    round_no += 1
+    atomic_write(store.root / ".reason_round", str(round_no))
+
+    complete_after = env_int("FAKE_COMPLETE_AFTER", 0)
+    if complete_after and round_no >= complete_after:
+        p = store.project()
+        p["status"] = "completed"
+        p["completed_at"] = now_iso()
+        p["completed_from"] = [anchor]
+        store.save_project(p)
+        print(f"[reason] round {round_no}: goal satisfied, project completed")
+        return 0
+
+    if env_flag("FAKE_EMPTY_FRONTIER"):
+        print(f"[reason] round {round_no}: no new attack surface")
+        return 0
+
+    existing = {i.get("description") for i in store.list_intents()}
+    generated = 0
+    for n, desc in enumerate(
+        [
+            f"对 {anchor} 指向的服务做端口与版本识别",
+            f"基于 {anchor} 枚举 Web 路径与参数",
+            f"对 {anchor} 做默认凭据与弱口令探测",
+        ]
+    ):
+        if desc in existing:
+            continue
+        if env_flag("FAKE_STALL") and store.list_intents():
+            break
+        iid = store.next_id("i")
+        it = {
+            "id": iid,
+            "from": [anchor],
+            "description": desc,
+            "title": desc[:40],
+            "status": "open",
+            "worker": None,
+            "requires_confirmation": False,
+            "confirmed_at": None,
+            "doc": "",
+            "creator": "reason",
+            "created_at": now_iso(),
+        }
+        store.save_intent(it)
+        generated += 1
+        if generated >= 3:
+            break
+    print(f"[reason] round {round_no}: generated {generated} intent(s) from {anchor}")
+    return 0
+
+
+def cmd_dispatch(store: Store, args: list[str]) -> int:
+    store.require()
+    model = take_opt(args, "--model", default="deepseek-flash")
+    timeout = take_opt(args, "--timeout", default="600")
+    take_opt(args, "--templates")
+    take_flag(args, "--skip-permissions")
+    dry = take_flag(args, "--dry-run")
+    claim_first = take_flag(args, "--claim")
+    take_opt(args, "--intent")
+    take_opt(args, "--max-options")
+    if not args:
+        usage_error("error: the following arguments are required: target")
+    target = args[0]
+
+    delay = env_int("FAKE_SLOW", 0)
+    if delay:
+        time.sleep(delay)
+    if env_flag("FAKE_ERROR"):
+        die(f"error: dispatch {target} failed (injected)")
+
+    if dry:
+        print(f"[dispatch] dry-run target={target} model={model} timeout={timeout}")
+        return 0
+
+    if target == "reason":
+        return _reason_round(store, model)
+    if target in ("verify", "blindspot", "brainstorm"):
+        print(f"[dispatch] {target} finished (model={model})")
+        return 0
+
+    it = store.get_intent(target)
+    if not it:
+        die(f"error: no intent {target}")
+    if it.get("status") == "done":
+        print(f"[explore] {target} already concluded -> {it.get('to')}")
+        return 0
+    if claim_first:
+        it["status"] = "claimed"
+        it["worker"] = f"dispatch-{os.getpid()}"
+        it["claimed_at"] = now_iso()
+        store.save_intent(it)
+
+    if env_flag("FAKE_NOOP_DISPATCH"):
+        print(f"[explore] {target} returned no new evidence")
+        return 0
+
+    desc = f"{it.get('description', '')}：已执行并取得可验证结果"
+    fact = store.add_fact(desc, title=it.get("title") or desc[:40], kind="note",
+                          creator="dispatch", from_intent=target)
+    it["status"] = "done"
+    it["to"] = fact["id"]
+    it["done_at"] = now_iso()
+    store.save_intent(it)
+    print(f"[explore] {target} -> {fact['id']}: {desc}")
+    return 0
+
+
+def cmd_flag(store: Store, args: list[str]) -> int:
+    store.require()
+    challenge = take_opt(args, "-c", "--challenge")
+    submit = take_flag(args, "--submit")
+    if not args:
+        usage_error("error: the following arguments are required: value")
+    value = args[0]
+    if any(f.get("kind") == "flag" and f.get("description") == value for f in store.list_facts()):
+        print(f"[sapper] flag already recorded: {value}")
+        return 0
+    fact = store.add_fact(value, title="captured flag", kind="flag",
+                          data={"challenge": challenge or ""}, creator="agent")
+    print(f"[sapper] {fact['id']} flag recorded: {value}" + (" (submitted)" if submit else ""))
+    return 0
+
+
+def cmd_validate(store: Store, args: list[str]) -> int:
+    store.require()
+    errors = []
+    facts = {f["id"] for f in store.list_facts()}
+    for it in store.list_intents():
+        for src in it.get("from", []):
+            if src not in facts:
+                errors.append(f"{it['id']} references missing fact {src}")
+        if it.get("status") == "done" and it.get("to") not in facts:
+            errors.append(f"{it['id']} done but target fact missing")
+    if errors:
+        print(f"graph invalid: {len(errors)} error(s)")
+        for e in errors:
+            print(f"  - {e}")
+        return 1
+    print(f"graph valid: {store.root}")
+    return 0
+
+
+def cmd_view(store: Store, args: list[str]) -> int:
+    store.require()
+    out = take_opt(args, "--out", default="sapper-graph.html")
+    serve = take_flag(args, "--serve")
+    host = take_opt(args, "--host", default="127.0.0.1")
+    port = take_opt(args, "--port", default="8765")
+    as_print = take_flag(args, "--print")
+    html = f"<html><body><h1>fake sapper view</h1><pre>{render_status(store)}</pre></body></html>"
+    if as_print:
+        print(html)
+        return 0
+    if serve:
+        print(f"[view] serving on http://{host}:{port}/ (fake)")
+        # 真实监听，便于 nuwa 的 ensure_view curl 探测
+        import http.server
+        import socketserver
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = html.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        try:
+            with socketserver.TCPServer((host, int(port)), H) as httpd:
+                httpd.serve_forever()
+        except OSError as e:
+            die(f"error: cannot bind {host}:{port}: {e}")
+        return 0
+    atomic_write(Path(out), html)
+    print(f"[view] wrote {out}")
+    return 0
+
+
+def cmd_teardown(store: Store, args: list[str]) -> int:
+    purge = take_flag(args, "--purge")
+    if purge and store.root.exists():
+        shutil.rmtree(store.root)
+        print(f"[sapper] purged {store.root}")
+    print("[sapper] teardown done")
+    return 0
+
+
+COMMANDS = {
+    "setup": cmd_setup,
+    "init": cmd_setup,
+    "status": cmd_status,
+    "graph": cmd_graph,
+    "frontier": cmd_frontier,
+    "pick": cmd_pick,
+    "fact": cmd_fact,
+    "intent": cmd_intent,
+    "hint": cmd_hint,
+    "show": cmd_show,
+    "doc": cmd_doc,
+    "claim": cmd_claim,
+    "release": cmd_release,
+    "done": cmd_done,
+    "complete": cmd_complete,
+    "confirm": cmd_confirm,
+    "dispatch": cmd_dispatch,
+    "flag": cmd_flag,
+    "validate": cmd_validate,
+    "view": cmd_view,
+    "teardown": cmd_teardown,
+}
+
+
+def main(argv: list[str]) -> int:
+    args = list(argv)
+    store_dir = DEFAULT_STORE
+    # 全局 --store 只允许出现在子命令之前（与 argparse 行为一致）
+    while args and args[0].startswith("--store"):
+        a = args.pop(0)
+        if a == "--store":
+            if not args:
+                usage_error("error: argument --store: expected one argument")
+            store_dir = args.pop(0)
+        elif a.startswith("--store="):
+            store_dir = a.split("=", 1)[1]
+
+    if not args or args[0] in ("-h", "--help"):
+        print("usage: sapper [--store DIR] <command> ...")
+        print("commands:", ", ".join(sorted(COMMANDS)))
+        return 0
+    if args[0] == "--version":
+        print("sapper 9.9.9-fake")
+        return 0
+
+    cmd = args.pop(0)
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        die(f"error: command not found: {cmd}", 2)
+
+    store = Store(Path(store_dir))
+    # 所有调用都记账，方便测试断言"nuwa 到底传了什么"
+    if cmd not in ("setup", "teardown"):
+        store.log_call([cmd] + args)
+
+    try:
+        return fn(store, args)
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -96,6 +96,25 @@ source ~/sapper-lab/env.sh && sapper-who
 
 细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、[`docs/SANDBOX.md`](docs/SANDBOX.md)、[`CHANGELOG.md`](CHANGELOG.md)。
 
+## 测试
+
+五套测试全部可离线、零模型成本重复执行：
+
+```bash
+./tests/run.sh          # 单元 18 + 协议 14 + 混沌 8 + 并发 5 + 端到端 4
+```
+
+| 套件 | 依赖 | 说明 |
+|---|---|---|
+| `tests/unit.test.ts` | bun | 纯函数与配置解析 |
+| `tests/test_nuwa_shell.py` | python3 | CLI 契约，对应每个缺陷编号 |
+| `tests/test_chaos.py` | flock | 坏图 / 陈旧锁 / SIGKILL / 只读目录 / 大图 |
+| `tests/test_concurrency.py` | flock | 单赢家、跨项目、锁清理、无重复派发 |
+| `tests/test_e2e_deterministic.py` | python3 | `fake-claude` 跑完整链路 |
+
+两个替身：`tests/fake-sapper`（sapper 协议仿真）、`tests/fake-claude`（确定性模型）。
+靶场与小长测见 [`docs/TESTING.md`](docs/TESTING.md)。
+
 ## 许可
 
 MIT。仅用于自己拥有或已获授权的目标。
