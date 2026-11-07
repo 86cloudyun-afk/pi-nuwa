@@ -103,16 +103,21 @@ url="$url_norm"
 stamp="$(date +%m%d-%H%M)"
 name="${name:-nuwa-$stamp-$$}"
 dir="$LAB_DIR/$name"
-if [[ -e "$dir" ]]; then
-  # 同名目录已存在：只有显式传入项目名且它是空目录时才复用，否则加后缀
-  if [[ -n "${2:-}" || ! -d "$dir" ]]; then
-    die "项目目录已存在: $dir（换一个名字或先删除）" 4
-  fi
-  name="$name-$(date +%s)"
-  dir="$LAB_DIR/$name"
+if [[ -e "$dir" && ! -d "$dir" ]]; then
+  die "项目路径已存在且不是目录: $dir" 4
+fi
+if [[ -d "$dir" && ! -d "$dir/.sapper" ]] && [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+  # 目录存在、非空、却不是 sapper 项目：拒绝覆盖
+  die "目录非空且不是 sapper 项目: $dir（换一个名字或先清理）" 4
 fi
 mkdir -p "$dir" || die "无法创建 $dir" 4
 cd "$dir" || die "无法进入 $dir" 4
+
+# 图损坏前置拦截：project.json 不是合法 JSON 时立刻退出，别带着坏图跑
+if [[ -d .sapper ]]; then
+  python3 -c 'import json; json.load(open(".sapper/project.json"))' 2>/dev/null \
+    || die "图损坏：.sapper/project.json 不是合法 JSON（重建: sapper teardown --purge）" 2
+fi
 
 AGENT_HOME="${PI_AGENT_HOME:-$HOME/.omp/agent}"
 [[ -d "$AGENT_HOME" ]] || AGENT_HOME="$HOME/.pi/agent"
@@ -141,7 +146,16 @@ cleanup_lock() {
   [[ -f "$LOCK_FILE" ]] || return 0
   [[ "$(cat "$LOCK_FILE" 2>/dev/null)" == "$$" ]] && rm -f "$LOCK_FILE"
 }
-trap cleanup_lock EXIT INT TERM
+# TERM/INT 必须真的退出：先清锁，再收掉仍在跑的 dispatch 子进程
+on_signal() {
+  cleanup_lock
+  local pids
+  pids="$(jobs -p 2>/dev/null || true)"
+  [[ -n "$pids" ]] && kill $pids 2>/dev/null
+  exit 143
+}
+trap cleanup_lock EXIT
+trap on_signal INT TERM
 
 # ---------------------------------------------------------------- 后台模式
 if (( detach )); then
@@ -286,6 +300,20 @@ hints.append({"content": "完成被拒绝：没有任何 flag/vuln/loot 事实",
 json.dump(hints, open(h, "w"), ensure_ascii=False, indent=2)'
 }
 
+# 完成验收：返回 0 表示"真完成，应停机"；返回 1 表示继续（必要时已打回 active）
+completion_ok() {
+  local status
+  status=$(python3 -c "import json;print(json.load(open('.sapper/project.json')).get('status',''))" 2>/dev/null)
+  [[ "$status" == "completed" ]] || return 1
+  if [[ "$(has_evidence)" == "yes" || "${NUWA_REQUIRE_EVIDENCE:-1}" == "0" ]]; then
+    return 0
+  fi
+  revert_completion
+  log "完成被拒绝：无证据，已打回 active"
+  event completion_rejected "round=${round:-0}"
+  return 1
+}
+
 # 图的推进签名：note 噪声不计入，避免空转时看起来一直"有进展"
 graph_sig() {
   python3 -c '
@@ -316,6 +344,7 @@ while :; do
   round=$((round + 1))
   remaining=$(( deadline - $(date +%s) ))
   if (( remaining <= 0 )); then
+    completion_ok && event project_completed "round=$round" "why=budget"
     log "预算用尽 ($minutes 分钟)"
     event budget_exhausted "minutes=$minutes"
     break
@@ -332,6 +361,11 @@ while :; do
   fi
 
   if [[ -z "$ids" ]]; then
+    if completion_ok; then
+      log "目标已完成（证据齐备）"
+      event project_completed "round=$round"
+      break
+    fi
     log "frontier 为空"
     event frontier_empty "round=$round"
     break
@@ -359,16 +393,10 @@ while :; do
     fi
   fi
 
-  status=$(python3 -c "import json;print(json.load(open('.sapper/project.json')).get('status',''))" 2>/dev/null)
-  if [[ "$status" == "completed" ]]; then
-    if [[ "$(has_evidence)" == "yes" || "${NUWA_REQUIRE_EVIDENCE:-1}" == "0" ]]; then
-      log "目标已完成（证据齐备）"
-      event project_completed "round=$round"
-      break
-    fi
-    revert_completion
-    log "完成被拒绝：无证据，已打回 active"
-    event completion_rejected "round=$round"
+  if completion_ok; then
+    log "目标已完成（证据齐备）"
+    event project_completed "round=$round"
+    break
   fi
   # 连续多轮图状态无有效变化 → 停机，别把预算烧在空转上
   sig="$(graph_sig)"
