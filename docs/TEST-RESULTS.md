@@ -89,3 +89,20 @@ cd <repo> && ./tests/run.sh                 # 五套，约 5 分钟
 | e2e | 4 pass |
 
 CI 工作流 `.github/workflows/test.yml` 在每次 push 时复跑这五套（bun + python3 + 临时安装 sapper CLI）。
+
+## 八、最终完整编排（8/8 PASS）
+
+`./bin/run-all.sh --soak-minutes 3`，报告目录 `reports/run-all-20261107-175833`：
+
+| 段 | 结果 | 耗时 |
+|---|---|---|
+| unit | PASS | ~0.1s |
+| shell | PASS | ~11s |
+| chaos | PASS | ~16s |
+| concurrency | PASS | ~150s |
+| e2e | PASS | ~78s |
+| targets | PASS | ~18s |
+| matrix | PASS | ~112s |
+| soak | PASS | ~183s |
+
+总墙钟 571s，全部在沙盒机执行。
