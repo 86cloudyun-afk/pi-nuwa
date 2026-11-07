@@ -83,6 +83,18 @@ python3 tests/soak.py --minutes 10 --interval 5 --instances 2
 - 状态体积：< 4 KB/fact（图随事实增长是正常的，按每 fact 计）
 - 事件日志：< 512 KB/min
 
+## 多类型同时压测（matrix）
+
+```bash
+python3 tests/matrix.py --replicas 2 --minutes 1
+python3 tests/matrix.py --skip-orchestration --http-workers 4 --http-seconds 10
+```
+
+两段：
+
+- **编排矩阵**：8 类目标 × N 副本同时起 `nuwa`（fake-sapper），断言退出码全 0、无残留锁、每类目标都有 dispatch。
+- **HTTP 矩阵**：每类目标开 C 个并发 worker 打 D 秒，按类型断言状态码（static 200 / deny 403 / redirect 302 / basicauth 401 / notfound 404 / gzip 200 / slow 超时 / dvwa 200 或 302），统计 p50/p95 与匹配率。
+
 ## 总编排
 
 ```bash

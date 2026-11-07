@@ -113,7 +113,12 @@ source ~/sapper-lab/env.sh && sapper-who
 | `tests/test_e2e_deterministic.py` | python3 | `fake-claude` 跑完整链路 |
 
 两个替身：`tests/fake-sapper`（sapper 协议仿真）、`tests/fake-claude`（确定性模型）。
-靶场与小长测见 [`docs/TESTING.md`](docs/TESTING.md)。
+
+多类型同时压测：`python3 tests/matrix.py --replicas 2 --minutes 1`，编排矩阵（8 类目标同时起）
+与 HTTP 矩阵（8 类响应面并发打）各一组断言。
+
+靶场、小长测与判定口径见 [`docs/TESTING.md`](docs/TESTING.md)，最近一次读数见
+[`docs/TEST-RESULTS.md`](docs/TEST-RESULTS.md)。
 
 ## 许可
 
