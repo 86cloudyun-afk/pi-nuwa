@@ -100,7 +100,7 @@
 |---|---|---|---|
 | reason 幻觉直接 complete | B 层第一次跑，模型编造"已访问 /flag 拿到 flag"，项目变 completed，实际零请求 | 完成证据闸门：无 flag/vuln/loot 的 completed 打回 active + hint，最多 3 次 | 源码 + B 层复跑 |
 | bash 循环无 stall 熔断 | noop 场景 61.8s / 405 次无效 dispatch | `graph_sig` + `NUWA_MAX_STALL`（默认 5） | **10.4s / 38 次**，事件 `stall_stop` |
-| 锁文件残留 | 13 个实例留下 13 个 `.nuwa.lock` | `trap cleanup_lock EXIT INT TERM` | 复跑 `lock_left=0` |
+| 锁文件残留 | 修复前批次每实例留 1 个 `.nuwa.lock` | `trap cleanup_lock EXIT INT TERM` | 修复后两个批次 `lock_left=0`（`stress-4x1-final` / `stress-noop2`） |
 
 ---
 
