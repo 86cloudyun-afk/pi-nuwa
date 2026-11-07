@@ -75,3 +75,17 @@ cd <repo> && ./tests/run.sh                 # 五套，约 5 分钟
 ./bin/run-all.sh --soak-minutes 5           # 加靶场断言 + 矩阵 + 小长测
 ./bin/matrix.py --replicas 2 --minutes 1    # 单独跑矩阵
 ```
+
+## 七、仓库布局复跑
+
+从干净 checkout 直接跑 `./tests/run.sh`（不依赖沙盒目录结构）：
+
+| 套件 | 结果 |
+|---|---|
+| unit | 18 pass / 0 fail |
+| shell | 14 pass |
+| chaos | 8 pass |
+| concurrency | 5 pass |
+| e2e | 4 pass |
+
+CI 工作流 `.github/workflows/test.yml` 在每次 push 时复跑这五套（bun + python3 + 临时安装 sapper CLI）。
