@@ -63,7 +63,7 @@ class Concurrency(unittest.TestCase):
             [str(NUWA), "http://127.0.0.1:19999", name, "--no-view",
              "--minutes", minutes, "--parallel", "2"],
             cwd=str(self.tmp), env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
     # ---------------------------------------------------------------- 1

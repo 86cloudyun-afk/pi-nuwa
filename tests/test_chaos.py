@@ -111,7 +111,8 @@ class Chaos(unittest.TestCase):
         p = subprocess.Popen(
             [str(NUWA), "http://127.0.0.1:19999", "p1", "--no-view",
              "--minutes", "5", "--parallel", "1"],
-            cwd=str(self.tmp), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(self.tmp), env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         time.sleep(3)
         p.kill()
