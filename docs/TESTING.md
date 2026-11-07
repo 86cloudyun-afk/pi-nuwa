@@ -74,8 +74,14 @@ cd tests && NUWA_WORK=<repo> bun test unit.test.ts
 python3 tests/soak.py --minutes 10 --interval 5 --instances 2
 ```
 
-每 5 秒采样：存活进程数、进程树 RSS、FD 数、事件行数、状态文件字节。
-结束算最小二乘斜率，判定：RSS < 2MB/min、FD 增长 ≤ 2、状态文件 < 64KB、退出码全 0。
+每 5 秒采样：主进程 RSS、FD、子进程数、facts 数、图 JSON 总字节、事件行数。
+跳过前 20% 预热样本后算最小二乘斜率。判定口径：
+
+- 退出码：0 或 143（采样器主动收工）
+- RSS：< 2 MB/min（只算主进程，避免短命子进程干扰）
+- FD：≤ 2/min
+- 状态体积：< 4 KB/fact（图随事实增长是正常的，按每 fact 计）
+- 事件日志：< 512 KB/min
 
 ## 总编排
 
