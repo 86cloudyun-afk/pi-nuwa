@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# nuwa <目标URL> [项目名] [--loop|--no-loop] [--detach] [--minutes N] [--parallel K] [--no-run] [--model M]
+# 女娲渗透：建图 → 出意图 → 逐条 dispatch 派生子代理（默认循环到完成/预算尽）
+set -uo pipefail
+LAB_DIR="${SAPPER_HOME:-$HOME/sapper-lab}"
+ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
+# shellcheck disable=SC1090
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+
+url=""; name=""; loop=1; minutes=60; parallel=3; run=1; detach=0; view=1; model="deepseek-flash"
+while (( $# )); do
+  case "$1" in
+    --loop) loop=1; shift ;;
+    --no-loop) loop=0; shift ;;
+    --detach) detach=1; shift ;;
+    --no-view) view=0; shift ;;
+    --no-run) run=0; shift ;;
+    --minutes) minutes="${2:-60}"; shift 2 ;;
+    --parallel) parallel="${2:-3}"; shift 2 ;;
+    --model) model="${2:-deepseek-flash}"; shift 2 ;;
+    -*) shift ;;
+    *) if [[ -z "$url" ]]; then url="$1"; elif [[ -z "$name" ]]; then name="$1"; fi; shift ;;
+  esac
+done
+[[ -n "$url" ]] || { echo "用法: nuwa <目标URL> [项目名] [--loop|--no-loop] [--detach] [--minutes 60] [--parallel 3] [--no-run] [--model deepseek-flash]"; exit 2; }
+(( run )) || loop=0
+name="${name:-nuwa-$(date +%m%d-%H%M)}"
+dir="$LAB_DIR/$name"
+mkdir -p "$dir" && cd "$dir" || exit 1
+# 女娲循环指针：nuwa-loop 扩展靠它把 session_stop 顶回去继续派单
+AGENT_HOME="${PI_AGENT_HOME:-$HOME/.omp/agent}"
+[[ -d "$AGENT_HOME" ]] || AGENT_HOME="$HOME/.pi/agent"
+mkdir -p "$AGENT_HOME/cache" && printf '%s\n' "$dir" > "$AGENT_HOME/cache/nuwa-current"
+
+if (( detach )); then
+  log="$dir/nuwa.log"
+  extra=(); (( view )) || extra+=(--no-view)
+  nohup "$0" "$url" "$name" --loop --minutes "$minutes" --parallel "$parallel" --model "$model" "${extra[@]}" >>"$log" 2>&1 &
+  echo "[nuwa] detached pid=$! log=$log dir=$dir"
+  echo "[nuwa] 看板: 启动后写入 $dir/VIEW.txt"
+  exit 0
+fi
+
+host=$(python3 -c "import sys,urllib.parse as u;p=u.urlparse(sys.argv[1]);print(p.hostname or '')" "$url")
+port=$(python3 -c "import sys,urllib.parse as u;p=u.urlparse(sys.argv[1]);print(p.port or (443 if p.scheme=='https' else 80))" "$url")
+
+if [[ ! -d .sapper ]]; then
+  sapper setup --goal "对 $url 做完整渗透评估并拿到 flag" --agents >/dev/null
+  sapper fact "靶标已授权且可达：$url" -t "靶标确认" -k host \
+    -d ip="$host" -d port="$port" -d url="$url" -d status=alive >/dev/null
+  echo "[nuwa] 新图: $dir"
+else
+  echo "[nuwa] 复用图: $dir"
+fi
+
+ensure_view() {
+  local url_file="$dir/.sapper/view.url" pid_file="$dir/.sapper/view.pid" log_file="$dir/.sapper/view.log"
+  if [[ -f "$url_file" ]]; then
+    local old; old=$(cat "$url_file" 2>/dev/null)
+    if [[ -n "$old" ]] && curl -fsS -m 2 -o /dev/null "$old" 2>/dev/null; then
+      printf '%s\n' "$old" > "$dir/VIEW.txt"
+      echo "[nuwa] 看板: $old"
+      echo "[nuwa] 看板文件: $dir/VIEW.txt"
+      return 0
+    fi
+  fi
+
+  local vport
+  vport=$(python3 - <<'PY'
+import socket
+for p in range(8765, 8865):
+    s = socket.socket()
+    s.settimeout(0.15)
+    try:
+        s.connect(("127.0.0.1", p))
+        s.close()
+    except OSError:
+        print(p)
+        break
+PY
+)
+  if [[ -z "$vport" ]]; then
+    echo "[nuwa] 看板: 8765-8864 端口已满，先停一个 sapper view"
+    return 1
+  fi
+
+  nohup sapper --store "$dir/.sapper" view --serve --host 127.0.0.1 --port "$vport" >"$log_file" 2>&1 &
+  echo $! > "$pid_file"
+  disown 2>/dev/null || true
+
+  local vurl="http://127.0.0.1:$vport/" i
+  for i in $(seq 1 24); do
+    curl -fsS -m 1 -o /dev/null "$vurl" 2>/dev/null && break
+    sleep 0.25
+  done
+
+  if curl -fsS -m 2 -o /dev/null "$vurl" 2>/dev/null; then
+    printf '%s\n' "$vurl" > "$url_file"
+    printf '%s\n' "$vurl" > "$dir/VIEW.txt"
+    echo "[nuwa] 看板: $vurl"
+    echo "[nuwa] 看板文件: $dir/VIEW.txt"
+  else
+    echo "[nuwa] 看板: 启动失败，日志 $log_file"
+    tail -4 "$log_file" 2>/dev/null
+  fi
+}
+
+(( view )) && ensure_view
+
+dispatch_one() {
+  echo "[nuwa] 执行 $1"
+  sapper dispatch "$1" --claim --model "$model" --skip-permissions --timeout 300 2>&1 | tail -6
+}
+
+round=0
+deadline=$(( $(date +%s) + minutes * 60 ))
+while :; do
+  round=$((round + 1))
+  echo "[nuwa] ===== round $round ====="
+  sapper dispatch reason --model "$model" --timeout 240 2>&1 | tail -1
+
+  ids=$(sapper frontier 2>/dev/null | awk '{print $1}')
+  if [[ -z "$ids" ]]; then
+    echo "[nuwa] frontier 为空"
+    break
+  fi
+
+  if (( run )); then
+    if (( parallel > 1 )); then
+      n=0
+      for id in $ids; do
+        dispatch_one "$id" &
+        n=$((n + 1))
+        if (( n >= parallel )); then wait; n=0; fi
+      done
+      wait
+    else
+      for id in $ids; do dispatch_one "$id"; done
+    fi
+  fi
+
+  status=$(python3 -c "import json;print(json.load(open('.sapper/project.json')).get('status',''))" 2>/dev/null)
+  [[ "$status" == "completed" ]] && { echo "[nuwa] 目标已完成"; break; }
+  if (( ! loop )); then break; fi
+  if (( $(date +%s) >= deadline )); then echo "[nuwa] 预算用尽 ($minutes 分钟)"; break; fi
+done
+
+echo "[nuwa] ===== 战报 ====="
+sapper status | sed -n '1,12p'
+[[ -f "$dir/.sapper/view.url" ]] && echo "[nuwa] 看板: $(cat "$dir/.sapper/view.url")"
+echo "[nuwa] 继续: cd $dir && nuwa \"$url\" --loop --minutes 60 --parallel 3"
