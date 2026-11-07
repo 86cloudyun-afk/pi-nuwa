@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+fake-claude — 确定性 claude 兼容引擎，供 B 层零成本端到端测试。
+
+sapper 的调用约定：
+  <engine> -p --output-format json --model M [--dangerously-skip-permissions] \
+           [--append-system-prompt S]
+  prompt 走 stdin，stdout 必须是 {"result": "..."}，result 里再套一层 JSON。
+
+判定规则（确定、不依赖模型）：
+  - 有 --append-system-prompt  → explore（sapper 只对 explore 传 system）
+  - 没有                        → reason
+
+模式（FAKE_ENGINE_MODE）：
+  normal        正常产出 intent / fact
+  noop          reason 返回空 intents
+  hallucinate   reason 直接返回 complete（用于验证证据闸门）
+  malformed     返回非 JSON（用于验证错误处理）
+  error         退出 1
+  slow          先睡 FAKE_ENGINE_DELAY 秒
+
+调用计数写 FAKE_ENGINE_COUNTER（默认 /tmp/fake-claude.count），用于让每轮
+产出的 description 唯一，避免图里的去重逻辑把测试挡住。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+MODE = os.environ.get("FAKE_ENGINE_MODE", "normal").strip() or "normal"
+DELAY = float(os.environ.get("FAKE_ENGINE_DELAY", "0") or 0)
+COUNTER = Path(os.environ.get("FAKE_ENGINE_COUNTER", "/tmp/fake-claude.count"))
+LOG = os.environ.get("FAKE_ENGINE_LOG", "")
+
+
+def bump() -> int:
+    try:
+        n = int(COUNTER.read_text().strip() or "0") + 1
+    except (OSError, ValueError):
+        n = 1
+    try:
+        COUNTER.write_text(str(n))
+    except OSError:
+        pass
+    return n
+
+
+def log(rec: dict) -> None:
+    if not LOG:
+        return
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def parse_argv(argv: list[str]) -> dict:
+    out = {"model": "", "system": "", "skip": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--model" and i + 1 < len(argv):
+            out["model"] = argv[i + 1]
+            i += 2
+        elif a == "--append-system-prompt" and i + 1 < len(argv):
+            out["system"] = argv[i + 1]
+            i += 2
+        elif a == "--dangerously-skip-permissions":
+            out["skip"] = True
+            i += 1
+        else:
+            i += 1
+    return out
+
+
+def main() -> int:
+    args = parse_argv(sys.argv[1:])
+    prompt = sys.stdin.read()
+    n = bump()
+    kind = "explore" if args["system"] else "reason"
+
+    log({"n": n, "kind": kind, "model": args["model"], "prompt_len": len(prompt),
+         "mode": MODE, "prompt_head": prompt[:200]})
+
+    if DELAY > 0:
+        time.sleep(DELAY)
+
+    if MODE == "error":
+        print("fake-claude: injected failure", file=sys.stderr)
+        return 1
+
+    if MODE == "malformed":
+        print(json.dumps({"result": "this is not json at all"}))
+        return 0
+
+    facts = re.findall(r"\bf\d{3}\b", prompt)
+    intents = re.findall(r"\bi\d{3}\b", prompt)
+    anchor = facts[0] if facts else "f001"
+    iid = intents[0] if intents else "i001"
+
+    if kind == "reason":
+        if MODE == "noop":
+            payload = {"intents": []}
+        elif MODE == "hallucinate":
+            payload = {"complete": {"from": [anchor],
+                                    "description": "fake engine claims the goal is complete"}}
+        else:
+            payload = {"intents": [
+                {"description": f"fake 探测 {n}：对 {anchor} 做端口识别",
+                 "from": [anchor], "title": f"fake-{n}-a", "kind": "service",
+                 "data": {"probe": "port", "seq": n}},
+                {"description": f"fake 探测 {n}：对 {anchor} 做路径枚举",
+                 "from": [anchor], "title": f"fake-{n}-b", "kind": "note",
+                 "data": {"probe": "path", "seq": n}},
+            ]}
+    else:
+        # 注意：sapper 的 _parse_explore_payload 会把 payload["data"] 当成整体，
+        # 所以 description/kind/title/doc 必须平铺在顶层，不能再嵌一层 data。
+        if MODE == "noop":
+            payload = {"description": f"fake explore {iid}：无新证据", "kind": "note"}
+        elif MODE == "hallucinate":
+            payload = {"description": f"flag{{fake-{n}}}", "kind": "flag",
+                       "title": "fake flag"}
+        else:
+            payload = {"description": f"fake explore {iid}：命中测试端点 probe={n}",
+                       "title": f"fake-{iid}-{n}", "kind": "service",
+                       "doc": f"echo probe-{n}\nGET /probe HTTP/1.1 -> 200",
+                       "accepted": True}
+
+    print(json.dumps({"result": json.dumps(payload, ensure_ascii=False)}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

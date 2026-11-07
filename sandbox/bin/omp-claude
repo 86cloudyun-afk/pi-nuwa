@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# omp-claude — 让 sapper 的 `claude` 调用面落到 omp 上。
+#
+# sapper 的调用约定（lib/sapper.py:run_claude）：
+#   <SAPPER_BIN> -p --output-format json --model M [--dangerously-skip-permissions] \
+#                 [--append-system-prompt S]
+#   prompt 从 stdin 进来，stdout 必须是 {"result": "..."} 的 JSON envelope。
+#
+# 本包装器把 claude 风格参数翻译成 omp 参数，再把 omp 的纯文本输出包成 envelope。
+set -uo pipefail
+
+OMP_CLI="${OMP_CLI:-/srv/omp-sandbox/runtime/pi-coding-agent/dist/cli.js}"
+DEFAULT_MODEL="${OMP_DEFAULT_MODEL:-deepseek/deepseek-flash}"
+MAX_TIME="${OMP_TIMEOUT:-600}"
+
+MODEL=""
+SYS=""
+while (( $# )); do
+  case "$1" in
+    -p|--print) shift ;;
+    --output-format) shift 2 ;;
+    --model) MODEL="${2:-}"; shift 2 ;;
+    --dangerously-skip-permissions) shift ;;
+    --append-system-prompt) SYS="${2:-}"; shift 2 ;;
+    --) shift; break ;;
+    *) shift ;;
+  esac
+done
+
+PROMPT="$(cat)"
+if [[ -z "$PROMPT" && $# -gt 0 ]]; then
+  PROMPT="$*"
+fi
+[[ -n "$PROMPT" ]] || { printf '{"result":"","is_error":true,"error":"empty prompt"}\n'; exit 0; }
+
+EXTRA=()
+[[ -n "$SYS" ]] && EXTRA+=(--append-system-prompt "$SYS")
+
+OUT="$(bun "$OMP_CLI" -p --model "${MODEL:-$DEFAULT_MODEL}" "${EXTRA[@]}" \
+  --max-time "$MAX_TIME" --no-title -- "$PROMPT" 2>/dev/null)"
+RC=$?
+
+python3 - "$RC" "$OUT" <<'PY'
+import json, sys
+rc, raw = sys.argv[1], sys.argv[2]
+lines = [l for l in raw.splitlines() if l.strip() and l.strip() != "Working..."]
+text = "\n".join(lines).strip()
+print(json.dumps({
+    "result": text,
+    "is_error": rc != "0" or text == "",
+    "exit_code": rc,
+}, ensure_ascii=False))
+PY
