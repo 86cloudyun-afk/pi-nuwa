@@ -29,7 +29,7 @@ class E2E(unittest.TestCase):
         (self.tmp / "lab").mkdir()
         (self.tmp / "agent").mkdir()
         self.env = dict(os.environ)
-        self.env["PATH"] = f"{BIN}:{Path.home()}/.local/bin:{self.env.get('PATH', '')}"
+        self.env["PATH"] = f"{Path.home()}/.local/bin:{BIN}:{self.env.get('PATH', '')}"
         self.env["SAPPER_HOME"] = str(self.tmp / "lab")
         self.env["PI_AGENT_HOME"] = str(self.tmp / "agent")
         self.env["NUWA_ENV"] = "/dev/null"
