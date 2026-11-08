@@ -21,6 +21,7 @@ case "${1:-}" in
     if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
       # shellcheck disable=SC1090
       [[ -f "${NUWA_ENV:-$LAB_DIR/env.sh}" ]] && source "${NUWA_ENV:-$LAB_DIR/env.sh}"
+      export PATH="$LAB_DIR/bin:$PATH"
       exec python3 "$_PKG_DIR/nuwa/cli.py" "$@"
     fi
     ;;

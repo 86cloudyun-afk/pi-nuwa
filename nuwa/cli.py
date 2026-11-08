@@ -128,8 +128,12 @@ def _ensure_project(target: str, name: str | None) -> Path:
 
 
 def cmd_run(args) -> int:
+    if not args.root and not args.target:
+        print("nuwa: 需要 target 或 --root", file=sys.stderr)
+        return 2
     try:
-        root = Path(args.root).resolve() if args.root else _ensure_project(args.target, args.name)
+        root = (Path(args.root).resolve() if args.root
+                else _ensure_project(args.target, args.name))
     except (RuntimeError, FileNotFoundError) as exc:
         print(f"nuwa: {exc}", file=sys.stderr)
         return 2
@@ -388,7 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_commit)
 
     s = sub.add_parser("run")
-    s.add_argument("target")
+    s.add_argument("target", nargs="?")
     s.add_argument("--name", default=None)
     s.add_argument("--minutes", type=int, default=60)
     s.add_argument("--parallel", type=int, default=2)

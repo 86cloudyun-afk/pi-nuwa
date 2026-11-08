@@ -80,6 +80,7 @@ class GuardTest(unittest.TestCase):
 
     def test_blocks_fact_from_intent(self):
         self.assertEqual(self.run_guard("fact", "x", "--from-intent", "i001").returncode, 7)
+        self.assertEqual(self.run_guard("fact", "x", "--f", "i001").returncode, 7)
 
     def test_blocks_dispatch_reason(self):
         self.assertEqual(self.run_guard("dispatch", "reason", "--model", "fake").returncode, 7)

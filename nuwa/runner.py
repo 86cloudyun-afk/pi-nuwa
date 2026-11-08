@@ -31,7 +31,12 @@ def _project_status(root: Path) -> str:
 
 
 def _evidence(root: Path) -> bool:
-    return any(f.get("kind") in ("flag", "vuln", "loot") for f in graph.facts(root))
+    facts = {f.get("id"): f for f in graph.facts(root)}
+    refs = graph.project(root).get("completed_from") or []
+    if refs:
+        return any(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
+                   for fid in refs)
+    return any(f.get("kind") in ("flag", "vuln", "loot") for f in facts.values())
 
 
 def _revert(root: Path, why: str) -> None:

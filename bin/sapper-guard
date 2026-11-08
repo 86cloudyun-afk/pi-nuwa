@@ -77,7 +77,7 @@ case "$cmd" in
     # fact --from-intent 会原子结案，必须走 nuwa commit。
     for (( j = cmd_idx + 1; j < ${#args[@]}; j++ )); do
       case "${args[$j]}" in
-        --from-intent|--from-intent=*|--from-i|--from-i=*|--from-in*)
+        --f*)
           (( ALLOWED == 1 )) || block "fact ${args[$j]}"
           ;;
       esac

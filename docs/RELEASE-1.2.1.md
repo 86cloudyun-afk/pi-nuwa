@@ -179,6 +179,15 @@
 | B28 | 账本缺坏尾隔离，残行吞掉下一条 reserve | `Ledger._append_locked` 写前检查末字节，缺 LF 先补 |
 | B24 | env.sh 在 PATH 前移后重置路径 | source 之后再压一次 `$SAPPER_HOME/bin` 到 PATH 最前 |
 
+## 第二十轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B29 | 续跑文案 `nuwa run --root` 缺 target，解析退出 2 | `run` 的 target 改可选；`--root` 优先，两者都空才报错 |
+| B24 | Python 子命令 source env.sh 后 PATH 被重置 | case 内 exec 前再压 `$SAPPER_HOME/bin` |
+| B26 | `fact` 的 `--from*` 合法缩写未覆盖 | guard 拦 `--f*`（fact 下唯一前缀） |
+| B25 | reason 完成只查整图证据 | `_evidence` 优先只认 `completed_from` 指向的 fact |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
