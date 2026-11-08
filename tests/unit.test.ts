@@ -130,6 +130,9 @@ describe("readGraph", () => {
 				{ id: "f004", kind: "vuln" },
 			],
 		});
+		writeFileSync(join(root, ".sapper", "intents", "i004.json"), JSON.stringify({
+			id: "i004", status: "complete", to: "goal", from: ["f004"],
+		}));
 		const g = mod.readGraph(root)!;
 		expect(g.open).toBe(1);
 		expect(g.claimed).toBe(1);

@@ -237,6 +237,14 @@
 |---|---|---|
 | 测试稳定性 | `test_night_verify_report` 依赖 smoke 的真实 verdict，偶发 `facts_ok=False` | 测试夹具把 REPORT 的 verdict 置为全 True；`test_night_smoke` 继续测真实采样 |
 
+## 第二十七轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B25 | 会话扩展的 `verified` 仍按整图任一强证据 | 扩展 `readGraph` 只认 `to=goal` 且 status=complete 的边，要求 from 非空且全强证据 |
+| B30 | `_revert` 锁内未重判证据；调用方丢弃 False；shell 吞删除错误 | 锁内重判 `_evidence`，有效完成不删；调用方记 `revert_failed`；shell 删除失败退出 1 并跑 validate |
+| M58 | 测试夹具覆盖 verdict 被指伪造 | 夹具只用于 verify 判定测试；`test_night_smoke` 继续测真实采样 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

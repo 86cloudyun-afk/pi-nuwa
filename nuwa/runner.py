@@ -55,6 +55,9 @@ def _revert(root: Path, why: str) -> bool:
         data = graph._load(p) or {}
         if data.get("status") != "completed":
             return False
+        if _evidence(root):
+            # 等待锁期间可能已有新的有效完成，不能误删。
+            return False
         # 与真实 sapper 共用 .sapper/.lock：删边、写 active、hint 都在锁内。
         for it in graph.intents(root):
             if it.get("to") == "goal":
@@ -204,8 +207,10 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                     if _evidence(root):
                         journal.append("project_completed", round=round_no)
                         break
-                    _revert(root, "没有任何 flag/vuln/loot 事实")
-                    journal.append("completion_rejected", round=round_no)
+                    if _revert(root, "没有任何 flag/vuln/loot 事实"):
+                        journal.append("completion_rejected", round=round_no)
+                    else:
+                        journal.append("revert_failed", round=round_no)
                 journal.append("frontier_empty", round=round_no)
                 break
             batch = ids[: max(1, parallel * 2)]
@@ -223,8 +228,10 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                 if _evidence(root):
                     journal.append("project_completed", round=round_no)
                     break
-                _revert(root, "没有任何 flag/vuln/loot 事实")
-                journal.append("completion_rejected", round=round_no)
+                if _revert(root, "没有任何 flag/vuln/loot 事实"):
+                    journal.append("completion_rejected", round=round_no)
+                else:
+                    journal.append("revert_failed", round=round_no)
 
             facts = graph.facts(root)
             sig = "|".join(str(x) for x in (

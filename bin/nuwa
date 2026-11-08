@@ -370,7 +370,7 @@ for path in glob.glob(".sapper/intents/*.json"):
         try:
             os.remove(path)
         except OSError:
-            pass
+            raise SystemExit(1)
 p = ".sapper/project.json"
 d = json.load(open(p))
 d["status"] = "active"
@@ -385,6 +385,7 @@ except Exception:
     hints = []
 hints.append({"content": "完成被拒绝：没有任何 flag/vuln/loot 事实", "creator": "nuwa", "created_at": d["updated_at"]})
 json.dump(hints, open(h, "w"), ensure_ascii=False, indent=2)'
+  sapper validate >/dev/null 2>&1 || log "回滚后 validate 失败"
   ) 8>"$dir/.sapper/.lock"
 }
 

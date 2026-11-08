@@ -425,11 +425,16 @@ export function readGraph(root: string): Graph | null {
 	let done = 0;
 	let claimed = 0;
 	const openIds: string[] = [];
+	const goalEdges: string[][] = [];
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
 			if (!f.endsWith(".json")) continue;
-			const it = readJson<{ id?: string; status?: string }>(join(root, ".sapper", "intents", f));
+			const it = readJson<{ id?: string; status?: string; to?: string; from?: string[] }>(
+				join(root, ".sapper", "intents", f));
 			if (!it) continue;
+			if (it.to === "goal" && it.status === "complete") {
+				goalEdges.push((it.from ?? []).map(String));
+			}
 			if (it.status === "open") {
 				open++;
 				if (it.id) openIds.push(it.id);
@@ -444,6 +449,7 @@ export function readGraph(root: string): Graph | null {
 	let flags = 0;
 	let effective = 0;
 	let verified = false;
+	const kinds: Record<string, string> = {};
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "facts"))) {
 			if (!f.endsWith(".json") || f === "goal.json") continue;
@@ -451,11 +457,14 @@ export function readGraph(root: string): Graph | null {
 			const fact = readJson<{ kind?: string }>(join(root, ".sapper", "facts", f));
 			if (fact?.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
-			if (fact?.kind === "flag" || fact?.kind === "vuln" || fact?.kind === "loot") verified = true;
+			if (fact?.kind) kinds[f.replace(/\.json$/, "")] = fact.kind;
 		}
 	} catch {
 		/* ignore */
 	}
+	const strong: Record<string, true> = { flag: true, vuln: true, loot: true };
+	verified = goalEdges.length > 0 && goalEdges.every((refs) =>
+		refs.length > 0 && refs.every((id) => strong[kinds[id] ?? ""] === true));
 	let viewUrl: string | null = null;
 	try {
 		const v = readFileSync(join(root, ".sapper", "view.url"), "utf8").trim();
