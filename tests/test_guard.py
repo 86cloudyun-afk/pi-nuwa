@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,11 +58,29 @@ class GuardTest(unittest.TestCase):
 
     def test_allows_reason_internal(self):
         self.assertNotEqual(
-            self.run_guard("dispatch", "reason", "--model", "fake", allowed=True).returncode, 7)
+            self.run_internal("dispatch", "reason", "--model", "fake").returncode, 7)
+
+    def run_internal(self, *args):
+        pkg = self.tmp / "pkg" / "nuwa"
+        pkg.mkdir(parents=True, exist_ok=True)
+        script = pkg / "cli.py"
+        script.write_text(
+            "import os, subprocess, sys\n"
+            "env = dict(os.environ)\n"
+            "try:\n"
+            "    env['NUWA_SUBMIT_ALLOWED'] = open(env['TOKEN_FILE']).read().strip()\n"
+            "except OSError:\n"
+            "    pass\n"
+            "sys.exit(subprocess.run(['sapper', *sys.argv[1:]], env=env).returncode)\n",
+            encoding="utf-8")
+        env = dict(self.env)
+        env["TOKEN_FILE"] = str(self.tmp / "lab" / ".submit_token")
+        return subprocess.run([sys.executable, str(script), *args], env=env,
+                              capture_output=True, text=True, timeout=30)
 
     def test_allows_internal_commit(self):
         self.assertNotEqual(
-            self.run_guard("done", "i001", "--fact", "x", allowed=True).returncode, 7)
+            self.run_internal("done", "i001", "--fact", "x").returncode, 7)
 
     def test_allows_version(self):
         self.assertEqual(self.run_guard("--version").returncode, 0)

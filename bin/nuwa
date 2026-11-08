@@ -397,7 +397,11 @@ completion_ok() {
   if [[ "$(has_evidence)" == "yes" || "${NUWA_REQUIRE_EVIDENCE:-1}" == "0" ]]; then
     return 0
   fi
-  revert_completion
+  if ! revert_completion; then
+    log "回滚失败：完成边未清理"
+    event revert_failed "round=${round:-0}"
+    return 1
+  fi
   log "完成被拒绝：无证据，已打回 active"
   event completion_rejected "round=${round:-0}"
   return 1

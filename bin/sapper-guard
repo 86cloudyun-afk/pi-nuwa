@@ -26,8 +26,14 @@ fi
 
 TOKEN_FILE="${SAPPER_HOME:-$HOME/sapper-lab}/.submit_token"
 TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+# 第二因子：父进程必须是 nuwa CLI/bin/nuwa。token 泄漏给同 UID 也不足以直接提交。
+PPID_CMD="$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null || true)"
+TRUSTED=0
+case "$PPID_CMD" in
+  *nuwa/cli.py*|*bin/nuwa*) TRUSTED=1 ;;
+esac
 ALLOWED=0
-if [[ -n "$TOKEN" && "${NUWA_SUBMIT_ALLOWED:-}" == "$TOKEN" ]]; then
+if [[ -n "$TOKEN" && "${NUWA_SUBMIT_ALLOWED:-}" == "$TOKEN" && $TRUSTED -eq 1 ]]; then
   ALLOWED=1
 fi
 

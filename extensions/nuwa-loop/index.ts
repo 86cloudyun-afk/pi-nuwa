@@ -427,12 +427,16 @@ export function readGraph(root: string): Graph | null {
 	let claimed = 0;
 	const openIds: string[] = [];
 	const goalEdges: Array<{ status?: string; refs: string[] }> = [];
+	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
 			if (!f.endsWith(".json")) continue;
 			const it = readJson<{ id?: string; status?: string; to?: string; from?: string[] }>(
 				join(root, ".sapper", "intents", f));
-			if (!it) continue;
+			if (!it) {
+				corrupt = true;
+				continue;
+			}
 			if (it.to === "goal") {
 				goalEdges.push({
 					status: it.status,
@@ -459,7 +463,11 @@ export function readGraph(root: string): Graph | null {
 			if (!f.endsWith(".json") || f === "goal.json") continue;
 			facts++;
 			const fact = readJson<{ kind?: string }>(join(root, ".sapper", "facts", f));
-			if (fact?.kind === "flag") flags++;
+			if (!fact) {
+				corrupt = true;
+				continue;
+			}
+			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
 			if (fact?.kind) kinds[f.replace(/\.json$/, "")] = fact.kind;
 		}
@@ -467,7 +475,7 @@ export function readGraph(root: string): Graph | null {
 		/* ignore */
 	}
 	const strong: Record<string, true> = { flag: true, vuln: true, loot: true };
-	verified = goalEdges.length > 0 && goalEdges.every((edge) =>
+	verified = !corrupt && goalEdges.length > 0 && goalEdges.every((edge) =>
 		edge.status === "complete" && edge.refs.length > 0 &&
 		edge.refs.every((id) => strong[kinds[id] ?? ""] === true));
 	let viewUrl: string | null = null;

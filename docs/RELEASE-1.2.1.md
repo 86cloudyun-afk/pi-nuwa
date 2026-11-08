@@ -258,6 +258,14 @@
 |---|---|---|
 | 锁泄漏（三） | `$(...) 9>&-` 的重定向未覆盖 `$()` 子 shell，SIGKILL 后子 shell 仍持锁 | 改为 `out=$(exec 9>&-; cmd ...)`；repair 用 `(exec 9>&-; ...)` |
 
+## 第三十轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B25 | 损坏节点被静默跳过，异常图可通过局部验收 | 扩展 `readGraph` 增加 `corrupt` 标志，任一 intent/fact 解析失败即 `verified=false` |
+| B30 | shell 回滚失败后仍记已打回 | `completion_ok` 检查 `revert_completion` 退出码，失败记 `revert_failed` 并继续等 |
+| B23 | 同 UID 可读 token 直接提交 | guard 增加第二因子：父进程 cmdline 必须是 `nuwa/cli.py` 或 `bin/nuwa`；测试用临时 `nuwa/cli.py` 验证 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
