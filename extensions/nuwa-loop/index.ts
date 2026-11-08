@@ -57,6 +57,67 @@ export function checkCommand(cmd: string): { allowed: boolean; rule?: string } {
 	return { allowed: true };
 }
 
+/** 写类工具：路径命中图或权威状态目录时拒绝，阻止绕开 CLI 直接改状态。 */
+const WRITE_TOOLS: Record<string, true> = {
+	write: true,
+	edit: true,
+	multi_edit: true,
+	apply_patch: true,
+	notebook_edit: true,
+};
+
+const PATH_RULES: Array<[RegExp, string]> = [
+	[/(^|\/)\.sapper\/(facts|intents)\//, "P-005"],
+	[/(^|\/)\.sapper\/project\.json$/, "P-009"],
+	[/(^|\/)\.nuwa\/(journal[^/]*\.jsonl|checkpoint[^/]*\.json|CURRENT|global[^/]*\.jsonl)$/, "P-007"],
+];
+
+/** 提交所有权：fact 只能经 nuwa commit 产生；按 id 的 dispatch 也只能走 nuwa。 */
+const PROMPT_RULES: Array<[RegExp, string]> = [
+	[/(?:^|[;\n])\s*sapper\s+done\s+\S+/, "P-006"],
+	[/(?:^|[;\n])\s*sapper\s+dispatch\s+i\d+/, "P-006"],
+	[/(?:^|[;\n])\s*sapper\s+complete\b/, "P-006"],
+];
+
+/** 三类工具统一判定：bash 看命令，task 看文案，write/edit 看目标路径。 */
+export function checkTool(
+	toolName: string,
+	input: Record<string, unknown>,
+): { allowed: boolean; rule?: string } {
+	if (toolName === "bash") {
+		const cmd = typeof input.command === "string" ? input.command : "";
+		const base = checkCommand(cmd);
+		if (!base.allowed) return base;
+		for (const [re, rule] of PROMPT_RULES) if (re.test(cmd)) return { allowed: false, rule };
+		return { allowed: true };
+	}
+	if (toolName === "task") {
+		// 批量派单用 tasks[]，单发用 task 字符串；取原始文案逐条扫，避免 JSON 转义后 ^ 失配。
+		const parts: string[] = [];
+		if (typeof input.task === "string") parts.push(input.task);
+		if (Array.isArray(input.tasks)) {
+			for (const t of input.tasks) {
+				if (typeof t === "string") {
+					parts.push(t);
+				} else if (t && typeof t === "object") {
+					const rec = t as Record<string, unknown>;
+					for (const k of ["task", "prompt", "description"]) {
+						if (typeof rec[k] === "string") parts.push(rec[k] as string);
+					}
+				}
+			}
+		}
+		const text = parts.join("\n") || JSON.stringify(input ?? {});
+		for (const [re, rule] of PROMPT_RULES) if (re.test(text)) return { allowed: false, rule };
+		return { allowed: true };
+	}
+	if (WRITE_TOOLS[toolName]) {
+		const p = String(input.path ?? input.file_path ?? input.file ?? "");
+		for (const [re, rule] of PATH_RULES) if (re.test(p)) return { allowed: false, rule };
+	}
+	return { allowed: true };
+}
+
 /** 运行时读配置，便于测试动态注入；非法值回落默认。 */
 export function readCfg() {
 	const num = (name: string, dflt: number, min: number) => {
@@ -332,12 +393,14 @@ export function buildDirective(g: Graph, st: LoopState, workerTag = "fujiang"): 
 		g.open > 0
 			? `按 SKILL.md 第 3 步派发本批（并行上限 5，一次 task 调用批量传）：\n` +
 				`- 待办 intent: ${g.openIds.slice(0, 12).join(" ") || "(见 sapper frontier)"}\n` +
-				`- 每个 task: agent="fujiang"，name=<intent id>，task 文案必须含下面四条（参数照抄）：\n` +
+				`- 每个 task: agent="fujiang"，name=<intent id>，task 文案必须含下面三条（参数照抄）：\n` +
 				`    cd ${g.root}\n` +
 				`    sapper claim <id> --worker "${workerTag}-<id>"\n` +
 				`    sapper doc <id> --set "<本轮执行的命令原文 + 关键输出摘要>"\n` +
-				`    sapper done <id> --fact "<已确认的结论>" -k <host|service|cred|vuln|loot|flag|note> -d key=value\n` +
-				`- 通道：优先 task{tasks:[]} 批量；若改用 eval 的 agent()/workpool，每项同样必须 agent="fujiang" 且带齐四个动作\n` +
+				`- 子代理只回 5 行结论（结论/证据/命令/阻断/下一步），不直接 sapper done；主线程按批收口：\n` +
+				`    nuwa commit --root ${g.root} --intent <id> --key auto --fact "<结论>" --kind <host|service|cred|vuln|loot|flag|note> --doc "<命令原文>"\n` +
+				`- 禁止 sapper done / sapper dispatch <id> / sapper complete：扩展按 P-006 拦截，fact 只能经 nuwa commit 产生\n` +
+				`- 通道：优先 task{tasks:[]} 批量；若改用 eval 的 agent()/workpool，每项同样必须 agent="fujiang"\n` +
 				`- 主线程禁止自己跑 nmap/ffuf/curl，扫描只能发生在子代理里\n`
 			: `frontier 为空：先 cd ${g.root} && sapper dispatch reason --model deepseek-flash --timeout 240，然后 sapper frontier 取新 intent 再派发。\n`;
 
@@ -397,19 +460,31 @@ export default function nuwaLoop(pi: ExtensionAPI) {
 		const sid = ctx.sessionManager.getSessionId();
 		liveToolCalls.set(sid, (liveToolCalls.get(sid) ?? 0) + 1);
 		const input = (event.input ?? {}) as Record<string, unknown>;
+		const verdict = checkTool(event.toolName, input);
+		if (!verdict.allowed && (process.env.NUWA_POLICY_ENFORCE ?? "1").trim() !== "0") {
+			const detail =
+				event.toolName === "bash"
+					? String(input.command ?? "")
+					: JSON.stringify(input ?? {});
+			logEvent(sid, {
+				event: "policy_block",
+				rule: verdict.rule,
+				tool: event.toolName,
+				detail: detail.slice(0, 160),
+			});
+			return {
+				block: true,
+				reason: `nuwa policy ${verdict.rule}: blocked ${event.toolName}`,
+			};
+		}
 		if (event.toolName === "bash") {
 			const cmd = typeof input.command === "string" ? input.command : "";
-			const verdict = checkCommand(cmd);
-			if (!verdict.allowed && (process.env.NUWA_POLICY_ENFORCE ?? "1").trim() !== "0") {
-				logEvent(sid, { event: "policy_block", rule: verdict.rule, command: cmd.slice(0, 160) });
-				return { block: true, reason: `nuwa policy ${verdict.rule}: blocked` };
-			}
 			if (/(^|[\s;&|()])sapper(\s|$)/.test(cmd)) arm(sid);
 			return;
 		}
 		if (event.toolName === "task") {
 			const agent = typeof input.agent === "string" ? input.agent : "";
-			const text = typeof input.task === "string" ? input.task : "";
+			const text = JSON.stringify(input ?? {});
 			if (agent === "fujiang" || /sapper/.test(text)) arm(sid);
 			return;
 		}

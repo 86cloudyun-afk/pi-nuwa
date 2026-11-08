@@ -26,9 +26,10 @@ class Journal:
                 os.fsync(fh.fileno())
         return rec
 
-    def last_seq(self) -> int:
+    @staticmethod
+    def _tail_seq(path: Path) -> int:
         try:
-            with open(self.path, "rb") as fh:
+            with open(path, "rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 size = fh.tell()
                 fh.seek(max(0, size - 8192))
@@ -41,6 +42,13 @@ class Journal:
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
         return 0
+
+    def last_seq(self) -> int:
+        """跨代取最大 seq：compact 后新文件若从 0 重数会与归档代撞号。"""
+        best = 0
+        for path in self._files():
+            best = max(best, self._tail_seq(path))
+        return best
 
     def _files(self) -> list[Path]:
         files = [self.path] if self.path.exists() else []
@@ -75,23 +83,55 @@ class Journal:
             out.append(r)
         return out
 
-    def compact(self) -> Path:
-        """把当前 journal 归档为 journal.<gen>.jsonl，开新文件。历史仍可重放。"""
+    def compact(self, keep: int | None = None) -> Path:
+        """把当前 journal 归档为 journal.<gen>.jsonl，开新文件。
+
+        seq 必须在 os.replace 之前取：替换后当前文件为空，last_seq() 会返回 0，
+        checkpoint 丢失基线，后续 append 也会从 1 重新计数。归档后按 keep 做代际
+        GC（默认取 NUWA_JOURNAL_KEEP，缺省 2），只删「当前代 - keep」之前的文件。
+        """
         gen = self.current_gen() + 1
+        seq = self.last_seq()
         if self.path.exists() and self.path.stat().st_size > 0:
             os.replace(self.path, self.dir / f"journal.{gen}.jsonl")
         self.path.touch()
         ck = self.dir / f"checkpoint.{gen}.json"
         tmp = ck.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"checkpoint_schema": 1, "gen": gen,
-                                   "seq": self.last_seq()}, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
+        tmp.write_text(json.dumps({"checkpoint_schema": 1, "gen": gen, "seq": seq},
+                                  ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, ck)
         cur = self.dir / "CURRENT"
         cur_tmp = cur.with_suffix(".tmp")
         cur_tmp.write_text(str(gen), encoding="utf-8")
         os.replace(cur_tmp, cur)
+        self.gc(keep=self._keep_default() if keep is None else keep)
         return ck
+
+    @staticmethod
+    def _keep_default() -> int:
+        try:
+            return int(os.environ.get("NUWA_JOURNAL_KEEP", "2"))
+        except ValueError:
+            return 2
+
+    def gc(self, keep: int = 2) -> list[Path]:
+        """删除早于「当前代 - keep」的代际文件；keep<=0 表示不删。
+
+        保留 CURRENT 指向的当前代与上一代，确保回退上一代仍可用。
+        """
+        keep = int(keep)
+        if keep <= 0:
+            return []
+        cur = self.current_gen()
+        cutoff = cur - max(1, keep)
+        removed: list[Path] = []
+        for gen in range(1, cutoff + 1):
+            for name in (f"journal.{gen}.jsonl", f"checkpoint.{gen}.json"):
+                p = self.dir / name
+                if p.exists():
+                    p.unlink()
+                    removed.append(p)
+        return removed
 
     def write_checkpoint(self, payload: dict) -> Path:
         """写 checkpoint.<gen>.json，原子更新 CURRENT 指针。"""

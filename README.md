@@ -59,12 +59,28 @@ source ~/sapper-lab/env.sh && sapper-who
 | `NUWA_IDLE_LIMIT` | `3` | 连续空转轮数上限 |
 | `NUWA_GUARD_HOURS` | `12` | 上膛有效期 |
 | `NUWA_REQUIRE_EVIDENCE` | `1` | 无 flag/vuln/loot 事实时拒绝 completed |
+| `NUWA_JOURNAL_KEEP` | `2` | journal 压缩后保留的代际数；`0` 关闭自动 GC |
+| `NUWA_POLICY_ENFORCE` | `1` | `0` 关闭扩展侧工具策略拦截 |
 | `NUWA_PROJECT` | — | 显式指定 `.sapper` 所在项目根 |
 | `SAPPER_TIMEOUT` | `300` | 单次 dispatch 超时（`NUWA_DISPATCH_TIMEOUT` 可覆盖） |
 | `PI_AGENT_HOME` | 自动探测 | `~/.omp/agent` 或 `~/.pi/agent` |
 | `SAPPER_HOME` | `~/sapper-lab` | 项目与入口目录 |
 
 运行时命令：`/nuwa-loop`、`/nuwa-loop off|on|reset`、`/nuwa-loop log [n]`、`/nuwa-loop why`、`/nuwa-loop budget [tokens]`。
+
+## 工具面策略
+
+扩展对三类工具做统一拦截（`NUWA_POLICY_ENFORCE=0` 关闭；Python 侧同名函数在 `nuwa/policy.py`）：
+
+| 规则 | 触发 | 拦截对象 |
+|---|---|---|
+| P-001..P-004 | `rm -rf /`、`mkfs.`、`dd of=/dev/sd*`、`curl --noproxy` 直连元数据 | bash |
+| P-005 | 写 `.sapper/facts/` 或 `.sapper/intents/` | write / edit / multi_edit / apply_patch |
+| P-006 | 直接 `sapper done` / `sapper dispatch i<N>` / `sapper complete` | bash 与 task 文案 |
+| P-007 | 写 `.nuwa/journal.jsonl`、`checkpoint.*`、`CURRENT`、`global*.jsonl` | 写类工具 |
+| P-009 | 直接改 `.sapper/project.json` | 写类工具 |
+
+fact 只能经 `nuwa dispatch` / `nuwa commit` 产生；`nuwa commit --key auto` 用 `sha256(project|intent|attempt)` 规范键做幂等。
 
 ## 退出码
 
@@ -101,16 +117,18 @@ source ~/sapper-lab/env.sh && sapper-who
 五套测试全部可离线、零模型成本重复执行：
 
 ```bash
-./tests/run.sh          # 单元 18 + 协议 14 + 混沌 8 + 并发 5 + 端到端 4
+./tests/run.sh          # 单元 30 + 协议 14 + 混沌 8 + 并发 5 + 端到端 4 + R1/R2-R7
 ```
 
 | 套件 | 依赖 | 说明 |
 |---|---|---|
-| `tests/unit.test.ts` | bun | 纯函数与配置解析 |
+| `tests/unit.test.ts` | bun | 纯函数、工具策略与配置解析（30 例） |
 | `tests/test_nuwa_shell.py` | python3 | CLI 契约，对应每个缺陷编号 |
 | `tests/test_chaos.py` | flock | 坏图 / 陈旧锁 / SIGKILL / 只读目录 / 大图 |
 | `tests/test_concurrency.py` | flock | 单赢家、跨项目、锁清理、无重复派发 |
 | `tests/test_e2e_deterministic.py` | python3 | `fake-claude` 跑完整链路 |
+| `tests/test_r1_core.py` | python3 + fake-sapper | journal 代际/GC、账本、幂等提交 |
+| `tests/test_r2_r7.py` | python3 | 公平、证据、指标、策略、插件、夜跑校验 |
 
 两个替身：`tests/fake-sapper`（sapper 协议仿真）、`tests/fake-claude`（确定性模型）。
 

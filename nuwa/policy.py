@@ -16,6 +16,20 @@ ALLOW_RULES = [
     (r"^(nmap|curl|dig|whois|python3|sapper|nuwa)\b", "A-001"),
 ]
 
+# 提交所有权：fact 只能经 nuwa commit 产生；按 id 的 dispatch/complete 同样走 nuwa。
+PROMPT_RULES = [
+    (r"(?m)(^|[;\n])\s*sapper\s+done\s+\S+", "P-006"),
+    (r"(?m)(^|[;\n])\s*sapper\s+dispatch\s+i\d+", "P-006"),
+    (r"(?m)(^|[;\n])\s*sapper\s+complete\b", "P-006"),
+]
+
+# 写类工具的目标路径：图与权威状态只能由 CLI 改。
+PATH_RULES = [
+    (r"(^|/)\.sapper/(facts|intents)/", "P-005"),
+    (r"(^|/)\.sapper/project\.json$", "P-009"),
+    (r"(^|/)\.nuwa/(journal[^/]*\.jsonl|checkpoint[^/]*\.json|CURRENT|global[^/]*\.jsonl)$", "P-007"),
+]
+
 REDACT_RULES = [
     (re.compile(r"sk-[A-Za-z0-9]{8,}"), "sk-***"),
     (re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s]+"), r"\1***"),
@@ -35,9 +49,20 @@ def check_command(command: str) -> tuple[bool, str | None]:
 
 
 def check_prompt(prompt: str) -> tuple[bool, str | None]:
-    """在派发前扫描渲染提示，拦截被注入的危险命令模式。"""
+    """在派发前扫描渲染提示，拦截被注入的危险命令模式与越权提交。"""
     for pattern, rule_id in DENY_RULES:
         if re.search(pattern, prompt):
+            return False, rule_id
+    for pattern, rule_id in PROMPT_RULES:
+        if re.search(pattern, prompt):
+            return False, rule_id
+    return True, None
+
+
+def check_path(path: str) -> tuple[bool, str | None]:
+    """写类工具的路径闸门：图与权威状态目录只允许 CLI 写入。"""
+    for pattern, rule_id in PATH_RULES:
+        if re.search(pattern, path):
             return False, rule_id
     return True, None
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 — 2026-11-08
+
+- journal 代际：`compact()` 在归档前取 seq（原先归档后取到 0，checkpoint 丢基线）；
+  `last_seq()` 跨代取最大值，压缩后新记录不再与归档代撞号；新增 `gc(keep)`，
+  默认保留 2 代，`NUWA_JOURNAL_KEEP=0` 关闭自动 GC
+- 工具面策略：扩展新增 `checkTool`，bash / task / write / edit / multi_edit / apply_patch
+  统一拦截；新增 P-005（写图目录）、P-006（绕开 nuwa 直接提交）、P-007（写权威状态）、
+  P-009（直接改 project.json），`nuwa/policy.py` 同步 `check_path`
+- 提交所有权：`buildDirective` 与 `SKILL.md` 不再 instruct `sapper done`，子代理只回结论，
+  主线程用 `nuwa commit --key auto` 收口；`auto` 按 `sha256(project|intent|attempt)` 生成规范键
+- 夜跑：`nuwa soak-verify <base>` 校验 `REPORT.json / MODE / COMMIT` 一致且判据全绿
+- 测试：扩展 30 例（新增 8 条工具策略）、journal 3 例（跨代 seq / GC / 环境变量）、
+  txn 1 例（auto 键幂等）、夜跑 2 例（报告校验 / 缺失报告）
+- 替身：`fake-sapper` 识别 `FAKE_ENGINE_MODE` 的 noop / hallucinate / malformed，
+  E2E 三种反例从 1/4 恢复到 4/4
+
 ## 1.1.0 — 2026-11-08
 
 - 扩展侧命令拦截：`nuwa-loop` 的 `tool_call` 对 bash 执行 deny 规则（P-001..P-004），

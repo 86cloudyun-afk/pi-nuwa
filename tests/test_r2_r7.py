@@ -136,6 +136,34 @@ class PolicyTest(unittest.TestCase):
         self.assertTrue(policy.verify_signature(b"data", key, sig))
         self.assertFalse(policy.verify_signature(b"data2", key, sig))
 
+    def test_prompt_blocks_direct_commit(self):
+        ok, rule = policy.check_prompt("正常提示\nsapper done i001 --fact x")
+        self.assertFalse(ok)
+        self.assertEqual(rule, "P-006")
+        ok, rule = policy.check_prompt("sapper claim i001 --worker w")
+        self.assertTrue(ok)
+
+    def test_prompt_allows_dry_run(self):
+        ok, rule = policy.check_prompt("[dispatch] dry-run target=i001 model=deepseek-flash")
+        self.assertTrue(ok)
+        self.assertIsNone(rule)
+
+    def test_path_rules(self):
+        cases = {
+            ".sapper/facts/f001.json": "P-005",
+            "/p/.sapper/intents/i001.json": "P-005",
+            "/p/.nuwa/journal.jsonl": "P-007",
+            "/p/.nuwa/checkpoint.3.json": "P-007",
+            "/p/.sapper/project.json": "P-009",
+        }
+        for path, want in cases.items():
+            ok, rule = policy.check_path(path)
+            self.assertFalse(ok, path)
+            self.assertEqual(rule, want, path)
+        ok, rule = policy.check_path("/tmp/notes.md")
+        self.assertTrue(ok)
+        self.assertIsNone(rule)
+
 
 class PluginTest(unittest.TestCase):
     def test_discover_and_run(self):
@@ -187,6 +215,39 @@ class NightTest(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(old)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_night_verify_report(self):
+        tmp = Path(tempfile.mkdtemp(prefix="r7-night-verify-"))
+        old = dict(os.environ)
+        os.environ.update({
+            "PATH": f"{HERE}:{old.get('PATH','')}",
+            "SAPPER_HOME": str(tmp / "lab"),
+            "PI_AGENT_HOME": str(tmp / "agent"),
+            "NUWA_ENGINE": "fake-claude",
+            "NUWA_MAX_ROUNDS": "1",
+        })
+        try:
+            night.run(tmp / "base", minutes=0.02, projects=2, interval=0.01, model="fake")
+            v = night.verify(tmp / "base")
+            self.assertTrue(v["ok"], v)
+            self.assertTrue(all(v["checks"].values()), v)
+            (tmp / "base" / "MODE").write_text("dev\n", encoding="utf-8")
+            bad = night.verify(tmp / "base")
+            self.assertFalse(bad["ok"])
+            self.assertFalse(bad["checks"]["mode"])
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_night_verify_missing_report(self):
+        tmp = Path(tempfile.mkdtemp(prefix="r7-night-missing-"))
+        try:
+            v = night.verify(tmp)
+            self.assertFalse(v["ok"])
+            self.assertIn("error", v)
+        finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
 

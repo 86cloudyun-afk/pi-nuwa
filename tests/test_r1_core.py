@@ -70,6 +70,48 @@ class JournalTest(unittest.TestCase):
         self.assertEqual(st["inflight"], {})
         self.assertIn("t1", st["committed"])
 
+    def test_compact_keeps_seq_across_generations(self):
+        """compact 后新文件必须接着归档代的 seq，不能从 1 重数。"""
+        j = Journal(self.tmp)
+        j.append("a")
+        j.append("b")
+        j.compact()
+        j.append("c")
+        self.assertEqual([r["seq"] for r in j.read()], [1, 2, 3])
+        ck = json.loads((j.dir / "checkpoint.1.json").read_text())
+        self.assertEqual(ck["seq"], 2)
+
+    def test_gc_removes_only_old_generations(self):
+        """keep=2 时保留当前代与上一代，更早的代际文件被删除。"""
+        j = Journal(self.tmp)
+        for _ in range(5):
+            j.append("x")
+            j.compact(keep=0)
+        self.assertEqual(j.current_gen(), 5)
+        for gen in (1, 2, 3, 4, 5):
+            self.assertTrue((j.dir / f"journal.{gen}.jsonl").exists())
+        removed = j.gc(keep=2)
+        names = {p.name for p in removed}
+        self.assertEqual(names, {"journal.1.jsonl", "checkpoint.1.json",
+                                 "journal.2.jsonl", "checkpoint.2.json",
+                                 "journal.3.jsonl", "checkpoint.3.json"})
+        self.assertTrue((j.dir / "journal.4.jsonl").exists())
+        self.assertTrue((j.dir / "journal.5.jsonl").exists())
+        self.assertTrue((j.dir / "checkpoint.5.json").exists())
+
+    def test_compact_auto_gc_uses_env(self):
+        j = Journal(self.tmp)
+        os.environ["NUWA_JOURNAL_KEEP"] = "1"
+        try:
+            for _ in range(3):
+                j.append("x")
+                j.compact()
+        finally:
+            del os.environ["NUWA_JOURNAL_KEEP"]
+        self.assertFalse((j.dir / "journal.1.jsonl").exists())
+        self.assertFalse((j.dir / "journal.2.jsonl").exists())
+        self.assertTrue((j.dir / "journal.3.jsonl").exists())
+
 
 class LedgerTest(unittest.TestCase):
     def setUp(self):
@@ -154,6 +196,19 @@ class TxnTest(unittest.TestCase):
         self.assertEqual(intent["to"], r1["fact"])
         fact = json.loads((self.root / ".sapper" / "facts" / f"{r1['fact']}.json").read_text())
         self.assertIn(f"[nuwa:{key}]", fact["description"])
+
+    def test_commit_auto_key_is_idempotent(self):
+        cmd = [sys.executable, "-m", "nuwa.cli", "commit", "--root", str(self.root),
+               "--intent", "i001", "--key", "auto", "--fact", "auto key", "--kind", "note"]
+        env = {**self.env, "PYTHONPATH": str(REPO)}
+        r1 = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        res1 = json.loads(r1.stdout)
+        self.assertEqual(res1["key"], txn.dispatch_key("p1", "i001", 0))
+        r2 = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        res2 = json.loads(r2.stdout)
+        self.assertTrue(res2["reused"])
+        self.assertEqual(res1["fact"], res2["fact"])
 
     def test_adopt_once(self):
         a = txn.adopt(self.root)

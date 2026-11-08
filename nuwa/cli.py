@@ -87,8 +87,16 @@ def cmd_commit(args) -> int:
     if not root:
         print("nuwa: 不在 sapper 项目内", file=sys.stderr)
         return 2
+    key = args.key
+    if key == "auto":
+        intent = graph.get_intent(root, args.intent) or {}
+        try:
+            attempt = int(intent.get("x-nuwa-attempt", 0))
+        except (TypeError, ValueError):
+            attempt = 0
+        key = txn.dispatch_key(root.name, args.intent, attempt)
     try:
-        res = txn.commit(root, args.intent, args.fact, args.key,
+        res = txn.commit(root, args.intent, args.fact, key,
                          kind=args.kind, doc=args.doc)
     except (txn.CommitError, FileNotFoundError) as exc:
         print(f"nuwa: {exc}", file=sys.stderr)
@@ -236,6 +244,12 @@ def cmd_soak_night(args) -> int:
     return 0 if all(res["verdict"].values()) else 1
 
 
+def cmd_soak_verify(args) -> int:
+    res = night_mod.verify(args.base)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0 if res.get("ok") else 1
+
+
 def cmd_migrate(args) -> int:
     root = Path(args.root).resolve() if args.root else find_project()
     detected = {}
@@ -372,6 +386,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=float, default=30)
     s.add_argument("--model", default="deepseek-flash")
     s.set_defaults(func=cmd_soak_night)
+
+    s = sub.add_parser("soak-verify")
+    s.add_argument("base")
+    s.set_defaults(func=cmd_soak_verify)
 
     s = sub.add_parser("migrate")
     s.add_argument("--from", dest="source", default="auto")

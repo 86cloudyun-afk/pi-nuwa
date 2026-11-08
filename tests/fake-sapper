@@ -678,6 +678,23 @@ def _reason_round(store: Store, model: str) -> int:
     round_no += 1
     atomic_write(store.root / ".reason_round", str(round_no))
 
+    # 与 fake-claude 对齐：noop / hallucinate / malformed 三个模式直接体现在 reason 上，
+    # 否则替身永远生成 intent，e2e 的三种反例无法成立。
+    mode = os.environ.get("FAKE_ENGINE_MODE", "").strip()
+    if mode == "malformed":
+        die("error: engine returned non-JSON output")
+    if mode == "noop":
+        print(f"[reason] round {round_no}: no new attack surface")
+        return 0
+    if mode == "hallucinate":
+        p = store.project()
+        p["status"] = "completed"
+        p["completed_at"] = now_iso()
+        p["completed_from"] = [anchor]
+        store.save_project(p)
+        print(f"[reason] round {round_no}: goal satisfied, project completed")
+        return 0
+
     complete_after = env_int("FAKE_COMPLETE_AFTER", 0)
     if complete_after and round_no >= complete_after:
         p = store.project()

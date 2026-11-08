@@ -176,11 +176,12 @@ describe("buildDirective", () => {
 		completionRejects: 0, sig: "s", lastReason: "",
 	};
 
-	test("四个 sapper 动作带齐参数", () => {
+	test("三条动作 + commit 收口", () => {
 		const d = mod.buildDirective(g, st, "fujiang");
 		expect(d).toContain("sapper claim <id> --worker");
 		expect(d).toContain("sapper doc <id> --set");
-		expect(d).toContain("sapper done <id> --fact");
+		expect(d).toContain("nuwa commit --root /tmp/x --intent <id> --key auto");
+		expect(d).not.toContain("    sapper done <id> --fact");
 		expect(d).toContain("sapper complete --from");
 	});
 
@@ -240,6 +241,44 @@ describe("checkCommand", () => {
 	});
 	test("放行 nmap", () => {
 		expect(mod.checkCommand("nmap -sV 127.0.0.1").allowed).toBe(true);
+	});
+});
+
+describe("checkTool", () => {
+	test("write 命中图目录被拦 P-005", () => {
+		const v = mod.checkTool("write", { path: "/p/.sapper/facts/f002.json", content: "x" });
+		expect(v.allowed).toBe(false);
+		expect(v.rule).toBe("P-005");
+	});
+	test("edit 命中 journal 被拦 P-007", () => {
+		const v = mod.checkTool("edit", { path: "/p/.nuwa/journal.jsonl", old: "a", new: "b" });
+		expect(v.allowed).toBe(false);
+		expect(v.rule).toBe("P-007");
+	});
+	test("write 改 project.json 被拦 P-009", () => {
+		const v = mod.checkTool("write", { path: "/p/.sapper/project.json" });
+		expect(v.allowed).toBe(false);
+		expect(v.rule).toBe("P-009");
+	});
+	test("普通文件写入放行", () => {
+		expect(mod.checkTool("write", { path: "/tmp/notes.md" }).allowed).toBe(true);
+	});
+	test("task 文案含 sapper done 被拦 P-006", () => {
+		const v = mod.checkTool("task", { agent: "fujiang", task: "cd /p\nsapper done i001 --fact x" });
+		expect(v.allowed).toBe(false);
+		expect(v.rule).toBe("P-006");
+	});
+	test("批量 tasks 数组同样被扫", () => {
+		const v = mod.checkTool("task", { tasks: [{ task: "sapper dispatch i002 --model x" }] });
+		expect(v.allowed).toBe(false);
+		expect(v.rule).toBe("P-006");
+	});
+	test("bash 直接 sapper done 被拦，claim 放行", () => {
+		expect(mod.checkTool("bash", { command: "sapper done i001 --fact x" }).rule).toBe("P-006");
+		expect(mod.checkTool("bash", { command: "sapper claim i001 --worker w" }).allowed).toBe(true);
+	});
+	test("只读工具放行", () => {
+		expect(mod.checkTool("read", { path: "/p/.sapper/facts/f001.json" }).allowed).toBe(true);
 	});
 });
 

@@ -21,7 +21,7 @@ case "${1:-}" in
     ;;
 esac
 
-NUWA_VERSION="0.3.1"
+NUWA_VERSION="1.2.0"
 
 LAB_DIR="${SAPPER_HOME:-$HOME/sapper-lab}"
 ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
