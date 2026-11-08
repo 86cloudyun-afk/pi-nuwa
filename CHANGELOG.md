@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.0 — 2026-11-08
+
+- 扩展侧命令拦截：`nuwa-loop` 的 `tool_call` 对 bash 执行 deny 规则（P-001..P-004），
+  命中即 `block` 并写 `policy_block`；`NUWA_POLICY_ENFORCE=0` 可关
+- 夜跑长测：`nuwa soak-night --base DIR --minutes 4320 --projects 4`，可续跑，
+  输出 `REPORT.json / MODE / COMMIT`
+- 崩溃矩阵：`tests/crash_matrix.py`，7 个提交点，支持 `--full`（20/5）
+- 单测：扩展 22 例（新增 4 条命令策略）
+- 安装器：新增 `nuwa-soak-night` 入口
+
 ## 1.0.0 — 2026-11-08
 
 - R1 补齐：journal 归档压缩（`journal.<gen>.jsonl` + checkpoint + CURRENT）、崩溃注入 4 点、repair 恢复

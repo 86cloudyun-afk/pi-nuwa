@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 
-from nuwa import evidence, fairness, metrics, plugins, policy, soak, migrate  # noqa: E402
+from nuwa import evidence, fairness, metrics, plugins, policy, soak, migrate, night  # noqa: E402
 from nuwa.journal import Journal  # noqa: E402
 
 
@@ -165,6 +165,28 @@ class MigrationTest(unittest.TestCase):
             self.assertEqual(res2["migrated"], [])
             self.assertEqual(res2["skipped"], ["s1.json"])
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class NightTest(unittest.TestCase):
+    def test_night_smoke(self):
+        tmp = Path(tempfile.mkdtemp(prefix="r7-night-"))
+        old = dict(os.environ)
+        os.environ.update({
+            "PATH": f"{HERE}:{old.get('PATH','')}",
+            "SAPPER_HOME": str(tmp / "lab"),
+            "PI_AGENT_HOME": str(tmp / "agent"),
+            "NUWA_ENGINE": "fake-claude",
+            "NUWA_MAX_ROUNDS": "1",
+        })
+        try:
+            res = night.run(tmp / "base", minutes=0.02, projects=2, interval=0.01, model="fake")
+            self.assertEqual(res["mode"], "soak")
+            self.assertTrue((tmp / "base" / "REPORT.json").exists())
+            self.assertTrue((tmp / "base" / "MODE").read_text().strip() == "soak")
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
             shutil.rmtree(tmp, ignore_errors=True)
 
 

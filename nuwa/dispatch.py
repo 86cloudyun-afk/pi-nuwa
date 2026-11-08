@@ -162,6 +162,7 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                      kind=str(data.get("kind") or "note"),
                      doc=data.get("doc") if isinstance(data.get("doc"), str) else None)
     ledger.settle(rid, tokens, status="ok")
+    _crash("after_settle")
     journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,
                    tokens=tokens, status="ok")
     journal.append("ack", txn=txn_id, intent=intent_id)

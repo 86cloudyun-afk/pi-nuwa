@@ -42,6 +42,21 @@ const LAB_DIR = process.env.SAPPER_HOME ?? join(HOME, "sapper-lab");
 
 const SCHEMA = 2;
 
+/** 命令级策略：与 nuwa/policy.py 保持同一组规则 id。 */
+const POLICY_RULES: Array<[RegExp, string]> = [
+	[/(^|\s)rm\s+-rf\s+\/(\s|$)/, "P-001"],
+	[/\bmkfs\./, "P-002"],
+	[/\bdd\s+[^\n]*of=\/dev\/[sh]d/, "P-003"],
+	[/curl[^\n]*--noproxy[^\n]*\b(169\.254|127\.0\.0\.1)/, "P-004"],
+];
+
+export function checkCommand(cmd: string): { allowed: boolean; rule?: string } {
+	for (const [re, rule] of POLICY_RULES) {
+		if (re.test(cmd)) return { allowed: false, rule };
+	}
+	return { allowed: true };
+}
+
 /** 运行时读配置，便于测试动态注入；非法值回落默认。 */
 export function readCfg() {
 	const num = (name: string, dflt: number, min: number) => {
@@ -384,6 +399,11 @@ export default function nuwaLoop(pi: ExtensionAPI) {
 		const input = (event.input ?? {}) as Record<string, unknown>;
 		if (event.toolName === "bash") {
 			const cmd = typeof input.command === "string" ? input.command : "";
+			const verdict = checkCommand(cmd);
+			if (!verdict.allowed && (process.env.NUWA_POLICY_ENFORCE ?? "1").trim() !== "0") {
+				logEvent(sid, { event: "policy_block", rule: verdict.rule, command: cmd.slice(0, 160) });
+				return { block: true, reason: `nuwa policy ${verdict.rule}: blocked` };
+			}
 			if (/(^|[\s;&|()])sapper(\s|$)/.test(cmd)) arm(sid);
 			return;
 		}

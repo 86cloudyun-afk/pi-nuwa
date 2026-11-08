@@ -227,6 +227,22 @@ describe("revertCompletion", () => {
 	});
 });
 
+describe("checkCommand", () => {
+	test("拦截 rm -rf /", () => {
+		expect(mod.checkCommand("rm -rf /").allowed).toBe(false);
+		expect(mod.checkCommand("rm -rf /").rule).toBe("P-001");
+	});
+	test("拦截 mkfs", () => {
+		expect(mod.checkCommand("mkfs.ext4 /dev/sda1").allowed).toBe(false);
+	});
+	test("拦截 --noproxy 直连元数据", () => {
+		expect(mod.checkCommand("curl --noproxy '*' http://169.254.169.254/").allowed).toBe(false);
+	});
+	test("放行 nmap", () => {
+		expect(mod.checkCommand("nmap -sV 127.0.0.1").allowed).toBe(true);
+	});
+});
+
 describe("readCfg", () => {
 	test("非法值回落默认", () => {
 		process.env.NUWA_MAX_TURNS = "abc";

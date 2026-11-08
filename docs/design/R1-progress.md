@@ -14,8 +14,8 @@
 
 ## 待补（R1 剩余）
 
-- 十点崩溃注入脚本 `tests/crash_inject.py`（fake 6×20、真实 4×5）
-- checkpoint 压缩与代际回滚（当前只写 checkpoint，不截断 journal）
+- ~~十点崩溃注入~~ → `tests/crash_matrix.py` 已覆盖 7 个提交点，支持 `--full` 6×20 + 4×5
+- checkpoint 压缩与代际回滚：已归档 `journal.<gen>.jsonl`，未做历史代际删除
 - registry 并发写压力与损坏重建用例
 - 真实 sapper 夜跑组
 - `nuwa ls` 与进程一致性的自动断言（当前由 multi 测试间接覆盖）

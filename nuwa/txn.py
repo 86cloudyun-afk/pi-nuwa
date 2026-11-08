@@ -23,6 +23,11 @@ class CommitError(RuntimeError):
     pass
 
 
+def _crash(point: str) -> None:
+    if os.environ.get("NUWA_CRASH_POINT") == point:
+        os._exit(137)
+
+
 def commit(root: str | Path, intent_id: str, fact_text: str, key: str,
            kind: str = "note", doc: str | None = None, worker: str = "nuwa") -> dict:
     """幂等提交：同 key 只产生一个 fact。"""
@@ -63,9 +68,11 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str,
             fact_id = fact["id"]
             graph.patch_intent(root, intent_id, fact_id, worker=worker)
 
+        _crash("after_done")
         ok, msg = graph.validate(root)
         if not ok:
             raise CommitError(f"validate 失败: {msg}")
+        _crash("after_validate")
 
         journal.append("commit_done", txn=key, intent=intent_id, fact=fact_id,
                        reused=reused, project=project_name)

@@ -11,12 +11,12 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from nuwa import graph, registry, txn, runner, dispatch as dispatch_mod  # type: ignore
-    from nuwa import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod  # type: ignore
+    from nuwa import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod, night as night_mod  # type: ignore
     from nuwa.ledger import Ledger  # type: ignore
     from nuwa.paths import find_project, pointer_path  # type: ignore
 else:
     from . import graph, registry, txn, runner, dispatch as dispatch_mod
-    from . import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod
+    from . import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod, night as night_mod
     from .ledger import Ledger
     from .paths import find_project, pointer_path
 
@@ -227,6 +227,15 @@ def cmd_soak(args) -> int:
     return 0 if all(summary["verdict"].values()) else 1
 
 
+def cmd_soak_night(args) -> int:
+    res = night_mod.run(args.base, args.minutes, args.projects,
+                        interval=args.interval, model=args.model)
+    print(json.dumps({k: res[k] for k in ("mode", "minutes", "samples", "facts",
+                                          "rss_growth_kb", "fd_growth", "verdict",
+                                          "commit")}, ensure_ascii=False, indent=2))
+    return 0 if all(res["verdict"].values()) else 1
+
+
 def cmd_migrate(args) -> int:
     root = Path(args.root).resolve() if args.root else find_project()
     detected = {}
@@ -355,6 +364,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model", default="deepseek-flash")
     s.add_argument("--project", action="append", default=None)
     s.set_defaults(func=cmd_soak)
+
+    s = sub.add_parser("soak-night")
+    s.add_argument("--base", required=True)
+    s.add_argument("--minutes", type=float, default=4320)
+    s.add_argument("--projects", type=int, default=4)
+    s.add_argument("--interval", type=float, default=30)
+    s.add_argument("--model", default="deepseek-flash")
+    s.set_defaults(func=cmd_soak_night)
 
     s = sub.add_parser("migrate")
     s.add_argument("--from", dest="source", default="auto")
