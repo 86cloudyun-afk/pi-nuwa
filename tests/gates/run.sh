@@ -3,8 +3,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-# 不可删除的核心锚点：任何阶段都必须存在
-REQUIRED_CORE=(0_baseline)
+# 已交付阶段清单：只增不减。新增阶段时把门禁名加入此数组与 expected。
+DELIVERED=(0_baseline)
 EXPECTED="gates/expected"
 
 fail=0
@@ -25,14 +25,14 @@ if (( ${#names[@]} == 0 )); then
   exit 1
 fi
 
-# 核心锚点必须在清单中
-for c in "${REQUIRED_CORE[@]}"; do
+# 已交付门禁必须在清单中
+for c in "${DELIVERED[@]}"; do
   found=0
   for n in "${names[@]}"; do
     [[ "$n" == "$c" ]] && found=1
   done
   if (( found == 0 )); then
-    echo "gates: 核心门禁 $c 不在 expected 中" >&2
+    echo "gates: 已交付门禁 $c 不在 expected 中" >&2
     fail=1
   fi
 done
