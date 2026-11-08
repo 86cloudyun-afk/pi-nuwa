@@ -232,6 +232,20 @@ describe("revertCompletion", () => {
 		expect(hints[0].content).toContain("no evidence");
 	});
 
+	test("回滚删除 goal edge 并原子写回 active", () => {
+		const root = fresh();
+		makeGraph(root, { status: "completed", facts: [{ id: "f001", kind: "flag" }] });
+		const ip = join(root, ".sapper", "intents", "i002.json");
+		writeFileSync(ip, JSON.stringify({
+			id: "i002", status: "complete", description: "done",
+			created_at: "2026-01-01T00:00:00Z", from: ["f001"], to: "goal",
+		}));
+		expect(mod.revertCompletion(root, "no evidence")).toBe(true);
+		expect(existsSync(ip)).toBe(false);
+		const p2 = JSON.parse(readFileSync(join(root, ".sapper", "project.json"), "utf8"));
+		expect(p2.status).toBe("active");
+	});
+
 	test("非 completed 状态不动", () => {
 		const root = fresh();
 		makeGraph(root, { status: "active" });

@@ -787,6 +787,8 @@ def cmd_dispatch(store: Store, args: list[str]) -> int:
         die(f"error: dispatch {target} failed (injected)")
 
     if dry:
+        if target.startswith("i") and not store.get_intent(target):
+            die(f"error: no intent {target}")
         print("## Graph")
         print(f"project goal: {store.project().get('goal', '')}")
         for it in store.list_intents()[:5]:

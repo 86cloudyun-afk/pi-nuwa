@@ -21,7 +21,7 @@
 | `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
 | `test_guard.py` | 18 | 18 pass | 执行层提交闸门（含 fleet、dry-run、fact 放行） |
 
-合计 **167 例 + 16 runs**。
+合计 **168 例 + 16 runs**。
 
 ## 二、门禁
 

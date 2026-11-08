@@ -25,6 +25,7 @@ import {
 	readFileSync,
 	readdirSync,
 	readlinkSync,
+	renameSync,
 	rmSync,
 	realpathSync,
 	statSync,
@@ -527,6 +528,8 @@ export function readGraph(root: string): Graph | null {
 			}
 			if (!fact.id || fact.id !== f.replace(/\.json$/, "")
 				|| !fact.description || !fact.created_at || !fact.creator) corrupt = true;
+			if ("source_intent" in fact && fact.source_intent !== null
+				&& typeof fact.source_intent !== "string") corrupt = true;
 			if (typeof fact.source_intent === "string" && !intentIds.has(fact.source_intent)) {
 				corrupt = true;
 			}
@@ -601,21 +604,41 @@ export function revertCompletion(root: string, why: string): boolean {
 	delete proj.completed_at;
 	delete proj.completed_from;
 	proj.updated_at = new Date().toISOString();
+	const goalFiles: Array<{ path: string; body: string }> = [];
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
 			if (!f.endsWith(".json")) continue;
 			const ip = join(root, ".sapper", "intents", f);
 			const it = readJson<{ to?: string }>(ip);
 			if (it?.to === "goal") {
-				try {
-					rmSync(ip);
-				} catch {
-					return false;
-				}
+				goalFiles.push({ path: ip, body: readFileSync(ip, "utf8") });
 			}
 		}
-		writeFileSync(p, JSON.stringify(proj, null, 2));
 	} catch {
+		return false;
+	}
+	const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
+	try {
+		writeFileSync(tmp, JSON.stringify(proj, null, 2));
+	} catch {
+		return false;
+	}
+	const removed: typeof goalFiles = [];
+	for (const g of goalFiles) {
+		try {
+			rmSync(g.path);
+			removed.push(g);
+		} catch {
+			for (const r of removed) writeFileSync(r.path, r.body);
+			try { rmSync(tmp); } catch { /* tmp 已不存在 */ }
+			return false;
+		}
+	}
+	try {
+		renameSync(tmp, p);
+	} catch {
+		for (const r of removed) writeFileSync(r.path, r.body);
+		try { rmSync(tmp); } catch { /* tmp 已不存在 */ }
 		return false;
 	}
 	try {

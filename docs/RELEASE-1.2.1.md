@@ -469,6 +469,20 @@
 - **M17/M22**：repair 合并摘要 inflight、保留零值 tokens；renew 只对打开预留生效，settle 只看最后生命周期。
 - **M61**：扩展校验 done/complete 的 `to` 必须命中 fact，`source_intent` 必须命中 intent。
 
+## 第五十六轮补充
+
+- **M31**：span 改为 `(samples-1)*interval*0.8`，两点短跑不再误判；journal 代际合并。
+- **M47**：dry-run 正例先建 fact/intent，fake 对缺失 intent 返错。
+- **M17**：pending 事件按字段合并，不再整条覆盖。
+- **M22**：summary 处理 renew；settle/reclaim 终态不再重复扣账。
+- **M61**：`source_intent` 类型校验。
+- **M5**：`exit_codes` 必须非空。
+- **M32**：复用 marker fact 时绑定 source_intent、持 txn.lock、validate 后提交。
+- **M59**：回滚先写临时 project，再删边、rename；失败恢复边。
+- **M74**：repair 读取成功 artifact，按 ok 结算。
+- **M75**：reason 加预算预留/结算。
+- **M21**：补 TS 回滚 goal edge 用例。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

@@ -66,6 +66,13 @@ def render_prompt(root: Path, intent_id: str, timeout: int = 60) -> str:
     return r.stdout
 
 
+def _bind_source(root: str | Path, fact_id: str, intent_id: str) -> None:
+    fp = Path(root) / ".sapper" / "facts" / f"{fact_id}.json"
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    data["source_intent"] = intent_id
+    fp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
 def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
              timeout: int = 300, engine: str | None = None,
              tokens: int = DEFAULT_TOKENS) -> dict:
@@ -99,9 +106,18 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                 and intent["to"] != existing["id"]):
             raise DispatchError(
                 f"intent 已由其他 fact 完成: {intent['to']} != {existing['id']}")
-        graph.patch_intent(root, intent_id, existing["id"])
-        journal.append("commit_done", txn=key, intent=intent_id,
-                       fact=existing["id"], reused=True, project=project)
+        with FileLock(nd / "txn.lock", blocking=True):
+            if existing.get("source_intent") not in (None, intent_id):
+                raise DispatchError(
+                    f"fact 已绑定其他意图: {existing.get('source_intent')} != {intent_id}")
+            if not existing.get("source_intent"):
+                _bind_source(root, existing["id"], intent_id)
+            graph.patch_intent(root, intent_id, existing["id"])
+            ok, msg = graph.validate(root)
+            if not ok:
+                raise DispatchError(f"复用后图校验失败: {msg}")
+            journal.append("commit_done", txn=key, intent=intent_id,
+                           fact=existing["id"], reused=True, project=project)
         return {"intent": intent_id, "fact": existing["id"], "reused": True, "key": key}
 
     txn_id = f"t-{uuid.uuid4().hex[:12]}"

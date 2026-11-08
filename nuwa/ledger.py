@@ -91,6 +91,8 @@ class Ledger:
                     "dispatches": int(rec.get("dispatches", 0)),
                     "expires_at": rec.get("expires_at", 0),
                 }
+            elif t == "renew" and rid and rid in outstanding:
+                outstanding[rid]["expires_at"] = rec.get("expires_at", 0)
             elif t == "settle" and rid:
                 settled_total += int(rec.get("tokens_actual", 0))
                 outstanding.pop(rid, None)
@@ -136,7 +138,7 @@ class Ledger:
             for rec in self._records_locked():
                 if rec.get("rid") == rid:
                     last = rec
-            if last is not None and last.get("type") == "settle":
+            if last is not None and last.get("type") in ("settle", "reclaim"):
                 return last
             return self._append_locked({"type": "settle", "rid": rid,
                                         "tokens_actual": int(tokens_actual), "status": status})

@@ -196,9 +196,15 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
         if not txn_id or txn_id in finished:
             continue
         if ev in TXN_PENDING:
+            prev = pending.get(txn_id, {})
+            rec_tokens = rec.get("tokens")
             pending[txn_id] = {
-                "txn": txn_id, "intent": rec.get("intent"), "rid": rec.get("rid"),
-                "tokens": rec.get("tokens", 4000), "state": ev,
+                "txn": txn_id,
+                "intent": rec.get("intent") or prev.get("intent"),
+                "rid": rec.get("rid") or prev.get("rid"),
+                "tokens": rec_tokens if rec_tokens is not None
+                else prev.get("tokens", 4000),
+                "state": ev,
             }
         elif ev in TXN_DONE:
             pending.pop(txn_id, None)
@@ -206,6 +212,28 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
     repaired = []
     for txn_id, info in pending.items():
         intent = info.get("intent")
+        result_path = nd / "artifacts" / txn_id / "result.json"
+        succeeded = False
+        if result_path.exists():
+            try:
+                res = json.loads(result_path.read_text(encoding="utf-8"))
+                succeeded = isinstance(res, dict) and res.get("exit_code") == 0
+            except (OSError, json.JSONDecodeError, ValueError):
+                succeeded = False
+        if succeeded:
+            rid = info.get("rid")
+            tokens = info.get("tokens")
+            if tokens is None:
+                tokens = 4000
+            if rid and led.has_reserve(rid):
+                led.settle(rid, tokens, status="ok")
+                journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent,
+                               tokens=tokens, status="ok")
+            journal.append("recovered_ok", txn=txn_id, intent=intent,
+                           rid=rid, artifact=str(result_path))
+            journal.append("ack", txn=txn_id, intent=intent, status="ok")
+            repaired.append(txn_id)
+            continue
         lock = nd / "inflight" / f"{intent}.lock"
         if intent and is_locked(lock):
             continue

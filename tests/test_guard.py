@@ -48,6 +48,10 @@ class GuardTest(unittest.TestCase):
     def test_allows_dry_run(self):
         subprocess.run(["sapper", "setup", "--goal", "g"], cwd=self.tmp,
                        env=self.env, check=True, capture_output=True, text=True)
+        subprocess.run(["sapper", "fact", "seed", "-k", "host"], cwd=self.tmp,
+                       env=self.env, check=True, capture_output=True, text=True)
+        subprocess.run(["sapper", "intent", "--from", "f001", "probe"], cwd=self.tmp,
+                       env=self.env, check=True, capture_output=True, text=True)
         self.assertEqual(
             self.run_guard("dispatch", "i001", "--dry-run").returncode, 0)
 

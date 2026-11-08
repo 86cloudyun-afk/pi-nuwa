@@ -189,9 +189,10 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
                         and abs(facts_delta - journal_commits) <= 2),
             "samples_recalc": recalc_ok,
             "resource": recalc_ok and rss_growth < 100 * 1024 and fd_growth <= 2,
-            "exit_codes": isinstance(exit_codes, dict) and not errors
+            "exit_codes": isinstance(exit_codes, dict) and bool(exit_codes) and not errors
             and all(int(v) == 0 for v in exit_codes.values()),
-            "span": interval > 0 and duration >= samples * interval * 0.8,
+            "span": interval > 0
+            and duration >= max(0.0, (samples - 1) * interval * 0.8),
         }
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,
                 "commit": commit, "report": str(rep_path),
