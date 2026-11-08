@@ -171,6 +171,14 @@
 | B26 | `fact --from-intent` 等直接结案入口绕过 guard | guard 拦 `fact --from-intent`；`auto`/`brainstorm-pick` 不在当前 CLI 子命令表 |
 | B23 | token 注入面过宽 | `graph.sapper(allow_submit=False)` 默认不注入；只有 done/complete/reason 提交链传 True |
 
+## 第十九轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B27 | guard 连 `--dry-run` 渲染也拦，正常 dispatch/reason 断链 | guard 对 `dispatch ... --dry-run` 直接放行；续跑文案改 `nuwa run` |
+| B28 | 账本缺坏尾隔离，残行吞掉下一条 reserve | `Ledger._append_locked` 写前检查末字节，缺 LF 先补 |
+| B24 | env.sh 在 PATH 前移后重置路径 | source 之后再压一次 `$SAPPER_HOME/bin` 到 PATH 最前 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

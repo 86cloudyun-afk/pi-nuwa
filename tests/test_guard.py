@@ -42,6 +42,10 @@ class GuardTest(unittest.TestCase):
         return subprocess.run(["sapper", *args], env=env, capture_output=True,
                               text=True, timeout=30)
 
+    def test_allows_dry_run(self):
+        self.assertNotEqual(
+            self.run_guard("dispatch", "i001", "--dry-run").returncode, 7)
+
     def test_blocks_done(self):
         self.assertEqual(self.run_guard("done", "i001", "--fact", "x").returncode, 7)
 

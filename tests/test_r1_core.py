@@ -338,6 +338,11 @@ class LedgerTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_append_after_bad_tail(self):
+        self.led.path.write_bytes(b'{"type":"reserve","rid":"r0","tokens":1}')
+        self.led.reserve("r1", "p1", 100)
+        self.assertEqual(len(self.led.records()), 2)
+
     def test_reserve_settle(self):
         self.led.reserve("r1", "p1", 100)
         s = self.led.summary()

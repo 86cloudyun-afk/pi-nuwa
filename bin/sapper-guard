@@ -52,11 +52,18 @@ while (( i < ${#args[@]} )); do
   esac
 done
 
+DRY=0
+for a in "${args[@]}"; do
+  [[ "$a" == "--dry-run" ]] && DRY=1
+done
+
 case "$cmd" in
   done|complete)
     (( ALLOWED == 1 )) || block "$cmd"
     ;;
   dispatch)
+    # --dry-run 只渲染提示，不执行也不提交，直接放行。
+    (( DRY == 1 )) && exec "$REAL" "$@"
     # 扫描 dispatch 之后所有 token，前置选项不能遮住 intent/reason。
     for (( j = cmd_idx + 1; j < ${#args[@]}; j++ )); do
       if [[ "${args[$j]}" =~ ^i[0-9]+$ ]]; then

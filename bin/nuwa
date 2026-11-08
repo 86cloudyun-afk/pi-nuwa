@@ -31,6 +31,8 @@ NUWA_VERSION="1.2.1"
 ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
 # shellcheck disable=SC1090
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+# env.sh 可能重置 PATH；再压一次，确保 guard 在真实 sapper 之前。
+export PATH="$LAB_DIR/bin:$PATH"
 
 # 安装器把 omp-claude 放在 $SAPPER_HOME/bin；解析引擎，供 Python dispatch 使用。
 if [[ -z "${NUWA_ENGINE:-}" ]]; then

@@ -25,7 +25,17 @@ class Ledger:
 
     def _append_locked(self, rec: dict) -> dict:
         rec.setdefault("ts", time.time())
+        need_lf = False
+        try:
+            if self.path.exists() and self.path.stat().st_size > 0:
+                with open(self.path, "rb") as fh:
+                    fh.seek(-1, os.SEEK_END)
+                    need_lf = fh.read(1) != b"\n"
+        except OSError:
+            need_lf = False
         with open(self.path, "a", encoding="utf-8") as fh:
+            if need_lf:
+                fh.write("\n")
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())

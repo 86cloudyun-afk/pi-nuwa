@@ -13,15 +13,15 @@
 | `test_chaos.py` | 8 | 8 pass | 坏图/锁/只读/SIGKILL |
 | `test_concurrency.py` | 5 | 5 pass | 单赢家/跨项目/锁清理 |
 | `test_e2e_deterministic.py` | 4 | 4 pass | 替身引擎 |
-| `test_r1_core.py` | 39 | 39 pass | journal 23 + 账本/事务 16 |
+| `test_r1_core.py` | 40 | 40 pass | journal 23 + 账本/事务 17 |
 | `test_r1_dispatch.py` | 2 | 2 pass | 预留/幂等 |
 | `test_r1_run.py` | 1 | 1 pass | round 循环 |
 | `test_r1_multi.py` | 1 | 1 pass | 四项目并发 |
 | `test_r2_r7.py` | 29 | 29 pass | 公平/证据/指标/策略/插件/夜跑 |
 | `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
-| `test_guard.py` | 13 | 13 pass | 执行层提交闸门（token/缩写/伪造/from-intent） |
+| `test_guard.py` | 14 | 14 pass | 执行层提交闸门（token/缩写/伪造/from-intent/dry-run） |
 
-合计 **158 例 + 16 runs**。
+合计 **160 例 + 16 runs**。
 
 ## 二、门禁
 

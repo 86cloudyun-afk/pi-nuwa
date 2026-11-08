@@ -572,7 +572,7 @@ export function buildDirective(g: Graph, st: LoopState, workerTag = "fujiang"): 
 				`- 禁止 sapper done / sapper dispatch <id> / 裸 sapper complete：扩展按 P-006 拦截；完成走 nuwa complete --from <fact>\n` +
 				`- 通道：优先 task{tasks:[]} 批量；若改用 eval 的 agent()/workpool，每项同样必须 agent="fujiang"\n` +
 				`- 主线程禁止自己跑 nmap/ffuf/curl，扫描只能发生在子代理里\n`
-			: `frontier 为空：先 cd ${g.root} && sapper dispatch reason --model deepseek-flash --timeout 240，然后 sapper frontier 取新 intent 再派发。\n`;
+			: `frontier 为空：先 cd ${g.root} && nuwa run --root ${g.root} --minutes 2 --parallel 1，然后 sapper frontier 取新 intent 再派发。\n`;
 
 	const discipline =
 		`收工判据只有两个：flag 已入账并 nuwa complete --from <flag fact>，或 vuln/loot 事实足以支撑结论。\n` +
