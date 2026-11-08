@@ -198,6 +198,15 @@
 | M53 | reason 的 `data.complete` 被忽略 | `_apply_reason` 校验 `complete.from` 的 kind 后走 `sapper complete` |
 | B26 | 真实 `auto`/`brainstorm-pick` 入口未拦 | guard 对 `auto`/`brainstorm-pick`/`sweep` 无 token 直接拦 |
 
+## 第二十二轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B27 | `auto`/`sweep` 的 `--dry-run` 被 guard 拦 | 所有聚合入口先判 `--dry-run` 放行 |
+| B30 | shell 回滚仍遗留 goal edge；Python 写 active 在删边前 | shell `revert_completion` 先删 `to=goal` intent；Python `_revert` 同序 |
+| B25 | 空引用退回整图、混合引用 any 放行 | 有完成边时只认其 `from`，且要求 all 都是 flag/vuln/loot；空 from 判失败 |
+| M53 | reason 的 `data.complete` 在 intents 缺失时提前返回 | 先处理 complete，再把 intents 归一为空列表 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

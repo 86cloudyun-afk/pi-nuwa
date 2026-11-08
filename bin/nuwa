@@ -335,7 +335,18 @@ print("yes" if hit else "no")'
 }
 
 revert_completion() {
-  python3 -c 'import datetime, json
+  python3 -c 'import datetime, glob, json, os
+# 先删除 to=goal 的完成边，再写 active；否则 validate 会持续报 completion edge。
+for path in glob.glob(".sapper/intents/*.json"):
+    try:
+        it = json.load(open(path))
+    except Exception:
+        continue
+    if it.get("to") == "goal":
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 p = ".sapper/project.json"
 d = json.load(open(p))
 d["status"] = "active"

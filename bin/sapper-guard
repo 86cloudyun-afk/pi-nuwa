@@ -73,7 +73,8 @@ case "$cmd" in
       fi
     done
     ;;
-  auto|brainstorm-pick|sweep)
+  auto|brainstorm-pick|sweep|command|fleet|bench)
+    (( DRY == 1 )) && exec "$REAL" "$@"
     (( ALLOWED == 1 )) || block "$cmd"
     ;;
   fact)

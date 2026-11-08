@@ -37,8 +37,12 @@ def _evidence(root: Path) -> bool:
         if it.get("to") == "goal" and it.get("status") in ("complete", "done"):
             refs.extend(str(x) for x in (it.get("from") or []))
     if refs:
-        return any(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
+        # 完成边存在时只认它引用的证据，且每个引用都必须是强证据。
+        return all(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
                    for fid in refs)
+    edge = any(it.get("to") == "goal" for it in graph.intents(root))
+    if edge:
+        return False
     return any(f.get("kind") in ("flag", "vuln", "loot") for f in facts.values())
 
 
@@ -50,8 +54,7 @@ def _revert(root: Path, why: str) -> None:
     data["status"] = "active"
     data.pop("completed_at", None)
     data.pop("completed_from", None)
-    graph._atomic_json(p, data)
-    # 真实 sapper 的完成边是一条 to=goal 的 intent；不打掉它，validate 会持续报错。
+    # 先删完成边，再写 active；否则中途退出会留下 completed + 无边的坏图。
     for it in graph.intents(root):
         if it.get("to") == "goal":
             edge = Path(root) / ".sapper" / "intents" / f"{it['id']}.json"
@@ -59,6 +62,7 @@ def _revert(root: Path, why: str) -> None:
                 edge.unlink()
             except FileNotFoundError:
                 pass
+    graph._atomic_json(p, data)
     hp = Path(root) / ".sapper" / "hints.json"
     hints = graph._load(hp) or []
     hints.append({"content": f"完成被拒绝：{why}", "creator": "nuwa",
@@ -87,9 +91,9 @@ def _annotate_intent(root: Path, intent_id: str, key: str) -> None:
 def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) -> int:
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     intents = data.get("intents") if isinstance(data, dict) else None
+    complete = data.get("complete") if isinstance(data, dict) else None
     if not isinstance(intents, list):
-        journal.append("reason_noop", round=round_no)
-        return 0
+        intents = []
     project = root.name
     created = 0
     for idx, item in enumerate(intents):
@@ -115,7 +119,6 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
         if after:
             _annotate_intent(root, after[0]["id"], key)
             created += 1
-    complete = data.get("complete") if isinstance(data, dict) else None
     if isinstance(complete, dict):
         from_ids = [str(x) for x in (complete.get("from") or []) if x]
         facts = {f.get("id"): f for f in graph.facts(root)}

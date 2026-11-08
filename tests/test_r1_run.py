@@ -46,6 +46,14 @@ class RunTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r
 
+    def test_revert_removes_goal_edge(self):
+        from nuwa import graph
+        self._run(["sapper", "complete", "--from", "f001", "--note", "done"])
+        self.assertEqual(graph.project(self.root).get("status"), "completed")
+        runner._revert(self.root, "test")
+        self.assertEqual(graph.project(self.root).get("status"), "active")
+        self.assertFalse(any(i.get("to") == "goal" for i in graph.intents(self.root)))
+
     def test_run_two_rounds(self):
         before = len(list((self.root / ".sapper" / "facts").glob("*.json")))
         code = runner.run(self.root, minutes=1, parallel=2, model="fake")
