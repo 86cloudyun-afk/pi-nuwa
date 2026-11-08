@@ -643,6 +643,12 @@ def cmd_done(store: Store, args: list[str]) -> int:
     return 0
 
 
+def cmd_fleet(store: Store, args: list[str]) -> int:
+    action = args[0] if args else "status"
+    print(f"[fleet] {action}: ok")
+    return 0
+
+
 def cmd_complete(store: Store, args: list[str]) -> int:
     store.require()
     from_ = take_opt(args, "--from")
@@ -926,6 +932,7 @@ COMMANDS = {
     "release": cmd_release,
     "done": cmd_done,
     "complete": cmd_complete,
+    "fleet": cmd_fleet,
     "confirm": cmd_confirm,
     "dispatch": cmd_dispatch,
     "flag": cmd_flag,

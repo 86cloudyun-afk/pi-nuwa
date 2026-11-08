@@ -50,12 +50,23 @@ class RunTest(unittest.TestCase):
         from nuwa import graph
         self._run(["sapper", "complete", "--from", "f001", "--note", "done"])
         self.assertEqual(graph.project(self.root).get("status"), "completed")
+        self.assertTrue(any(i.get("to") == "goal" for i in graph.intents(self.root)))
         runner._revert(self.root, "test")
         self.assertEqual(graph.project(self.root).get("status"), "active")
         self.assertFalse(any(i.get("to") == "goal" for i in graph.intents(self.root)))
         v = subprocess.run(["sapper", "validate"], cwd=self.root, env=self.env,
                            capture_output=True, text=True)
         self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+
+    def test_revert_keeps_valid_completion(self):
+        from nuwa import graph
+        self._run(["sapper", "flag", "flag{ok}"])
+        flags = [f for f in graph.facts(self.root) if f.get("kind") == "flag"]
+        self.assertTrue(flags)
+        self._run(["sapper", "complete", "--from", flags[0]["id"], "--note", "done"])
+        self.assertEqual(runner._revert(self.root, "x"), "noop")
+        self.assertEqual(graph.project(self.root).get("status"), "completed")
+        self.assertTrue(any(i.get("to") == "goal" for i in graph.intents(self.root)))
 
     def test_run_two_rounds(self):
         before = len(list((self.root / ".sapper" / "facts").glob("*.json")))

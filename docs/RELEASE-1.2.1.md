@@ -442,6 +442,16 @@
 | M44 | 测试清理匹配 `/tmp/nuwa-study` | 限定 `-user $(id -u)`，只删当前用户的 `nuwa-*` |
 | M55 | fake complete 不建完成边 | fake-sapper complete 创建 `to=goal` intent，测试断言边存在 |
 
+## 第五十四轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| M44 | 清理仍匹配 `/tmp/nuwa-study` | 只匹配测试专用前缀（nuwa-r1-/e2e-/chaos-/guard-/unit-/night-/qa-/soak-/crash-/multi-/dispatch-） |
+| M31 | 基线在线程启动后采集；复用项目历史 commit_done 混入 | baseline 移到 `t.start()` 前；记录 `journal_base`，verify 只统计增量 |
+| M47 | fleet 正例接受后端失败 | fake-sapper 增加 `fleet status` 返回 0；guard 断言 rc=0 |
+| M55 | 回滚测试缺“边存在”断言与合法完成保留 | 补断言与 `test_revert_keeps_valid_completion` |
+| M15 | 测试表/backlog 旧读数 | 更新 167 例；登记 B6/B23/B30 接受边界 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

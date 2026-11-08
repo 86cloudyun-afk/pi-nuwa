@@ -125,7 +125,7 @@ class GuardTest(unittest.TestCase):
         self.assertNotEqual(self.run_guard("fact", "x", "-k", "host").returncode, 7)
 
     def test_allows_fleet_status(self):
-        self.assertNotEqual(self.run_guard("fleet", "status").returncode, 7)
+        self.assertEqual(self.run_guard("fleet", "status").returncode, 0)
 
     def test_blocks_fleet_up(self):
         self.assertEqual(self.run_guard("fleet", "up").returncode, 7)

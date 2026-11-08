@@ -107,16 +107,27 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             raise ValueError("projects 为空")
         journal_dispatches = 0
         journal_commits = 0
+        base_map = rep.get("journal_base") or {}
+        if not isinstance(base_map, dict):
+            raise ValueError("journal_base 不是对象")
         for proj in projects:
+            base_seq = int(base_map.get(str(proj), 0) or 0)
             jp = Path(str(proj)) / ".nuwa" / "journal.jsonl"
             try:
                 lines = jp.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
             for line in lines:
-                if '"event": "executing_prepare"' in line:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if int(rec.get("seq", 0) or 0) <= base_seq:
+                    continue
+                ev = rec.get("event")
+                if ev == "executing_prepare":
                     journal_dispatches += 1
-                elif '"event": "commit_done"' in line:
+                elif ev == "commit_done":
                     journal_commits += 1
         facts = _number(rep.get("facts", 0), "facts")
         baseline = rep.get("facts_baseline") or {}

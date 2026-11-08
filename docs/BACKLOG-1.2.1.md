@@ -23,6 +23,14 @@
 | M34 | `extensions/nuwa-loop/index.ts:246` | `candidateDirs` 祖先链带来的路径检查放大 | 缓存 resolve 结果；候选数上限 + 超限 fail-closed |
 | M35/M36 | `nuwa/txn.py:75`、`nuwa/ledger.py:143` | 基线遗留的账本/事务边界 | 并入 M17/M22 一起处理 |
 
+## 既定接受边界（审计已排除为 blocking）
+
+| ID | 边界 | 缓解 |
+|---|---|---|
+| B6 | 目录复制/移动的隐含子路径、递归覆盖；直接改图属于宿主写入边界 | 提交语义由执行层 guard 收口；扩展只做字面兜底 |
+| B23 | 同 UID 可读 token；PPID 名称子串 | token + PPID 双因子；同 UID 是信任边界 |
+| B30 | 扩展侧 Node 无 flock，回滚在 `.sapper/.lock` 外 | shell/Python 锁内重判；扩展回滚仅处理 session 内单线程 |
+
 ## 结论
 
 阻断项已从「数据丢失 / 普通输入绕过 / 虚假结算」收敛到「竞态与极端输入」。

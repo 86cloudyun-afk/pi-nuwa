@@ -5,7 +5,12 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 export NUWA_WORK="${NUWA_WORK:-$(cd .. && pwd)}"
 # 清理一天前的 nuwa 测试临时目录，避免 /tmp 越跑越乱
-find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -user "$(id -u)" -name 'nuwa-*' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -user "$(id -u)" \
+  \( -name 'nuwa-r1-*' -o -name 'nuwa-e2e-*' -o -name 'nuwa-chaos-*' \
+     -o -name 'nuwa-guard-*' -o -name 'nuwa-unit-*' -o -name 'nuwa-night-*' \
+     -o -name 'nuwa-qa-*' -o -name 'nuwa-soak-*' -o -name 'nuwa-crash-*' \
+     -o -name 'nuwa-multi-*' -o -name 'nuwa-dispatch-*' \) \
+  -mtime +1 -exec rm -rf {} + 2>/dev/null || true
 
 fail=0
 run() {
