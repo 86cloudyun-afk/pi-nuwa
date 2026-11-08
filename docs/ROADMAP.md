@@ -163,7 +163,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 | 类型 | 单位 | 计费时点 | 来源 | 预留 | 结算 |
 |---|---|---|---|---|---|
-| tokens | input+output | `executed`（任何状态） | 引擎 usage；缺失按 `ceil((prompt+artifact)/4)` 估算并标 `estimated` | `min(p95, per_task_cap)` | 实际/估算，只补不退 |
+| tokens | input+output | `executed`（任何状态） | 引擎 usage；缺失按 `ceil((prompt+artifact)/4)` 估算并标 `estimated` | `min(p95, per_task_cap)` | `settled_total += actual`；settled 时释放整笔预留，未用部分回到可用余额，已消耗不退款 |
 | wall | 秒（经过，暂停不计） | 项目结束 | 首次 dispatch 到结束，排除暂停区间 | 不预留 | 结束结算 |
 | dispatches | 次 | `executed` | 每次尝试 | 1 | 结算 |
 
@@ -179,7 +179,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 在途：单项目 ≤ `--parallel`，全局 ≤ `NUWA_GLOBAL_CONCURRENCY`。
 - 暂停：`overdraft` 或人工暂停期间 wall 不计时（记录 pause/resume 时间戳）。
 
-- 预留生命周期：`reserved`（执行中）→ `pending_settlement`（executed 后额度仍占用）→ `settled`（释放）。只有 `reserved` 且锁空闲、且无 executed 记录才可 `reclaim`；`pending_settlement` 必须等结算完成才释放额度，避免提前释放造成双花。
+- 预留生命周期：`reserved`（执行中）→ `pending_settlement`（executed 后额度仍占用）→ `settled`（释放）。只有 `reserved`、锁空闲、无 executed 记录、且无 `result.json`/artifact 才可 `reclaim`；若锁空闲但 `result.json` 存在，先补 `executed(ok)` 再结算，禁止直接回收。`pending_settlement` 必须等结算完成才释放额度，避免提前释放造成双花。
 - 续租：`executing` 期间每 2 分钟 `renew`；TTL 10 分钟。
 - 迟到结算：`late_settle` 按 `rid` 匹配，不重复扣。
 - 超支：三类均以各自额度为分母（tokens/dispatches 用 reserve，wall 用 wall_cap）；`overspend = max(0, actual - quota)/quota`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`、项目暂停、门禁失败。
@@ -211,6 +211,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
     "command": "curl -sS -m 5 http://h:8080/flag",
     "cwd": "/work/p1",
     "exit_code": 0,
+    "source": "executor-hook",
     "hash_spec": "v1",
     "raw_sha256": "...",
     "norm_sha256": "...",
@@ -327,10 +328,10 @@ reserve → executing_prepare → executing → executed → commit_prepare
 3. 获取 `global.lock`，再按固定顺序获取各项目锁（barrier）；记录 `global_cut_seq`、每个项目 journal 的 `cut_seq[p]` 与 `queue_cut_seq`；把队列前缀复制为 `queue.<snapshot_id>.jsonl`（此后接受的请求 seq > queue_cut，归入 delta）；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
 4. 在各项目锁内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；导出完成后校验每个项目 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
 5. 复制 artifact 原始字节到 `snapshot/artifacts/`（默认开启；关闭时标 `evidence_incomplete`）。
-6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.jsonl`（冻结期间已接受的 commit/结算请求）。
+6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.<snapshot_id>.jsonl`（barrier 内复制的前缀，不打包活文件）。
 7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。恢复分两段断言：`restore` 后 facts 与余额必须等于 `at_cut_*`；重放 queue 后必须等于 `at_cut_* + queue 产生的增量`，两段分别校验。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
 
-**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）、以及 `accepted_at > snapshot.frozen_at` 且尚未写入 journal/账本的 `queue.jsonl` 条目（按 txn_id 去重）；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9+ 扩展遇到 schema 3 必须 fail-closed（拒绝上膛并写 `state_schema_too_new`），不得静默重置；0.3.x 无此能力，回滚不得指向 schema 3 目录。
+**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）、以及 `qseq > queue_cut_seq` 且尚未写入 journal/账本的队列条目（按 txn_id 去重）；队列每条带单调 `qseq`，不用时间戳裁切。回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9 支持 `loop_schema <= 3`（3 由它引入），仅 `>3` 时 fail-closed（拒绝上膛并写 `state_schema_too_new`）；0.3.x 支持 `<=2`，遇 3 会清空，故回滚不得指向 schema 3 目录。
 
 **初始化/迁移样本**：
 
@@ -358,7 +359,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 长测协议：
 - 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 60`；引擎固定 omp + `deepseek-flash`，负载固定 4 项目 × 每轮 8 个 intent，单项目预算 2M tokens；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
-- 两周观察：候选版本 = release tag；暴露量 = 72h 连续 + 14 天等价负载；出现新提交后计时重置
+- 两周观察：候选版本 = release tag；等价负载基准 = 4 项目 × 2 并发 × 60 dispatch/hour，每日至少 1 小时；发布判定唯一：72h 长测全部判据通过 **且** 14 天内 P0/P1 为 0，两者缺一不可，不得互相替代；出现新提交后两项同时重置
 - 采样间隔 30s；PID 范围 = 各项目进程树；**所有判据按项目分别计算**（每项目 RSS 斜率、FD 差、dispatch/hour、facts 增长），任一项目不达标即失败；全局汇总只作展示，不得掩盖单项目停滞
 - 有效运行 ≥259200 秒；提前退出、采样间隔 >60s，判失败
 - **RSS**：预热 20% 后对 RSS(KB)-时间(min) 最小二乘，斜率 <1024 KB/min
@@ -383,7 +384,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 | 阶段 | 验收命令（阶段内交付） | 阈值 |
 |---|---|---|
-| R1 | `nuwa ls --json`；`tests/crash_inject.py --points 10 --repeat 20` | 一致 ≤2s；同 intent 活子进程 ≤1；重复 fact 0 |
+| R1 | `nuwa ls --json`；`tests/crash_inject.py --fake-points 6 --fake-repeat 20 --real-points 4 --real-repeat 5` | 一致 ≤2s；同 intent 活子进程 ≤1；重复 fact 0 |
 | R2 | `nuwa budget fairness --projects 3 --weights 2:1:1 --seconds 60` | 50/25/25 ±5pp；等权 33% ±5pp；≥10 dispatch |
 | R3 | `nuwa verify --samples 5 --expect reject`；固定样本集 100 | 5/5 拒绝；p95 <2s |
 | R4 | `nuwa metrics --json`；`nuwa report --offline` | 对账 ≤1；断网可开 |
