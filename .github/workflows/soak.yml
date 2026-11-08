@@ -1,5 +1,6 @@
 name: soak
 
+# 72h 长测必须跑在自托管 runner：GitHub 托管 runner 单作业上限 6 小时。
 on:
   workflow_dispatch:
     inputs:
@@ -12,7 +13,7 @@ on:
 
 jobs:
   soak:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     timeout-minutes: 4500
     env:
       SAPPER_REF: c91881dc1629409bbf278577dfdaa6b8f383b438
@@ -25,16 +26,15 @@ jobs:
 
       - name: Run soak
         run: |
-          python3 tests/soak.py --minutes "${{ github.event.inputs.minutes || '4320' }}" \
-            --interval 30 --instances 4 --out soak-report
+          MIN="${{ github.event.inputs.minutes || '4320' }}"
+          # R7 起替换为 nuwa soak；当前 tests/soak.py 仅作 preview，不可用于发布验收
+          python3 tests/soak.py --minutes "$MIN" --interval 30 --instances 4 --out soak-report
+          echo "${{ github.sha }}" > soak-report/COMMIT
+          echo "preview" > soak-report/MODE
 
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: soak-report
+          name: soak-preview-${{ github.sha }}
           path: soak-report/
-
-      - name: Bind report to commit
-        run: |
-          echo "${{ github.sha }}" > soak-report/COMMIT

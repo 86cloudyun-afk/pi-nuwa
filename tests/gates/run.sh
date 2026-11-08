@@ -1,52 +1,60 @@
 #!/usr/bin/env bash
-# 阶段门禁：核心锚点 + expected 清单 + 非空校验 + 执行。
+# 阶段门禁：已发布历史 + 已交付清单 + 非空校验 + 执行。
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-# 已交付阶段清单：只增不减。新增阶段时把门禁名加入此数组与 expected。
+# 本版本已交付的阶段门禁：只增不减
 DELIVERED=(0_baseline)
 EXPECTED="gates/expected"
+RELEASED="gates/released.json"
 
 fail=0
 declare -a names=()
 
-if [[ ! -f "$EXPECTED" ]]; then
-  echo "gates: 缺少 $EXPECTED" >&2
-  exit 1
-fi
+[[ -f "$EXPECTED" ]] || { echo "gates: 缺少 $EXPECTED" >&2; exit 1; }
+[[ -f "$RELEASED" ]] || { echo "gates: 缺少 $RELEASED" >&2; exit 1; }
 
 while IFS= read -r line; do
   [[ -z "${line// }" || "${line:0:1}" == "#" ]] && continue
   names+=("$line")
 done <"$EXPECTED"
 
-if (( ${#names[@]} == 0 )); then
-  echo "gates: expected 为空" >&2
-  exit 1
-fi
+(( ${#names[@]} > 0 )) || { echo "gates: expected 为空" >&2; exit 1; }
 
-# 已交付门禁必须在清单中
+has_name() {
+  local needle="$1" n
+  for n in "${names[@]}"; do [[ "$n" == "$needle" ]] && return 0; done
+  return 1
+}
+
+# 1) 本版本已交付清单必须在 expected 中
 for c in "${DELIVERED[@]}"; do
-  found=0
-  for n in "${names[@]}"; do
-    [[ "$n" == "$c" ]] && found=1
-  done
-  if (( found == 0 )); then
-    echo "gates: 已交付门禁 $c 不在 expected 中" >&2
-    fail=1
-  fi
+  has_name "$c" || { echo "gates: 已交付门禁 $c 不在 expected 中" >&2; fail=1; }
 done
 
-# 每个清单项必须有非空脚本
+# 2) 历史发布过的门禁必须在 expected 中（删除需改 released.json，属发布变更）
+while IFS= read -r g; do
+  [[ -z "$g" ]] && continue
+  has_name "$g" || { echo "gates: 历史门禁 $g 缺失" >&2; fail=1; }
+done < <(python3 - "$RELEASED" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for gates in d.values():
+    for g in gates:
+        print(g)
+PY
+)
+
+# 3) 每个清单项必须有非空脚本
 for n in "${names[@]}"; do
   f="gates/g${n}.sh"
-  if [[ ! -s "$f" ]]; then
-    echo "gates: 缺少或为空: $f" >&2
-    fail=1
-  fi
+  [[ -s "$f" ]] || { echo "gates: 缺少或为空: $f" >&2; fail=1; }
 done
 
-# 执行所有实际存在的脚本
+# 4) 执行所有实际存在的脚本
 shopt -s nullglob
 for f in gates/g*.sh; do
   printf '\n== %s ==\n' "$f"

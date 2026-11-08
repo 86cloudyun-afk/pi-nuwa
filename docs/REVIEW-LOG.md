@@ -96,4 +96,25 @@
 
 ## Round 10 — 2026-11-08
 
+- 结论：**fail**，78/100
+- 阻塞 5 项：wrapper exec 后无人写完成标记；预算宣称零超支但引擎无前置计量；artifact 30 天销毁与未提交事务冲突；压缩可能删掉快照增量所需记录；增量未含会话计数
+- 修订：wrapper 改 fork+wait+result.json；预算预留留 5% 头寸并定义 minor/major overrun；artifact 被未提交事务引用时保留；压缩下界取活跃快照 cut；增量含会话计数与 3→2 降级
+- 同步：契约 dry-run 改内容哈希、未知字段过写操作校验
+
+## Round 11 — 2026-11-08
+
+- 结论：**fail**，83/100（评审对象为未完全落盘的旧稿）
+- 阻塞 4 项：exec 后无完成标记写入者；token 零超支缺引擎契约；快照遗漏 queue.jsonl；schema 超前时重置与 fail-closed 冲突
+- 修订：完成标记与恢复判据统一；预算改为 5% 头寸 + minor/major overrun；快照打包 queue 并定义单独 restore 的重放；会话状态 schema 超前改 fail-closed
+- 同步：压缩代际绑定与发布顺序；门禁改 DELIVERED 只增不减清单；快照命令拆成可执行示例
+
+## Round 12 — 2026-11-08
+
+- 结论：**fail**，83/100
+- 阻塞 3 项：压缩覆盖旧代导致无法回退；准入公式未给新预留计头寸且未减已结算；托管 runner 6 小时上限撑不起 72h 长测
+- 修订：代际文件 + CURRENT 指针 + 保留上一代；`remaining_global = cap - settled - outstanding*1.05`，准入 `reserve*1.05 <= remaining_global`；长测改自托管 runner
+- 同步：锁 fd 由业务子进程继承并加"只杀 wrapper"用例；freeze 加 owner/snapshot_id/续租；门禁加 `released.json` 历史基线；长测产物写 MODE/COMMIT；矛盾 fact 固定三组样本
+
+## Round 13 — 2026-11-08
+
 （待填）

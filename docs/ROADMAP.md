@@ -76,7 +76,7 @@
 - Bloom 仅作快速否定：Bloom 判"不存在"→ 新事务；"可能存在"→ 必须查索引；索引查不到 → **按新事务处理**，绝不跳过。
 - 压缩保留 checkpoint + `seq > checkpoint.seq` 的记录 + `unresolved` 完整记录 + 全量索引。
 压缩下界 = `min(所有活跃快照的 cut_seq[p], checkpoint.seq)`；`snapshots.idx` 登记每个快照的 cut 与引用计数，仍有快照引用时不得删除其后的记录，引用归零后才可 GC。
-代际绑定：checkpoint、`dispatch_keys.idx`、journal 均写 `gen`；发布顺序为「写 checkpoint.tmp → fsync → rename → 写 index.tmp（gen+1）→ fsync → rename → 截断 journal 到同一 gen」。恢复选择 gen 最大且三者一致的一组；不一致则回退上一代并写 `compaction_rolled_back`。
+代际文件：`checkpoint.<gen>.json`、`index.<gen>.idx`、`journal.<gen>.jsonl` 一律不覆盖；每代写完 fsync 后，原子更新 `CURRENT`（tmp+rename）指向 gen；上一代保留到下一次压缩成功，截断只作用于 gen-2 及更早。恢复读 `CURRENT`；文件缺失或三者不一致则回退上一代并写 `compaction_rolled_back`。
 重放断言：run/账本/facts 与压缩前一致，且无重复 `commit_done`。
 
 ## 4. 各阶段
@@ -108,7 +108,9 @@
 - spawn 的是 `nuwa-worker-lock` 包装器：它先打开 **意图级锁** `.nuwa/inflight/<intent>.lock`、取得 `flock(LOCK_EX)`、写 `ready` 文件（pid + starttime + attempt_seq），然后 **fork 子进程执行业务命令并 wait**（不 exec，保证包装器存活到命令结束）；命令退出后写 `result.json`（exit_code + 完成标记），再释放锁。
 - 包装器在 exec 前重读 intent，若 `attempt_seq` 与自身不符则直接退出（不执行）；因此被判定死亡后恢复的旧 wrapper 即使醒来也拿不到锁或版本不符。
 - 父进程等待 `ready`（超时 5s）。拿到 ready 才写 `executing`；超时则 kill 并按启动失败处理。
+- 业务子进程继承同一锁 fd（dup2 到固定 fd 并清除 CLOEXEC）；wrapper 与业务进程共同持锁，只有两者都退出锁才释放。
 - 业务命令正常退出后，wrapper 写 `result.json`（exit_code + 完成标记）；异常退出不写。恢复只有同时看到 marker 与 exit 0 才判 ok，否则按 crashed 处理。
+- 混沌用例：只杀 wrapper、保留业务子进程 → 恢复必须等待锁释放，不得重派。
 - 存活判定 = 尝试 `flock(LOCK_EX|LOCK_NB)`：拿不到 → 活；拿得到 → 死。锁在任何业务代码之前取得，不存在"进程已跑、锁未持有"的窗口。
 - 重派前必须先拿到旧锁（证明旧子进程已退出），再创建新 txn。
 - `pid/starttime` 仅诊断。
@@ -164,12 +166,13 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 **准入与硬上限**：
 
-- `reserve = min(ceil(p95*1.05), NUWA_TASK_CAP, remaining_project, remaining_global - sum(outstanding_reserved)*1.05)`
-- 准入：`reserve >= MIN_VIABLE` 且 `sum(outstanding_reserved)*1.05 + reserve <= global_cap`；为实际超预留留 5% 头寸。
+- `remaining_global = global_cap - settled_total - sum(outstanding_reserved)*1.05`
+- `reserve = min(ceil(p95*1.05), NUWA_TASK_CAP, remaining_project, remaining_global / 1.05)`
+- 准入：`reserve >= MIN_VIABLE` 且 `reserve*1.05 <= remaining_global`；新预留与既有预留都计 5% 头寸。
 - 预检：spawn 前估算 input tokens `ceil(prompt_chars/4)`；若超过 reserve 则拒绝或排队。支持输出上限的引擎传 `max_output_tokens = reserve - input_est`。
 - `per_task_cap = reserve`；timeout 由 `NUWA_TASK_TIMEOUT` 单独设定。
 - 结算：`overspend = max(0, actual - reserve) / reserve`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`，项目暂停且门禁失败。
-- 账本可用余额 = `global_cap - sum(outstanding_reserved)*1.05`，恒不为负；短期负实际余额必须在下一结算周期补平。
+- 账本可用余额 = `remaining_global`，恒不为负；短期负实际余额必须在下一结算周期补平。
 - 在途：单项目 ≤ `--parallel`，全局 ≤ `NUWA_GLOBAL_CONCURRENCY`。
 - 暂停：`overdraft` 或人工暂停期间 wall 不计时（记录 pause/resume 时间戳）。
 
@@ -252,7 +255,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 验收：
 - 五类样本按表拒绝，退出码一致
-- 3 组矛盾 fact 被标记且不阻塞推进
+- 矛盾样本固定为 `tests/fixtures/contradiction/` 三组（同端口不同服务、同 flag 不同来源、同 CVE 不同版本）；标记字段 `x-nuwa:contradiction={with:[fact_ids],field,values}`；预期 facts 保留、project 仍 active、事件 `contradiction_flagged`、下一轮 dispatch 正常开始
 - 固定样本集 p95 <2s（exec 到断言，排除排队）
 - 置信度 rubric 单测：三类输入得到预期分值；覆盖 24h 后失效
 - 单测：截断输出、非 UTF-8、超时命令、artifact 缺失
@@ -315,7 +318,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 **快照一致性协议**（R6 交付）：
 
-1. 短暂获取 `global.lock`：写 `$SAPPER_HOME/budget/freeze.json`（`freeze=true`、owner pid、expires 10min），记录 `freeze_seq`，释放。启动时发现过期 freeze → 写 `freeze_recovered` 并清除；commit/结算队列持久化在 `queue.jsonl`，启动时重放。冻结后**新 dispatch 拒绝；commit 全路径与新结算一律入队**。
+1. 短暂获取 `global.lock`：写 `$SAPPER_HOME/budget/freeze.json`（`freeze=true`、`owner_pid`、`snapshot_id`、`renewed_at`、`expires` 10min），记录 `freeze_seq`，释放；快照进程每 60s 续租。其他进程只有在 owner 进程已死时才可清除过期 freeze（写 `freeze_recovered`）；解冻必须匹配 `snapshot_id`，旧快照不能清除新快照的 freeze。commit/结算队列持久化在 `queue.jsonl`，启动时重放。冻结后**新 dispatch 拒绝；commit 全路径与新结算一律入队**。
 2. 等待 inflight 全部到达 `executed`（只等执行结束，**不等 commit 队列**），最长 120s；超时则 kill 子进程、写 `executed{crashed}` 并入队。
 3. 获取 `global.lock`，再按固定顺序获取各项目锁（barrier）；记录 `global_cut_seq` 与每个项目 journal 的 `cut_seq[p]`；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
 4. 在各项目锁内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；导出完成后校验每个项目 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
@@ -350,7 +353,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 **目标**：可以长期挂着跑，升级/回滚可整体操作。
 
 长测协议：
-- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 60`
+- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 60`；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
 - 采样间隔 30s；PID 范围 = 各项目进程树
 - 有效运行 ≥259200 秒；提前退出、采样间隔 >60s，判失败
 - **RSS**：预热 20% 后对 RSS(KB)-时间(min) 最小二乘，斜率 <1024 KB/min
@@ -370,7 +373,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 ## 5. 横切约束
 
 - **测试先行**：每阶段先加失败用例，再实现。
-- **阶段门禁**：CI 与本地都执行 `tests/run.sh`（契约 → 五套 → `gates/run.sh`）。CI 作业超时 10 分钟；72h 长测是独立 `soak.yml`（`timeout-minutes: 4500`），产物 `soak-report` 与 commit sha 绑定，发布要求报告 commit 与发布 commit 一致。 `gates/run.sh` 内置**只增不减的已交付清单** `DELIVERED=(0_baseline ...)`，每个已发布阶段的门禁名都在其中，`expected` 必须是它的超集；删除某阶段脚本或清单项都会触发缺项失败；每个名称对应 `gates/g<name>.sh` 必须存在且非空；`NUWA_REQUIRE_GATES=1` 时任何缺项失败。新增阶段时同一变更内更新 `expected` 与门禁脚本；删除清单项不能绕过核心锚点。
+- **阶段门禁**：CI 与本地都执行 `tests/run.sh`（契约 → 五套 → `gates/run.sh`）。CI 作业超时 10 分钟；72h 长测是独立 `soak.yml`，**必须跑在自托管 runner**（GitHub 托管 runner 单作业上限 6 小时），`timeout-minutes: 4500`；产物名含 commit 与 mode，发布要求 `MODE=soak` 且 `COMMIT` 与发布 commit 一致。 `gates/run.sh` 内置**只增不减的已交付清单** `DELIVERED=(0_baseline ...)`，并读取 `gates/released.json`（发布历史，只追加）；历史中每个门禁都必须在 `expected` 中且脚本非空，删除需同时改发布历史（属发布变更，需 release note）；每个名称对应 `gates/g<name>.sh` 必须存在且非空；`NUWA_REQUIRE_GATES=1` 时任何缺项失败。新增阶段时同一变更内更新 `expected` 与门禁脚本；删除清单项不能绕过核心锚点。
 - **场景到命令**：
 
 | 阶段 | 验收命令（阶段内交付） | 阈值 |
