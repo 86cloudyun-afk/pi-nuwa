@@ -201,8 +201,9 @@ function resolvePath(value: string, baseDir: string): string[] {
 		}
 		return cur;
 	};
-	const real = walk(abs);
-	const out = new Set<string>([real]);
+	const real = walk(isAbsolute(normalized) ? normalized : normalized);
+	// 字面路径与真实路径都保留：保护目录链接到普通位置时，字面名仍是判据。
+	const out = new Set<string>([abs, real]);
 	try {
 		out.add(realpathSync(abs));
 		return [...out];
@@ -451,12 +452,17 @@ export function readGraph(root: string): Graph | null {
 			if (!f.endsWith(".json")) continue;
 			const it = readJson<{ id?: string; status?: string; to?: string; from?: string[] }>(
 				join(root, ".sapper", "intents", f));
-			if (!it || typeof it !== "object") {
+			if (!it || typeof it !== "object" || Array.isArray(it)) {
 				corrupt = true;
 				continue;
 			}
-			if (it.status && !["open", "claimed", "done", "complete"].includes(it.status)) {
+			if (!it.status || !["open", "claimed", "done", "complete"].includes(it.status)) {
 				corrupt = true;
+			}
+			if (it.from !== undefined) {
+				const refs = Array.isArray(it.from)
+					? it.from.filter((x): x is string => typeof x === "string") : [];
+				if (!Array.isArray(it.from) || refs.length !== it.from.length) corrupt = true;
 			}
 			if (it.to === "goal") {
 				const refs = Array.isArray(it.from)

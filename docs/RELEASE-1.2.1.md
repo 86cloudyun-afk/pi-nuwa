@@ -299,6 +299,15 @@
 | B30 | 锁内直接删届时全部 goal 边；False 同时表示无变化与错误 | shell 锁内先重判有效完成（有效则 exit 0）；Python `_revert` 返回 `reverted/noop/failed` 三态 |
 | B40 | `resolve` 先折叠 `..` 再 realpath，链接后 `..` 偏离 shell 语义 | `resolvePath` 改为逐段 realpath 的 `walk`，先跟随链接再处理 `..` |
 
+## 第三十五轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B41 | `resolvePath` 只保留 real，保护目录链接到普通位置时丢失字面名 | 候选集同时保留字面路径与真实路径 |
+| B40 | 相对路径仍先 `join` 折叠 `..` | `walk` 接收原始相对路径，从 baseDir 逐段 realpath |
+| B25 | 空 status/数组/普通 intent 的 from 未校验 | status 必填白名单；数组/非对象置 corrupt；所有 intent 的 from 校验成员类型 |
+| B30 | shell 锁内有效完成与已回滚共用 exit 0 | 有效完成返回 3，`completion_ok` 记 `project_completed` 并停机 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

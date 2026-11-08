@@ -385,7 +385,7 @@ if edges and all(
             for r in (e.get("from") or []))
     for _, e in edges
 ):
-    raise SystemExit(0)
+    raise SystemExit(3)
 for path, _e in edges:
     try:
         os.remove(path)
@@ -417,7 +417,14 @@ completion_ok() {
   if [[ "$(has_evidence)" == "yes" || "${NUWA_REQUIRE_EVIDENCE:-1}" == "0" ]]; then
     return 0
   fi
-  if ! revert_completion; then
+  revert_completion
+  local rc=$?
+  if (( rc == 3 )); then
+    log "有效完成：锁内证据通过"
+    event project_completed "round=${round:-0}" "why=recheck"
+    return 0
+  fi
+  if (( rc != 0 )); then
     log "回滚失败：完成边未清理"
     event revert_failed "round=${round:-0}"
     failed=1
