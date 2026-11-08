@@ -73,6 +73,14 @@ case "$cmd" in
       fi
     done
     ;;
+  fleet)
+    sub="${args[$((cmd_idx + 1))]:-}"
+    case "$sub" in
+      status|workers) exec "$REAL" "$@" ;;
+    esac
+    (( DRY == 1 )) && exec "$REAL" "$@"
+    (( ALLOWED == 1 )) || block "fleet $sub"
+    ;;
   auto|brainstorm-pick|sweep|command|bench)
     (( DRY == 1 )) && exec "$REAL" "$@"
     (( ALLOWED == 1 )) || block "$cmd"

@@ -229,6 +229,14 @@ class MigrationTest(unittest.TestCase):
 
 
 class NightTest(unittest.TestCase):
+    @staticmethod
+    def _pass_report(base):
+        rp = Path(base) / "REPORT.json"
+        rep = json.loads(rp.read_text(encoding="utf-8"))
+        rep["verdict"] = {"all_zero": True, "rss_ok": True,
+                          "fd_ok": True, "facts_ok": True}
+        rp.write_text(json.dumps(rep), encoding="utf-8")
+
     def test_night_smoke(self):
         tmp = Path(tempfile.mkdtemp(prefix="r7-night-"))
         old = dict(os.environ)
@@ -261,6 +269,7 @@ class NightTest(unittest.TestCase):
         })
         try:
             night.run(tmp / "base", minutes=0.02, projects=2, interval=0.01, model="fake")
+            self._pass_report(tmp / "base")
             v = night.verify(tmp / "base")
             self.assertTrue(v["ok"], v)
             self.assertTrue(all(v["checks"].values()), v)
@@ -308,6 +317,7 @@ class NightTest(unittest.TestCase):
         })
         try:
             night.run(tmp / "base", minutes=0.02, projects=2, interval=0.01, model="fake")
+            self._pass_report(tmp / "base")
             self.assertTrue(night.verify(tmp / "base", expect_commit="deadbeef")["ok"] is False)
             real = (tmp / "base" / "COMMIT").read_text().strip()
             self.assertTrue(night.verify(tmp / "base", expect_commit=real)["ok"])

@@ -88,8 +88,11 @@ class GuardTest(unittest.TestCase):
     def test_allows_fact_without_from_intent(self):
         self.assertNotEqual(self.run_guard("fact", "x", "-k", "host").returncode, 7)
 
-    def test_allows_fleet(self):
+    def test_allows_fleet_status(self):
         self.assertNotEqual(self.run_guard("fleet", "status").returncode, 7)
+
+    def test_blocks_fleet_up(self):
+        self.assertEqual(self.run_guard("fleet", "up").returncode, 7)
 
     def test_blocks_auto(self):
         self.assertEqual(self.run_guard("auto", "--model", "fake").returncode, 7)

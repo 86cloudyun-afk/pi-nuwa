@@ -32,33 +32,30 @@ def _project_status(root: Path) -> str:
 
 def _evidence(root: Path) -> bool:
     facts = {f.get("id"): f for f in graph.facts(root)}
-    refs: list[str] = []
-    edge = False
-    for it in graph.intents(root):
-        if it.get("to") == "goal":
-            edge = True
-            if it.get("status") in ("complete", "done"):
-                refs.extend(str(x) for x in (it.get("from") or []))
-    if edge:
-        # 有完成边时只认它引用的证据，且每个引用都必须是强证据。
-        return bool(refs) and all(
-            facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
-            for fid in refs)
-    # 无完成边的 completed 是异常状态，不能用整图历史事实兜底。
-    return False
+    edges = [it for it in graph.intents(root) if it.get("to") == "goal"]
+    if not edges:
+        # 无完成边的 completed 是异常状态，不能用整图历史事实兜底。
+        return False
+    for edge in edges:
+        if edge.get("status") != "complete":
+            return False
+        refs = [str(x) for x in (edge.get("from") or [])]
+        if not refs:
+            return False
+        if not all(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
+                   for fid in refs):
+            return False
+    return True
 
 
-def _revert(root: Path, why: str) -> None:
+def _revert(root: Path, why: str) -> bool:
     p = Path(root) / ".sapper" / "project.json"
-    data = graph._load(p) or {}
-    if data.get("status") != "completed":
-        return
-    data["status"] = "active"
-    data.pop("completed_at", None)
-    data.pop("completed_from", None)
-    # 与真实 sapper 共用 .sapper/.lock：删边、写 active、validate 在同一临界区。
     from .locks import FileLock
     with FileLock(Path(root) / ".sapper" / ".lock", blocking=True):
+        data = graph._load(p) or {}
+        if data.get("status") != "completed":
+            return False
+        # 与真实 sapper 共用 .sapper/.lock：删边、写 active、hint 都在锁内。
         for it in graph.intents(root):
             if it.get("to") == "goal":
                 edge = Path(root) / ".sapper" / "intents" / f"{it['id']}.json"
@@ -67,13 +64,17 @@ def _revert(root: Path, why: str) -> None:
                 except FileNotFoundError:
                     pass
                 except OSError:
-                    return
+                    return False
+        data["status"] = "active"
+        data.pop("completed_at", None)
+        data.pop("completed_from", None)
         graph._atomic_json(p, data)
-    hp = Path(root) / ".sapper" / "hints.json"
-    hints = graph._load(hp) or []
-    hints.append({"content": f"完成被拒绝：{why}", "creator": "nuwa",
-                  "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
-    graph._atomic_json(hp, hints)
+        hp = Path(root) / ".sapper" / "hints.json"
+        hints = graph._load(hp) or []
+        hints.append({"content": f"完成被拒绝：{why}", "creator": "nuwa",
+                      "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        graph._atomic_json(hp, hints)
+    return True
 
 
 def _write_run(root: Path, **fields) -> None:
@@ -198,6 +199,13 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                 _reason(root, model, round_no, journal)
                 ids = _ids(root)
             if not ids:
+                status = _project_status(root)
+                if status == "completed":
+                    if _evidence(root):
+                        journal.append("project_completed", round=round_no)
+                        break
+                    _revert(root, "没有任何 flag/vuln/loot 事实")
+                    journal.append("completion_rejected", round=round_no)
                 journal.append("frontier_empty", round=round_no)
                 break
             batch = ids[: max(1, parallel * 2)]

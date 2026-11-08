@@ -301,12 +301,12 @@ dispatch_one() {
       return 3
     fi
     out=$(PYTHONPATH="$_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 "$_PKG_DIR/nuwa/cli.py" \
-      dispatch "$id" --root "$PWD" --model "$model" --timeout "$to" 2>&1 9>&-)
+      dispatch "$id" --root "$PWD" --model "$model" --timeout "$to" 2>&1) 9>&-
     rc=$?
   elif [[ "$mode" == "sapper" ]]; then
     event dispatch_legacy "id=$id" "mode=sapper"
     _tk="$(cat "$LAB_DIR/.submit_token" 2>/dev/null || true)"
-    out=$(NUWA_SUBMIT_ALLOWED="$_tk" sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1 9>&-)
+    out=$(NUWA_SUBMIT_ALLOWED="$_tk" sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1) 9>&-
     rc=$?
   else
     log "ERROR: NUWA_SUBMIT_MODE 只能是 cli 或 sapper（当前 $mode）" >&2
@@ -327,11 +327,33 @@ frontier_ids() {
 # 完成证据闸门：只有 flag/vuln/loot 事实才算真完成
 has_evidence() {
   python3 -c 'import glob, json
-kinds = ("flag", "vuln", "loot")
-hit = any(json.load(open(p)).get("kind") in kinds
-          for p in glob.glob(".sapper/facts/*.json")
-          if not p.endswith("goal.json"))
-print("yes" if hit else "no")'
+facts = {}
+for p in glob.glob(".sapper/facts/*.json"):
+    if p.endswith("goal.json"):
+        continue
+    try:
+        f = json.load(open(p)); facts[f.get("id")] = f
+    except Exception:
+        pass
+edges = []
+for p in glob.glob(".sapper/intents/*.json"):
+    try:
+        it = json.load(open(p))
+    except Exception:
+        continue
+    if it.get("to") == "goal":
+        edges.append(it)
+if not edges:
+    print("no"); raise SystemExit
+for e in edges:
+    if e.get("status") != "complete":
+        print("no"); raise SystemExit
+    refs = e.get("from") or []
+    if not refs:
+        print("no"); raise SystemExit
+    if not all(facts.get(r, {}).get("kind") in ("flag", "vuln", "loot") for r in refs):
+        print("no"); raise SystemExit
+print("yes")'
 }
 
 revert_completion() {
@@ -484,7 +506,7 @@ done
 # 收工前修复未完成事务：预留不悬挂到下一轮
 if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
   PYTHONPATH="$_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 "$_PKG_DIR/nuwa/cli.py" \
-    recover --root "$PWD" --repair >/dev/null 2>&1 9>&- || true
+    recover --root "$PWD" --repair >/dev/null 2>&1 || true
 fi
 
 failed=0

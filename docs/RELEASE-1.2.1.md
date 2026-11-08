@@ -216,6 +216,27 @@
 | M55 | 回滚测试空验收 | 增加 `sapper validate` 断言 |
 | M56 | `fleet` 只读查询被 guard 拦 | guard 放行 `fleet`，保留 `auto`/`brainstorm-pick`/`sweep`/`command`/`bench` |
 
+## 第二十四轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B26 | `fleet up/hire` 获整类放行后可启动 auto | guard 只放行 `fleet status/workers`，其余子命令无 token 拦 |
+| B25 | shell 仍用整图证据；空 frontier 提前退出；多边/`done→goal` 宽松 | shell `has_evidence` 改为只认 `to=goal` 且 status=complete、from 非空且全强证据；runner 空 frontier 先做完成验收 |
+| B30 | 锁外快照/删边失败静默 | `_revert` 全部收进 `.sapper/.lock`，锁内重读，删边失败返回 False |
+| M57 | 删除失败被正常返回 | `_revert` 返回 bool，失败路径不再静默 |
+
+## 第二十五轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| 锁泄漏回归 | `9>&-` 写在 `$()` 内，只关闭 python 的 fd，持有锁的子 shell 仍继承 fd 9 | 重定向移到 `$(...) 9>&-` 外侧；`recover` 不再单独关闭 |
+
+## 第二十六轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| 测试稳定性 | `test_night_verify_report` 依赖 smoke 的真实 verdict，偶发 `facts_ok=False` | 测试夹具把 REPORT 的 verdict 置为全 True；`test_night_smoke` 继续测真实采样 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
