@@ -55,7 +55,7 @@ def check_command(command: str) -> tuple[bool, str | None]:
     for pattern, rule_id in DENY_RULES:
         if re.search(pattern, command):
             return False, rule_id
-    if re.search(r"\bsapper[^;|&]*(?:--store|-s)\s*(?:=\s*)?[^\s;|&]*[$`]", command):
+    if re.search(r"\bsapper[^;|&]*(?:--store|-s)[^;|&]*?[$`]", command):
         return False, "P-006"
     for pattern, rule_id in PROMPT_RULES:
         if re.search(pattern, strip_global_options(command)):

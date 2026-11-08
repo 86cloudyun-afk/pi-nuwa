@@ -229,6 +229,19 @@ class JournalTest(unittest.TestCase):
         rec = txn.recover(self.tmp)
         self.assertEqual(rec["last_seq"], 1)
 
+    def test_rejected_reserve_without_ack_has_tombstone(self):
+        j = Journal(self.tmp)
+        j.append("executing_prepare", txn="t1", intent="i001")
+        j.append("reserve_rejected", txn="t1", intent="i001")
+        j.compact(keep=0)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        rec = j.read_recovery()
+        self.assertNotIn("t1", rec.get("inflight", {}))
+        self.assertIn("t1", rec.get("ended", []))
+
     def test_rejected_reserve_not_in_recovery(self):
         j = Journal(self.tmp)
         j.append("executing_prepare", txn="t1", intent="i001")

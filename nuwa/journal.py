@@ -318,7 +318,8 @@ class Journal:
                 elif ev in ("executed", "commit_done", "ack", "reserve_rejected",
                             "dispatch_rejected", "recovered_crashed"):
                     state["inflight"].pop(txn, None)
-                if ev in ("ack", "recovered_crashed") and txn:
+                if ev in ("ack", "recovered_crashed", "reserve_rejected",
+                          "dispatch_rejected") and txn:
                     ended.add(str(txn))
                 if ev == "ledger_settle" and rec.get("rid"):
                     settled.add(str(rec.get("rid")))
@@ -452,6 +453,8 @@ def replay_state(root: str | Path) -> dict:
         elif ev in ("executed", "commit_done", "ack", "reserve_rejected",
                     "dispatch_rejected", "recovered_crashed"):
             state["inflight"].pop(txn, None)
+        if ev in ("ack", "reserve_rejected", "dispatch_rejected") and txn:
+            state.setdefault("ended", set()).add(txn)
         if ev == "ledger_settle":
             state["settled"].add(rec.get("rid"))
         if ev == "commit_done":

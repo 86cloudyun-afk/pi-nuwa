@@ -101,6 +101,11 @@ function stripGlobalOptions(cmd: string): string {
 const COMMIT_RE =
 	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
+/** store 值里出现变量展开/命令替换时，静态剥离不可靠：直接 fail-closed。 */
+function hasUnresolvedStore(cmd: string): boolean {
+	return /\bsapper[^;|&]*(?:--store|-s)[^;|&]*?[$`]/.test(cmd);
+}
+
 /** 命令中所有可能的 cwd：原目录与每个 cd 之后的目录。检查时取并集，避免时序漏检。 */
 function candidateDirs(cmd: string, baseDir: string): string[] {
 	const dirs = new Set<string>();
@@ -245,9 +250,7 @@ export function checkTool(
 		const base = checkCommand(cmd);
 		if (!base.allowed) return base;
 		// store 值含变量展开/命令替换时无法可靠剥离，按提交语义不明直接拒绝。
-		if (/\bsapper[^;|&]*(?:--store|-s)\s*(?:=\s*)?[^\s;|&]*[$`]/.test(cmd)) {
-			return { allowed: false, rule: "P-006" };
-		}
+		if (hasUnresolvedStore(cmd)) return { allowed: false, rule: "P-006" };
 		if (COMMIT_RE.test(stripGlobalOptions(cmd))) return { allowed: false, rule: "P-006" };
 		for (const target of collectShellTargets(cmd)) {
 			for (const shellDir of candidateDirs(cmd, baseDir)) {
@@ -263,7 +266,9 @@ export function checkTool(
 	if (toolName === "task") {
 		const texts: string[] = [];
 		collectStrings(input, texts);
-		const text = stripGlobalOptions(texts.join("\n"));
+		const rawText = texts.join("\n");
+		if (hasUnresolvedStore(rawText)) return { allowed: false, rule: "P-006" };
+		const text = stripGlobalOptions(rawText);
 		if (COMMIT_RE.test(text)) return { allowed: false, rule: "P-006" };
 		return { allowed: true };
 	}

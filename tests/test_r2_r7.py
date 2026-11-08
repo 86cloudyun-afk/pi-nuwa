@@ -167,6 +167,7 @@ class PolicyTest(unittest.TestCase):
             "sapper --store /p/.sapper done i001 --fact x",
             'sapper --store="/p/a b/.sapper" done i001 --fact x',
             "sapper -s/p/.sapper done i001 --fact x",
+            'sapper --store "$STORE" done i001 --fact x',
         ):
             ok, rule = policy.check_command(text)
             self.assertFalse(ok, text)

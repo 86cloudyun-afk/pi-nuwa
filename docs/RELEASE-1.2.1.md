@@ -138,6 +138,13 @@
 | B21 | store 值含变量展开/反引号时剥离残片导致漏检 | 未解析 store 直接按 P-006 拒绝（fail-closed） |
 | M5 | 短跑样本不足 | soak 至少采两个点 |
 
+## 第十五轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B20 | 拒绝后 `ack` 前退出，旧 inflight 在 recovery 合并时复活 | `reserve_rejected`/`dispatch_rejected` 写入 `ended` 墓碑，摘要与 replay 共用 |
+| B21 | 引号/空格后的 `$` 守卫漏检，task 分支缺守卫 | 守卫改为 `[^;|&]*[$`]`，bash 与 task 共用 `hasUnresolvedStore` |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
