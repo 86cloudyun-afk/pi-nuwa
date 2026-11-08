@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SAPPER_REF: c91881dc1629409bbf278577dfdaa6b8f383b438
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 

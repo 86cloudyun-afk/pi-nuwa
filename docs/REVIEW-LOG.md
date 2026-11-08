@@ -138,4 +138,18 @@
 
 ## Round 16 — 2026-11-08
 
+- 结论：**fail**，83/100
+- 阻塞 4 项：业务结束到 executed 落盘之间崩溃会被 TTL 回收；schema 3 支持范围与 fail-closed 冲突；快照打包活 queue 且增量用未定义时间戳；72h 与两周观察判定可互替
+- 修订：回收需无 result.json/artifact；0.9 支持 ≤3、>3 才 fail-closed；快照只打包 queue 前缀并用 qseq 裁切；发布判定改为 72h 与 14 天 P0/P1=0 两者缺一不可
+- 同步：settled 释放整笔预留、已消耗不退款；证据示例补 source；崩溃命令按 fake/real 分组
+
+## Round 17 — 2026-11-08
+
+- 结论：**fail**，83/100
+- 阻塞 2 项：运行锁与事务锁未区分，commit 被长持有锁阻塞且锁序冲突；会话状态在屏障外复制且原地截写，可能读到半写文件
+- 修订：拆 `run.lock`（运行互斥）与 `txn.lock`（事务短锁），事务锁序 global→txn；会话状态 tmp+rename + `<hash>.lock` + `state_seq`，快照在 barrier 内复制并按 state_seq 导出增量
+- 同步：p95 窗口/冷启动/默认值；长测预算 20M、速率 30/h；键统一含 `sha256:` 前缀；CI 超时改 10 分钟
+
+## Round 18 — 2026-11-08
+
 （待填）

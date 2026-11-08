@@ -52,7 +52,7 @@
 | 全局预算 | `$SAPPER_HOME/budget/global.jsonl` | **唯一权威**，`global.lock` 串行化 | 快照校验后重放；失败冻结全部新 dispatch |
 | 图 | `<proj>/.sapper/` | sapper 自身 | 常规只读；R1 提交修复在项目锁内受控写 JSON，写完必须 `sapper validate` |
 | 交接 | `<proj>/.nuwa/handoff.json` | 派生 | 可重建 |
-| 会话状态 | `cache/nuwa-loop/<hash>.json` | 可重建 | schema < current → 先迁移（2→3 保留 turns/spentTokens/armedAt）；schema > current → 0.9+ 在加载前 fail-closed（写 `state_schema_too_new`，拒绝上膛，不清空）；0.3.x 的 loadState 会返回空状态，因此回滚时不得指向 schema 3 目录（用独立 state dir 或先降级迁移）；仅 JSON 损坏才重置并写 `state_reset` |
+| 会话状态 | `cache/nuwa-loop/<hash>.json` | 可重建 | 写入统一 tmp+rename（原子），并取 `<hash>.lock`；状态带单调 `state_seq`。schema < current → 先迁移；schema > current → 0.9+ fail-closed（`state_schema_too_new`）；0.3.x 遇 3 会清空，回滚不得指向 schema 3 目录；仅 JSON 损坏才重置 |
 
 权威类损坏且无重放依据：保留现场、冻结新 dispatch、退出码 6；恢复动作写 journal。
 
@@ -72,7 +72,7 @@
 }
 ```
 
-- `dispatch_keys.idx` 是**精确**去重层：每行一个完整 `sha256:<64 hex>`，排序后二分查找。812 条约 58KB，成本可接受。
+- `dispatch_keys.idx` 是**精确**去重层：每行一个规范键 `sha256:<64 hex>`；fact 的 `[nuwa:<key>]` 标记与索引使用同一规范串（含 `sha256:` 前缀）。812 条约 58KB，成本可接受。
 - Bloom 仅作快速否定：Bloom 判"不存在"→ 新事务；"可能存在"→ 必须查索引；索引查不到 → **按新事务处理**，绝不跳过。
 - 压缩保留 checkpoint + `seq > checkpoint.seq` 的记录 + `unresolved` 完整记录 + 全量索引。
 压缩下界 = `min(所有活跃快照的 cut_seq[p], checkpoint.seq)`；`snapshots.idx` 登记每个快照的 cut 与引用计数，仍有快照引用时不得删除其后的记录，引用归零后才可 GC。
@@ -92,7 +92,8 @@
 - 执行结果 artifact、inflight 锁
 - `nuwa --resume <name>`
 - **提交所有权**：R1 起所有 fact 创建走 `nuwa dispatch <id>` / `nuwa commit`，由 nuwa 渲染提示（`sapper dispatch --dry-run`）、调用引擎、按幂等键提交；SKILL 与续跑指令同步改写，禁止在女娲流程内直接调用 `sapper done` 或 `sapper dispatch <id>`（`sapper` 仅用于建图、查询、校验）
-- **幂等提交**：`nuwa commit --key <dispatch_key>`，按固定锁序 `global.lock → 项目锁` 执行；全系统禁止反向获取
+- **锁分层**：`.nuwa/run.lock` 是运行互斥（bin/nuwa 整个生命周期持有，只防两个 runner）；`.nuwa/txn.lock` 是事务锁（每次 commit 短持有）。事务锁序固定为 `global.lock → txn.lock`；`run.lock` 不参与该序，也不阻塞 commit。
+- **幂等提交**：`nuwa commit --key <dispatch_key>`，按上述事务锁序执行；全系统禁止反向获取。0.3.x 的 `.nuwa.lock` 迁移为 `run.lock`，`txn.lock` 为新增文件。
 - **接管契约**：首次接管已有 0.3.1 项目时，写 `adopt` 记录（现有 facts/intents 快照、spent 未知则 `opening_balance=0` 且标 `estimated`），不重置既有计数
 - `tests/contract_check.py`、`tests/gates/run.sh`、`tests/gates/expected`
 
@@ -170,6 +171,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 **准入与硬上限**：
 
 - `remaining_global = global_cap - settled_total - sum(outstanding_reserved)*1.05`
+- `p95` 口径：每项目、每模型类别的滚动 50 次 dispatch 分位；不足 50 次时冷启动默认 4000 tokens。默认 `MIN_VIABLE=500`，`NUWA_TASK_CAP=200000`。
 - `reserve = min(ceil(p95*1.05), NUWA_TASK_CAP, remaining_project, remaining_global / 1.05)`
 - 准入：`reserve >= MIN_VIABLE` 且 `reserve*1.05 <= remaining_global`；新预留与既有预留都计 5% 头寸。
 - 预检：spawn 前估算 input tokens `ceil(prompt_chars/4)`；若超过 reserve 则拒绝或排队。支持输出上限的引擎传 `max_output_tokens = reserve - input_est`。
@@ -325,13 +327,13 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 1. 短暂获取 `global.lock`：写 `$SAPPER_HOME/budget/freeze.json`（`freeze=true`、`owner_pid`、`snapshot_id`、`renewed_at`、`expires` 10min），记录 `freeze_seq`，释放；快照进程每 60s 续租。其他进程只有在 owner 进程已死时才可清除过期 freeze（写 `freeze_recovered`）；解冻必须匹配 `snapshot_id`，旧快照不能清除新快照的 freeze。commit/结算队列持久化在 `queue.jsonl`，启动时重放。冻结后**新 dispatch 拒绝；commit 全路径与新结算一律入队**。
 2. 等待 inflight 全部到达 `executed`（只等执行结束，**不等 commit 队列**），最长 120s；超时则 kill 子进程、写 `executed{crashed}` 并入队。
-3. 获取 `global.lock`，再按固定顺序获取各项目锁（barrier）；记录 `global_cut_seq`、每个项目 journal 的 `cut_seq[p]` 与 `queue_cut_seq`；把队列前缀复制为 `queue.<snapshot_id>.jsonl`（此后接受的请求 seq > queue_cut，归入 delta）；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
-4. 在各项目锁内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；导出完成后校验每个项目 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
+3. 获取 `global.lock`，再按固定顺序获取各项目 `txn.lock`（barrier；不碰 `run.lock`，运行进程只需遵守 freeze 标志暂停新 dispatch）；记录 `global_cut_seq`、每个项目 journal 的 `cut_seq[p]` 与 `queue_cut_seq`；把队列前缀复制为 `queue.<snapshot_id>.jsonl`（此后接受的请求 seq > queue_cut，归入 delta）；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
+4. 在各项目 `txn.lock` 内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；同时取各会话 `<hash>.lock` 复制会话状态，记录 `state_seq`；导出完成后校验 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
 5. 复制 artifact 原始字节到 `snapshot/artifacts/`（默认开启；关闭时标 `evidence_incomplete`）。
-6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.<snapshot_id>.jsonl`（barrier 内复制的前缀，不打包活文件）。
+6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数，含 `state_seq`）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.<snapshot_id>.jsonl`（barrier 内复制的前缀，不打包活文件）。
 7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。恢复分两段断言：`restore` 后 facts 与余额必须等于 `at_cut_*`；重放 queue 后必须等于 `at_cut_* + queue 产生的增量`，两段分别校验。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
 
-**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）、以及 `qseq > queue_cut_seq` 且尚未写入 journal/账本的队列条目（按 txn_id 去重）；队列每条带单调 `qseq`，不用时间戳裁切。回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9 支持 `loop_schema <= 3`（3 由它引入），仅 `>3` 时 fail-closed（拒绝上膛并写 `state_schema_too_new`）；0.3.x 支持 `<=2`，遇 3 会清空，故回滚不得指向 schema 3 目录。
+**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 中 `state_seq > snapshot_state_seq` 的变化（turns/spentTokens/armedAt）、以及 `qseq > queue_cut_seq` 且尚未写入 journal/账本的队列条目（按 txn_id 去重）；队列每条带单调 `qseq`，不用时间戳裁切。回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9 支持 `loop_schema <= 3`（3 由它引入），仅 `>3` 时 fail-closed（拒绝上膛并写 `state_schema_too_new`）；0.3.x 支持 `<=2`，遇 3 会清空，故回滚不得指向 schema 3 目录。
 
 **初始化/迁移样本**：
 
@@ -358,7 +360,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 **目标**：可以长期挂着跑，升级/回滚可整体操作。
 
 长测协议：
-- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 60`；引擎固定 omp + `deepseek-flash`，负载固定 4 项目 × 每轮 8 个 intent，单项目预算 2M tokens；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
+- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 30`；引擎固定 omp + `deepseek-flash`，负载固定 4 项目 × 每轮 8 个 intent，单项目预算 20M tokens（2160 次 dispatch，约 9k tokens/次，覆盖 reason 开销）；预算耗尽即判失败；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
 - 两周观察：候选版本 = release tag；等价负载基准 = 4 项目 × 2 并发 × 60 dispatch/hour，每日至少 1 小时；发布判定唯一：72h 长测全部判据通过 **且** 14 天内 P0/P1 为 0，两者缺一不可，不得互相替代；出现新提交后两项同时重置
 - 采样间隔 30s；PID 范围 = 各项目进程树；**所有判据按项目分别计算**（每项目 RSS 斜率、FD 差、dispatch/hour、facts 增长），任一项目不达标即失败；全局汇总只作展示，不得掩盖单项目停滞
 - 有效运行 ≥259200 秒；提前退出、采样间隔 >60s，判失败
@@ -379,7 +381,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 ## 5. 横切约束
 
 - **测试先行**：每阶段先加失败用例，再实现。
-- **阶段门禁**：CI 与本地都执行 `tests/run.sh`（契约 → 五套 → `gates/run.sh`）。CI 作业超时 10 分钟；72h 长测是独立 `soak.yml`，**必须跑在自托管 runner**（GitHub 托管 runner 单作业上限 6 小时），`timeout-minutes: 4500`；产物名含 commit 与 mode，发布要求 `MODE=soak` 且 `COMMIT` 与发布 commit 一致。 `gates/run.sh` 内置**只增不减的已交付清单** `DELIVERED=(0_baseline ...)`，并读取 `gates/released.json`（发布历史，只追加）；历史中每个门禁都必须在 `expected` 中且脚本非空，删除需同时改发布历史（属发布变更，需 release note）；每个名称对应 `gates/g<name>.sh` 必须存在且非空；`NUWA_REQUIRE_GATES=1` 时任何缺项失败。新增阶段时同一变更内更新 `expected` 与门禁脚本；删除清单项不能绕过核心锚点。
+- **阶段门禁**：CI 与本地都执行 `tests/run.sh`（契约 → 五套 → `gates/run.sh`）。CI 作业超时 10 分钟（`.github/workflows/test.yml` 的 `timeout-minutes: 10`，0.4.0 起生效）；72h 长测是独立 `soak.yml`，**必须跑在自托管 runner**（GitHub 托管 runner 单作业上限 6 小时），`timeout-minutes: 4500`；产物名含 commit 与 mode，发布要求 `MODE=soak` 且 `COMMIT` 与发布 commit 一致。 `gates/run.sh` 内置**只增不减的已交付清单** `DELIVERED=(0_baseline ...)`，并读取 `gates/released.json`（发布历史，只追加）；历史中每个门禁都必须在 `expected` 中且脚本非空，删除需同时改发布历史（属发布变更，需 release note）；每个名称对应 `gates/g<name>.sh` 必须存在且非空；`NUWA_REQUIRE_GATES=1` 时任何缺项失败。新增阶段时同一变更内更新 `expected` 与门禁脚本；删除清单项不能绕过核心锚点。
 - **场景到命令**：
 
 | 阶段 | 验收命令（阶段内交付） | 阈值 |
