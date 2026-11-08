@@ -93,7 +93,8 @@
 - `nuwa --resume <name>`
 - **提交所有权**：R1 起所有 fact 创建走 `nuwa dispatch <id>` / `nuwa commit`，由 nuwa 渲染提示（`sapper dispatch --dry-run`）、调用引擎、按幂等键提交；SKILL 与续跑指令同步改写，禁止在女娲流程内直接调用 `sapper done` 或 `sapper dispatch <id>`（`sapper` 仅用于建图、查询、校验）
 - **锁分层**：`.nuwa/run.lock` 是运行互斥（bin/nuwa 整个生命周期持有，只防两个 runner）；`.nuwa/txn.lock` 是事务锁（每次 commit 短持有）。事务锁序固定为 `global.lock → txn.lock`；`run.lock` 不参与该序，也不阻塞 commit。
-- **幂等提交**：`nuwa commit --key <dispatch_key>`，按上述事务锁序执行；全系统禁止反向获取。0.3.x 的 `.nuwa.lock` 迁移为 `run.lock`，`txn.lock` 为新增文件。
+- **幂等提交**：`nuwa commit --key <dispatch_key>`，按上述事务锁序执行；全系统禁止反向获取。
+- **锁迁移**：0.4.0 首次启动若发现 `.nuwa.lock` 被活进程持有 → 退出码 5，提示先停旧 runner；旧 runner 退出后原子 rename 为 `run.lock`。迁移窗口内（存在 `.nuwa.lock`）扩展与 runner 均按“已锁定”处理，禁止旧会话直接改图；`txn.lock` 为新增文件。
 - **接管契约**：首次接管已有 0.3.1 项目时，写 `adopt` 记录（现有 facts/intents 快照、spent 未知则 `opening_balance=0` 且标 `estimated`），不重置既有计数
 - `tests/contract_check.py`、`tests/gates/run.sh`、`tests/gates/expected`
 
@@ -130,6 +131,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - `executing`：spawn 成功后写，含 pid、pid_starttime。
 - `executed`：进程退出或确认死亡后**必写**，`status: ok|crashed|timeout`，含 exit_code、artifact（可为 null）、tokens（实际或估算）、`settled:false`、`rid`。
 - `commit_prepare`：fact 内容、kind、doc、rid。
+- `reason` 也是事务：`txn kind=reason`，key = `sha256(project|reason|round)`，同样走 reserve/executed/settle；reason 用强模型，失败按链回退并结算估算 tokens，成本计入账本。
 
 **恢复规则**：
 
@@ -333,7 +335,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数，含 `state_seq`）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.<snapshot_id>.jsonl`（barrier 内复制的前缀，不打包活文件）。
 7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。恢复分两段断言：`restore` 后 facts 与余额必须等于 `at_cut_*`；重放 queue 后必须等于 `at_cut_* + queue 产生的增量`，两段分别校验。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
 
-**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 中 `state_seq > snapshot_state_seq` 的变化（turns/spentTokens/armedAt）、以及 `qseq > queue_cut_seq` 且尚未写入 journal/账本的队列条目（按 txn_id 去重）；队列每条带单调 `qseq`，不用时间戳裁切。回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9 支持 `loop_schema <= 3`（3 由它引入），仅 `>3` 时 fail-closed（拒绝上膛并写 `state_schema_too_new`）；0.3.x 支持 `<=2`，遇 3 会清空，故回滚不得指向 schema 3 目录。
+**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、**已有 fact 的变更记录**（`{fact_id, rev, changed_fields, ts}`，覆盖补证/置信度/矛盾标记）、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 中 `state_seq > snapshot_state_seq` 的变化（turns/spentTokens/armedAt）、以及 `qseq > queue_cut_seq` 且尚未写入 journal/账本的队列条目（按 txn_id 去重）；队列每条带单调 `qseq`，不用时间戳裁切。回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`（按 `fact_id+rev` 应用变更，rev 大者胜）。恢复断言除数量外，还要比对每个 fact 的字段级校验和。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9 支持 `loop_schema <= 3`（3 由它引入），仅 `>3` 时 fail-closed（拒绝上膛并写 `state_schema_too_new`）；0.3.x 支持 `<=2`，遇 3 会清空，故回滚不得指向 schema 3 目录。
 
 **初始化/迁移样本**：
 
@@ -366,7 +368,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 有效运行 ≥259200 秒；提前退出、采样间隔 >60s，判失败
 - **RSS**：预热 20% 后对 RSS(KB)-时间(min) 最小二乘，斜率 <1024 KB/min
 - **FD**：`max(后10个采样) - min(预热后前10个采样) ≤ 0`
-- **推进**：每小时 dispatch ≥60（滚动 60 分钟窗口，首小时后每窗满足）；任意连续 6 小时 facts 增长 >0
+- **推进**：每小时 dispatch ≥30（滚动 60 分钟窗口，首小时后每窗满足；72h 合计约 2160 次/项目）；任意连续 6 小时 facts 增长 >0
 - 每 6 小时 `sapper validate`
 - 唯一通过判定 = 全部条件同时成立
 
