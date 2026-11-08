@@ -91,14 +91,26 @@ const PATH_RULES: Array<[RegExp, string]> = [
  * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
  */
 const COMMIT_RE =
-	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:--store(?:[=\s]+\S+)?|-s(?:\s+\S+|\S*))\s*)?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:--store(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))?|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+))?)\s*)*(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
 /** 从 shell 命令里提取写入目标：重定向、tee、cp/mv/install 的全部路径参数。 */
+function shellBaseDir(cmd: string, baseDir: string): string {
+	// 只处理行首/命令分隔符后的 cd，避免把参数里的 "cd" 当切换。
+	let dir = baseDir;
+	for (const m of cmd.matchAll(/(?:^|[;&|]\s*)cd\s+([^\s;|&]+)/g)) {
+		const target = m[1].replace(/^["']|["']$/g, "");
+		dir = isAbsolute(target) ? target : resolve(dir, target);
+	}
+	return dir;
+}
+
 function collectShellTargets(cmd: string): string[] {
 	const out: string[] = [];
-	for (const m of cmd.matchAll(/(?:>>?|tee(?:\s+-a)?)\s*([^\s;|&]+)/g)) {
-		const target = m[1].replace(/^["']|["']$/g, "");
-		if (target && target !== "/dev/null" && !target.startsWith("&")) out.push(target);
+	for (const m of cmd.matchAll(/(?:>>?|tee(?:\s+-a)?)\s*([^;|&]+)/g)) {
+		for (const part of m[1].split(/\s+/)) {
+			const target = part.replace(/^["']|["']$/g, "");
+			if (target && target !== "/dev/null" && !target.startsWith("&")) out.push(target);
+		}
 	}
 	for (const m of cmd.matchAll(/\b(?:cp|mv|install)\s+([^;|&]+)/g)) {
 		for (const part of m[1].split(/\s+/)) {
@@ -191,6 +203,10 @@ function collectPatchTargets(input: Record<string, unknown>, out: string[]): voi
 		for (const m of v.matchAll(/^\*\*\* Move to:\s*(.+)$/gm)) {
 			out.push(m[1].trim());
 		}
+		for (const m of v.matchAll(/^---\s+(?:a\/)?(.+)$/gm)) {
+			const target = m[1].split(/\s+/)[0];
+			if (target && target !== "/dev/null") out.push(target);
+		}
 		for (const m of v.matchAll(/^\+\+\+\s+(?:b\/)?(.+)$/gm)) {
 			const target = m[1].split(/\s+/)[0];
 			if (target && target !== "/dev/null") out.push(target);
@@ -209,8 +225,9 @@ export function checkTool(
 		const base = checkCommand(cmd);
 		if (!base.allowed) return base;
 		if (COMMIT_RE.test(cmd)) return { allowed: false, rule: "P-006" };
+		const shellDir = shellBaseDir(cmd, baseDir);
 		for (const p of collectShellTargets(cmd)) {
-			for (const candidate of resolvePath(p, baseDir)) {
+			for (const candidate of resolvePath(p, shellDir)) {
 				for (const [re, rule] of PATH_RULES) {
 					if (re.test(candidate)) return { allowed: false, rule };
 				}

@@ -97,6 +97,24 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
         if not all(isinstance(v, bool) and v for v in verdict.values()):
             raise ValueError("verdict 存在非布尔或假值")
 
+        projects = rep.get("projects")
+        if not isinstance(projects, list) or not projects:
+            raise ValueError("projects 为空")
+        journal_dispatches = 0
+        journal_commits = 0
+        for proj in projects:
+            jp = Path(str(proj)) / ".nuwa" / "journal.jsonl"
+            try:
+                lines = jp.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                if '"event": "executing_prepare"' in line:
+                    journal_dispatches += 1
+                elif '"event": "commit_done"' in line:
+                    journal_commits += 1
+        facts = _number(rep.get("facts", 0), "facts")
+
         minutes = _number(rep.get("minutes"), "minutes")
         samples = _number(rep.get("samples"), "samples")
         if not samples.is_integer():
@@ -115,6 +133,7 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             "samples": samples >= 2,
             "verdict": True,
             "duration": finished >= started and duration >= minutes * 60 * 0.9,
+            "journal": journal_dispatches > 0 and abs(facts - journal_commits) <= 2,
         }
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,
                 "commit": commit, "report": str(rep_path),

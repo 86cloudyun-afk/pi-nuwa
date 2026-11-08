@@ -19,7 +19,7 @@ codex `gpt-6.1-sol` ultra 三轮交付审计（35 → 45 → 50，均 block）�
 - 第三轮补充：尾部缺 seq、bash 重定向/复制路径、`--store=`/`-s`、预算拒绝不虚假结算、
   其他键冲突前置、ack 终结 inflight、补丁目标过滤、recover/repair 接 recovery 摘要
 - 文档：`RELEASE-1.2.1.md` 按真实状态标注 closed/partial；`TEST-RESULTS.md` 更新到 1.2.1
-- 测试：扩展 42、journal 16、r1core 31、r2r7 28，合计 136 例 + 16 runs
+- 测试：扩展 42、journal 18、r1core 33、r2r7 28，合计 138 例 + 16 runs
 
 ## 1.2.0 — 2026-11-08
 

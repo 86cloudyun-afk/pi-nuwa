@@ -31,6 +31,7 @@ PENDING_EVENTS = (
     "ledger_settle",
 )
 FINAL_EVENTS = ("commit_done", "ack")
+DONE_EVENTS = ("commit_done", "ack", "reserve_rejected", "recovered_crashed")
 
 
 class Journal:
@@ -65,7 +66,7 @@ class Journal:
                     start = max(0, size - window)
                     fh.seek(start)
                     data = fh.read()
-                    for raw in reversed(data.splitlines()):
+                    for raw in reversed(data.split(b"\n")):
                         try:
                             line = raw.decode("utf-8")
                         except UnicodeDecodeError:
@@ -149,9 +150,8 @@ class Journal:
         recs: list[dict] = []
         for path in self._files():
             for rec in self._iter_records(path):
-                try:
-                    seq = int(rec.get("seq", 0))
-                except (TypeError, ValueError):
+                seq = rec.get("seq")
+                if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
                     continue
                 if seq > since_seq:
                     recs.append(rec)
@@ -242,18 +242,25 @@ class Journal:
             os.close(fd)
 
     def _pending_floor_locked(self) -> int:
-        """返回含未决事务的最早代；0 表示没有未决事务。"""
+        """返回含未决事务的最早代；终态优先于后续的 ledger_settle。"""
         last: dict[str, tuple[int, str]] = {}
+        done: set[str] = set()
         for path in self._files():
             gen = self._gen_of(path)
             for rec in self._iter_records(path):
                 txn = rec.get("txn")
-                if txn:
-                    last[str(txn)] = (gen, str(rec.get("event", "")))
+                if not txn:
+                    continue
+                txn = str(txn)
+                ev = str(rec.get("event", ""))
+                if ev in DONE_EVENTS:
+                    done.add(txn)
+                    last.pop(txn, None)
+                elif ev in PENDING_EVENTS and txn not in done:
+                    last[txn] = (gen, ev)
         floor = 0
-        for gen, ev in last.values():
-            if ev in PENDING_EVENTS:
-                floor = gen if floor == 0 else min(floor, gen)
+        for gen, _ev in last.values():
+            floor = gen if floor == 0 else min(floor, gen)
         return floor
 
     def _summarize_locked(self) -> dict:
@@ -281,10 +288,10 @@ class Journal:
                     state["inflight"].pop(txn, None)
                 if ev in ("ack", "recovered_crashed") and txn:
                     ended.add(str(txn))
-            if ev == "ledger_settle" and rec.get("rid"):
-                settled.add(str(rec.get("rid")))
-            if ev in ("commit_done", "done_apply") and txn:
-                committed.add(str(txn))
+                if ev == "ledger_settle" and rec.get("rid"):
+                    settled.add(str(rec.get("rid")))
+                if ev == "commit_done" and txn:
+                    committed.add(str(txn))
         state["settled"] = sorted(settled)
         state["committed"] = sorted(committed)
         state["ended"] = sorted(ended)
@@ -401,6 +408,6 @@ def replay_state(root: str | Path) -> dict:
             state["inflight"].pop(txn, None)
         if ev == "ledger_settle":
             state["settled"].add(rec.get("rid"))
-        if ev in ("commit_done", "done_apply"):
+        if ev == "commit_done":
             state["committed"].add(rec.get("txn"))
     return state

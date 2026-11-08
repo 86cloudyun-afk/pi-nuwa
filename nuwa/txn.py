@@ -67,11 +67,12 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
         if key is None:
             key = dispatch_key(project_name, intent_id, attempt_of(intent))
 
+        before = json.loads(json.dumps(intent, ensure_ascii=False))
         done_to = intent.get("to") if intent.get("status") == "done" else None
         if done_to:
             done_fact = graph.get_fact(root, done_to)
             if done_fact:
-                done_keys = set(re.findall(r"\[nuwa:(sha256:[0-9a-f]{64})\]",
+                done_keys = set(re.findall(r"\[nuwa:([^\]]+)\]",
                                            done_fact.get("description") or ""))
                 aux = done_fact.get("x-nuwa-key")
                 if isinstance(aux, str) and aux:
@@ -81,6 +82,8 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
                         f"intent 已由其他键完成: {sorted(done_keys)[0]}")
 
         existing = graph.find_fact_by_key(root, key)
+        if existing and done_to and existing.get("id") != done_to:
+            raise CommitError("intent 已完成于其他 fact，拒绝改指")
         reused = existing is not None
 
         if not reused and done_to:
@@ -108,12 +111,20 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
         _crash("after_done")
         ok, msg = graph.validate(root)
         if not ok:
+            _restore_intent(root, intent_id, before)
             raise CommitError(f"validate 失败: {msg}")
         _crash("after_validate")
 
         journal.append("commit_done", txn=key, intent=intent_id, fact=fact_id,
                        reused=reused, project=project_name)
         return {"intent": intent_id, "fact": fact_id, "reused": reused, "key": key}
+
+
+def _restore_intent(root: Path, intent_id: str, data: dict) -> None:
+    p = root / ".sapper" / "intents" / f"{intent_id}.json"
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def _snapshot_state(j: Journal) -> tuple[dict | None, list[dict], set[str]]:

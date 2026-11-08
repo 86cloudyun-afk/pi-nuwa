@@ -78,6 +78,12 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
         raise DispatchError(f"intent 不存在: {intent_id}")
     if is_locked(nd / "inflight" / f"{intent_id}.lock"):
         raise DispatchError(f"intent 正在执行: {intent_id}")
+    if intent.get("status") == "done" and intent.get("to"):
+        done_fact = graph.get_fact(root, intent["to"])
+        if done_fact:
+            return {"intent": intent_id, "fact": done_fact["id"], "reused": True,
+                    "key": txn.dispatch_key(project, intent_id,
+                                            txn.attempt_of(intent))}
 
     attempt = txn.attempt_of(intent)
     key = txn.dispatch_key(project, intent_id, attempt)
@@ -106,7 +112,9 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     _crash("after_reserve")
     journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id)
     journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
-                   attempt_seq=attempt, key=key)
+                   attempt_seq=attempt, key=key, tokens=tokens)
+    # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。
+    graph.set_intent_field(root, intent_id, "x-nuwa-attempt", attempt + 1)
 
     art = nd / "artifacts" / txn_id
     art.mkdir(parents=True, exist_ok=True)
@@ -190,9 +198,16 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
         journal.append("ack", txn=txn_id, intent=intent_id, status="crashed")
         raise DispatchError("payload 缺少 description")
 
-    res = txn.commit(root, intent_id, desc, key,
-                     kind=str(data.get("kind") or "note"),
-                     doc=data.get("doc") if isinstance(data.get("doc"), str) else None)
+    try:
+        res = txn.commit(root, intent_id, desc, key,
+                         kind=str(data.get("kind") or "note"),
+                         doc=data.get("doc") if isinstance(data.get("doc"), str) else None)
+    except Exception:  # noqa: BLE001  提交异常同样要结算，不能留悬挂预留
+        ledger.settle(rid, tokens, status="crashed")
+        journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,
+                       tokens=tokens, status="crashed")
+        journal.append("ack", txn=txn_id, intent=intent_id, status="crashed")
+        raise
     ledger.settle(rid, tokens, status="ok")
     _crash("after_settle")
     journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,

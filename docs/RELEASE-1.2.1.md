@@ -9,6 +9,7 @@
 | 2 | 1.2.1 `ef94baa` | block，45/100 | B2/B4–B9 partial；新增 B10/B11/M9–M15 |
 | 3 | 1.2.1 `4fc3463` | block，50/100 | 新增 B12（预算拒绝虚假结算）、B13（覆写 intent.to）；B5/B6/B7/B11 partial |
 | 4 | 1.2.1 `d876cd6` | block，53/100 | B7 回归（`-s PATH`）、B13 快路径、M22–M24 恢复/账本口径 |
+| 5 | 1.2.1 `774f517` | 待复审 | 本轮修复见下 |
 
 本文件按第四轮复审前的源码状态标注，不把 partial 写成 closed。
 
@@ -45,13 +46,27 @@
 | M23 | `recovered_crashed` 后未 ack，摘要留幽灵 inflight | 摘要将 `recovered_crashed` 视为终态并 pop |
 | M24 | 缺 seq 的 ack 不参与摘要；recover 忽略摘要 inflight | `_summarize` 按文件顺序扫描全部记录；`recover` 从摘要 inflight 起算 |
 
+## 第五轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B5 | `splitlines()` 把 JSON 内的 CR 当换行，尾读拆碎记录 | 尾读改为只按 `\n` 分行 |
+| B6 | `cd` 后相对写目标仍按原 cwd；`tee` 只查首个输出 | `shellBaseDir` 解析行首/分隔符后的 `cd`；tee/cp/mv 全部参数入检查 |
+| M1 | 统一 diff 的旧路径 `--- a/` 未提取 | 增加 `---` 行解析，过滤 `/dev/null` |
+| M3 | 冲突集合只认规范 sha256 键 | 改为任意 `[nuwa:<key>]`，辅助键参与冲突 |
+| M5 | verdict 无独立锚点 | verify 读各项目 `.nuwa/journal.jsonl`，要求 `executing_prepare > 0` 且 facts 与 commit_done 差 ≤2 |
+| M12 | `txn.commit` 抛异常时跳过结算/ack | commit 包 try，异常落 `ledger_settle`+`ack` |
+| M17 | `done_apply` 被当作已完成；摘要缺 tokens | committed 只认 `commit_done`；`executing_prepare` 写 tokens/rid；repair 取摘要值 |
+| M20 | attempt 不递增，迟到 worker 无法拒绝 | dispatch 写 `x-nuwa-attempt=attempt+1`；worker 拿锁后比对版本；done intent 直接复用 |
+| B13 | validate 失败后 intent 已改盘 | 提交前快照 intent，validate 失败恢复 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
   真正的原子收口在宿主写入边界，扩展层只能把普通输入绕过压到竞态级别。
 - **M2**：`sapper flag` 直接采集的 flag 没有 intent 归属；强制关联会误伤正常采集。
-- **M5**：`verdict` 仍是 soak 自报数据，没有独立探针重算；只能校验自洽与时长。
-- **M20**：attempt 没有持久递增，worker 拿锁后无法用版本号拒绝迟到执行；当前靠 inflight 锁缩窗。
+- **M5**：已用各项目 journal 的 `executing_prepare`/`commit_done` 做独立锚点；`verdict` 的 RSS/FD 仍是 soak 自报。
+- **M20**：attempt 已持久递增，worker 拿锁后按版本拒绝；同 intent 的并发准入仍靠 inflight 锁，非分布式锁。
 - **真实 sapper**：`contract_check` 与 real 崩溃组仍需要 PATH 中的真实实现。
 
 ## 判据

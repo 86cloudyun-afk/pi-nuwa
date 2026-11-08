@@ -67,6 +67,18 @@ def _atomic_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def set_intent_field(root: str | Path, intent_id: str, field: str, value) -> bool:
+    p = Path(root) / ".sapper" / "intents" / f"{intent_id}.json"
+    data = _load(p)
+    if not data:
+        return False
+    data[field] = value
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+    return True
+
+
 def patch_intent(root: str | Path, intent_id: str, fact_id: str, worker: str = "nuwa") -> dict:
     p = Path(root) / ".sapper" / "intents" / f"{intent_id}.json"
     data = _load(p)

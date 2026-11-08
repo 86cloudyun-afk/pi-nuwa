@@ -192,6 +192,27 @@ class JournalTest(unittest.TestCase):
         self.assertEqual([r["seq"] for r in recs], [1, 2])
         self.assertEqual(recs[-1]["event"], "b")
 
+    def test_tail_seq_handles_cr_in_json(self):
+        """JSON 属性间的 CR 不能被当换行，否则尾读会退回旧 seq。"""
+        j = Journal(self.tmp)
+        with open(j.path, "wb") as fh:
+            fh.write(b'{"seq":8,"event":"a"}\n{"seq":9,\r"event":"b"}\n')
+        self.assertEqual(j.last_seq(), 9)
+        self.assertEqual(len(j.read()), 2)
+
+    def test_recovery_merges_settled_and_committed_across_files(self):
+        j = Journal(self.tmp)
+        j.append("commit_done", txn="t1")
+        j.append("ledger_settle", txn="t1", rid="r1")
+        j.compact(keep=0)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        rec = j.read_recovery()
+        self.assertIn("t1", rec["committed"])
+        self.assertIn("r1", rec["settled"])
+
     def test_recovery_does_not_revive_committed_inflight(self):
         j = Journal(self.tmp)
         j.append("executing_prepare", txn="t1", intent="i001")

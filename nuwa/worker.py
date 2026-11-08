@@ -45,6 +45,14 @@ def main(argv: list[str] | None = None) -> int:
 
     lock = FileLock(args.lock, blocking=True)
     with lock:
+        try:
+            it = json.loads((Path(".sapper/intents") / f"{args.intent}.json").read_text(
+                encoding="utf-8"))
+            current = it.get("x-nuwa-attempt", 0)
+            if int(current) != args.attempt + 1:
+                return 3
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
         pid = os.getpid()
         _atomic(Path(args.ready), {
             "pid": pid, "starttime": _starttime(pid),
