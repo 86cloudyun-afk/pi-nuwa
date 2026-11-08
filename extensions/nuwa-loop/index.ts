@@ -103,7 +103,8 @@ const COMMIT_RE =
 
 /** store 值里出现变量展开/命令替换时，静态剥离不可靠：直接 fail-closed。 */
 function hasUnresolvedStore(cmd: string): boolean {
-	return /\bsapper[^;|&]*(?:--store|-s)[^;|&]*?[$`]/.test(cmd);
+	// 只要 sapper 段内出现变量展开/命令替换，就无法静态确定 store 与子命令边界，直接拒绝。
+	return /\bsapper\b[^\n]*?[$`]/.test(cmd);
 }
 
 /** 命令中所有可能的 cwd：原目录与每个 cd 之后的目录。检查时取并集，避免时序漏检。 */

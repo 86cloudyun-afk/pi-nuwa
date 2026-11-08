@@ -1,7 +1,8 @@
 # 1.2.1 审计 backlog
 
-审计口径：codex `gpt-6.1-sol` / `reasoning=ultra`，只读沙盒，十一轮。
-当前状态：block，57/100；真实 sapper 1.0.0 下 `contract` 13/13、`tests/run.sh` EXIT=0。
+审计口径：codex `gpt-6.1-sol` / `reasoning=ultra`，只读沙盒，十六轮。
+当前状态：block，57/100；真实 sapper 1.0.0 下 `contract` 13/13、`tests/run.sh` EXIT=0、145 例 + 16 runs。
+已关闭：B1–B5、B11–B21（其中 B6/B7/B21 仅余 shell 语义边界）、M9/M11/M12/M13/M14/M16/M23/M26。
 
 下列项不在本轮 blocking 修复范围，按「证据 → 风险 → 下一步」登记，供 1.3 逐条处理。
 
