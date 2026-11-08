@@ -442,7 +442,8 @@ class TxnTest(unittest.TestCase):
 
     def test_complete_requires_evidence(self):
         self._run(["sapper", "fact", "just a note", "-k", "note"])
-        facts = sorted((self.root / ".sapper" / "facts").glob("*.json"))
+        facts = [f for f in (self.root / ".sapper" / "facts").glob("*.json")
+                 if json.loads(f.read_text()).get("kind") == "note"]
         note_id = json.loads(facts[-1].read_text())["id"]
         env = {**self.env, "PYTHONPATH": str(REPO)}
 
@@ -454,9 +455,9 @@ class TxnTest(unittest.TestCase):
         r = complete(note_id)
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
         self._run(["sapper", "flag", "flag{test}"])
-        facts = sorted((self.root / ".sapper" / "facts").glob("*.json"))
+        facts = [f for f in (self.root / ".sapper" / "facts").glob("*.json")
+                 if json.loads(f.read_text()).get("kind") == "flag"]
         flag_id = json.loads(facts[-1].read_text())["id"]
-        self.assertEqual(json.loads(facts[-1].read_text())["kind"], "flag")
         r2 = complete(flag_id)
         self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
         project = json.loads((self.root / ".sapper" / "project.json").read_text())

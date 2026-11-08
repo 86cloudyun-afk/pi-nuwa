@@ -359,6 +359,21 @@
 | B25 | 三个完成入口缺统一 schema | 扩展校验 goal/fact/intent 必填字段、文件身份、引用完整性；Python/shell 补 goal 身份与 description 一致性 |
 | 测试 | 夹具缺 created_at/creator | `makeGraph` 补必填字段 |
 
+## 第四十三轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B45 | `graph.facts()` 跳过 goal.json，`_evidence` 取不到 goal → 合法完成被回滚 | 改用 `graph.get_fact(root, "goal")` |
+| B25 | intent 文件身份、from 必填非空 | intent.id 必须等于文件名；普通 intent 的 from 必须非空数组 |
+| B25 | shell 锁内重判未校验 goal 身份 | 锁内重判前先校验 goal_fact 与 project.goal 一致 |
+
+## 第四十四轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| 测试 | fake-sapper setup 不创建 goal.json，`_evidence` 的 goal 校验让 5 个项目全失败 | fake-sapper setup 生成 goal fact（仿真真实 sapper） |
+| 测试 | `facts[-1]` 取到 goal.json | 改为按 kind 取 note/flag |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

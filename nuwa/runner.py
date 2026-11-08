@@ -32,7 +32,7 @@ def _project_status(root: Path) -> str:
 
 def _evidence(root: Path) -> bool:
     facts = {f.get("id"): f for f in graph.facts(root)}
-    goal = facts.get("goal")
+    goal = graph.get_fact(root, "goal")
     proj = graph.project(root)
     if (not goal or not proj.get("goal")
             or goal.get("description") != proj.get("goal")):

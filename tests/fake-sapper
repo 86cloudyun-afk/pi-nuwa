@@ -119,6 +119,12 @@ class Store:
             shutil.rmtree(self.root)
         self.intents_dir.mkdir(parents=True, exist_ok=True)
         self.facts_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write(
+            self.facts_dir / "goal.json",
+            json.dumps({"id": "goal", "description": goal, "created_at": now_iso(),
+                        "creator": "system", "source_intent": None},
+                       ensure_ascii=False, indent=2) + "\n",
+        )
         self.save_project(
             {
                 "schema": 1,

@@ -402,7 +402,14 @@ for path in glob.glob(".sapper/intents/*.json"):
     if it.get("to") == "goal":
         edges.append((path, it))
 # 锁内重判：等待锁期间产生的有效完成不能删。
-if edges and all(
+try:
+    proj = json.load(open(".sapper/project.json"))
+    goal_fact = json.load(open(".sapper/facts/goal.json"))
+except Exception:
+    raise SystemExit(1)
+goal_ok = (goal_fact.get("id") == "goal" and proj.get("goal")
+           and goal_fact.get("description") == proj.get("goal"))
+if goal_ok and edges and all(
     e.get("status") == "complete"
     and (e.get("from") or [])
     and all(facts.get(r, {}).get("kind") in ("flag", "vuln", "loot")

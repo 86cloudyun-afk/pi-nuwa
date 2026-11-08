@@ -466,7 +466,9 @@ export function readGraph(root: string): Graph | null {
 			if (!it.status || !["open", "claimed", "done", "complete"].includes(it.status)) {
 				corrupt = true;
 			}
-			if (!it.id || !it.description || !it.created_at) corrupt = true;
+			if (!it.id || it.id !== f.replace(/\.json$/, "")
+				|| !it.description || !it.created_at) corrupt = true;
+			if (!Array.isArray(it.from) || it.from.length === 0) corrupt = true;
 			if (it.from !== undefined) {
 				const refs = Array.isArray(it.from)
 					? it.from.filter((x): x is string => typeof x === "string") : [];
