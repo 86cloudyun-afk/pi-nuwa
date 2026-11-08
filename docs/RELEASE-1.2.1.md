@@ -154,6 +154,15 @@
 | 安装 | `install.sh` 自动建立 `sapper.real` 并安装 guard 到 `$SAPPER_HOME/bin/sapper` |
 | 测试 | `tests/test_guard.py` 7 例：done/dispatch/complete/--store 前缀被拦，reason/version/内部提交放行 |
 
+## 第十七轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B22 | guard 不认 `--store` 缩写；dispatch 只看紧随 token | argv 扫描支持 `--st*` 缩写；dispatch 扫描其后所有 `i<N>` |
+| B23 | `NUWA_SUBMIT_ALLOWED=1` 可伪造 | 改为 `$SAPPER_HOME/.submit_token`（0600）随机 token；`graph.sapper` 读取同一文件 |
+| B24 | 真实 sapper 在 `$SAPPER_HOME/bin` 时跳过安装；PATH 顺序不利 | install 先备份/改名 `sapper.real` 再装 guard；`bin/nuwa` 在子命令 exec 前把 `$SAPPER_HOME/bin` 放到 PATH 最前 |
+| B25 | guard 放行 `dispatch reason`；真实 complete 绕过校验 | `complete` 一律拦；`dispatch i<N>` 无论前置选项都拦；`reason` 保留（只生成意图） |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

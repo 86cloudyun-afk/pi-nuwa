@@ -19,9 +19,9 @@
 | `test_r1_multi.py` | 1 | 1 pass | 四项目并发 |
 | `test_r2_r7.py` | 29 | 29 pass | 公平/证据/指标/策略/插件/夜跑 |
 | `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
-| `test_guard.py` | 7 | 7 pass | 执行层提交闸门 |
+| `test_guard.py` | 10 | 10 pass | 执行层提交闸门（token/缩写/伪造） |
 
-合计 **152 例 + 16 runs**。
+合计 **155 例 + 16 runs**。
 
 ## 二、门禁
 

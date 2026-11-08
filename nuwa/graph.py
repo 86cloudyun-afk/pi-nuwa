@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+
+from .paths import sapper_home
 from pathlib import Path
 
 
@@ -110,8 +112,12 @@ def annotate_fact(root: str | Path, fact_id: str, key: str) -> None:
 
 def sapper(root: str | Path, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
     env = dict(os.environ)
-    # nuwa 是唯一合法提交入口；guard 靠这个标记放行内部调用。
-    env["NUWA_SUBMIT_ALLOWED"] = "1"
+    # nuwa 是唯一合法提交入口；guard 用 0600 token 放行，调用者无法伪造。
+    try:
+        env["NUWA_SUBMIT_ALLOWED"] = (
+            sapper_home() / ".submit_token").read_text(encoding="utf-8").strip()
+    except OSError:
+        env["NUWA_SUBMIT_ALLOWED"] = ""
     return subprocess.run(["sapper", *args], cwd=str(root), env=env,
                           capture_output=True, text=True, timeout=timeout)
 

@@ -23,10 +23,13 @@ class GuardTest(unittest.TestCase):
         (self.bin / "sapper.real").symlink_to(FAKE)
         shutil.copy(GUARD, self.bin / "sapper")
         (self.bin / "sapper").chmod(0o755)
+        lab = self.tmp / "lab"
+        lab.mkdir()
+        (lab / ".submit_token").write_text("testtoken\n", encoding="utf-8")
         self.env = {
             **os.environ,
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
-            "SAPPER_HOME": str(self.tmp / "lab"),
+            "SAPPER_HOME": str(lab),
         }
 
     def tearDown(self):
@@ -35,7 +38,7 @@ class GuardTest(unittest.TestCase):
     def run_guard(self, *args, allowed=False):
         env = dict(self.env)
         if allowed:
-            env["NUWA_SUBMIT_ALLOWED"] = "1"
+            env["NUWA_SUBMIT_ALLOWED"] = "testtoken"
         return subprocess.run(["sapper", *args], env=env, capture_output=True,
                               text=True, timeout=30)
 
@@ -61,6 +64,21 @@ class GuardTest(unittest.TestCase):
     def test_blocks_store_prefix(self):
         self.assertEqual(
             self.run_guard("--store", "/p/.sapper", "done", "i001", "--fact", "x").returncode, 7)
+
+    def test_blocks_abbrev_store(self):
+        self.assertEqual(
+            self.run_guard("--st", "/p/.sapper", "done", "i001", "--fact", "x").returncode, 7)
+
+    def test_blocks_dispatch_with_options(self):
+        self.assertEqual(
+            self.run_guard("dispatch", "--model", "fake", "i001").returncode, 7)
+
+    def test_blocks_forged_env(self):
+        env = dict(self.env)
+        env["NUWA_SUBMIT_ALLOWED"] = "1"
+        r = subprocess.run(["sapper", "done", "i001", "--fact", "x"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 7)
 
 
 if __name__ == "__main__":

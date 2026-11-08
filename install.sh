@@ -89,9 +89,22 @@ say "[4/6] 安装 nuwa 入口与 Python 包"
 install -m 0755 "$REPO_DIR/bin/nuwa" "$SAPPER_HOME/bin/nuwa"
 
 # 执行层提交闸门：真实 sapper 链到 sapper.real，sapper 指向 guard。
-_real_sapper="$(command -v sapper || true)"
-if [[ -n "$_real_sapper" && "$_real_sapper" != "$SAPPER_HOME/bin/sapper" ]]; then
-  ln -sf "$_real_sapper" "$SAPPER_HOME/bin/sapper.real"
+TOKEN_FILE="$SAPPER_HOME/.submit_token"
+if [[ ! -s "$TOKEN_FILE" ]]; then
+  python3 -c 'import secrets; print(secrets.token_hex(20))' >"$TOKEN_FILE"
+  chmod 600 "$TOKEN_FILE"
+fi
+_guard="$(readlink -f "$REPO_DIR/bin/sapper-guard")"
+_real_sapper="$(readlink -f "$(command -v sapper || true)" 2>/dev/null || true)"
+if [[ -f "$SAPPER_HOME/bin/sapper" ]] && grep -q 'sapper-guard' "$SAPPER_HOME/bin/sapper" 2>/dev/null; then
+  install -m 0755 "$REPO_DIR/bin/sapper-guard" "$SAPPER_HOME/bin/sapper"
+  echo "updated: sapper guard -> $SAPPER_HOME/bin/sapper"
+elif [[ -n "$_real_sapper" && "$_real_sapper" != "$_guard" ]]; then
+  if [[ "$_real_sapper" == "$SAPPER_HOME/bin/sapper" ]]; then
+    mv "$SAPPER_HOME/bin/sapper" "$SAPPER_HOME/bin/sapper.real"
+  else
+    ln -sfn "$_real_sapper" "$SAPPER_HOME/bin/sapper.real"
+  fi
   install -m 0755 "$REPO_DIR/bin/sapper-guard" "$SAPPER_HOME/bin/sapper"
   echo "installed: sapper guard -> $SAPPER_HOME/bin/sapper (real: $_real_sapper)"
 fi

@@ -2,8 +2,8 @@
 # sapper-guard — 执行层提交闸门。
 #
 # 扩展层的 shell 解析只能覆盖字面量；真正的最后一道闸门在 CLI 入口：
-# 除 nuwa CLI 内部（NUWA_SUBMIT_ALLOWED=1）外，done / dispatch <intent> / complete
-# 一律拒绝。这样即使命令经过引号、$()、env、xargs 等包装，也无法绕过提交所有权。
+# 除 nuwa CLI 内部（NUWA_SUBMIT_ALLOWED 等于 $SAPPER_HOME/.submit_token）外，
+# done / dispatch <intent> / complete 一律拒绝。token 文件 0600，调用者无法伪造。
 #
 # 安装：install.sh 把真实 sapper 链接为 sapper.real，并把本脚本装到
 #       $SAPPER_HOME/bin/sapper（该目录在 bin/nuwa 的 PATH 最前）。
@@ -12,8 +12,8 @@ set -uo pipefail
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 REAL="${SAPPER_REAL:-}"
 if [[ -z "$REAL" ]]; then
-  for cand in "$SELF_DIR/sapper.real" "$HOME/.local/bin/sapper.real" "$HOME/.local/bin/sapper"; do
-    if [[ -x "$cand" && "$cand" != "$SELF_DIR/sapper" && "$cand" != "$0" ]]; then
+  for cand in "$SELF_DIR/sapper.real" "$HOME/.local/bin/sapper.real"; do
+    if [[ -x "$cand" ]]; then
       REAL="$cand"
       break
     fi
@@ -24,7 +24,19 @@ if [[ -z "$REAL" || ! -x "$REAL" ]]; then
   exit 3
 fi
 
-# 解析第一个非选项参数作为子命令；--store/-s 的值跳过。
+TOKEN_FILE="${SAPPER_HOME:-$HOME/sapper-lab}/.submit_token"
+TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+ALLOWED=0
+if [[ -n "$TOKEN" && "${NUWA_SUBMIT_ALLOWED:-}" == "$TOKEN" ]]; then
+  ALLOWED=1
+fi
+
+block() {
+  echo "sapper-guard: 提交所有权：$1 只能经 nuwa commit/complete/dispatch" >&2
+  exit 7
+}
+
+# 解析第一个非选项参数作为子命令；支持 --store 的 argparse 缩写与分离/等号值。
 args=("$@")
 cmd=""
 cmd_idx=-1
@@ -32,27 +44,27 @@ i=0
 while (( i < ${#args[@]} )); do
   a="${args[$i]}"
   case "$a" in
-    --store|-s) (( i += 2 )); continue ;;
-    --store=*|-s?*) (( i += 1 )); continue ;;
+    --store|--stor|--sto|--st|--s|-s) (( i += 2 )); continue ;;
+    --store=*|--stor=*|--sto=*|--st=*|--s=*|-s?*) (( i += 1 )); continue ;;
+    --*) (( i += 1 )); continue ;;
     -*) (( i += 1 )); continue ;;
     *) cmd="$a"; cmd_idx=$i; break ;;
   esac
 done
 
-if [[ "${NUWA_SUBMIT_ALLOWED:-0}" != "1" ]]; then
-  case "$cmd" in
-    done|complete)
-      echo "sapper-guard: 提交所有权：$cmd 只能经 nuwa commit/complete" >&2
-      exit 7
-      ;;
-    dispatch)
-      next="${args[$((cmd_idx + 1))]:-}"
-      if [[ "$next" =~ ^i[0-9]+$ ]]; then
-        echo "sapper-guard: 提交所有权：dispatch $next 只能经 nuwa dispatch" >&2
-        exit 7
+case "$cmd" in
+  done|complete)
+    (( ALLOWED == 1 )) || block "$cmd"
+    ;;
+  dispatch)
+    # 扫描 dispatch 之后所有 token，前置选项不能遮住 intent。
+    for (( j = cmd_idx + 1; j < ${#args[@]}; j++ )); do
+      if [[ "${args[$j]}" =~ ^i[0-9]+$ ]]; then
+        (( ALLOWED == 1 )) || block "dispatch ${args[$j]}"
+        break
       fi
-      ;;
-  esac
-fi
+    done
+    ;;
+esac
 
 exec "$REAL" "$@"

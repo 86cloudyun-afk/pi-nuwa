@@ -12,14 +12,15 @@ set -uo pipefail
 
 _SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 _PKG_DIR="$(cd "$_SELF_DIR/.." && pwd)"
+LAB_DIR="${SAPPER_HOME:-$HOME/sapper-lab}"
+export PATH="$LAB_DIR/bin:$PATH"
 
 # R1 子命令走 Python CLI；其余参数保持旧 URL 语义
 case "${1:-}" in
   ls|status|attach|budget|flag|complete|commit|recover|adopt|dispatch|run|metrics|report|verify|policy|fairness|plugin|soak|soak-night|soak-verify|migrate)
     if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
-      _lab="${SAPPER_HOME:-$HOME/sapper-lab}"
       # shellcheck disable=SC1090
-      [[ -f "${NUWA_ENV:-$_lab/env.sh}" ]] && source "${NUWA_ENV:-$_lab/env.sh}"
+      [[ -f "${NUWA_ENV:-$LAB_DIR/env.sh}" ]] && source "${NUWA_ENV:-$LAB_DIR/env.sh}"
       exec python3 "$_PKG_DIR/nuwa/cli.py" "$@"
     fi
     ;;
@@ -27,13 +28,11 @@ esac
 
 NUWA_VERSION="1.2.1"
 
-LAB_DIR="${SAPPER_HOME:-$HOME/sapper-lab}"
 ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
 # shellcheck disable=SC1090
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 
-# 安装器把 omp-claude 放在 $SAPPER_HOME/bin；加入 PATH 并解析引擎，供 Python dispatch 使用。
-export PATH="$LAB_DIR/bin:$PATH"
+# 安装器把 omp-claude 放在 $SAPPER_HOME/bin；解析引擎，供 Python dispatch 使用。
 if [[ -z "${NUWA_ENGINE:-}" ]]; then
   for _cand in "$LAB_DIR/bin/omp-claude" "omp-claude" "fake-claude"; do
     if command -v "$_cand" >/dev/null 2>&1; then NUWA_ENGINE="$_cand"; break; fi
@@ -303,7 +302,8 @@ dispatch_one() {
     rc=$?
   elif [[ "$mode" == "sapper" ]]; then
     event dispatch_legacy "id=$id" "mode=sapper"
-    out=$(NUWA_SUBMIT_ALLOWED=1 sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1 9>&-)
+    _tk="$(cat "$LAB_DIR/.submit_token" 2>/dev/null || true)"
+    out=$(NUWA_SUBMIT_ALLOWED="$_tk" sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1 9>&-)
     rc=$?
   else
     log "ERROR: NUWA_SUBMIT_MODE 只能是 cli 或 sapper（当前 $mode）" >&2
