@@ -12,7 +12,7 @@ set -uo pipefail
 
 # R1 子命令走 Python CLI；其余参数保持旧 URL 语义
 case "${1:-}" in
-  ls|status|attach|budget|commit|recover|adopt)
+  ls|status|attach|budget|commit|recover|adopt|dispatch|run|metrics|report|verify|policy|fairness|plugin|soak|migrate)
     _self_dir="$(cd "$(dirname "$0")" && pwd)"
     _pkg_dir="$(cd "$_self_dir/.." && pwd)"
     if [[ -f "$_pkg_dir/nuwa/cli.py" ]]; then

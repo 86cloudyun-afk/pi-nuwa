@@ -11,10 +11,12 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from nuwa import graph, registry, txn, runner, dispatch as dispatch_mod  # type: ignore
+    from nuwa import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod  # type: ignore
     from nuwa.ledger import Ledger  # type: ignore
     from nuwa.paths import find_project, pointer_path  # type: ignore
 else:
     from . import graph, registry, txn, runner, dispatch as dispatch_mod
+    from . import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod
     from .ledger import Ledger
     from .paths import find_project, pointer_path
 
@@ -147,6 +149,100 @@ def cmd_dispatch(args) -> int:
     return 0
 
 
+def cmd_metrics(args) -> int:
+    root = Path(args.root).resolve() if args.root else find_project()
+    if not root:
+        print("nuwa: 不在 sapper 项目内", file=sys.stderr)
+        return 2
+    data = metrics.compute(root)
+    if args.html:
+        Path(args.html).write_text(metrics.render_html(data), encoding="utf-8")
+        print(args.html)
+        return 0
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_report(args) -> int:
+    root = Path(args.root).resolve() if args.root else find_project()
+    if not root:
+        print("nuwa: 不在 sapper 项目内", file=sys.stderr)
+        return 2
+    out = Path(args.out)
+    out.write_text(metrics.render_html(metrics.compute(root)), encoding="utf-8")
+    print(str(out))
+    return 0
+
+
+def cmd_verify(args) -> int:
+    root = Path(args.root).resolve() if args.root else find_project()
+    if not root:
+        print("nuwa: 不在 sapper 项目内", file=sys.stderr)
+        return 2
+    fact = graph.get_fact(root, args.fact)
+    if not fact:
+        print(f"nuwa: fact 不存在: {args.fact}", file=sys.stderr)
+        return 2
+    stdout = Path(args.stdout).read_bytes() if args.stdout else None
+    code, msg = evidence.verify(fact, stdout)
+    ev = fact.get("x-nuwa-evidence") or fact.get("evidence") or {}
+    print(json.dumps({"code": code, "message": msg,
+                      "confidence": evidence.confidence(ev)}, ensure_ascii=False))
+    return 0 if code == 0 else code
+
+
+def cmd_policy(args) -> int:
+    if args.action == "check":
+        ok, rule = policy.check_command(args.command)
+        print(json.dumps({"allowed": ok, "rule": rule}, ensure_ascii=False))
+        return 0 if ok else 1
+    print(policy.redact(args.text))
+    return 0
+
+
+def cmd_fairness(args) -> int:
+    parts = args.weights.split(":")
+    weights = {f"p{i}": int(w) for i, w in enumerate(parts)}
+    shares = fairness.schedule(weights, slots=max(100, args.seconds * 10))
+    print(json.dumps({"weights": weights, "shares": shares}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_plugin(args) -> int:
+    found = plugins_mod.discover(args.dir)
+    print(json.dumps({"api_version": plugins_mod.API_VERSION,
+                      "plugins": [{"name": p["name"], "api_version": p["api_version"]}
+                                  for p in found]}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_soak(args) -> int:
+    roots = args.project or [i["root"] for i in registry.load()]
+    if not roots:
+        print("nuwa: 没有可跑的项目", file=sys.stderr)
+        return 2
+    summary = soak_mod.soak(roots, minutes=args.minutes, interval=args.interval,
+                            parallel=args.parallel, model=args.model)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if all(summary["verdict"].values()) else 1
+
+
+def cmd_migrate(args) -> int:
+    root = Path(args.root).resolve() if args.root else find_project()
+    detected = {}
+    if root:
+        for name in ("run.json", "journal.jsonl"):
+            p = root / ".nuwa" / name
+            if p.exists():
+                detected[name] = "present"
+        proj = root / ".sapper" / "project.json"
+        if proj.exists():
+            detected["graph"] = "sapper-managed"
+    print(json.dumps({"from": args.source, "dry_run": args.dry_run,
+                      "detected": detected}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_recover(args) -> int:
     root = Path(args.root).resolve() if args.root else find_project()
     if not root:
@@ -217,6 +313,52 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--timeout", type=int, default=300)
     s.add_argument("--root", default=None)
     s.set_defaults(func=cmd_dispatch)
+
+    s = sub.add_parser("metrics")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--html", default=None)
+    s.add_argument("--root", default=None)
+    s.set_defaults(func=cmd_metrics)
+
+    s = sub.add_parser("report")
+    s.add_argument("--out", required=True)
+    s.add_argument("--root", default=None)
+    s.set_defaults(func=cmd_report)
+
+    s = sub.add_parser("verify")
+    s.add_argument("fact")
+    s.add_argument("--stdout", default=None)
+    s.add_argument("--root", default=None)
+    s.set_defaults(func=cmd_verify)
+
+    s = sub.add_parser("policy")
+    s.add_argument("action", choices=["check", "redact"])
+    s.add_argument("--command", default="")
+    s.add_argument("--text", default="")
+    s.set_defaults(func=cmd_policy)
+
+    s = sub.add_parser("fairness")
+    s.add_argument("--weights", default="2:1:1")
+    s.add_argument("--seconds", type=int, default=60)
+    s.set_defaults(func=cmd_fairness)
+
+    s = sub.add_parser("plugin")
+    s.add_argument("--dir", default="nuwa_plugins")
+    s.set_defaults(func=cmd_plugin)
+
+    s = sub.add_parser("soak")
+    s.add_argument("--minutes", type=float, default=1)
+    s.add_argument("--interval", type=float, default=5)
+    s.add_argument("--parallel", type=int, default=2)
+    s.add_argument("--model", default="deepseek-flash")
+    s.add_argument("--project", action="append", default=None)
+    s.set_defaults(func=cmd_soak)
+
+    s = sub.add_parser("migrate")
+    s.add_argument("--from", dest="source", default="auto")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--root", default=None)
+    s.set_defaults(func=cmd_migrate)
 
     s = sub.add_parser("recover")
     s.add_argument("--root", default=None)

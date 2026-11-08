@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.0-rc1 — 2026-11-08
+
+- R2：`nuwa fairness` 加权调度、账本准入、超支口径
+- R3：`nuwa/evidence.py` 五类拒绝（10–14）与置信度 rubric、`nuwa verify`
+- R4：`nuwa metrics --json`、`nuwa report` 离线 HTML、webhook 告警
+- R5：`nuwa policy check/redact`、HMAC 签名校验
+- R6：`nuwa/plugins.py`（api_version 校验）、`nuwa migrate --dry-run`
+- R7：`nuwa soak` 多项目采样与判据
+- 测试：R2–R7 模块 17 例；门禁 `g2_r2r7`
+- 发布说明：`docs/RELEASE-1.0.md`（GA 缺口清单）
+
 ## 0.4.0-dev — 2026-11-08
 
 R1 运行时（Python 包 `nuwa/`）：
