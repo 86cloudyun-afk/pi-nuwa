@@ -23,11 +23,12 @@ import {
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, InputEvent, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 
 const HOME = homedir();
@@ -66,54 +67,110 @@ const WRITE_TOOLS: Record<string, true> = {
 	notebook_edit: true,
 };
 
+/** 只认路径类字段，避免把 write 的正文内容误当路径。 */
+const PATH_KEYS: Record<string, true> = {
+	path: true,
+	file_path: true,
+	file: true,
+	filename: true,
+	notebook_path: true,
+	target: true,
+};
+
 const PATH_RULES: Array<[RegExp, string]> = [
-	[/(^|\/)\.sapper\/(facts|intents)\//, "P-005"],
-	[/(^|\/)\.sapper\/project\.json$/, "P-009"],
-	[/(^|\/)\.nuwa\/(journal[^/]*\.jsonl|checkpoint[^/]*\.json|CURRENT|global[^/]*\.jsonl)$/, "P-007"],
+	[/(^|[\\/])\.sapper[\\/](facts|intents)[\\/]/, "P-005"],
+	[/(^|[\\/])\.sapper[\\/]project\.json$/, "P-009"],
+	[/(^|[\\/])\.nuwa[\\/](journal[^\\/]*\.jsonl|checkpoint[^\\/]*\.json|CURRENT|global[^\\/]*\.jsonl)$/, "P-007"],
+	[/(^|[\\/])budget[\\/][^\\/]*\.jsonl$/, "P-007"],
 ];
 
-/** 提交所有权：fact 只能经 nuwa commit 产生；按 id 的 dispatch 也只能走 nuwa。 */
-const PROMPT_RULES: Array<[RegExp, string]> = [
-	[/(?:^|[;\n])\s*sapper\s+done\s+\S+/, "P-006"],
-	[/(?:^|[;\n])\s*sapper\s+dispatch\s+i\d+/, "P-006"],
-	[/(?:^|[;\n])\s*sapper\s+complete\b/, "P-006"],
-];
+/**
+ * 提交所有权：fact 只能经 nuwa commit 产生。分隔符覆盖 ; & | ( ) 换行引号反引号，
+ * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
+ */
+const COMMIT_RE =
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?sapper\s+(?:done\s+\S+|dispatch\s+i\d+|complete\b(?!\s+--from\s+\S+))/i;
 
-/** 三类工具统一判定：bash 看命令，task 看文案，write/edit 看目标路径。 */
+/** 递归收集路径类字段；multi_edit/files/edits 等嵌套结构也能覆盖。 */
+function collectPaths(value: unknown, out: string[], depth = 0): void {
+	if (depth > 6 || value === null || typeof value !== "object") return;
+	if (Array.isArray(value)) {
+		for (const item of value) collectPaths(item, out, depth + 1);
+		return;
+	}
+	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof v === "string" && PATH_KEYS[k]) out.push(v);
+		else if (v && typeof v === "object") collectPaths(v, out, depth + 1);
+	}
+}
+
+/** 递归收集所有字符串；task 的 context/description 等字段同样参与 P-006 扫描。 */
+function collectStrings(value: unknown, out: string[], depth = 0): void {
+	if (depth > 6 || value === null) return;
+	if (typeof value === "string") {
+		out.push(value);
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) collectStrings(item, out, depth + 1);
+		return;
+	}
+	if (typeof value === "object") {
+		for (const v of Object.values(value as Record<string, unknown>)) {
+			collectStrings(v, out, depth + 1);
+		}
+	}
+}
+
+/** 把相对路径、file://、符号链接都归一到真实绝对路径；不存在的文件用父目录 realpath。 */
+function resolvePath(value: string, baseDir: string): string[] {
+	const raw = value.startsWith("file://") ? value.slice(7) : value;
+	const normalized = raw.replace(/\\/g, "/");
+	const abs = isAbsolute(normalized) ? normalized : resolve(baseDir, normalized);
+	const out = new Set<string>([abs]);
+	try {
+		out.add(realpathSync(abs));
+	} catch {
+		try {
+			const parent = realpathSync(dirname(abs));
+			out.add(join(parent, abs.split("/").pop() ?? ""));
+		} catch {
+			/* 父目录也不存在，保留字面量 */
+		}
+	}
+	return [...out];
+}
+
+/** 三类工具统一判定：bash 看命令，task 看全部文案，write/edit 看全部路径字段。 */
 export function checkTool(
 	toolName: string,
 	input: Record<string, unknown>,
+	baseDir = process.cwd(),
 ): { allowed: boolean; rule?: string } {
 	if (toolName === "bash") {
 		const cmd = typeof input.command === "string" ? input.command : "";
 		const base = checkCommand(cmd);
 		if (!base.allowed) return base;
-		for (const [re, rule] of PROMPT_RULES) if (re.test(cmd)) return { allowed: false, rule };
+		if (COMMIT_RE.test(cmd)) return { allowed: false, rule: "P-006" };
 		return { allowed: true };
 	}
 	if (toolName === "task") {
-		// 批量派单用 tasks[]，单发用 task 字符串；取原始文案逐条扫，避免 JSON 转义后 ^ 失配。
-		const parts: string[] = [];
-		if (typeof input.task === "string") parts.push(input.task);
-		if (Array.isArray(input.tasks)) {
-			for (const t of input.tasks) {
-				if (typeof t === "string") {
-					parts.push(t);
-				} else if (t && typeof t === "object") {
-					const rec = t as Record<string, unknown>;
-					for (const k of ["task", "prompt", "description"]) {
-						if (typeof rec[k] === "string") parts.push(rec[k] as string);
-					}
-				}
-			}
-		}
-		const text = parts.join("\n") || JSON.stringify(input ?? {});
-		for (const [re, rule] of PROMPT_RULES) if (re.test(text)) return { allowed: false, rule };
+		const texts: string[] = [];
+		collectStrings(input, texts);
+		const text = texts.join("\n");
+		if (COMMIT_RE.test(text)) return { allowed: false, rule: "P-006" };
 		return { allowed: true };
 	}
 	if (WRITE_TOOLS[toolName]) {
-		const p = String(input.path ?? input.file_path ?? input.file ?? "");
-		for (const [re, rule] of PATH_RULES) if (re.test(p)) return { allowed: false, rule };
+		const paths: string[] = [];
+		collectPaths(input, paths);
+		for (const p of paths) {
+			for (const candidate of resolvePath(p, baseDir)) {
+				for (const [re, rule] of PATH_RULES) {
+					if (re.test(candidate)) return { allowed: false, rule };
+				}
+			}
+		}
 	}
 	return { allowed: true };
 }
@@ -399,14 +456,14 @@ export function buildDirective(g: Graph, st: LoopState, workerTag = "fujiang"): 
 				`    sapper doc <id> --set "<本轮执行的命令原文 + 关键输出摘要>"\n` +
 				`- 子代理只回 5 行结论（结论/证据/命令/阻断/下一步），不直接 sapper done；主线程按批收口：\n` +
 				`    nuwa commit --root ${g.root} --intent <id> --key auto --fact "<结论>" --kind <host|service|cred|vuln|loot|flag|note> --doc "<命令原文>"\n` +
-				`- 禁止 sapper done / sapper dispatch <id> / sapper complete：扩展按 P-006 拦截，fact 只能经 nuwa commit 产生\n` +
+				`- 禁止 sapper done / sapper dispatch <id> / 裸 sapper complete：扩展按 P-006 拦截；完成走 nuwa complete --from <fact>\n` +
 				`- 通道：优先 task{tasks:[]} 批量；若改用 eval 的 agent()/workpool，每项同样必须 agent="fujiang"\n` +
 				`- 主线程禁止自己跑 nmap/ffuf/curl，扫描只能发生在子代理里\n`
 			: `frontier 为空：先 cd ${g.root} && sapper dispatch reason --model deepseek-flash --timeout 240，然后 sapper frontier 取新 intent 再派发。\n`;
 
 	const discipline =
-		`收工判据只有两个：flag 已入账并 sapper complete --from <flag fact>，或 vuln/loot 事实足以支撑结论。\n` +
-		`禁止在没有 flag/vuln/loot 事实时 sapper complete：运行时会把无证据完成打回 active。\n` +
+		`收工判据只有两个：flag 已入账并 nuwa complete --from <flag fact>，或 vuln/loot 事实足以支撑结论。\n` +
+		`禁止在没有 flag/vuln/loot 事实时 nuwa complete：入口会校验 fact 的 kind，证据不足直接拒绝。\n` +
 		`一轮 task 返回 ≠ 收工；不许输出"本轮战报""已完成"之类收尾段落。\n` +
 		`每批返回后先跑 sapper status / sapper frontier 验收，再决定下一批。`;
 
@@ -460,7 +517,7 @@ export default function nuwaLoop(pi: ExtensionAPI) {
 		const sid = ctx.sessionManager.getSessionId();
 		liveToolCalls.set(sid, (liveToolCalls.get(sid) ?? 0) + 1);
 		const input = (event.input ?? {}) as Record<string, unknown>;
-		const verdict = checkTool(event.toolName, input);
+		const verdict = checkTool(event.toolName, input, ctx?.cwd ?? process.cwd());
 		if (!verdict.allowed && (process.env.NUWA_POLICY_ENFORCE ?? "1").trim() !== "0") {
 			const detail =
 				event.toolName === "bash"

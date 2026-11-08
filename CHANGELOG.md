@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.1 — 2026-11-08
+
+codex `gpt-6.1-sol` ultra 交付审计（block，35/100）后的修复：
+
+- journal：compact 代号不覆盖、append/compact/gc/read 共用锁、seq 并入 checkpoint 高水位、
+  GC 保护未决事务代并写 recovery.json、尾读窗口按需扩大（B1–B5）
+- 策略：路径归一（cwd/`..`/符号链接/反斜杠）+ 递归收集 files/edits 路径；
+  P-006 覆盖 `&&`/管道/`$()`/引号/反斜杠；P-007 覆盖 `budget/global.jsonl`（B6–B8）
+- 入口：URL 默认走 `nuwa dispatch` 事务提交，回退 sapper 记 `dispatch_fallback`；
+  `bin/nuwa` 转发 flag/complete/soak-night/soak-verify（B9、M6）
+- 完成：`nuwa complete --from <fact>` 校验 kind=flag/vuln/loot，裸 `sapper complete` 仍拦（M2）
+- 一致：`txn.attempt_of` 严格校验（M3）；`night.verify` 严格 schema、实际时长、
+  `--expect-commit`（M4/M5）；`g1` 逐项聚合退出码（M8）
+- 新增 `nuwa flag`；README/RELEASE 说明 flag 属证据采集
+- 测试：扩展 37、journal 12、r1core 23、r2r7 28、e2e 4，合计 123 例 + 16 runs
+
 ## 1.2.0 — 2026-11-08
 
 - journal 代际：`compact()` 在归档前取 seq（原先归档后取到 0，checkpoint 丢基线）；

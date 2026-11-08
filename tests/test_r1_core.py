@@ -112,6 +112,92 @@ class JournalTest(unittest.TestCase):
         self.assertFalse((j.dir / "journal.2.jsonl").exists())
         self.assertTrue((j.dir / "journal.3.jsonl").exists())
 
+    def test_empty_compaction_keeps_seq_high_water(self):
+        """空代被 GC 后，seq 必须从 checkpoint 高水位继续，不能回到 0。"""
+        j = Journal(self.tmp)
+        j.append("a")
+        j.compact()
+        j.compact()
+        j.compact()
+        self.assertFalse((j.dir / "journal.1.jsonl").exists())
+        j.append("b")
+        self.assertEqual(j.last_seq(), 2)
+        self.assertEqual([r["seq"] for r in j.read()], [2])
+
+    def test_compact_never_overwrites_existing_gen(self):
+        """CURRENT 未发布（模拟崩溃）时，下一次 compact 不能覆盖已有归档。"""
+        j = Journal(self.tmp)
+        j.append("a")
+        j.compact(keep=0)
+        (j.dir / "CURRENT").unlink()
+        j.append("b")
+        j.compact(keep=0)
+        self.assertTrue((j.dir / "journal.1.jsonl").exists())
+        self.assertTrue((j.dir / "journal.2.jsonl").exists())
+        self.assertEqual([r["seq"] for r in j.read()], [1, 2])
+
+    def test_gc_keeps_generation_with_pending_txn(self):
+        j = Journal(self.tmp)
+        j.append("executing_prepare", txn="t1", intent="i001")
+        j.compact(keep=1)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        self.assertTrue((j.dir / "journal.1.jsonl").exists(), "未决事务所在代必须保留")
+
+    def test_gc_writes_recovery_snapshot(self):
+        j = Journal(self.tmp)
+        j.append("commit_done", txn="t1", intent="i001")
+        j.compact(keep=0)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        self.assertFalse((j.dir / "journal.1.jsonl").exists())
+        rec = j.read_recovery()
+        self.assertIsNotNone(rec)
+        self.assertIn("t1", rec["committed"])
+        self.assertIn("t1", replay_state(self.tmp)["committed"])
+
+    def test_tail_seq_handles_long_record(self):
+        j = Journal(self.tmp)
+        j.append("x", blob="a" * 20000)
+        self.assertEqual(j.last_seq(), 1)
+        j.compact(keep=0)
+        j.append("y")
+        self.assertEqual(j.last_seq(), 2)
+
+    def test_concurrent_append_and_compact_unique_seq(self):
+        j = Journal(self.tmp)
+        errors = []
+
+        def writer():
+            try:
+                for _ in range(10):
+                    j.append("w")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def compactor():
+            try:
+                for _ in range(3):
+                    j.compact(keep=0)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer) for _ in range(3)]
+        threads.append(threading.Thread(target=compactor))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        seqs = [r["seq"] for r in j.read()]
+        self.assertEqual(len(seqs), 30)
+        self.assertEqual(len(set(seqs)), 30)
+        self.assertEqual(sorted(seqs), list(range(1, 31)))
+
 
 class LedgerTest(unittest.TestCase):
     def setUp(self):
@@ -209,6 +295,37 @@ class TxnTest(unittest.TestCase):
         res2 = json.loads(r2.stdout)
         self.assertTrue(res2["reused"])
         self.assertEqual(res1["fact"], res2["fact"])
+
+    def test_attempt_of_strict(self):
+        from nuwa.txn import attempt_of, CommitError
+        self.assertEqual(attempt_of({}), 0)
+        self.assertEqual(attempt_of({"x-nuwa-attempt": 3}), 3)
+        self.assertEqual(attempt_of({"x-nuwa-attempt": "2"}), 2)
+        for bad in (None, -1, "abc", True, 1.5):
+            with self.assertRaises(CommitError):
+                attempt_of({"x-nuwa-attempt": bad})
+
+    def test_complete_requires_evidence(self):
+        self._run(["sapper", "fact", "just a note", "-k", "note"])
+        facts = sorted((self.root / ".sapper" / "facts").glob("*.json"))
+        note_id = json.loads(facts[-1].read_text())["id"]
+        env = {**self.env, "PYTHONPATH": str(REPO)}
+
+        def complete(fid):
+            return subprocess.run(
+                [sys.executable, "-m", "nuwa.cli", "complete", "--root", str(self.root),
+                 "--from", fid], env=env, capture_output=True, text=True)
+
+        r = complete(note_id)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self._run(["sapper", "flag", "flag{test}"])
+        facts = sorted((self.root / ".sapper" / "facts").glob("*.json"))
+        flag_id = json.loads(facts[-1].read_text())["id"]
+        self.assertEqual(json.loads(facts[-1].read_text())["kind"], "flag")
+        r2 = complete(flag_id)
+        self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+        project = json.loads((self.root / ".sapper" / "project.json").read_text())
+        self.assertEqual(project["status"], "completed")
 
     def test_adopt_once(self):
         a = txn.adopt(self.root)

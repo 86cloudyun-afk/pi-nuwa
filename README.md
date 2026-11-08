@@ -76,11 +76,12 @@ source ~/sapper-lab/env.sh && sapper-who
 |---|---|---|
 | P-001..P-004 | `rm -rf /`、`mkfs.`、`dd of=/dev/sd*`、`curl --noproxy` 直连元数据 | bash |
 | P-005 | 写 `.sapper/facts/` 或 `.sapper/intents/` | write / edit / multi_edit / apply_patch |
-| P-006 | 直接 `sapper done` / `sapper dispatch i<N>` / `sapper complete` | bash 与 task 文案 |
+| P-006 | 直接 `sapper done` / `sapper dispatch i<N>` / 裸 `sapper complete`（带 `--from` 的完成走 `nuwa complete`） | bash 与 task 文案 |
 | P-007 | 写 `.nuwa/journal.jsonl`、`checkpoint.*`、`CURRENT`、`global*.jsonl` | 写类工具 |
 | P-009 | 直接改 `.sapper/project.json` | 写类工具 |
 
 fact 只能经 `nuwa dispatch` / `nuwa commit` 产生；`nuwa commit --key auto` 用 `sha256(project|intent|attempt)` 规范键做幂等。
+flag 属于证据采集，允许 `sapper flag` / `nuwa flag` 直接入账；P-006 只约束 done / dispatch / complete。
 
 ## 退出码
 

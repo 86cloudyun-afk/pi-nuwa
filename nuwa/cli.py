@@ -13,11 +13,13 @@ if __package__ in (None, ""):
     from nuwa import graph, registry, txn, runner, dispatch as dispatch_mod  # type: ignore
     from nuwa import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod, night as night_mod  # type: ignore
     from nuwa.ledger import Ledger  # type: ignore
+    from nuwa.journal import Journal  # type: ignore
     from nuwa.paths import find_project, pointer_path  # type: ignore
 else:
     from . import graph, registry, txn, runner, dispatch as dispatch_mod
     from . import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod, night as night_mod
     from .ledger import Ledger
+    from .journal import Journal
     from .paths import find_project, pointer_path
 
 
@@ -90,11 +92,7 @@ def cmd_commit(args) -> int:
     key = args.key
     if key == "auto":
         intent = graph.get_intent(root, args.intent) or {}
-        try:
-            attempt = int(intent.get("x-nuwa-attempt", 0))
-        except (TypeError, ValueError):
-            attempt = 0
-        key = txn.dispatch_key(root.name, args.intent, attempt)
+        key = txn.dispatch_key(root.name, args.intent, txn.attempt_of(intent))
     try:
         res = txn.commit(root, args.intent, args.fact, key,
                          kind=args.kind, doc=args.doc)
@@ -244,8 +242,49 @@ def cmd_soak_night(args) -> int:
     return 0 if all(res["verdict"].values()) else 1
 
 
+def cmd_flag(args) -> int:
+    root = Path(args.root).resolve() if args.root else find_project()
+    if not root:
+        print("nuwa: 不在 sapper 项目内", file=sys.stderr)
+        return 2
+    cmd = ["flag", args.value]
+    if args.challenge:
+        cmd += ["-c", args.challenge]
+    r = graph.sapper(root, cmd)
+    if r.returncode != 0:
+        print((r.stdout + r.stderr).strip()[:400], file=sys.stderr)
+        return 1
+    Journal(root).append("flag_recorded", value=args.value, challenge=args.challenge or "")
+    print(json.dumps({"flag": args.value, "challenge": args.challenge or ""},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_complete(args) -> int:
+    root = Path(args.root).resolve() if args.root else find_project()
+    if not root:
+        print("nuwa: 不在 sapper 项目内", file=sys.stderr)
+        return 2
+    fact = graph.get_fact(root, args.from_fact)
+    if not fact:
+        print(f"nuwa: fact 不存在: {args.from_fact}", file=sys.stderr)
+        return 2
+    kind = fact.get("kind")
+    if kind not in ("flag", "vuln", "loot"):
+        print(f"nuwa: 证据类型不足: {kind}（需要 flag/vuln/loot）", file=sys.stderr)
+        return 3
+    r = graph.sapper(root, ["complete", "--from", args.from_fact])
+    if r.returncode != 0:
+        print((r.stdout + r.stderr).strip()[:400], file=sys.stderr)
+        return 1
+    Journal(root).append("project_completed", fact=args.from_fact, kind=kind)
+    print(json.dumps({"completed": True, "from": args.from_fact, "kind": kind},
+                     ensure_ascii=False))
+    return 0
+
+
 def cmd_soak_verify(args) -> int:
-    res = night_mod.verify(args.base)
+    res = night_mod.verify(args.base, expect_commit=args.expect_commit)
     print(json.dumps(res, ensure_ascii=False, indent=2))
     return 0 if res.get("ok") else 1
 
@@ -312,6 +351,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--set", type=int, default=None)
     s.add_argument("--add", type=int, default=None)
     s.set_defaults(func=cmd_budget)
+
+    s = sub.add_parser("flag")
+    s.add_argument("value")
+    s.add_argument("--challenge", "-c", default=None)
+    s.add_argument("--root", default=None)
+    s.set_defaults(func=cmd_flag)
+
+    s = sub.add_parser("complete")
+    s.add_argument("--from", dest="from_fact", required=True)
+    s.add_argument("--root", default=None)
+    s.set_defaults(func=cmd_complete)
 
     s = sub.add_parser("commit")
     s.add_argument("--key", required=True)
@@ -389,6 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("soak-verify")
     s.add_argument("base")
+    s.add_argument("--expect-commit", default=None)
     s.set_defaults(func=cmd_soak_verify)
 
     s = sub.add_parser("migrate")

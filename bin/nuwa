@@ -10,23 +10,33 @@
 #   5  另一个 nuwa 正在操作同一张图
 set -uo pipefail
 
+_SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+_PKG_DIR="$(cd "$_SELF_DIR/.." && pwd)"
+
 # R1 子命令走 Python CLI；其余参数保持旧 URL 语义
 case "${1:-}" in
-  ls|status|attach|budget|commit|recover|adopt|dispatch|run|metrics|report|verify|policy|fairness|plugin|soak|migrate)
-    _self_dir="$(cd "$(dirname "$0")" && pwd)"
-    _pkg_dir="$(cd "$_self_dir/.." && pwd)"
-    if [[ -f "$_pkg_dir/nuwa/cli.py" ]]; then
-      exec python3 "$_pkg_dir/nuwa/cli.py" "$@"
+  ls|status|attach|budget|flag|complete|commit|recover|adopt|dispatch|run|metrics|report|verify|policy|fairness|plugin|soak|soak-night|soak-verify|migrate)
+    if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
+      exec python3 "$_PKG_DIR/nuwa/cli.py" "$@"
     fi
     ;;
 esac
 
-NUWA_VERSION="1.2.0"
+NUWA_VERSION="1.2.1"
 
 LAB_DIR="${SAPPER_HOME:-$HOME/sapper-lab}"
 ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
 # shellcheck disable=SC1090
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+
+# 安装器把 omp-claude 放在 $SAPPER_HOME/bin；加入 PATH 并解析引擎，供 Python dispatch 使用。
+export PATH="$LAB_DIR/bin:$PATH"
+if [[ -z "${NUWA_ENGINE:-}" ]]; then
+  for _cand in "$LAB_DIR/bin/omp-claude" "omp-claude" "fake-claude"; do
+    if command -v "$_cand" >/dev/null 2>&1; then NUWA_ENGINE="$_cand"; break; fi
+  done
+fi
+export NUWA_ENGINE
 
 # ---------------------------------------------------------------- 日志
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -274,8 +284,17 @@ dispatch_one() {
   event dispatch_start "id=$id" "timeout=$to"
   local t0; t0=$(date +%s)
   local out rc
-  out=$(sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1)
-  rc=$?
+  # 默认走 Python dispatch：渲染提示 → 引擎 → 幂等提交 → 账本结算。
+  # 没有可用引擎或显式 NUWA_SUBMIT_MODE=sapper 时才回退 sapper 内部提交，并记事件。
+  if [[ "${NUWA_SUBMIT_MODE:-cli}" == "cli" && -f "$_PKG_DIR/nuwa/cli.py" && -n "${NUWA_ENGINE:-}" ]]; then
+    out=$(PYTHONPATH="$_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 "$_PKG_DIR/nuwa/cli.py" \
+      dispatch "$id" --root "$PWD" --model "$model" --timeout "$to" 2>&1)
+    rc=$?
+  else
+    out=$(sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1)
+    rc=$?
+    event dispatch_fallback "id=$id" "rc=$rc" "mode=${NUWA_SUBMIT_MODE:-cli}"
+  fi
   local dt=$(( $(date +%s) - t0 ))
   printf '%s\n' "$out" | tail -6
   event dispatch_end "id=$id" "rc=$rc" "dur=${dt}s"

@@ -16,18 +16,19 @@ ALLOW_RULES = [
     (r"^(nmap|curl|dig|whois|python3|sapper|nuwa)\b", "A-001"),
 ]
 
-# 提交所有权：fact 只能经 nuwa commit 产生；按 id 的 dispatch/complete 同样走 nuwa。
+# 提交所有权：fact 只能经 nuwa commit 产生。分隔符覆盖 ; & | ( ) 换行引号反引号，
+# 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
 PROMPT_RULES = [
-    (r"(?m)(^|[;\n])\s*sapper\s+done\s+\S+", "P-006"),
-    (r"(?m)(^|[;\n])\s*sapper\s+dispatch\s+i\d+", "P-006"),
-    (r"(?m)(^|[;\n])\s*sapper\s+complete\b", "P-006"),
+    (r"(?:^|[;&|()\n\r\t\"'`\s]|\$\()\s*\\?sapper\s+"
+     r"(?:done\s+\S+|dispatch\s+i\d+|complete\b(?!\s+--from\s+\S+))", "P-006"),
 ]
 
-# 写类工具的目标路径：图与权威状态只能由 CLI 改。
+# 写类工具的目标路径：图与权威状态只能由 CLI 改（路径需先归一为绝对路径）。
 PATH_RULES = [
-    (r"(^|/)\.sapper/(facts|intents)/", "P-005"),
-    (r"(^|/)\.sapper/project\.json$", "P-009"),
-    (r"(^|/)\.nuwa/(journal[^/]*\.jsonl|checkpoint[^/]*\.json|CURRENT|global[^/]*\.jsonl)$", "P-007"),
+    (r"(^|[\\/])\.sapper[\\/](facts|intents)[\\/]", "P-005"),
+    (r"(^|[\\/])\.sapper[\\/]project\.json$", "P-009"),
+    (r"(^|[\\/])\.nuwa[\\/](journal[^\\/]*\.jsonl|checkpoint[^\\/]*\.json|CURRENT|global[^\\/]*\.jsonl)$", "P-007"),
+    (r"(^|[\\/])budget[\\/][^\\/]*\.jsonl$", "P-007"),
 ]
 
 REDACT_RULES = [

@@ -148,6 +148,27 @@ class PolicyTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIsNone(rule)
 
+    def test_prompt_blocks_shell_wrappers(self):
+        for text in (
+            "cd /p && sapper done i001 --fact x",
+            "sh -c 'sapper done i001 --fact x'",
+            "echo $(sapper done i001 --fact x)",
+            "\\sapper done i001 --fact x",
+            "sapper complete",
+        ):
+            ok, rule = policy.check_prompt(text)
+            self.assertFalse(ok, text)
+            self.assertEqual(rule, "P-006", text)
+        ok, rule = policy.check_prompt("sapper complete --from f009")
+        self.assertTrue(ok, rule)
+
+    def test_path_blocks_real_budget_ledger(self):
+        for path in ("/root/sapper-lab/budget/global.jsonl",
+                     "C:\\lab\\.sapper\\facts\\f1.json"):
+            ok, rule = policy.check_path(path)
+            self.assertFalse(ok, path)
+        self.assertEqual(policy.check_path("/root/sapper-lab/budget/global.jsonl")[1], "P-007")
+
     def test_path_rules(self):
         cases = {
             ".sapper/facts/f001.json": "P-005",
@@ -236,6 +257,45 @@ class NightTest(unittest.TestCase):
             bad = night.verify(tmp / "base")
             self.assertFalse(bad["ok"])
             self.assertFalse(bad["checks"]["mode"])
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_night_verify_rejects_malformed_types(self):
+        tmp = Path(tempfile.mkdtemp(prefix="r7-night-bad-"))
+        try:
+            (tmp / "MODE").write_text("soak\n", encoding="utf-8")
+            (tmp / "COMMIT").write_text("abc\n", encoding="utf-8")
+            cases = [
+                {"mode": "soak", "minutes": "abc", "samples": 2, "verdict": {}},
+                {"mode": "soak", "minutes": 1, "samples": 2,
+                 "verdict": {"all_zero": "false", "rss_ok": True, "fd_ok": True, "facts_ok": True}},
+                {"mode": "soak", "minutes": 1, "samples": 2, "verdict": ["ok"]},
+            ]
+            for body in cases:
+                (tmp / "REPORT.json").write_text(json.dumps(body), encoding="utf-8")
+                v = night.verify(tmp)
+                self.assertFalse(v["ok"], body)
+                self.assertIn("error", v)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_night_verify_expect_commit(self):
+        tmp = Path(tempfile.mkdtemp(prefix="r7-night-expect-"))
+        old = dict(os.environ)
+        os.environ.update({
+            "PATH": f"{HERE}:{old.get('PATH','')}",
+            "SAPPER_HOME": str(tmp / "lab"),
+            "PI_AGENT_HOME": str(tmp / "agent"),
+            "NUWA_ENGINE": "fake-claude",
+            "NUWA_MAX_ROUNDS": "1",
+        })
+        try:
+            night.run(tmp / "base", minutes=0.02, projects=2, interval=0.01, model="fake")
+            self.assertTrue(night.verify(tmp / "base", expect_commit="deadbeef")["ok"] is False)
+            real = (tmp / "base" / "COMMIT").read_text().strip()
+            self.assertTrue(night.verify(tmp / "base", expect_commit=real)["ok"])
         finally:
             os.environ.clear()
             os.environ.update(old)

@@ -76,7 +76,7 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     if not intent:
         raise DispatchError(f"intent 不存在: {intent_id}")
 
-    attempt = int(intent.get("x-nuwa-attempt", 0))
+    attempt = txn.attempt_of(intent)
     key = txn.dispatch_key(project, intent_id, attempt)
     existing = graph.find_fact_by_key(root, key)
     if existing:

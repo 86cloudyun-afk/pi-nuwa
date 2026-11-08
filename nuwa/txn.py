@@ -14,6 +14,22 @@ from .locks import FileLock, is_locked
 from .paths import ensure_nuwa
 
 
+def attempt_of(intent: dict) -> int:
+    """严格读取 x-nuwa-attempt：只接受非负整数或其十进制字符串，其余报错。"""
+    raw = intent.get("x-nuwa-attempt", 0)
+    if isinstance(raw, bool):
+        raise CommitError(f"x-nuwa-attempt 非法: {raw!r}")
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        value = int(raw.strip())
+    else:
+        raise CommitError(f"x-nuwa-attempt 非法: {raw!r}")
+    if value < 0:
+        raise CommitError(f"x-nuwa-attempt 为负: {value}")
+    return value
+
+
 def dispatch_key(project: str, intent: str, attempt_seq: int) -> str:
     raw = f"{project}|{intent}|{attempt_seq}".encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()

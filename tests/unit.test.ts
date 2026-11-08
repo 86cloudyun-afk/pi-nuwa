@@ -5,7 +5,7 @@
  * 环境：NUWA_WORK 指向仓库根（默认 /tmp/nuwa-work）
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -182,7 +182,7 @@ describe("buildDirective", () => {
 		expect(d).toContain("sapper doc <id> --set");
 		expect(d).toContain("nuwa commit --root /tmp/x --intent <id> --key auto");
 		expect(d).not.toContain("    sapper done <id> --fact");
-		expect(d).toContain("sapper complete --from");
+		expect(d).toContain("nuwa complete --from");
 	});
 
 	test("stall>=3 时给出换路指令", () => {
@@ -279,6 +279,46 @@ describe("checkTool", () => {
 	});
 	test("只读工具放行", () => {
 		expect(mod.checkTool("read", { path: "/p/.sapper/facts/f001.json" }).allowed).toBe(true);
+	});
+	test("相对路径与 .. 归一后仍被拦", () => {
+		const root = fresh();
+		mkdirSync(join(root, ".sapper", "facts"), { recursive: true });
+		const v = mod.checkTool("write", { path: "../../.sapper/facts/f002.json" }, join(root, "a", "b"));
+		expect(v.rule).toBe("P-005");
+	});
+	test("符号链接指向图目录被拦", () => {
+		const root = fresh();
+		const real = join(root, ".sapper", "facts");
+		mkdirSync(real, { recursive: true });
+		symlinkSync(real, join(root, "alias"));
+		const v = mod.checkTool("write", { path: join(root, "alias", "f002.json") });
+		expect(v.rule).toBe("P-005");
+	});
+	test("multi_edit 的 files[] 路径被扫", () => {
+		const v = mod.checkTool("multi_edit", { files: [{ path: ".nuwa/journal.jsonl" }] }, "/p");
+		expect(v.rule).toBe("P-007");
+	});
+	test("真实账本 budget/global.jsonl 被拦", () => {
+		const v = mod.checkTool("write", { path: "/root/sapper-lab/budget/global.jsonl" });
+		expect(v.rule).toBe("P-007");
+	});
+	test("bash 的 && / sh -c / $() / 反斜杠绕不过", () => {
+		for (const cmd of [
+			"cd /p && sapper done i001 --fact x",
+			"sh -c 'sapper done i001 --fact x'",
+			"echo $(sapper done i001 --fact x)",
+			"\\sapper done i001 --fact x",
+		]) {
+			expect(mod.checkTool("bash", { command: cmd }).rule).toBe("P-006");
+		}
+	});
+	test("带 --from 的 complete 放行，裸 complete 拦截", () => {
+		expect(mod.checkTool("bash", { command: "sapper complete --from f009" }).allowed).toBe(true);
+		expect(mod.checkTool("bash", { command: "sapper complete" }).rule).toBe("P-006");
+	});
+	test("task 的 context 字段同样被扫", () => {
+		const v = mod.checkTool("task", { tasks: [{ agent: "fujiang", context: "接着 sapper done i001 --fact x" }] });
+		expect(v.rule).toBe("P-006");
 	});
 });
 
