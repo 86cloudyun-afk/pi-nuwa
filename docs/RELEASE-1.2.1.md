@@ -308,6 +308,29 @@
 | B25 | 空 status/数组/普通 intent 的 from 未校验 | status 必填白名单；数组/非对象置 corrupt；所有 intent 的 from 校验成员类型 |
 | B30 | shell 锁内有效完成与已回滚共用 exit 0 | 有效完成返回 3，`completion_ok` 记 `project_completed` 并停机 |
 
+## 第三十六轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B30 | `rc=3` 被 `|| exit 1` 覆盖，有效完成分支不可达 | shell 先捕获 `_prc`，3 直接 `exit 3`，其余非零 `exit 1` |
+| B40 | `cd` 进入目录链接后，相对 `..` 仍按字面 baseDir | `walk` 的相对起点改用 `realpath(baseDir)` |
+| B25 | `strong[kind]` 可被原型链键（如 `toString`）误判 | 改为显式 `kind === flag/vuln/loot` 比较 |
+
+## 第三十七轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| 锁泄漏（四） | SIGKILL 孤儿继承 fd 9 持有 `.nuwa.lock` | `sapper`/`python3` 函数 wrapper 统一 `9>&-`；flock 失败时只扫描 cmdline 含 `nuwa` 的进程，清掉指向锁文件的 fd 后重试 |
+| B30 | `rc=3` 被 `|| exit 1` 覆盖 | 先捕获 `_prc`，3 直接 `exit 3` |
+| B40 | 链接 cwd 下的相对 `..` | `walk` 相对起点用 `realpath(baseDir)` |
+| B25 | `strong` 原型链键误判 | 显式 `kind === flag/vuln/loot` |
+
+## 第三十八轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| 锁泄漏（五） | 孤儿清理误杀正在运行的合法 nuwa 实例 | 只清理 PPID=1 的进程；合法实例 PPID 是 shell/test，不进入清理 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

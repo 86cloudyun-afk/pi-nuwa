@@ -185,7 +185,13 @@ function resolvePath(value: string, baseDir: string): string[] {
 	const normalized = raw.replace(/\\/g, "/");
 	const abs = isAbsolute(normalized) ? normalized : join(baseDir, normalized);
 	const walk = (p: string): string => {
-		let cur = isAbsolute(p) ? "/" : baseDir;
+		let cur = isAbsolute(p) ? "/" : (() => {
+			try {
+				return realpathSync(baseDir);
+			} catch {
+				return baseDir;
+			}
+		})();
 		for (const seg of p.split("/")) {
 			if (!seg || seg === ".") continue;
 			if (seg === "..") {
@@ -521,10 +527,11 @@ export function readGraph(root: string): Graph | null {
 	} catch {
 		corrupt = true;
 	}
-	const strong: Record<string, true> = { flag: true, vuln: true, loot: true };
+	const isStrong = (kind?: string): boolean =>
+		kind === "flag" || kind === "vuln" || kind === "loot";
 	verified = !corrupt && goalEdges.length > 0 && goalEdges.every((edge) =>
 		edge.status === "complete" && edge.refs.length > 0 &&
-		edge.refs.every((id) => strong[kinds[id] ?? ""] === true));
+		edge.refs.every((id) => isStrong(kinds[id])));
 	let viewUrl: string | null = null;
 	try {
 		const v = readFileSync(join(root, ".sapper", "view.url"), "utf8").trim();
