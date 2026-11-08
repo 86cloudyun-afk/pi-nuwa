@@ -17,10 +17,10 @@
 | `test_r1_dispatch.py` | 2 | 2 pass | 预留/幂等 |
 | `test_r1_run.py` | 1 | 1 pass | round 循环 |
 | `test_r1_multi.py` | 1 | 1 pass | 四项目并发 |
-| `test_r2_r7.py` | 28 | 28 pass | 公平/证据/指标/策略/插件/夜跑 |
+| `test_r2_r7.py` | 29 | 29 pass | 公平/证据/指标/策略/插件/夜跑 |
 | `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
 
-合计 **141 例 + 16 runs**。
+合计 **142 例 + 16 runs**。
 
 ## 二、门禁
 

@@ -299,11 +299,11 @@ dispatch_one() {
       return 3
     fi
     out=$(PYTHONPATH="$_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 "$_PKG_DIR/nuwa/cli.py" \
-      dispatch "$id" --root "$PWD" --model "$model" --timeout "$to" 2>&1)
+      dispatch "$id" --root "$PWD" --model "$model" --timeout "$to" 2>&1 9>&-)
     rc=$?
   elif [[ "$mode" == "sapper" ]]; then
     event dispatch_legacy "id=$id" "mode=sapper"
-    out=$(sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1)
+    out=$(sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1 9>&-)
     rc=$?
   else
     log "ERROR: NUWA_SUBMIT_MODE 只能是 cli 或 sapper（当前 $mode）" >&2
@@ -466,7 +466,7 @@ done
 # 收工前修复未完成事务：预留不悬挂到下一轮
 if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
   PYTHONPATH="$_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 "$_PKG_DIR/nuwa/cli.py" \
-    recover --root "$PWD" --repair >/dev/null 2>&1 || true
+    recover --root "$PWD" --repair >/dev/null 2>&1 9>&- || true
 fi
 
 failed=0

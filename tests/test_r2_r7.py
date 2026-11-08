@@ -162,6 +162,16 @@ class PolicyTest(unittest.TestCase):
         ok, rule = policy.check_command("sapper complete --from f009")
         self.assertFalse(ok, rule)
 
+    def test_command_blocks_global_store_forms(self):
+        for text in (
+            "sapper --store /p/.sapper done i001 --fact x",
+            'sapper --store="/p/a b/.sapper" done i001 --fact x',
+            "sapper -s/p/.sapper done i001 --fact x",
+        ):
+            ok, rule = policy.check_command(text)
+            self.assertFalse(ok, text)
+            self.assertEqual(rule, "P-006", text)
+
     def test_path_blocks_real_budget_ledger(self):
         for path in ("/root/sapper-lab/budget/global.jsonl",
                      "C:\\lab\\.sapper\\facts\\f1.json"):

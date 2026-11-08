@@ -92,7 +92,7 @@ const PATH_RULES: Array<[RegExp, string]> = [
  */
 // 只在命令分隔符之后剥离开关，避免删除引号内的可执行文本或跨分隔符吞 token。
 const GLOBAL_OPT_RE =
-	/(^|[;&|()\n]|\bsapper\s+)(\s*)((?:(?:--store|-s)(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+)|\S+)?\s*)+)/g;
+	/(^|[;&|()\n]|\bsapper\s+)(\s*)((?:(?:--store|-s)(?:=(?:"[^"]*"|'[^']*'|[^\s;&|()]+)|\s+(?:"[^"]*"|'[^']*'|[^\s;&|()]+)|[^\s;&|()]+)?\s*)+)/g;
 
 function stripGlobalOptions(cmd: string): string {
 	return cmd.replace(GLOBAL_OPT_RE, "$1$2");
@@ -114,7 +114,7 @@ function candidateDirs(cmd: string, baseDir: string): string[] {
 		}
 	};
 	addChain(baseDir);
-	for (const m of cmd.matchAll(/(?:^|[;&|]\s*)cd\s+([^\s;|&>]+)/g)) {
+	for (const m of cmd.matchAll(/(?:^|[;&|]|\n)\s*cd\s+([^\s;|&>]+)/g)) {
 		const target = m[1].replace(/^["']|["']$/g, "");
 		// 每个 cd 可能成功、失败或停在任意祖先：对所有当前候选都解析一次。
 		for (const base of [...dirs]) {
