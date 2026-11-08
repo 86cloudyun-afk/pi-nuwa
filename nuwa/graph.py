@@ -78,6 +78,8 @@ def _atomic_json(path: Path, data: dict) -> None:
 
 
 def set_intent_field(root: str | Path, intent_id: str, field: str, value) -> bool:
+    if not _safe_id(intent_id):
+        return False
     p = Path(root) / ".sapper" / "intents" / f"{intent_id}.json"
     data = _load(p)
     if not data:
@@ -107,6 +109,8 @@ def patch_intent(root: str | Path, intent_id: str, fact_id: str, worker: str = "
 
 
 def annotate_fact(root: str | Path, fact_id: str, key: str) -> None:
+    if not _safe_id(fact_id):
+        return
     p = Path(root) / ".sapper" / "facts" / f"{fact_id}.json"
     data = _load(p)
     if not data:

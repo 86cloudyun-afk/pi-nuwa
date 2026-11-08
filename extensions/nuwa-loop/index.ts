@@ -524,7 +524,7 @@ export function readGraph(root: string): Graph | null {
 				|| !fact.description || !fact.created_at || !fact.creator) corrupt = true;
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
-			if (fact?.kind) kinds[f.replace(/\.json$/, "")] = fact.kind;
+			kinds[f.replace(/\.json$/, "")] = fact.kind ?? "";
 		}
 	} catch {
 		corrupt = true;

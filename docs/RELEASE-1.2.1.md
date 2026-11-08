@@ -424,6 +424,13 @@
 | M78 | 扩展只把 truthy kind 的 fact 加入引用映射，kind 缺省/null 的合法 fact 被判 corrupt | 所有 fact id 都写入 `kinds`（kind 缺省为空串），引用完整性只查 id 存在 |
 | B50 | 路径型 intent/fact id 可拼接出图外路径并 patch 外部 JSON | `graph.get_intent/get_fact/patch_intent` 统一 `_safe_id`（`[A-Za-z0-9._-]+`），拒绝 `/`、`..` |
 
+## 第五十二轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| M78 | 上一轮替换未命中 `fact?.kind`，修复未落地 | 实际改为 `kinds[id] = fact.kind ?? ""`，未分类 fact 也进入引用映射 |
+| B50 | 公共写入层 `annotate_fact`/`set_intent_field` 仍拼接 id | 两处统一 `_safe_id`，路径型 id 直接拒绝 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
