@@ -117,4 +117,18 @@
 
 ## Round 13 — 2026-11-08
 
+- 结论：**fail**，85/100（分数达标，仍有 2 项阻断）
+- 阻塞 2 项：回退上一代缺少切代后新增 journal 尾部的保存；引擎突破预留时 remaining_global 可为负，与"恒非负"验收冲突
+- 修订：切代写 `journal.<gen-1>.tail.jsonl` 并按 seq 去重；透支改为显式 `major_overrun` + 项目冻结 + `nuwa budget add` 补平
+- 同步：恢复改两段断言（at_cut 与 queue 增量）；0.3.x schema 失配会清空，回滚不得指向 schema 3 目录；长测按项目分别判定；门禁 JSON 解析失败即失败
+
+## Round 14 — 2026-11-08
+
+- 结论：**fail**，85/100（分数达标，仍有 2 项阻断）
+- 阻塞 2 项：tail 只在切代时生成，切代后的 commit_done 不在回退集合；增量未包含冻结期间接受的 queue 条目
+- 修订：tail 改为切代后**双写**直至 gen+1；export-delta 增加 `accepted_at > frozen_at` 且未落账的 queue 条目
+- 同步：账本误差拆成记账错误 0 与估算误差 ≤1 预留，并定义观测切点；证据改由工具执行层采集（executor-hook/subagent-hook），引擎 stdout 永不作为证据；风险表区分硬拒绝与置信度覆盖并定 7 天窗口；文档路径区分仓库与沙盒
+
+## Round 15 — 2026-11-08
+
 （待填）

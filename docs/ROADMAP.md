@@ -76,7 +76,7 @@
 - Bloom 仅作快速否定：Bloom 判"不存在"→ 新事务；"可能存在"→ 必须查索引；索引查不到 → **按新事务处理**，绝不跳过。
 - 压缩保留 checkpoint + `seq > checkpoint.seq` 的记录 + `unresolved` 完整记录 + 全量索引。
 压缩下界 = `min(所有活跃快照的 cut_seq[p], checkpoint.seq)`；`snapshots.idx` 登记每个快照的 cut 与引用计数，仍有快照引用时不得删除其后的记录，引用归零后才可 GC。
-代际文件：`checkpoint.<gen>.json`、`index.<gen>.idx`、`journal.<gen>.jsonl` 一律不覆盖；每代写完 fsync 后，原子更新 `CURRENT`（tmp+rename）指向 gen；上一代保留到下一次压缩成功，截断只作用于 gen-2 及更早。切代时把 `seq > checkpoint.<gen-1>.seq` 的记录写入 `journal.<gen-1>.tail.jsonl`，保留到 gen+1。回退上一代 = `checkpoint.<gen-1>` + `journal.<gen-1>` + tail，按 seq 去重；因此切代后新增的 `commit_done` 不会丢失。
+代际文件：`checkpoint.<gen>.json`、`index.<gen>.idx`、`journal.<gen>.jsonl` 一律不覆盖；每代写完 fsync 后，原子更新 `CURRENT`（tmp+rename）指向 gen；上一代保留到下一次压缩成功，截断只作用于 gen-2 及更早。切代后，新记录**同时追加**到 `journal.<gen>.jsonl` 与 `journal.<gen-1>.tail.jsonl`，直到 gen+1 压缩成功。回退上一代 = `checkpoint.<gen-1>` + `journal.<gen-1>` + tail（含切代后的全部记录），按 seq 去重；因此切代后新增的 `commit_done` 不会丢失。
 重放断言：run/账本/facts 与压缩前一致，且无重复 `commit_done`。
 
 ## 4. 各阶段
@@ -145,10 +145,11 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 验收：
 - 8 个项目同时运行，`nuwa ls --json` 与实际进程一致（≤2s）
+- 观测切点：恢复后等待 inflight 为空且 queue 排空，再做账本比对。
 - 十个崩溃点（reserve 后、prepare 后、spawn 后未写 executing、执行中、executed 后、done_apply 中、ledger_settle 中、压缩写 checkpoint 后、索引更新后、journal 截断前）各 20 次 SIGKILL：
   - 同一 intent 同时存活子进程 ≤1（inflight 锁证明）
   - 丢失 fact 0、重复 fact 0（完整键去重）
-  - 崩溃尝试均有 `executed`，账本误差 ≤1 次预留
+  - 崩溃尝试均有 `executed`；记账错误（漏结算/重复扣）为 0，估算误差 `|estimated-actual|` ≤1 次预留
 - 0.3.1 项目接管：facts/intents 不丢，重启两次不重置计数，`opening_balance` 只写一次
 - checkpoint 压缩后重放一致；run.json 截断 50% 可重放
 
@@ -224,7 +225,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 - **哈希规范 v1**：`norm_sha256` 针对归一化字节（去 ANSI、CRLF→LF，步骤写死）；`raw_sha256` 针对原始字节。两者都存。
 - **脱敏解耦**：R5 只作用于日志、报告、events、fact 预览；永不改写 artifact 与哈希。
-- **采集来源**：执行器 wrapper，模型自报字段拒绝。
+- **采集来源**：由**工具执行层**采集——bash 循环在命令执行时截获 stdout/stderr/exit_code 并写 artifact；会话内子代理由 `nuwa-loop` 的 `tool_result` 钩子采集。引擎 stdout 只是模型文本，永不作为证据；`evidence.source` 取值 `executor-hook|subagent-hook`，缺失即拒绝。
 - **目标绑定**：`target` 与 intent 目标一致。
 - **断言**：`op` 限 `contains/regex/eq/gt/lt`；默认对 artifact 前 1MB 求值，超限置 `truncated` 并拒绝依赖截断部分的断言。
 - **新鲜度**：`captured_at` 距 `done` ≤30 分钟。
@@ -326,7 +327,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.jsonl`（冻结期间已接受的 commit/结算请求）。
 7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。恢复分两段断言：`restore` 后 facts 与余额必须等于 `at_cut_*`；重放 queue 后必须等于 `at_cut_* + queue 产生的增量`，两段分别校验。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
 
-**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；旧扩展遇到 schema 3 必须 fail-closed（拒绝上膛并写 `state_schema_too_new`），不得静默重置。
+**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）、以及 `accepted_at > snapshot.frozen_at` 且尚未写入 journal/账本的 `queue.jsonl` 条目（按 txn_id 去重）；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；旧扩展遇到 schema 3 必须 fail-closed（拒绝上膛并写 `state_schema_too_new`），不得静默重置。
 
 **初始化/迁移样本**：
 
@@ -399,7 +400,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 | omp 扩展 API 变化 | 启动版本检查失败；`session_stop` 不触发 | 续跑失效 | 切兼容层，降级 bash 循环 | 会话 block 用例 |
 | 多项目锁竞争 | `nuwa ls` waiting >30s | 吞吐下降 | 降并发，检查 registry pid | 8 项目推进 |
 | 模型成本失控 | 账本 1 小时增幅 >预算 20% | 超支 | 路由降级 + 硬上限 | overspend ≤5% |
-| 证据验收误报 | verify 拒绝率 >10% | 阻塞推进 | 人工覆盖 + 审计 | 抽样复核一致 |
+| 证据验收误报 | 7 天滚动窗口拒绝率 >10% | 阻塞推进 | 仅置信度阈值可 `--force-confidence`；五类硬拒绝不可覆盖；抽样 20 条人工复核 | 复核结论与规则一致 |
 | schema 迁移失败 | migrate 非零退出 | 状态不可用 | 停止升级，恢复快照 | validate + 旧版查询 |
 
 固定依赖：sapper 固定到 `c91881dc1629409bbf278577dfdaa6b8f383b438`（CI 已写入 `SAPPER_REF`）；契约检查记录真实版本字符串；E2E 在真实 sapper 缺失时必须失败，仅 `NUWA_ALLOW_FAKE_SAPPER=1` 允许回退，CI 禁用该变量。

@@ -72,8 +72,8 @@
 
 ```bash
 cd <repo> && ./tests/run.sh                 # 五套，约 5 分钟
-./bin/run-all.sh --soak-minutes 5           # 加靶场断言 + 矩阵 + 小长测
-./bin/matrix.py --replicas 2 --minutes 1    # 单独跑矩阵
+/srv/nuwa-sandbox/bin/run-all.sh --soak-minutes 5   # 沙盒部署路径           # 加靶场断言 + 矩阵 + 小长测
+/srv/nuwa-sandbox/bin/matrix.py --replicas 2 --minutes 1    # 单独跑矩阵
 ```
 
 ## 七、仓库布局复跑
