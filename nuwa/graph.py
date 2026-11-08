@@ -9,6 +9,10 @@ from .paths import sapper_home
 from pathlib import Path
 
 
+def _safe_id(item_id: str) -> bool:
+    return bool(__import__("re").fullmatch(r"[A-Za-z0-9._-]+", item_id or ""))
+
+
 def _load(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -45,10 +49,14 @@ def facts(root: str | Path) -> list[dict]:
 
 
 def get_intent(root: str | Path, intent_id: str) -> dict | None:
+    if not _safe_id(intent_id):
+        return None
     return _load(Path(root) / ".sapper" / "intents" / f"{intent_id}.json")
 
 
 def get_fact(root: str | Path, fact_id: str) -> dict | None:
+    if not _safe_id(fact_id):
+        return None
     return _load(Path(root) / ".sapper" / "facts" / f"{fact_id}.json")
 
 
@@ -82,6 +90,8 @@ def set_intent_field(root: str | Path, intent_id: str, field: str, value) -> boo
 
 
 def patch_intent(root: str | Path, intent_id: str, fact_id: str, worker: str = "nuwa") -> dict:
+    if not _safe_id(intent_id):
+        raise FileNotFoundError(f"intent {intent_id} not found")
     p = Path(root) / ".sapper" / "intents" / f"{intent_id}.json"
     data = _load(p)
     if not data:

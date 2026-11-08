@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO))
 
 from nuwa.journal import Journal, replay_state  # noqa: E402
 from nuwa.ledger import Ledger  # noqa: E402
-from nuwa import txn  # noqa: E402
+from nuwa import graph, txn  # noqa: E402
 
 
 def env_for(tmp: Path) -> dict:
@@ -417,6 +417,12 @@ class TxnTest(unittest.TestCase):
         self.assertEqual(intent["to"], r1["fact"])
         fact = json.loads((self.root / ".sapper" / "facts" / f"{r1['fact']}.json").read_text())
         self.assertIn(f"[nuwa:{key}]", fact["description"])
+
+    def test_path_like_id_rejected(self):
+        self.assertIsNone(graph.get_intent(self.root, "../project"))
+        self.assertIsNone(graph.get_fact(self.root, "../../etc/passwd"))
+        with self.assertRaises(FileNotFoundError):
+            graph.patch_intent(self.root, "../x", "f001")
 
     def test_commit_auto_key_is_idempotent(self):
         cmd = [sys.executable, "-m", "nuwa.cli", "commit", "--root", str(self.root),
