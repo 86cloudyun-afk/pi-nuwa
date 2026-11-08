@@ -173,4 +173,18 @@
 
 ## Round 21 — 2026-11-08
 
-（待填）
+- 结论：**PASS**，90/100，blocking=0
+- 评分：measurable 9 / sequencing 10 / acceptance 8 / risk 9 / scope 10 / compatibility 8
+- 评审意见：现有内容足以开工；3 项 major 可在对应阶段补齐
+  - M1 提交所有权切换后，需同步替换 `tests/unit.test.ts` 与 `test_nuwa_shell.py` 中旧的 `sapper done` 断言，并加会话入口绕过事务提交的回归
+  - M2 引擎插件接口需补 usage/结果/证据引用/错误字段与签名验证输入
+  - M3 两周观察需日报格式、故障记录来源、缺测处理规则
+- 2 项 minor：废弃项移除语义与 `SAPPER_TIMEOUT` 映射结束行为；日志分层中“恢复只读 journal + 索引”的表述范围
+
+## 签核
+
+- 评审员：Codex CLI 0.164.0，`gpt-6.1-sol`，reasoning `max`，只读沙盒
+- 轮次：21（63 → 68 → 70 → 80 → 70 → 75 → 82 → 77 → 78 → 78 → 83 → 83 → 85 → 85 → 82 → 83 → 83 → 82 → 88 → 87 → 90）
+- 最终判定：**pass**（score 90，blocking 0）
+- 证据：`docs/REVIEW-ROUND-21.json`
+
