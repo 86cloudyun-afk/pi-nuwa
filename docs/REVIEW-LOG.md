@@ -131,4 +131,11 @@
 
 ## Round 15 — 2026-11-08
 
+- 结论：**fail**，82/100
+- 阻塞 3 项：跨文件 reserve 缺写入顺序与孤立记录恢复；锁释放即回收额度导致提前放量双花；快照打包活 queue 文件缺切点
+- 修订：reserve 三段式 + orphan_reserve TTL；额度生命周期 reserved→pending_settlement→settled，结算前不释放；快照在 barrier 内复制 queue 前缀并记 queue_cut_seq
+- 同步：0.9+ 与 0.3.x 的 schema 能力分开表述；崩溃点拆 fake 快跑组与真实 sapper 夜跑组；长测固定引擎/负载/预算与两周暴露规则；正常/异常路径分别验收
+
+## Round 16 — 2026-11-08
+
 （待填）

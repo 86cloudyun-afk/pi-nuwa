@@ -122,7 +122,9 @@ reserve → executing_prepare → executing → executed → commit_prepare
         → done_apply → intent_verify → ledger_settle → commit_done → ack
 ```
 
-- `attempt_seq` 每 intent 从 0 递增；`dispatch_key = sha256(project|intent|attempt_seq)`。
+ - `attempt_seq` 每 intent 从 0 递增；`dispatch_key = sha256(project|intent|attempt_seq)`。
+- `reserve` 分三步：journal 写 `reserve_pending(txn,rid,amount)` → 全局账本 append `reserve(rid)` → journal 写 `reserve_committed`。
+- 恢复：`pending` 且全局无对应 `rid` → 删除；全局有 `rid` 但 journal 无 committed → 标 `orphan_reserve`，按 TTL 回收（R1 提供基础租约）。
 - `executing_prepare`：spawn 前写，无 pid，含 txn_id、key。
 - `executing`：spawn 成功后写，含 pid、pid_starttime。
 - `executed`：进程退出或确认死亡后**必写**，`status: ok|crashed|timeout`，含 exit_code、artifact（可为 null）、tokens（实际或估算）、`settled:false`、`rid`。
@@ -146,7 +148,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 验收：
 - 8 个项目同时运行，`nuwa ls --json` 与实际进程一致（≤2s）
 - 观测切点：恢复后等待 inflight 为空且 queue 排空，再做账本比对。
-- 十个崩溃点（reserve 后、prepare 后、spawn 后未写 executing、执行中、executed 后、done_apply 中、ledger_settle 中、压缩写 checkpoint 后、索引更新后、journal 截断前）各 20 次 SIGKILL：
+- 十个崩溃点分两组：**fake-sapper 快跑组**（reserve 后、prepare 后、spawn 后、executed 后、压缩写 checkpoint 后、索引更新后）每次 20 轮；**真实 sapper 夜跑组**（执行中、done_apply 中、ledger_settle 中、journal 截断前）每次 5 轮。两组都要求：
   - 同一 intent 同时存活子进程 ≤1（inflight 锁证明）
   - 丢失 fact 0、重复 fact 0（完整键去重）
   - 崩溃尝试均有 `executed`；记账错误（漏结算/重复扣）为 0，估算误差 `|estimated-actual|` ≤1 次预留
@@ -177,7 +179,8 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 在途：单项目 ≤ `--parallel`，全局 ≤ `NUWA_GLOBAL_CONCURRENCY`。
 - 暂停：`overdraft` 或人工暂停期间 wall 不计时（记录 pause/resume 时间戳）。
 
-- 预留续租：`executing` 期间每 2 分钟 `renew`；TTL 10 分钟；锁判死即 `reclaim`。
+- 预留生命周期：`reserved`（执行中）→ `pending_settlement`（executed 后额度仍占用）→ `settled`（释放）。只有 `reserved` 且锁空闲、且无 executed 记录才可 `reclaim`；`pending_settlement` 必须等结算完成才释放额度，避免提前释放造成双花。
+- 续租：`executing` 期间每 2 分钟 `renew`；TTL 10 分钟。
 - 迟到结算：`late_settle` 按 `rid` 匹配，不重复扣。
 - 超支：三类均以各自额度为分母（tokens/dispatches 用 reserve，wall 用 wall_cap）；`overspend = max(0, actual - quota)/quota`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`、项目暂停、门禁失败。
 - 公平性：三个持续就绪项目共享 60s 窗口；每项目按并发槽位累计 busy 秒（sum over slots，不用并集），分母为三者之和；等权 1:1:1 各 33%±5pp，加权 2:1:1 为 50%/25%/25%±5pp；每项目 ≥10 次 dispatch。
@@ -194,7 +197,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 路由：reason 使用强模型、explore 使用廉价模型；强模型失败时按链回退，事件记录 `model` 与 `fallback_from`
 - 准入拒绝、硬上限截断（含 `per_task_cap` 由全局余量决定）、暂停不计 wall 三类用例通过
 - 429 轮换后重复 fact 0
-- 账本并发扣减无负数；journal 重放与账本一致（跨项目快照一致性属 R6 验收）
+- 正常路径：账本并发扣减无负数；异常路径：引擎越限记为 `major_overrun` 并允许 `remaining_global` 为负，但项目必须冻结；两条路径分别验收；journal 重放与账本一致（跨项目快照一致性属 R6 验收）
 
 ### R3 证据质量与反幻觉（0.6.0）
 
@@ -321,13 +324,13 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 1. 短暂获取 `global.lock`：写 `$SAPPER_HOME/budget/freeze.json`（`freeze=true`、`owner_pid`、`snapshot_id`、`renewed_at`、`expires` 10min），记录 `freeze_seq`，释放；快照进程每 60s 续租。其他进程只有在 owner 进程已死时才可清除过期 freeze（写 `freeze_recovered`）；解冻必须匹配 `snapshot_id`，旧快照不能清除新快照的 freeze。commit/结算队列持久化在 `queue.jsonl`，启动时重放。冻结后**新 dispatch 拒绝；commit 全路径与新结算一律入队**。
 2. 等待 inflight 全部到达 `executed`（只等执行结束，**不等 commit 队列**），最长 120s；超时则 kill 子进程、写 `executed{crashed}` 并入队。
-3. 获取 `global.lock`，再按固定顺序获取各项目锁（barrier）；记录 `global_cut_seq` 与每个项目 journal 的 `cut_seq[p]`；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
+3. 获取 `global.lock`，再按固定顺序获取各项目锁（barrier）；记录 `global_cut_seq`、每个项目 journal 的 `cut_seq[p]` 与 `queue_cut_seq`；把队列前缀复制为 `queue.<snapshot_id>.jsonl`（此后接受的请求 seq > queue_cut，归入 delta）；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
 4. 在各项目锁内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；导出完成后校验每个项目 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
 5. 复制 artifact 原始字节到 `snapshot/artifacts/`（默认开启；关闭时标 `evidence_incomplete`）。
 6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.jsonl`（冻结期间已接受的 commit/结算请求）。
 7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。恢复分两段断言：`restore` 后 facts 与余额必须等于 `at_cut_*`；重放 queue 后必须等于 `at_cut_* + queue 产生的增量`，两段分别校验。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
 
-**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）、以及 `accepted_at > snapshot.frozen_at` 且尚未写入 journal/账本的 `queue.jsonl` 条目（按 txn_id 去重）；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；旧扩展遇到 schema 3 必须 fail-closed（拒绝上膛并写 `state_schema_too_new`），不得静默重置。
+**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）、以及 `accepted_at > snapshot.frozen_at` 且尚未写入 journal/账本的 `queue.jsonl` 条目（按 txn_id 去重）；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9+ 扩展遇到 schema 3 必须 fail-closed（拒绝上膛并写 `state_schema_too_new`），不得静默重置；0.3.x 无此能力，回滚不得指向 schema 3 目录。
 
 **初始化/迁移样本**：
 
@@ -354,7 +357,8 @@ reserve → executing_prepare → executing → executed → commit_prepare
 **目标**：可以长期挂着跑，升级/回滚可整体操作。
 
 长测协议：
-- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 60`；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
+- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 60`；引擎固定 omp + `deepseek-flash`，负载固定 4 项目 × 每轮 8 个 intent，单项目预算 2M tokens；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
+- 两周观察：候选版本 = release tag；暴露量 = 72h 连续 + 14 天等价负载；出现新提交后计时重置
 - 采样间隔 30s；PID 范围 = 各项目进程树；**所有判据按项目分别计算**（每项目 RSS 斜率、FD 差、dispatch/hour、facts 增长），任一项目不达标即失败；全局汇总只作展示，不得掩盖单项目停滞
 - 有效运行 ≥259200 秒；提前退出、采样间隔 >60s，判失败
 - **RSS**：预热 20% 后对 RSS(KB)-时间(min) 最小二乘，斜率 <1024 KB/min
