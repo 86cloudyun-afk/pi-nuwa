@@ -131,6 +131,9 @@ def cmd_run(args) -> int:
     if not args.root and not args.target:
         print("nuwa: 需要 target 或 --root", file=sys.stderr)
         return 2
+    if args.root and not (Path(args.root) / ".sapper" / "project.json").exists():
+        print(f"nuwa: 不是 sapper 项目: {args.root}", file=sys.stderr)
+        return 2
     try:
         root = (Path(args.root).resolve() if args.root
                 else _ensure_project(args.target, args.name))

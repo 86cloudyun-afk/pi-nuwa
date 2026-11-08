@@ -32,7 +32,10 @@ def _project_status(root: Path) -> str:
 
 def _evidence(root: Path) -> bool:
     facts = {f.get("id"): f for f in graph.facts(root)}
-    refs = graph.project(root).get("completed_from") or []
+    refs: list[str] = []
+    for it in graph.intents(root):
+        if it.get("to") == "goal" and it.get("status") in ("complete", "done"):
+            refs.extend(str(x) for x in (it.get("from") or []))
     if refs:
         return any(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
                    for fid in refs)
@@ -48,6 +51,14 @@ def _revert(root: Path, why: str) -> None:
     data.pop("completed_at", None)
     data.pop("completed_from", None)
     graph._atomic_json(p, data)
+    # 真实 sapper 的完成边是一条 to=goal 的 intent；不打掉它，validate 会持续报错。
+    for it in graph.intents(root):
+        if it.get("to") == "goal":
+            edge = Path(root) / ".sapper" / "intents" / f"{it['id']}.json"
+            try:
+                edge.unlink()
+            except FileNotFoundError:
+                pass
     hp = Path(root) / ".sapper" / "hints.json"
     hints = graph._load(hp) or []
     hints.append({"content": f"完成被拒绝：{why}", "creator": "nuwa",
@@ -104,6 +115,22 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
         if after:
             _annotate_intent(root, after[0]["id"], key)
             created += 1
+    complete = data.get("complete") if isinstance(data, dict) else None
+    if isinstance(complete, dict):
+        from_ids = [str(x) for x in (complete.get("from") or []) if x]
+        facts = {f.get("id"): f for f in graph.facts(root)}
+        if from_ids and all(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
+                            for fid in from_ids):
+            r = graph.sapper(root, ["complete", "--from", ",".join(from_ids),
+                                    "--note", str(complete.get("description") or "reason complete")],
+                             allow_submit=True)
+            if r.returncode == 0:
+                journal.append("reason_complete", round=round_no, facts=from_ids)
+            else:
+                journal.append("reason_complete_failed", round=round_no,
+                               error=(r.stdout + r.stderr)[:200])
+        else:
+            journal.append("reason_complete_rejected", round=round_no, facts=from_ids)
     journal.append("reason_applied", round=round_no, created=created)
     return created
 

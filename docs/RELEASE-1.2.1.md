@@ -188,6 +188,16 @@
 | B26 | `fact` 的 `--from*` 合法缩写未覆盖 | guard 拦 `--f*`（fact 下唯一前缀） |
 | B25 | reason 完成只查整图证据 | `_evidence` 优先只认 `completed_from` 指向的 fact |
 
+## 第二十一轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B30 | 真实 sapper 无证据完成被打回后，`to=goal` 完成边残留，validate 持续报错 | `_revert` 删除完成边 intent |
+| B25 | 真实完成没有 `completed_from`，退回整图证据 | `_evidence` 读 `to=goal` intent 的 `from` 列表 |
+| M52 | `nuwa run --root` 指向非项目仍成功退出 | `cmd_run` 校验 `.sapper/project.json` |
+| M53 | reason 的 `data.complete` 被忽略 | `_apply_reason` 校验 `complete.from` 的 kind 后走 `sapper complete` |
+| B26 | 真实 `auto`/`brainstorm-pick` 入口未拦 | guard 对 `auto`/`brainstorm-pick`/`sweep` 无 token 直接拦 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

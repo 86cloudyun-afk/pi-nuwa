@@ -88,6 +88,12 @@ class GuardTest(unittest.TestCase):
     def test_allows_fact_without_from_intent(self):
         self.assertNotEqual(self.run_guard("fact", "x", "-k", "host").returncode, 7)
 
+    def test_blocks_auto(self):
+        self.assertEqual(self.run_guard("auto", "--model", "fake").returncode, 7)
+
+    def test_blocks_brainstorm_pick(self):
+        self.assertEqual(self.run_guard("brainstorm-pick", "i001").returncode, 7)
+
     def test_blocks_forged_env(self):
         env = dict(self.env)
         env["NUWA_SUBMIT_ALLOWED"] = "1"

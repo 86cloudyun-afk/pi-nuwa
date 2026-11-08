@@ -73,6 +73,9 @@ case "$cmd" in
       fi
     done
     ;;
+  auto|brainstorm-pick|sweep)
+    (( ALLOWED == 1 )) || block "$cmd"
+    ;;
   fact)
     # fact --from-intent 会原子结案，必须走 nuwa commit。
     for (( j = cmd_idx + 1; j < ${#args[@]}; j++ )); do
