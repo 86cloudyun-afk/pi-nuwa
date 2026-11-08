@@ -119,6 +119,10 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
                 elif '"event": "commit_done"' in line:
                     journal_commits += 1
         facts = _number(rep.get("facts", 0), "facts")
+        baseline = rep.get("facts_baseline") or {}
+        if not isinstance(baseline, dict):
+            raise ValueError("facts_baseline 不是对象")
+        facts_delta = facts - sum(_number(v, "facts_baseline") for v in baseline.values())
         samples_file = base / str(rep.get("samples_file") or "samples.jsonl")
         try:
             raw = [json.loads(line) for line in
@@ -161,7 +165,8 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             "samples": samples >= 2,
             "verdict": True,
             "duration": finished >= started and duration >= minutes * 60 * 0.9,
-            "journal": journal_dispatches > 0 and abs(facts - journal_commits) <= 2,
+            "journal": (journal_dispatches > 0
+                        and abs(facts_delta - journal_commits) <= 2),
             "samples_recalc": recalc_ok,
         }
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,

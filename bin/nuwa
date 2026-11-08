@@ -274,7 +274,7 @@ PY
     return 1
   fi
 
-  nohup sapper --store "$dir/.sapper" view --serve --host 127.0.0.1 --port "$vport" >"$log_file" 2>&1 &
+  nohup sapper --store "$dir/.sapper" view --serve --host 127.0.0.1 --port "$vport" >"$log_file" 2>&1 9>&- &
   echo $! > "$pid_file"
   disown 2>/dev/null || true
 

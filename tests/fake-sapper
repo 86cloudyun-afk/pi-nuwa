@@ -651,13 +651,23 @@ def cmd_complete(store: Store, args: list[str]) -> int:
     if not from_:
         usage_error("error: the following arguments are required: --from")
     p = store.project()
+    from_ids = [x for x in re.split(r"[,\s]+", from_.strip()) if x]
     p["status"] = "completed"
     p["completed_at"] = now_iso()
-    p["completed_from"] = [x for x in re.split(r"[,\s]+", from_.strip()) if x]
+    p["completed_from"] = from_ids
     p["completion_note"] = note or ""
     p["updated_at"] = now_iso()
     store.save_project(p)
-    print(f"[sapper] project completed from {','.join(p['completed_from'])}")
+    # 与真实 sapper 一致：完成边是一条 to=goal 的 intent。
+    if not any(i.get("to") == "goal" for i in store.list_intents()):
+        iid = store.next_id("i")
+        store.save_intent({
+            "id": iid, "from": from_ids, "to": "goal", "status": "complete",
+            "description": note or "complete", "title": None, "doc": None,
+            "creator": "reason", "worker": "reason", "requires_confirmation": False,
+            "confirmed_at": None, "created_at": now_iso(),
+        })
+    print(f"[sapper] project completed from {','.join(from_ids)}")
     return 0
 
 

@@ -708,7 +708,6 @@ export function buildDirective(g: Graph, st: LoopState, workerTag = "fujiang"): 
 
 export default function nuwaLoop(pi: ExtensionAPI) {
 	const cfg = readCfg();
-	if (!cfg.loop) return;
 
 	// 每会话的实时工具调用计数（避免每次 tool_call 都写盘）
 	const liveToolCalls = new Map<string, number>();
@@ -726,11 +725,13 @@ export default function nuwaLoop(pi: ExtensionAPI) {
 	const TRIGGER = /女娲模式|女娲渗透|开图|接入\s*sapper|sapper\s*模式/i;
 
 	pi.on("before_agent_start", (event, ctx) => {
+		if (!cfg.loop) return;
 		if (!TRIGGER.test(event.prompt)) return;
 		arm(ctx.sessionManager.getSessionId());
 	});
 
 	pi.on("input", (event: InputEvent, ctx) => {
+		if (!cfg.loop) return;
 		if (!TRIGGER.test(event.text)) return;
 		arm(ctx.sessionManager.getSessionId());
 	});
@@ -771,6 +772,7 @@ export default function nuwaLoop(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_stop", (event: SessionStopEvent, ctx) => {
+		if (!cfg.loop) return;
 		const sid = String(event.session_id ?? "default");
 		const st = loadState(sid);
 		if (!st.armed || Date.now() - st.armedAt > cfg.guardMs) return;

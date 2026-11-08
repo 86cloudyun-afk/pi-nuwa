@@ -44,6 +44,7 @@ def soak(projects: list[str | Path], minutes: float = 1, interval: float = 5,
     for t in threads:
         t.start()
 
+    baseline = {str(p): len(graph.facts(p)) for p in projects}
     samples = []
     # 至少采两个点：短跑时 runner 可能在第一次 interval 前就结束。
     while any(t.is_alive() for t in threads) or len(samples) < 2:
@@ -74,6 +75,7 @@ def soak(projects: list[str | Path], minutes: float = 1, interval: float = 5,
         "minutes": minutes,
         "samples": len(samples),
         "samples_raw": samples,
+        "facts_baseline": baseline,
         "exit_codes": results,
         "errors": errors,
         "facts": total_facts,

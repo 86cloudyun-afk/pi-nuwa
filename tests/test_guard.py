@@ -2,6 +2,7 @@
 """sapper-guard：执行层提交闸门。"""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -57,10 +58,16 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(self.run_guard("complete", "--from", "f001").returncode, 7)
 
     def test_allows_reason_internal(self):
-        self.assertNotEqual(
-            self.run_internal("dispatch", "reason", "--model", "fake").returncode, 7)
+        proj = self.tmp / "proj2"
+        proj.mkdir()
+        env = dict(self.env)
+        for cmd in (["sapper", "setup", "--goal", "g"],
+                    ["sapper", "fact", "x", "-k", "host"]):
+            subprocess.run(cmd, cwd=proj, env=env, check=True, capture_output=True)
+        r = self.run_internal("dispatch", "reason", "--model", "fake", cwd=proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def run_internal(self, *args):
+    def run_internal(self, *args, cwd=None):
         pkg = self.tmp / "pkg" / "nuwa"
         pkg.mkdir(parents=True, exist_ok=True)
         script = pkg / "cli.py"
@@ -76,11 +83,21 @@ class GuardTest(unittest.TestCase):
         env = dict(self.env)
         env["TOKEN_FILE"] = str(self.tmp / "lab" / ".submit_token")
         return subprocess.run([sys.executable, str(script), *args], env=env,
-                              capture_output=True, text=True, timeout=30)
+                              cwd=str(cwd or self.tmp), capture_output=True,
+                              text=True, timeout=30)
 
     def test_allows_internal_commit(self):
-        self.assertNotEqual(
-            self.run_internal("done", "i001", "--fact", "x").returncode, 7)
+        proj = self.tmp / "proj"
+        proj.mkdir()
+        env = dict(self.env)
+        for cmd in (["sapper", "setup", "--goal", "g"],
+                    ["sapper", "fact", "x", "-k", "host"],
+                    ["sapper", "intent", "--from", "f001", "p"]):
+            subprocess.run(cmd, cwd=proj, env=env, check=True, capture_output=True)
+        r = self.run_internal("done", "i001", "--fact", "ok", cwd=proj)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        intent = json.loads((proj / ".sapper" / "intents" / "i001.json").read_text())
+        self.assertEqual(intent["status"], "done")
 
     def test_allows_version(self):
         self.assertEqual(self.run_guard("--version").returncode, 0)

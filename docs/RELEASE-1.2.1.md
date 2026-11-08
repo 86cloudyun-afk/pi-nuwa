@@ -431,6 +431,17 @@
 | M78 | 上一轮替换未命中 `fact?.kind`，修复未落地 | 实际改为 `kinds[id] = fact.kind ?? ""`，未分类 fact 也进入引用映射 |
 | B50 | 公共写入层 `annotate_fact`/`set_intent_field` 仍拼接 id | 两处统一 `_safe_id`，路径型 id 直接拒绝 |
 
+## 第五十三轮补充（approve_after_fixes 后的 major 清理）
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| M86 | `NUWA_LOOP=0` 在策略 handler 注册前 return，连带关闭工具策略 | 策略 handler 始终注册；仅 arm/续跑逻辑检查 `cfg.loop` |
+| M62 | 看板 `nohup` 继承锁 fd 9 | `nohup ... 9>&-` |
+| M31 | 夜跑 facts 基线按整图比较，四项目恒差 4 | soak 记录逐项目 `facts_baseline`，verify 用增量与 commit_done 比较 |
+| M47 | guard 正例只断言“不等于 7” | 临时项目跑真实 setup/fact/intent，断言 done rc=0 与 intent 状态 |
+| M44 | 测试清理匹配 `/tmp/nuwa-study` | 限定 `-user $(id -u)`，只删当前用户的 `nuwa-*` |
+| M55 | fake complete 不建完成边 | fake-sapper complete 创建 `to=goal` intent，测试断言边存在 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
