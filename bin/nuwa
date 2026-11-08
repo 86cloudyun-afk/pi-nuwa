@@ -357,7 +357,7 @@ except Exception:
     print("no"); raise SystemExit
 goal_fact = None
 for path in glob.glob(".sapper/facts/*.json"):
-    if path.endswith("goal.json"):
+    if path == ".sapper/facts/goal.json":
         goal_fact = json.load(open(path))
 if (not goal_fact or goal_fact.get("id") != "goal" or not proj.get("goal")
         or goal_fact.get("description") != proj.get("goal")):
@@ -393,7 +393,7 @@ revert_completion() {
 # 先删除 to=goal 的完成边，再写 active；否则 validate 会持续报 completion edge。
 facts = {}
 for path in glob.glob(".sapper/facts/*.json"):
-    if path.endswith("goal.json"):
+    if path == ".sapper/facts/goal.json":
         continue
     try:
         f = json.load(open(path)); facts[f.get("id")] = f
@@ -404,6 +404,8 @@ for path in glob.glob(".sapper/intents/*.json"):
     try:
         it = json.load(open(path))
     except Exception:
+        raise SystemExit(1)
+    if not isinstance(it, dict) or it.get("id") != path.rsplit("/", 1)[-1][:-5]:
         raise SystemExit(1)
     if it.get("to") == "goal":
         if not isinstance(it.get("from"), list) or not all(

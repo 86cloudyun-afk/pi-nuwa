@@ -67,9 +67,10 @@ def _revert(root: Path, why: str) -> str:
             # 等待锁期间可能已有新的有效完成，不能误删。
             return "noop"
         # 与真实 sapper 共用 .sapper/.lock：删边、写 active、hint 都在锁内。
-        for it in graph.intents(root):
+        for ipath in sorted((Path(root) / ".sapper" / "intents").glob("*.json")):
+            it = graph._load(ipath) or {}
             if it.get("to") == "goal":
-                edge = Path(root) / ".sapper" / "intents" / f"{it['id']}.json"
+                edge = ipath
                 try:
                     edge.unlink()
                 except FileNotFoundError:

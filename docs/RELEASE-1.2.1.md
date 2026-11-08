@@ -396,6 +396,14 @@
 | B25 | shell 外层 from 直接迭代（dict 迭代键） | 外层校验 `from` 为字符串数组 |
 | B30 | shell 锁内缺 project.status 重判 | 锁内读 project，status != completed 直接 exit 0 |
 
+## 第四十八轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B49 | 外层用 `endswith("goal.json")` 跳过，其他 `*goal.json` 被当 goal | 只跳过精确 `.sapper/facts/goal.json`，其余按普通 fact 校验身份 |
+| B25 | shell 锁内未校验 fact 文件身份 | 锁内 intent/fact 均校验 id 与文件名 |
+| B30 | Python 用内嵌 id 构造删除路径，可能删错文件 | 改为遍历实际 intent 文件路径删除 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
