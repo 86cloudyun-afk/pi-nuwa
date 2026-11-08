@@ -134,7 +134,7 @@ dir="$LAB_DIR/$name"
 if [[ -e "$dir" && ! -d "$dir" ]]; then
   die "项目路径已存在且不是目录: $dir" 4
 fi
-if [[ -d "$dir" && ! -d "$dir/.sapper" ]] && [[ -n "$(ls -A "$dir" 2>/dev/null)" ]]; then
+if [[ -d "$dir" && ! -d "$dir/.sapper" ]] && [[ -n "$(ls -A "$dir" 2>/dev/null | grep -v '^nuwa\.log$')" ]]; then
   # 目录存在、非空、却不是 sapper 项目：拒绝覆盖
   die "目录非空且不是 sapper 项目: $dir（换一个名字或先清理）" 4
 fi
@@ -478,6 +478,4 @@ sapper status | sed -n '1,12p'
 [[ -f "$dir/.sapper/view.url" ]] && log "看板: $(cat "$dir/.sapper/view.url")"
 log "继续: cd $dir && nuwa \"$url\" --loop --minutes 60 --parallel 3"
 event report_done "rounds=$round"
-exit 0
-
-(( failed == 0 )) || exit 1
+exit $failed

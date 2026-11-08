@@ -116,12 +116,18 @@ class Ledger:
                                         "tokens_actual": int(tokens_actual), "status": status})
 
     def has_reserve(self, rid: str) -> bool:
-        """该 rid 是否真实预留且尚未结算；repair 只结算真实存在的预留。"""
+        """该 rid 的最后一条账本事件是否为未关闭的 reserve/renew。"""
         with FileLock(self.lock_path, blocking=True):
             recs = self._records_locked()
-        reserved = any(r.get("type") == "reserve" and r.get("rid") == rid for r in recs)
-        settled = any(r.get("type") == "settle" and r.get("rid") == rid for r in recs)
-        return reserved and not settled
+        state = None
+        for rec in recs:
+            if rec.get("rid") != rid:
+                continue
+            if rec.get("type") in ("reserve", "renew"):
+                state = "reserve"
+            elif rec.get("type") in ("settle", "reclaim"):
+                state = "closed"
+        return state == "reserve"
 
     def admit_reserve(self, rid: str, project: str, tokens: int,
                       dispatches: int = 1, ttl: int = 600,

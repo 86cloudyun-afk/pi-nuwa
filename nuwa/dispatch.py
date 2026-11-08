@@ -83,6 +83,10 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     key = txn.dispatch_key(project, intent_id, attempt)
     existing = graph.find_fact_by_key(root, key)
     if existing:
+        if (intent.get("status") == "done" and intent.get("to")
+                and intent["to"] != existing["id"]):
+            raise DispatchError(
+                f"intent 已由其他 fact 完成: {intent['to']} != {existing['id']}")
         graph.patch_intent(root, intent_id, existing["id"])
         journal.append("commit_done", txn=key, intent=intent_id,
                        fact=existing["id"], reused=True, project=project)

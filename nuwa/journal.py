@@ -262,18 +262,25 @@ class Journal:
         settled: set[str] = set()
         committed: set[str] = set()
         ended: set[str] = set()
-        for rec in self._read_locked(0):
-            state["last_seq"] = rec.get("seq", state["last_seq"])
-            ev = rec.get("event")
-            txn = rec.get("txn")
-            if ev == "executing_prepare":
-                state["inflight"][txn] = {"intent": rec.get("intent"), "state": "prepare"}
-            elif ev == "executing":
-                state["inflight"].setdefault(txn, {})["state"] = "executing"
-            elif ev in ("executed", "commit_done", "ack"):
-                state["inflight"].pop(txn, None)
-            if ev == "ack" and txn:
-                ended.add(str(txn))
+        # 按文件顺序扫描而非 _read_locked：缺 seq 的终态记录也要参与状态归并。
+        for path in self._files():
+            for rec in self._iter_records(path):
+                seq = rec.get("seq")
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    state["last_seq"] = max(int(state["last_seq"]), seq)
+                ev = rec.get("event")
+                txn = rec.get("txn")
+                if ev == "executing_prepare":
+                    state["inflight"][txn] = {
+                        "intent": rec.get("intent"), "state": "prepare",
+                        "rid": rec.get("rid"), "tokens": rec.get("tokens"),
+                    }
+                elif ev == "executing":
+                    state["inflight"].setdefault(txn, {})["state"] = "executing"
+                elif ev in ("executed", "commit_done", "ack", "recovered_crashed"):
+                    state["inflight"].pop(txn, None)
+                if ev in ("ack", "recovered_crashed") and txn:
+                    ended.add(str(txn))
             if ev == "ledger_settle" and rec.get("rid"):
                 settled.add(str(rec.get("rid")))
             if ev in ("commit_done", "done_apply") and txn:

@@ -325,6 +325,7 @@ describe("checkTool", () => {
 	test("sapper --store= 与 -s 形式被拦", () => {
 		expect(mod.checkTool("bash", { command: "sapper --store=/p/.sapper done i001 --fact x" }).rule).toBe("P-006");
 		expect(mod.checkTool("bash", { command: "sapper -s/p/.sapper done i001 --fact x" }).rule).toBe("P-006");
+		expect(mod.checkTool("bash", { command: "sapper -s /p/.sapper done i001 --fact x" }).rule).toBe("P-006");
 	});
 	test("sapper 全局选项与绝对路径也拦", () => {
 		expect(mod.checkTool("bash", { command: "sapper --store /p/.sapper done i001 --fact x" }).rule).toBe("P-006");

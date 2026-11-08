@@ -131,6 +131,12 @@ def recover(root: str | Path) -> dict:
     j = Journal(root)
     base, records, finished = _snapshot_state(j)
     pending: dict[str, dict] = {}
+    if base:
+        for txn, info in (base.get("inflight") or {}).items():
+            if txn not in finished:
+                pending[txn] = {"txn": txn, "state": info.get("state", "recovered"),
+                                "intent": info.get("intent"), "rid": info.get("rid"),
+                                "tokens": info.get("tokens")}
     last = int(base.get("last_seq", 0) or 0) if base else 0
     for rec in records:
         last = max(last, int(rec.get("seq", 0) or 0))

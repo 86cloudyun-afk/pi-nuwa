@@ -91,7 +91,7 @@ const PATH_RULES: Array<[RegExp, string]> = [
  * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
  */
 const COMMIT_RE =
-	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:--store(?:[=\s]+\S+)?|-s\S*)\s*)?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:--store(?:[=\s]+\S+)?|-s(?:\s+\S+|\S*))\s*)?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
 /** 从 shell 命令里提取写入目标：重定向、tee、cp/mv/install 的全部路径参数。 */
 function collectShellTargets(cmd: string): string[] {
