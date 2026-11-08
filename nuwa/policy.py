@@ -18,9 +18,16 @@ ALLOW_RULES = [
 
 # 提交所有权：fact 只能经 nuwa commit 产生。分隔符覆盖 ; & | ( ) 换行引号反引号，
 # 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
+GLOBAL_OPT_RE = re.compile(
+    r'(?:--store|-s)(?:=(?:"[^"]*"|\'[^\']*\'|\S+)|\s+(?:"[^"]*"|\'[^\']*\'|\S+)|\S+)?\s*')
+
+
+def strip_global_options(cmd: str) -> str:
+    return GLOBAL_OPT_RE.sub(" ", cmd)
+
+
 PROMPT_RULES = [
     (r"(?:^|[;&|()\n\r\t\"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+"
-     r"(?:(?:(?:--store(?:=(?:\"[^\"]*\"|'[^']*'|\S+)|\s+(?:\"[^\"]*\"|'[^']*'|\S+))|-s(?:\S+|\s+(?:\"[^\"]*\"|'[^']*'|\S+)))\s+){0,8})?"
      r"(?:done\s+\S+|dispatch\s+i\d+|complete\b)", "P-006"),
 ]
 
@@ -49,7 +56,7 @@ def check_command(command: str) -> tuple[bool, str | None]:
         if re.search(pattern, command):
             return False, rule_id
     for pattern, rule_id in PROMPT_RULES:
-        if re.search(pattern, command):
+        if re.search(pattern, strip_global_options(command)):
             return False, rule_id
     return True, None
 

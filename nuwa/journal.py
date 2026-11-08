@@ -198,7 +198,7 @@ class Journal:
         for path in self._files():
             for rec in self._iter_records(path):
                 seq = rec.get("seq")
-                if isinstance(seq, int) and not isinstance(seq, bool):
+                if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
                     if seq in seen:
                         continue
                     seen.add(seq)
@@ -336,10 +336,18 @@ class Journal:
         # 终态删除信息不能被旧摘要的并集复活；ack 同样是终态。
         inflight = {k: v for k, v in inflight.items()
                     if k not in committed and k not in ended}
+        try:
+            old_last = int(old.get("last_seq", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            old_last = 0
+        try:
+            cur_last = int(cur["last_seq"] or 0)
+        except (TypeError, ValueError, OverflowError):
+            cur_last = 0
         merged = {
             "recovery_schema": 1,
             "gen": self.current_gen(),
-            "last_seq": max(int(old.get("last_seq", 0) or 0), int(cur["last_seq"] or 0)),
+            "last_seq": max(old_last, cur_last),
             "settled": sorted(set(old.get("settled", [])) | set(cur["settled"])),
             "committed": sorted(committed),
             "ended": sorted(ended),
@@ -427,7 +435,7 @@ def replay_state(root: str | Path) -> dict:
                              if k not in ended}
         try:
             state["last_seq"] = int(base.get("last_seq", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             state["last_seq"] = 0
     for rec in records:
         ev = rec.get("event")

@@ -92,6 +92,15 @@
 **真实 sapper 已装**：`~/.local/bin/sapper` 1.0.0，`contract_check` 13/13；全量
 `tests/run.sh` 退出码 0（140 例 + 16 runs）。
 
+## 第十轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B17 | `base.last_seq` 为无限值时 `int()` 抛 OverflowError | recover/replay/recovery 合并全部捕获 OverflowError |
+| B18 | seq=0/负数进入 seen，后续 ack 被去重丢弃 | 只对正整数 seq 去重，零/负记录保留参与归并 |
+| B6 | 失败 `cd` 的虚拟目录推进，真实 cwd 落在候选集外 | `candidateDirs` 为每个 cd 目标加入整条祖先链 |
+| B7 | 固定选项上限漏第 N 个 | 改为先剥离全部 `--store/-s`，再匹配提交命令 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

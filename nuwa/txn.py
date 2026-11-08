@@ -154,7 +154,7 @@ def recover(root: str | Path) -> dict:
                                 "tokens": info.get("tokens")}
     try:
         last = int(base.get("last_seq", 0) or 0) if base else 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         last = 0
     for rec in records:
         seq = rec.get("seq")

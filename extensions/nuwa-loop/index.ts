@@ -90,18 +90,33 @@ const PATH_RULES: Array<[RegExp, string]> = [
  * 提交所有权：fact 只能经 nuwa commit 产生。分隔符覆盖 ; & | ( ) 换行引号反引号，
  * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
  */
+const GLOBAL_OPT_RE =
+	/(?:--store|-s)(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+)|\S+)?\s*/g;
+
+function stripGlobalOptions(cmd: string): string {
+	return cmd.replace(GLOBAL_OPT_RE, " ");
+}
+
 const COMMIT_RE =
-	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:(?:--store(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+)))\s+){0,8})?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
 /** 命令中所有可能的 cwd：原目录与每个 cd 之后的目录。检查时取并集，避免时序漏检。 */
 function candidateDirs(cmd: string, baseDir: string): string[] {
 	const dirs = [baseDir];
+	const addChain = (p: string) => {
+		let cur = p;
+		while (true) {
+			dirs.push(cur);
+			const parent = dirname(cur);
+			if (parent === cur) break;
+			cur = parent;
+		}
+	};
 	let dir = baseDir;
 	for (const m of cmd.matchAll(/(?:^|[;&|]\s*)cd\s+([^\s;|&>]+)/g)) {
 		const target = m[1].replace(/^["']|["']$/g, "");
 		dir = isAbsolute(target) ? target : resolve(dir, target);
-		dirs.push(dir);
-		dirs.push(dirname(dir)); // cd 失败时会停在父目录，候选集要覆盖
+		addChain(dir); // cd 失败会停在任意祖先，候选集覆盖整条链
 	}
 	return [...new Set(dirs)];
 }
@@ -226,7 +241,7 @@ export function checkTool(
 		const cmd = typeof input.command === "string" ? input.command : "";
 		const base = checkCommand(cmd);
 		if (!base.allowed) return base;
-		if (COMMIT_RE.test(cmd)) return { allowed: false, rule: "P-006" };
+		if (COMMIT_RE.test(stripGlobalOptions(cmd))) return { allowed: false, rule: "P-006" };
 		for (const target of collectShellTargets(cmd)) {
 			for (const shellDir of candidateDirs(cmd, baseDir)) {
 				for (const candidate of resolvePath(target.path, shellDir)) {

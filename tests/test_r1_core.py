@@ -211,6 +211,14 @@ class JournalTest(unittest.TestCase):
         j.append("y")
         self.assertEqual(j.last_seq(), 9)
 
+    def test_zero_seq_records_not_deduped(self):
+        j = Journal(self.tmp)
+        with open(j.path, "wb") as fh:
+            fh.write(b'{"seq":0,"event":"executing_prepare","txn":"t1"}\n')
+            fh.write(b'{"seq":0,"event":"ack","txn":"t1"}\n')
+        st = replay_state(self.tmp)
+        self.assertNotIn("t1", st["inflight"])
+
     def test_snapshot_ignores_bad_seq(self):
         j = Journal(self.tmp)
         j.append("a")
