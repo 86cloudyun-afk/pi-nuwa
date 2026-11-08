@@ -244,6 +244,10 @@ export function checkTool(
 		const cmd = typeof input.command === "string" ? input.command : "";
 		const base = checkCommand(cmd);
 		if (!base.allowed) return base;
+		// store 值含变量展开/命令替换时无法可靠剥离，按提交语义不明直接拒绝。
+		if (/\bsapper[^;|&]*(?:--store|-s)\s*(?:=\s*)?[^\s;|&]*[$`]/.test(cmd)) {
+			return { allowed: false, rule: "P-006" };
+		}
 		if (COMMIT_RE.test(stripGlobalOptions(cmd))) return { allowed: false, rule: "P-006" };
 		for (const target of collectShellTargets(cmd)) {
 			for (const shellDir of candidateDirs(cmd, baseDir)) {

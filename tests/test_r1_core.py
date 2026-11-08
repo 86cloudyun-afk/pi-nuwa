@@ -229,6 +229,19 @@ class JournalTest(unittest.TestCase):
         rec = txn.recover(self.tmp)
         self.assertEqual(rec["last_seq"], 1)
 
+    def test_rejected_reserve_not_in_recovery(self):
+        j = Journal(self.tmp)
+        j.append("executing_prepare", txn="t1", intent="i001")
+        j.append("reserve_rejected", txn="t1", intent="i001")
+        j.append("ack", txn="t1", intent="i001", status="rejected")
+        j.compact(keep=0)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        rec = j.read_recovery()
+        self.assertNotIn("t1", rec.get("inflight", {}))
+
     def test_recovery_merges_settled_and_committed_across_files(self):
         j = Journal(self.tmp)
         j.append("commit_done", txn="t1")

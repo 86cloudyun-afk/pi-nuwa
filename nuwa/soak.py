@@ -45,10 +45,13 @@ def soak(projects: list[str | Path], minutes: float = 1, interval: float = 5,
         t.start()
 
     samples = []
-    while any(t.is_alive() for t in threads):
+    # 至少采两个点：短跑时 runner 可能在第一次 interval 前就结束。
+    while any(t.is_alive() for t in threads) or len(samples) < 2:
         facts = sum(len(graph.facts(p)) for p in projects)
         samples.append({"t": round(time.time() - t0, 1), "rss_kb": _rss_kb(),
                         "fds": _fd_count(), "facts": facts})
+        if not any(t.is_alive() for t in threads) and len(samples) >= 2:
+            break
         time.sleep(interval)
 
     for t in threads:

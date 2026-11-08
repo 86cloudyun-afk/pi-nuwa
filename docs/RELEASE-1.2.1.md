@@ -130,6 +130,14 @@
 | M20 | 同 intent 并发 | txn.lock 内单赢家准入 |
 | M21 | 并发测试无屏障 | `threading.Barrier` + reserve tokens 反例 |
 
+## 第十四轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B20 | `reserve_rejected` 后摘要仍保留 `executing_prepare` 幽灵 inflight | 摘要与 replay 的 pop 条件加入 `reserve_rejected`/`dispatch_rejected` |
+| B21 | store 值含变量展开/反引号时剥离残片导致漏检 | 未解析 store 直接按 P-006 拒绝（fail-closed） |
+| M5 | 短跑样本不足 | soak 至少采两个点 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

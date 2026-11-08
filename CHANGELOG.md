@@ -20,7 +20,7 @@ codex `gpt-6.1-sol` ultra 三轮交付审计（35 → 45 → 50，均 block）�
   其他键冲突前置、ack 终结 inflight、补丁目标过滤、recover/repair 接 recovery 摘要
 - 文档：`RELEASE-1.2.1.md` 按真实状态标注 closed/partial；`TEST-RESULTS.md` 更新到 1.2.1；
   剩余 M 项登记到 `docs/BACKLOG-1.2.1.md`
-- 测试：扩展 42、journal 21、r1core 37、r2r7 29，合计 143 例 + 16 runs；真实 sapper 1.0.0 下 contract 13/13、总退出码 0
+- 测试：扩展 42、journal 22、r1core 38、r2r7 29，合计 144 例 + 16 runs；真实 sapper 1.0.0 下 contract 13/13、总退出码 0
 
 ## 1.2.0 — 2026-11-08
 

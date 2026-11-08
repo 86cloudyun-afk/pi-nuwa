@@ -315,7 +315,8 @@ class Journal:
                     }
                 elif ev == "executing":
                     state["inflight"].setdefault(txn, {})["state"] = "executing"
-                elif ev in ("executed", "commit_done", "ack", "recovered_crashed"):
+                elif ev in ("executed", "commit_done", "ack", "reserve_rejected",
+                            "dispatch_rejected", "recovered_crashed"):
                     state["inflight"].pop(txn, None)
                 if ev in ("ack", "recovered_crashed") and txn:
                     ended.add(str(txn))
@@ -448,7 +449,8 @@ def replay_state(root: str | Path) -> dict:
             state["inflight"][txn] = {"intent": rec.get("intent"), "state": "prepare"}
         elif ev == "executing":
             state["inflight"].setdefault(txn, {})["state"] = "executing"
-        elif ev in ("executed", "commit_done", "ack"):
+        elif ev in ("executed", "commit_done", "ack", "reserve_rejected",
+                    "dispatch_rejected", "recovered_crashed"):
             state["inflight"].pop(txn, None)
         if ev == "ledger_settle":
             state["settled"].add(rec.get("rid"))
