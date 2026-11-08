@@ -34,8 +34,8 @@ def _evidence(root: Path) -> bool:
     facts = {f.get("id"): f for f in graph.facts(root)}
     goal = graph.get_fact(root, "goal")
     proj = graph.project(root)
-    if (not goal or not proj.get("goal")
-            or goal.get("description") != proj.get("goal")):
+    if (not isinstance(goal, dict) or goal.get("id") != "goal"
+            or not proj.get("goal") or goal.get("description") != proj.get("goal")):
         return False
     edges = [it for it in graph.intents(root) if it.get("to") == "goal"]
     if not edges:
@@ -44,7 +44,10 @@ def _evidence(root: Path) -> bool:
     for edge in edges:
         if edge.get("status") != "complete":
             return False
-        refs = [str(x) for x in (edge.get("from") or [])]
+        raw_refs = edge.get("from") or []
+        if not isinstance(raw_refs, list) or not all(isinstance(x, str) for x in raw_refs):
+            return False
+        refs = list(raw_refs)
         if not refs:
             return False
         if not all(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")

@@ -374,6 +374,13 @@
 | 测试 | fake-sapper setup 不创建 goal.json，`_evidence` 的 goal 校验让 5 个项目全失败 | fake-sapper setup 生成 goal fact（仿真真实 sapper） |
 | 测试 | `facts[-1]` 取到 goal.json | 改为按 kind 取 note/flag |
 
+## 第四十五轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B46 | Python `_evidence` 的 goal 未校验对象类型/id | 要求 `isinstance(goal, dict)` 且 `goal.id == "goal"`；edge.from 成员必须是字符串 |
+| B25 | shell facts 文件身份、from 成员类型；扩展 to/worker/source_intent 类型 | shell 校验 fact.id 与文件名、from 成员字符串；扩展校验 to/worker/source_intent 类型 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

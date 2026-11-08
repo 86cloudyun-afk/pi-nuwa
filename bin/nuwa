@@ -345,7 +345,10 @@ for p in glob.glob(".sapper/facts/*.json"):
     if p.endswith("goal.json"):
         continue
     try:
-        f = json.load(open(p)); facts[f.get("id")] = f
+        f = json.load(open(p))
+        if f.get("id") != p.rsplit("/", 1)[-1][:-5]:
+            print("no"); raise SystemExit
+        facts[f.get("id")] = f
     except Exception:
         print("no"); raise SystemExit
 try:
@@ -411,9 +414,10 @@ goal_ok = (goal_fact.get("id") == "goal" and proj.get("goal")
            and goal_fact.get("description") == proj.get("goal"))
 if goal_ok and edges and all(
     e.get("status") == "complete"
-    and (e.get("from") or [])
+    and isinstance(e.get("from"), list)
+    and e["from"] and all(isinstance(r, str) for r in e["from"])
     and all(facts.get(r, {}).get("kind") in ("flag", "vuln", "loot")
-            for r in (e.get("from") or []))
+            for r in e["from"])
     for _, e in edges
 ):
     raise SystemExit(3)
