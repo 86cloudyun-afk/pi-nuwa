@@ -159,4 +159,18 @@
 
 ## Round 19 — 2026-11-08
 
+- 结论：**fail**，88/100
+- 阻塞 1 项：导出增量后、restore 前新接受的队列条目既不在快照也不在增量
+- 修订：回滚全程保持 freeze，队列部分改在 import 时读取 `qseq > queue_cut_seq` 的当前队列
+- 同步：双写顺序 tail→primary + 重启对账；result.json 统一按 R1 规则判 ok/crashed；规范键统一 `sha256:<64hex>`
+
+## Round 20 — 2026-11-08
+
+- 结论：**fail**，87/100
+- 阻塞 1 项：reason 定义为事务，但批量产出 intent / 修改完成状态缺应用、去重与恢复协议
+- 修订：reason 批量幂等（intent_key 写入 intent JSON，逐条跳过/创建）、complete 带 key、从 payload 重放 apply
+- 同步：公平性固定夹具（fake/100ms/2:1:1/并发 4/预热 10s）；长测预算 30M、速率 25–45/h；证据两条采集路径正向用例；超时变量优先级；快照 kill 后确认锁释放
+
+## Round 21 — 2026-11-08
+
 （待填）

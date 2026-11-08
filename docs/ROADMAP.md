@@ -131,7 +131,10 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - `executing`：spawn 成功后写，含 pid、pid_starttime。
 - `executed`：进程退出或确认死亡后**必写**，`status: ok|crashed|timeout`，含 exit_code、artifact（可为 null）、tokens（实际或估算）、`settled:false`、`rid`。
 - `commit_prepare`：fact 内容、kind、doc、rid。
-- `reason` 也是事务：`txn kind=reason`，key = `sha256(project|reason|round)`，同样走 reserve/executed/settle；reason 用强模型，失败按链回退并结算估算 tokens，成本计入账本。
+ - `reason` 也是事务：`txn kind=reason`，key = `sha256(project|reason|round)`，同样走 reserve/executed/settle；reason 用强模型，失败按链回退并结算估算 tokens，成本计入账本。
+- reason 提交是**批量幂等**：`reason_apply` 记录 payload 哈希与每个条目的 `intent_key = sha256(project|round|index|description_hash)`；应用时逐条检查 `.sapper/intents/*.json` 的 `x-nuwa:intent_key`，已存在则跳过，缺失则创建并写入该字段。
+- `complete` 条目同样带 key；若项目已 completed 则跳过，未完成则走证据闸门后再置完成。
+- 恢复：有 `reason_prepare` 无 `reason_apply` → 从 payload artifact 重放 apply（按 intent_key 去重）；payload 缺失 → 以新 attempt 重跑 reason。
 
 **恢复规则**：
 
@@ -177,7 +180,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - `reserve = min(ceil(p95*1.05), NUWA_TASK_CAP, remaining_project, remaining_global / 1.05)`
 - 准入：`reserve >= MIN_VIABLE` 且 `reserve*1.05 <= remaining_global`；新预留与既有预留都计 5% 头寸。
 - 预检：spawn 前估算 input tokens `ceil(prompt_chars/4)`；若超过 reserve 则拒绝或排队。支持输出上限的引擎传 `max_output_tokens = reserve - input_est`。
-- `per_task_cap = reserve`；timeout 由 `NUWA_TASK_TIMEOUT` 单独设定。
+- `per_task_cap = reserve`；timeout 优先级 `NUWA_TASK_TIMEOUT > NUWA_DISPATCH_TIMEOUT > SAPPER_TIMEOUT > 300`，0.5.0 起 `SAPPER_TIMEOUT` 仅作映射保留 1 个 minor。
 - 结算：`overspend = max(0, actual - reserve) / reserve`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`，项目暂停且门禁失败。
 - 准入保证 `sum(reserve)*1.05 <= global_cap` 时不透支。若引擎突破硬上限导致 `actual > 1.05*reserve`，记 `major_overrun`，`remaining_global` 允许为负，项目立即冻结并禁止新 dispatch；只能通过 `nuwa budget add <n>` 或提高 cap 补平，补平前门禁失败。
 - 在途：单项目 ≤ `--parallel`，全局 ≤ `NUWA_GLOBAL_CONCURRENCY`。
@@ -187,7 +190,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 续租：`executing` 期间每 2 分钟 `renew`；TTL 10 分钟。
 - 迟到结算：`late_settle` 按 `rid` 匹配，不重复扣。
 - 超支：三类均以各自额度为分母（tokens/dispatches 用 reserve，wall 用 wall_cap）；`overspend = max(0, actual - quota)/quota`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`、项目暂停、门禁失败。
-- 公平性：三个持续就绪项目共享 60s 窗口；每项目按并发槽位累计 busy 秒（sum over slots，不用并集），分母为三者之和；等权 1:1:1 各 33%±5pp，加权 2:1:1 为 50%/25%/25%±5pp；每项目 ≥10 次 dispatch。
+- 公平性夹具：fake 引擎、每次 dispatch 固定 100ms、3 项目权重 2:1:1、全局并发 4、预热 10s 不计、测量 60s；每项目按并发槽位累计 busy 秒（sum over slots），分母为三者之和；等权 1:1:1 各 33%±5pp，加权 2:1:1 为 50%/25%/25%±5pp；每项目 ≥10 次 dispatch。
 - 退避：1/2/4/8s，上限 60s；重试使用新 `attempt_seq`。
 
 交付：
@@ -263,6 +266,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 **性能基准固定化**：`tests/fixtures/verify/` 放 100 个固定样本（命令固定 `curl -sS -m 2 http://127.0.0.1:18081/flag`，输出固定 4KB），p95 只在该样本集上计算；慢命令与超时样本单独分组。
 
 验收：
+- 两条采集路径各有正向用例：bash 钩子与子代理钩子分别执行固定命令，产出 `verified` fact（source/artifact/哈希齐全），验收器接受并计入 completed 候选
 - 五类样本按表拒绝，退出码一致
 - 矛盾样本固定为 `tests/fixtures/contradiction/` 三组（同端口不同服务、同 flag 不同来源、同 CVE 不同版本）；标记字段 `x-nuwa:contradiction={with:[fact_ids],field,values}`；预期 facts 保留、project 仍 active、事件 `contradiction_flagged`、下一轮 dispatch 正常开始
 - 固定样本集 p95 <2s（exec 到断言，排除排队）
@@ -328,7 +332,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 **快照一致性协议**（R6 交付）：
 
 1. 短暂获取 `global.lock`：写 `$SAPPER_HOME/budget/freeze.json`（`freeze=true`、`owner_pid`、`snapshot_id`、`renewed_at`、`expires` 10min），记录 `freeze_seq`，释放；快照进程每 60s 续租。其他进程只有在 owner 进程已死时才可清除过期 freeze（写 `freeze_recovered`）；解冻必须匹配 `snapshot_id`，旧快照不能清除新快照的 freeze。commit/结算队列持久化在 `queue.jsonl`，启动时重放。冻结后**新 dispatch 拒绝；commit 全路径与新结算一律入队**。
-2. 等待 inflight 全部到达 `executed`（只等执行结束，**不等 commit 队列**），最长 120s；超时则 kill 子进程、写 `executed{crashed}` 并入队。
+2. 等待 inflight 全部到达 `executed`（只等执行结束，**不等 commit 队列**），最长 120s；超时则按 R1 顺序处理：kill 子进程 → 确认 inflight 锁可获取（子进程已退出）→ 写 `executed{crashed}` 并入队。
 3. 获取 `global.lock`，再按固定顺序获取各项目 `txn.lock`（barrier；不碰 `run.lock`，运行进程只需遵守 freeze 标志暂停新 dispatch）；记录 `global_cut_seq`、每个项目 journal 的 `cut_seq[p]` 与 `queue_cut_seq`；把队列前缀复制为 `queue.<snapshot_id>.jsonl`（此后接受的请求 seq > queue_cut，归入 delta）；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
 4. 在各项目 `txn.lock` 内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；同时取各会话 `<hash>.lock` 复制会话状态，记录 `state_seq`；导出完成后校验 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
 5. 复制 artifact 原始字节到 `snapshot/artifacts/`（默认开启；关闭时标 `evidence_incomplete`）。
@@ -362,7 +366,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 **目标**：可以长期挂着跑，升级/回滚可整体操作。
 
 长测协议：
-- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 30`；引擎固定 omp + `deepseek-flash`，负载固定 4 项目 × 每轮 8 个 intent，单项目预算 20M tokens（2160 次 dispatch，约 9k tokens/次，覆盖 reason 开销）；预算耗尽即判失败；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
+- 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 30`；引擎固定 omp + `deepseek-flash`，负载固定 4 项目 × 每轮 8 个 intent，单项目预算 30M tokens，速率区间 25–45 次/小时（72h 最多 3240 次 × 约 9k ≈ 29.2M，预算可覆盖；超过 45/h 视为负载越界，判失败）；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
 - 两周观察：候选版本 = release tag；等价负载基准 = 4 项目 × 2 并发 × 60 dispatch/hour，每日至少 1 小时；发布判定唯一：72h 长测全部判据通过 **且** 14 天内 P0/P1 为 0，两者缺一不可，不得互相替代；出现新提交后两项同时重置
 - 采样间隔 30s；PID 范围 = 各项目进程树；**所有判据按项目分别计算**（每项目 RSS 斜率、FD 差、dispatch/hour、facts 增长），任一项目不达标即失败；全局汇总只作展示，不得掩盖单项目停滞
 - 有效运行 ≥259200 秒；提前退出、采样间隔 >60s，判失败
