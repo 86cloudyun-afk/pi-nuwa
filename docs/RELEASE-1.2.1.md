@@ -2,61 +2,51 @@
 
 日期：2026-11-08
 审计：codex-cli 0.164.0 / `gpt-6.1-sol` / `model_reasoning_effort=ultra`，只读沙盒
-对象：1.2.0 commit `66cdbcb`（基线 `0dbbdb0`）
-结论：**block，35/100**（B1–B9 阻断，M1–M8 major）
+第一轮：1.2.0 commit `66cdbcb` → **block，35/100**
+第二轮：1.2.1 commit `ef94baa` → **block，45/100**（B1/B3/M6/M8/m1 关闭，其余 partial）
+本文件记录第二轮之后的修复；状态按源码实际能力标注，不把 partial 写成 closed。
 
-## 审计指出的根因
+## 第二轮后的修复
 
-1.2.0 把「能跑」当成了「可交付」：journal 的 seq/GC 只在正常路径成立，策略只覆盖了
-最朴素的命令/路径形态，URL 入口仍绕过事务提交。审计据此判 block 是对的。
+| ID | 第二轮状态 | 本轮处理 | 当前 |
+|---|---|---|---|
+| B2 | partial：replay 与 GC 半新半旧 | `Journal.snapshot()` 在 `journal.lock` 内一次性取 recovery + 全量记录；`replay_state` 改用 snapshot | closed |
+| B4 | partial：`ledger_settle` 未列入未决 | `PENDING_EVENTS` 加 `ledger_settle`；dispatch 失败/拦截/缺 payload 全路径补 `ack` | closed |
+| B5 | partial：replace 解码与尾读分裂 | `_iter_records` 改 bytes + 严格 UTF-8，与 `_tail_seq` 同口径；坏行整行跳过 | closed |
+| B6 | partial：多级祖先、文件链接、TOCTOU | `resolvePath` 向上找最近存在祖先 realpath + 文件 `readlink`；`apply_patch` 正文目标单独提取 | closed（TOCTOU 仍属宿主写入边界，见下） |
+| B7 | partial：全局选项与绝对路径 | `COMMIT_RE` 支持 `(?:\S*/)?sapper` 与 `--store/-s <path>`；`--from` 不再放行 | closed |
+| B8 | partial：cap.json 未保护 | `PATH_RULES` 增加 `budget/cap.json`、`budget/freeze.json`、`.nuwa/recovery.json` | closed |
+| B9 | partial：回退分支仍绕过 | 默认 `cli`；无 CLI/引擎直接退出 3，不再静默回退；`NUWA_SUBMIT_MODE=sapper` 为显式遗留模式并记 `dispatch_legacy` | closed |
+| B10 | 新增：recovery.json 未保护 | 同上路径规则 | closed |
+| B11 | 新增：inflight 并集复活终态 | recovery 合并后按 committed 集合剔除 inflight；`replay_state` 从 snapshot 起算 | closed |
+| M1 | partial：补丁正文目标遗漏 | `collectPatchTargets` 提取 `*** Add/Update/Delete File:` 与 `+++ b/` 目标 | closed |
+| M2 | partial：多 fact 与关联 | `--from` 支持逗号/空白分隔多个 fact，逐个校验 kind；带 `[nuwa:key]` 的证据要求键可回溯 | partial：未强制 fact 必须挂在某个 intent 的 `to` 上 |
+| M3 | partial：attempt 锁外读取、键吸收 | `txn.commit(key=None)` 在 `txn.lock` 内生成规范键；已由其他键完成的 intent 直接报冲突，不再吸收 | closed |
+| M4 | partial：Infinity/非整数 samples | `_number` 拒绝非有限数与溢出；samples 必须整数 | closed |
+| M5 | partial：duration 未交叉核对 | `duration` 与 `finished-started` 误差 >5% 判失败；`--expect-commit` 库层与 CLI 均生效 | closed |
+| M9 | 新增：check_prompt 误伤 | `check_prompt` 只查 P-001..P-004；P-006 移到 `check_command`（工具层） | closed |
+| M10 | 新增：`complete --from` 绕过 kind | P-006 一律拦 `sapper complete`；完成只走 `nuwa complete` | closed |
+| M11 | 新增：gen 字典序 | `_files()` 按代号数字排序 | closed |
+| M12 | 新增：URL 循环不 repair | 收工前调用 `nuwa recover --repair` | partial：循环内单条失败仍不即时 repair |
+| M13 | 新增：repair 重复结算 | `Ledger.settle` 按 rid 幂等；失败路径写 `ack` | closed |
+| M14 | 新增：admit/reserve 分离 | `Ledger.admit_reserve` 在同一把 `global.lock` 内检查并预留 | closed |
+| M15 | 新增：关闭表把 partial 写成 closed | 本文件重写为真实状态 | closed |
+| m4 | 新增：子命令转发早于 env | case 分支内 exec 前 source `env.sh` | closed |
 
-## 逐条关闭
+## 仍然存在的边界
 
-| ID | 问题 | 修复 |
-|---|---|---|
-| B1 | compact 代号复用，CURRENT 未发布时会覆盖归档 | `_next_gen_locked()` 取 `max(CURRENT, 现有 journal/checkpoint)+1`，rename 前检查目标 |
-| B2 | compact 不持锁，append 与 read 可读到半写/换代的混合视图 | `append/compact/gc/read` 共用 `journal.lock`；read 在锁内取稳定快照 |
-| B3 | `last_seq` 忽略 checkpoint 高水位，空代 GC 后 seq 回 0 | `_checkpoint_high()` 并入高水位；空代删除后 seq 仍单调 |
-| B4 | GC 删掉含未决事务的代，replay/recover 丢依据 | `_pending_floor_locked()` 保护未决代；删除前写 `recovery.json`，`replay_state` 从摘要起算 |
-| B5 | 尾读固定 8192 字节，超长记录/UTF-8 切点会返回 0 | 窗口按需翻倍直到行首，编码错误按坏行跳过 |
-| B6 | 路径规则只看字面量，`..`、符号链接、反斜杠、相对 cwd 可绕过 | `resolvePath()` 归一（cwd、`..`、file://、realpath/父目录 realpath），递归收集 `files[]/edits[]` 路径字段 |
-| B7 | P-006 只认行首/分号，`&&`、管道、`$()`、引号、`\sapper` 可绕过 | 分隔符扩到 `; & | ( ) 换行 空白 引号 反引号`，允许 `\` 与 `$(` |
-| B8 | P-007 只保护 `.nuwa/global*.jsonl`，真实账本在 `budget/global.jsonl` | 增加 `budget/*.jsonl` 规则（TS/Python 同步） |
-| B9 | URL 入口直接 `sapper dispatch`，绕过 nuwa 事务/账本 | `dispatch_one` 默认走 `nuwa dispatch`；无引擎或 `NUWA_SUBMIT_MODE=sapper` 时回退并记 `dispatch_fallback` |
-| M2 | 续跑指令要求 `sapper complete`，与 P-006 冲突 | 新增 `nuwa complete --from <fact>`，校验 kind=flag/vuln/loot；裸 `sapper complete` 仍拦 |
-| M3 | `x-nuwa-attempt` 在 CLI 回退 0、dispatch 抛错，两路不一致 | `txn.attempt_of()` 严格非负整数/十进制字符串，两路共用 |
-| M4 | `night.verify` 对类型异常崩溃，字符串 `"false"` 被当真 | 严格 schema：数值字段、四个必需判据键、布尔真值 |
-| M5 | 旧 REPORT + 旧 COMMIT 可通过，执行期间换提交归属漂移 | REPORT 记录 `started_at/finished_at/duration_seconds`；校验实际时长；`--expect-commit` 绑定提交 |
-| M6 | `bin/nuwa` 未转发 `soak-night` / `soak-verify` | 子命令表补齐，并加 `flag` / `complete` |
-| M8 | `g1` 返回码取最后一条，早期套件失败可被覆盖 | 逐项 `|| fail=1`，最后统一退出 |
-
-## 次要项
-
-- m1：`gc` 注释改为「keep=2 当前代 + 上一代；keep=1 仅当前代」。
-- m3：新增 `nuwa flag`，README 说明 flag 属证据采集、P-006 只约束 done/dispatch/complete。
-- m2：`fake-sapper` 的 `FAKE_ENGINE_MODE` 只用于 e2e 反例，RELEASE 明确它是替身行为，
-  真实引擎的 malformed 覆盖留在 CI（需真实 sapper）。
+- **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后才写入。扩展层无法原子锁住文件系统；
+  真正的收口在 CLI/宿主写入边界。当前策略把「普通输入可绕过」压到「检查后替换链接」这一类竞态。
+- **M2 的 intent 关联**：`sapper flag` 直接采集的 flag 没有 intent 归属，强制关联会误伤；
+  当前只校验 kind 与 `[nuwa:key]` 可回溯。
+- **M12 的循环内 repair**：URL 循环是并行 shell 子进程，逐条 repair 会与在跑事务抢锁；
+  当前在收工前统一 repair。
+- **真实 sapper**：`contract_check` 与 real 崩溃组仍需要 PATH 中的真实实现；本机只有替身。
 
 ## 判据
 
-- 新增反例：空代 GC 高水位、CURRENT 缺失不覆盖、未决事务代保护、recovery 摘要、
-  20KB 单条记录、并发 append+compact、路径 `..`/符号链接、`&&`/`sh -c`/`$()`/反斜杠、
-  真实账本路径、task context 字段、`complete` 证据闸门、attempt 严格校验、verify 类型/提交绑定。
-- 全量测试读数见 `docs/TEST-RESULTS.md`；`contract` 仍因本机无真实 sapper 退出 2。
+新增反例：gen9/gen10 排序、坏 UTF-8 行、recovery inflight 复活、ledger_settle 未决保护、
+`--store`/绝对路径 sapper、apply_patch 正文、多级祖先符号链接、`nuwa complete` 放行、
+有限数/整数 samples、duration 一致性。
 
-## 修复后读数（本机）
-
-| 套件 | 用例 | 结果 |
-|---|---|---|
-| unit | 37 | 全过 |
-| shell | 14 | 全过 |
-| chaos | 8 | 全过 |
-| concurrency | 5 | 全过 |
-| e2e | 4 | 全过 |
-| r1 core | 23 | 全过 |
-| r1 dispatch / run / multi | 2 / 1 / 1 | 全过 |
-| crash matrix | 16 runs | 全过 |
-| r2–r7 | 28 | 全过 |
-
-合计 123 例 + 16 runs；`contract` 仍因 PATH 中没有真实 sapper 退出 2，`g0_baseline`
-随之报缺依赖。URL 入口实测 28 facts 全部带 `[nuwa:sha256:…]` 键。
+全量读数见 `docs/TEST-RESULTS.md`。

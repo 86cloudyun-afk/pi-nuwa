@@ -85,16 +85,16 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                        fact=existing["id"], reused=True, project=project)
         return {"intent": intent_id, "fact": existing["id"], "reused": True, "key": key}
 
-    ok, remaining = ledger.admit(tokens)
-    if not ok:
-        raise DispatchError(f"预算不足: remaining={remaining} need={tokens}")
-
     txn_id = f"t-{uuid.uuid4().hex[:12]}"
     rid = f"r-{uuid.uuid4().hex[:12]}"
     _crash("before_reserve")
     journal.append("reserve_pending", txn=txn_id, rid=rid, intent=intent_id,
                    attempt_seq=attempt, tokens=tokens, project=project)
-    ledger.reserve(rid, project, tokens)
+    ok, remaining = ledger.admit_reserve(rid, project, tokens)
+    if not ok:
+        journal.append("reserve_rejected", txn=txn_id, rid=rid, intent=intent_id,
+                       remaining=remaining)
+        raise DispatchError(f"预算不足: remaining={remaining} need={tokens}")
     _crash("after_reserve")
     journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id)
     journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
@@ -107,11 +107,21 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     out = art / "stdout.txt"
     err = art / "stderr.txt"
 
-    prompt = render_prompt(root, intent_id)
+    try:
+        prompt = render_prompt(root, intent_id)
+    except Exception as exc:  # noqa: BLE001
+        ledger.settle(rid, 0, status="crashed")
+        journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,
+                       tokens=0, status="crashed")
+        journal.append("ack", txn=txn_id, intent=intent_id, status="crashed")
+        raise DispatchError(f"渲染提示失败: {exc}") from exc
     ok, rule = policy.check_prompt(prompt)
     if not ok:
         journal.append("policy_block", txn=txn_id, intent=intent_id, rule=rule)
         ledger.settle(rid, 0, status="blocked")
+        journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,
+                       tokens=0, status="blocked")
+        journal.append("ack", txn=txn_id, intent=intent_id, status="blocked")
         raise DispatchError(f"策略拦截: {rule}")
     _crash("after_prepare")
     eng = engine or os.environ.get("NUWA_ENGINE", "omp-claude")
@@ -137,6 +147,9 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     except subprocess.TimeoutExpired:
         rc = 124
         status = "timeout"
+    except Exception:  # noqa: BLE001  引擎缺失/权限错误同样要落 executed 与结算
+        rc = -1
+        status = "crashed"
     dur = int((time.time() - t0) * 1000)
 
     if status == "ok" and (not result.exists() or json.loads(result.read_text()).get("exit_code") != 0):
@@ -149,6 +162,7 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
         ledger.settle(rid, tokens, status=status)
         journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,
                        tokens=tokens, status=status)
+        journal.append("ack", txn=txn_id, intent=intent_id, status=status)
         raise DispatchError(f"dispatch 失败: status={status} rc={rc}")
 
     payload = parse_engine_stdout(out.read_text(encoding="utf-8", errors="replace"))
@@ -156,6 +170,9 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     desc = data.get("description") if isinstance(data, dict) else None
     if not desc:
         ledger.settle(rid, tokens, status="crashed")
+        journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,
+                       tokens=tokens, status="crashed")
+        journal.append("ack", txn=txn_id, intent=intent_id, status="crashed")
         raise DispatchError("payload 缺少 description")
 
     res = txn.commit(root, intent_id, desc, key,

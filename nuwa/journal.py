@@ -28,6 +28,7 @@ PENDING_EVENTS = (
     "executed",
     "commit_prepare",
     "done_apply",
+    "ledger_settle",
 )
 FINAL_EVENTS = ("commit_done", "ack")
 
@@ -64,11 +65,14 @@ class Journal:
                     start = max(0, size - window)
                     fh.seek(start)
                     data = fh.read()
-                    for line in reversed(data.splitlines()):
+                    for raw in reversed(data.splitlines()):
+                        try:
+                            line = raw.decode("utf-8")
+                        except UnicodeDecodeError:
+                            continue
                         try:
                             return int(json.loads(line).get("seq", 0))
-                        except (json.JSONDecodeError, ValueError, TypeError,
-                                UnicodeDecodeError):
+                        except (json.JSONDecodeError, ValueError, TypeError):
                             continue
                     if start == 0:
                         return 0
@@ -99,7 +103,8 @@ class Journal:
     # ---------------------------------------------------------------- 读
     def _files(self) -> list[Path]:
         files = [self.path] if self.path.exists() else []
-        files += sorted(self.dir.glob("journal.*.jsonl"))
+        # 按代号数字排序：字典序会把 gen10 排在 gen9 前，重放时终态会倒退。
+        files += sorted(self.dir.glob("journal.*.jsonl"), key=self._gen_of)
         return files
 
     def _gen_of(self, path: Path) -> int:
@@ -114,12 +119,16 @@ class Journal:
     @staticmethod
     def _iter_records(path: Path):
         try:
-            fh = open(path, encoding="utf-8", errors="replace")
+            fh = open(path, "rb")
         except FileNotFoundError:
             return
         with fh:
-            for line in fh:
-                line = line.strip()
+            for raw in fh:
+                try:
+                    line = raw.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    # 与 _tail_seq 同一口径：坏编码整行跳过，不能被 replace 洗成合法事件。
+                    continue
                 if not line:
                     continue
                 try:
@@ -153,6 +162,11 @@ class Journal:
     def read(self, since_seq: int = 0) -> list[dict]:
         with FileLock(self.lock_path, blocking=True):
             return self._read_locked(since_seq)
+
+    def snapshot(self) -> tuple[dict | None, list[dict]]:
+        """锁内一次性取 recovery 摘要与全量记录，避免 GC 插入造成半新半旧。"""
+        with FileLock(self.lock_path, blocking=True):
+            return self.read_recovery(), self._read_locked(0)
 
     def read_recovery(self) -> dict | None:
         try:
@@ -260,13 +274,17 @@ class Journal:
     def _write_recovery_locked(self) -> None:
         old = self.read_recovery() or {}
         cur = self._summarize_locked()
+        committed = set(old.get("committed", [])) | set(cur["committed"])
+        inflight = {**old.get("inflight", {}), **cur["inflight"]}
+        # 终态删除信息不能被旧摘要的并集复活。
+        inflight = {k: v for k, v in inflight.items() if k not in committed}
         merged = {
             "recovery_schema": 1,
             "gen": self.current_gen(),
             "last_seq": max(int(old.get("last_seq", 0) or 0), int(cur["last_seq"] or 0)),
             "settled": sorted(set(old.get("settled", [])) | set(cur["settled"])),
-            "committed": sorted(set(old.get("committed", [])) | set(cur["committed"])),
-            "inflight": {**old.get("inflight", {}), **cur["inflight"]},
+            "committed": sorted(committed),
+            "inflight": inflight,
         }
         tmp = self.recovery_path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -341,13 +359,13 @@ def replay_state(root: str | Path) -> dict:
     """从 recovery 摘要 + journal 重放到最后一条终态，返回恢复所需摘要。"""
     j = Journal(root)
     state: dict = {"inflight": {}, "settled": set(), "committed": set(), "last_seq": 0}
-    base = j.read_recovery()
+    base, records = j.snapshot()
     if base:
         state["settled"] = set(base.get("settled", []))
         state["committed"] = set(base.get("committed", []))
         state["inflight"] = dict(base.get("inflight", {}))
         state["last_seq"] = int(base.get("last_seq", 0) or 0)
-    for rec in j.read():
+    for rec in records:
         ev = rec.get("event")
         state["last_seq"] = rec.get("seq", state["last_seq"])
         txn = rec.get("txn")

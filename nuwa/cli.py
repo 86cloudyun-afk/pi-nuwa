@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -89,10 +90,7 @@ def cmd_commit(args) -> int:
     if not root:
         print("nuwa: 不在 sapper 项目内", file=sys.stderr)
         return 2
-    key = args.key
-    if key == "auto":
-        intent = graph.get_intent(root, args.intent) or {}
-        key = txn.dispatch_key(root.name, args.intent, txn.attempt_of(intent))
+    key = None if args.key == "auto" else args.key
     try:
         res = txn.commit(root, args.intent, args.fact, key,
                          kind=args.kind, doc=args.doc)
@@ -265,20 +263,34 @@ def cmd_complete(args) -> int:
     if not root:
         print("nuwa: 不在 sapper 项目内", file=sys.stderr)
         return 2
-    fact = graph.get_fact(root, args.from_fact)
-    if not fact:
-        print(f"nuwa: fact 不存在: {args.from_fact}", file=sys.stderr)
+    ids = [x for x in re.split(r"[,\s]+", args.from_fact.strip()) if x]
+    if not ids:
+        print("nuwa: --from 为空", file=sys.stderr)
         return 2
-    kind = fact.get("kind")
-    if kind not in ("flag", "vuln", "loot"):
-        print(f"nuwa: 证据类型不足: {kind}（需要 flag/vuln/loot）", file=sys.stderr)
-        return 3
-    r = graph.sapper(root, ["complete", "--from", args.from_fact])
+    kinds = {}
+    for fid in ids:
+        fact = graph.get_fact(root, fid)
+        if not fact:
+            print(f"nuwa: fact 不存在: {fid}", file=sys.stderr)
+            return 2
+        kind = fact.get("kind")
+        if kind not in ("flag", "vuln", "loot"):
+            print(f"nuwa: 证据类型不足: {fid}={kind}（需要 flag/vuln/loot）", file=sys.stderr)
+            return 3
+        desc = fact.get("description") or ""
+        for marker in re.findall(r"\[nuwa:(sha256:[0-9a-f]{64})\]", desc):
+            if not any(marker in (f.get("description") or "")
+                       for f in graph.facts(root)):
+                print(f"nuwa: 证据键无法回溯: {marker}", file=sys.stderr)
+                return 4
+        kinds[fid] = kind
+    joined = ",".join(ids)
+    r = graph.sapper(root, ["complete", "--from", joined])
     if r.returncode != 0:
         print((r.stdout + r.stderr).strip()[:400], file=sys.stderr)
         return 1
-    Journal(root).append("project_completed", fact=args.from_fact, kind=kind)
-    print(json.dumps({"completed": True, "from": args.from_fact, "kind": kind},
+    Journal(root).append("project_completed", fact=joined, kind=",".join(sorted(set(kinds.values()))))
+    print(json.dumps({"completed": True, "from": joined, "kinds": kinds},
                      ensure_ascii=False))
     return 0
 

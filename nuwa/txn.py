@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -44,9 +45,9 @@ def _crash(point: str) -> None:
         os._exit(137)
 
 
-def commit(root: str | Path, intent_id: str, fact_text: str, key: str,
+def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
            kind: str = "note", doc: str | None = None, worker: str = "nuwa") -> dict:
-    """幂等提交：同 key 只产生一个 fact。"""
+    """幂等提交：同 key 只产生一个 fact；key=None 时在事务锁内按 attempt 生成。"""
     root = Path(root).resolve()
     nd = ensure_nuwa(root)
     journal = Journal(root)
@@ -56,6 +57,8 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str,
         intent = graph.get_intent(root, intent_id)
         if not intent:
             raise CommitError(f"intent 不存在: {intent_id}")
+        if key is None:
+            key = dispatch_key(project_name, intent_id, attempt_of(intent))
 
         existing = graph.find_fact_by_key(root, key)
         reused = existing is not None
@@ -63,6 +66,10 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str,
         if not reused and intent.get("status") == "done" and intent.get("to"):
             fact = graph.get_fact(root, intent["to"])
             if fact:
+                keys = re.findall(r"\[nuwa:(sha256:[0-9a-f]{64})\]",
+                                  fact.get("description") or "")
+                if keys and key not in keys:
+                    raise CommitError(f"intent 已由其他键完成: {keys[0]}")
                 graph.annotate_fact(root, fact["id"], key)
                 existing = fact
                 reused = True

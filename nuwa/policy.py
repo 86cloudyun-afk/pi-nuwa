@@ -19,8 +19,8 @@ ALLOW_RULES = [
 # 提交所有权：fact 只能经 nuwa commit 产生。分隔符覆盖 ; & | ( ) 换行引号反引号，
 # 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
 PROMPT_RULES = [
-    (r"(?:^|[;&|()\n\r\t\"'`\s]|\$\()\s*\\?sapper\s+"
-     r"(?:done\s+\S+|dispatch\s+i\d+|complete\b(?!\s+--from\s+\S+))", "P-006"),
+    (r"(?:^|[;&|()\n\r\t\"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+"
+     r"(?:(?:--store|-s)\s+\S+\s+)?(?:done\s+\S+|dispatch\s+i\d+|complete\b)", "P-006"),
 ]
 
 # 写类工具的目标路径：图与权威状态只能由 CLI 改（路径需先归一为绝对路径）。
@@ -43,18 +43,23 @@ class PolicyError(RuntimeError):
 
 
 def check_command(command: str) -> tuple[bool, str | None]:
+    """工具层命令检查：危险命令 + 提交所有权。"""
     for pattern, rule_id in DENY_RULES:
+        if re.search(pattern, command):
+            return False, rule_id
+    for pattern, rule_id in PROMPT_RULES:
         if re.search(pattern, command):
             return False, rule_id
     return True, None
 
 
 def check_prompt(prompt: str) -> tuple[bool, str | None]:
-    """在派发前扫描渲染提示，拦截被注入的危险命令模式与越权提交。"""
+    """渲染提示注入门：只查危险命令，不查提交所有权。
+
+    sapper 自己的 dry-run 模板会提到 `sapper done` 等动作；把 P-006 放进这里
+    会让正常派发被自身提示中止（审计 M9）。
+    """
     for pattern, rule_id in DENY_RULES:
-        if re.search(pattern, prompt):
-            return False, rule_id
-    for pattern, rule_id in PROMPT_RULES:
         if re.search(pattern, prompt):
             return False, rule_id
     return True, None

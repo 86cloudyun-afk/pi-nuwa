@@ -20,15 +20,22 @@ class Ledger:
         self.cap_path = d / "cap.json"
 
     def _append(self, rec: dict) -> dict:
-        rec.setdefault("ts", time.time())
         with FileLock(self.lock_path, blocking=True):
-            with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+            return self._append_locked(rec)
+
+    def _append_locked(self, rec: dict) -> dict:
+        rec.setdefault("ts", time.time())
+        with open(self.path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         return rec
 
     def records(self) -> list[dict]:
+        with FileLock(self.lock_path, blocking=True):
+            return self._records_locked()
+
+    def _records_locked(self) -> list[dict]:
         out = []
         try:
             with open(self.path, encoding="utf-8") as fh:
@@ -56,9 +63,13 @@ class Ledger:
         os.replace(tmp, self.cap_path)
 
     def summary(self) -> dict:
+        with FileLock(self.lock_path, blocking=True):
+            return self._summary_locked()
+
+    def _summary_locked(self) -> dict:
         settled_total = 0
         outstanding: dict[str, dict] = {}
-        for rec in self.records():
+        for rec in self._records_locked():
             t = rec.get("type")
             rid = rec.get("rid")
             if t == "opening_balance":
@@ -96,8 +107,29 @@ class Ledger:
         return self._append({"type": "renew", "rid": rid, "expires_at": time.time() + ttl})
 
     def settle(self, rid: str, tokens_actual: int, status: str = "ok") -> dict:
-        return self._append({"type": "settle", "rid": rid,
-                             "tokens_actual": int(tokens_actual), "status": status})
+        """按 rid 幂等：同一预留重复结算不重复扣账。"""
+        with FileLock(self.lock_path, blocking=True):
+            for rec in self._records_locked():
+                if rec.get("type") == "settle" and rec.get("rid") == rid:
+                    return rec
+            return self._append_locked({"type": "settle", "rid": rid,
+                                        "tokens_actual": int(tokens_actual), "status": status})
+
+    def admit_reserve(self, rid: str, project: str, tokens: int,
+                      dispatches: int = 1, ttl: int = 600,
+                      project_remaining: int | None = None) -> tuple[bool, int]:
+        """准入与预留同一把锁：并发 dispatch 不会各自基于旧余额获准。"""
+        with FileLock(self.lock_path, blocking=True):
+            s = self._summary_locked()
+            want = int(tokens * 1.05)
+            if want > s["remaining_global"]:
+                return False, s["remaining_global"]
+            if project_remaining is not None and tokens > project_remaining:
+                return False, project_remaining
+            self._append_locked({"type": "reserve", "rid": rid, "project": project,
+                                 "tokens": int(tokens), "dispatches": int(dispatches),
+                                 "expires_at": time.time() + ttl})
+            return True, s["remaining_global"]
 
     def reclaim(self, rid: str, reason: str = "expired") -> dict:
         return self._append({"type": "reclaim", "rid": rid, "reason": reason})

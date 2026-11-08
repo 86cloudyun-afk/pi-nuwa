@@ -21,8 +21,10 @@ import {
 	appendFileSync,
 	existsSync,
 	mkdirSync,
+	lstatSync,
 	readFileSync,
 	readdirSync,
+	readlinkSync,
 	realpathSync,
 	statSync,
 	writeFileSync,
@@ -80,8 +82,8 @@ const PATH_KEYS: Record<string, true> = {
 const PATH_RULES: Array<[RegExp, string]> = [
 	[/(^|[\\/])\.sapper[\\/](facts|intents)[\\/]/, "P-005"],
 	[/(^|[\\/])\.sapper[\\/]project\.json$/, "P-009"],
-	[/(^|[\\/])\.nuwa[\\/](journal[^\\/]*\.jsonl|checkpoint[^\\/]*\.json|CURRENT|global[^\\/]*\.jsonl)$/, "P-007"],
-	[/(^|[\\/])budget[\\/][^\\/]*\.jsonl$/, "P-007"],
+	[/(^|[\\/])\.nuwa[\\/](journal[^\\/]*\.jsonl|checkpoint[^\\/]*\.json|CURRENT|global[^\\/]*\.jsonl|recovery\.json)$/, "P-007"],
+	[/(^|[\\/])budget[\\/]([^\\/]*\.jsonl|cap\.json|freeze\.json)$/, "P-007"],
 ];
 
 /**
@@ -89,7 +91,7 @@ const PATH_RULES: Array<[RegExp, string]> = [
  * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
  */
 const COMMIT_RE =
-	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?sapper\s+(?:done\s+\S+|dispatch\s+i\d+|complete\b(?!\s+--from\s+\S+))/i;
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:--store|-s)\s+\S+\s+)?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
 /** 递归收集路径类字段；multi_edit/files/edits 等嵌套结构也能覆盖。 */
 function collectPaths(value: unknown, out: string[], depth = 0): void {
@@ -122,7 +124,7 @@ function collectStrings(value: unknown, out: string[], depth = 0): void {
 	}
 }
 
-/** 把相对路径、file://、符号链接都归一到真实绝对路径；不存在的文件用父目录 realpath。 */
+/** 把相对路径、file://、符号链接都归一到真实绝对路径；不存在的文件用最近存在的祖先 realpath。 */
 function resolvePath(value: string, baseDir: string): string[] {
 	const raw = value.startsWith("file://") ? value.slice(7) : value;
 	const normalized = raw.replace(/\\/g, "/");
@@ -130,15 +132,50 @@ function resolvePath(value: string, baseDir: string): string[] {
 	const out = new Set<string>([abs]);
 	try {
 		out.add(realpathSync(abs));
+		return [...out];
 	} catch {
-		try {
-			const parent = realpathSync(dirname(abs));
-			out.add(join(parent, abs.split("/").pop() ?? ""));
-		} catch {
-			/* 父目录也不存在，保留字面量 */
+		/* 目标不存在，继续按祖先解析 */
+	}
+	let probe = abs;
+	const rest: string[] = [];
+	while (probe !== dirname(probe) && !existsSync(probe)) {
+		rest.unshift(probe.split("/").pop() ?? "");
+		probe = dirname(probe);
+	}
+	try {
+		out.add(join(realpathSync(probe), ...rest));
+	} catch {
+		/* 祖先也不存在 */
+	}
+	try {
+		if (lstatSync(abs).isSymbolicLink()) {
+			const target = readlinkSync(abs);
+			const targetAbs = isAbsolute(target) ? target : resolve(dirname(abs), target);
+			out.add(targetAbs);
+			try {
+				out.add(realpathSync(targetAbs));
+			} catch {
+				/* 链接目标不存在 */
+			}
 		}
+	} catch {
+		/* 非链接或无法 lstat */
 	}
 	return [...out];
+}
+
+/** apply_patch 的目标在补丁正文里，单独提取。 */
+function collectPatchTargets(input: Record<string, unknown>, out: string[]): void {
+	for (const key of ["patch", "input", "text", "diff"]) {
+		const v = input[key];
+		if (typeof v !== "string") continue;
+		for (const m of v.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)) {
+			out.push(m[1].trim());
+		}
+		for (const m of v.matchAll(/^\+\+\+\s+(?:b\/)?(.+)$/gm)) {
+			out.push(m[1].trim());
+		}
+	}
 }
 
 /** 三类工具统一判定：bash 看命令，task 看全部文案，write/edit 看全部路径字段。 */
@@ -164,6 +201,7 @@ export function checkTool(
 	if (WRITE_TOOLS[toolName]) {
 		const paths: string[] = [];
 		collectPaths(input, paths);
+		if (toolName === "apply_patch") collectPatchTargets(input, paths);
 		for (const p of paths) {
 			for (const candidate of resolvePath(p, baseDir)) {
 				for (const [re, rule] of PATH_RULES) {

@@ -2,19 +2,22 @@
 
 ## 1.2.1 — 2026-11-08
 
-codex `gpt-6.1-sol` ultra 交付审计（block，35/100）后的修复：
+codex `gpt-6.1-sol` ultra 两轮交付审计（35 → 45，均 block）后的修复：
 
-- journal：compact 代号不覆盖、append/compact/gc/read 共用锁、seq 并入 checkpoint 高水位、
-  GC 保护未决事务代并写 recovery.json、尾读窗口按需扩大（B1–B5）
-- 策略：路径归一（cwd/`..`/符号链接/反斜杠）+ 递归收集 files/edits 路径；
-  P-006 覆盖 `&&`/管道/`$()`/引号/反斜杠；P-007 覆盖 `budget/global.jsonl`（B6–B8）
-- 入口：URL 默认走 `nuwa dispatch` 事务提交，回退 sapper 记 `dispatch_fallback`；
-  `bin/nuwa` 转发 flag/complete/soak-night/soak-verify（B9、M6）
-- 完成：`nuwa complete --from <fact>` 校验 kind=flag/vuln/loot，裸 `sapper complete` 仍拦（M2）
-- 一致：`txn.attempt_of` 严格校验（M3）；`night.verify` 严格 schema、实际时长、
-  `--expect-commit`（M4/M5）；`g1` 逐项聚合退出码（M8）
-- 新增 `nuwa flag`；README/RELEASE 说明 flag 属证据采集
-- 测试：扩展 37、journal 12、r1core 23、r2r7 28、e2e 4，合计 123 例 + 16 runs
+- journal：compact 代号不覆盖、统一锁、seq 并入 checkpoint 高水位、未决事务代保护、
+  recovery 摘要与 snapshot 原子读、尾读扩窗、严格 UTF-8、gen 数字排序（B1–B5、B11、M11）
+- 策略：路径归一（cwd/`..`/多级祖先/符号链接/反斜杠）+ `files[]`/`apply_patch` 正文；
+  P-006 覆盖 `&&`/管道/`$()`/引号/反斜杠/`--store`/绝对路径；P-007 覆盖 `budget/global.jsonl`、
+  `cap.json`、`freeze.json`、`.nuwa/recovery.json`（B6–B8、B10、M1）
+- 入口：URL 默认走 `nuwa dispatch` 事务提交；无 CLI/引擎 fail-closed；
+  `NUWA_SUBMIT_MODE=sapper` 为显式遗留模式；`bin/nuwa` 转发 flag/complete/soak-night/soak-verify；
+  收工前 `recover --repair`（B9、M6、M12）
+- 完成：`nuwa complete --from` 支持多 fact、kind 校验、`[nuwa:key]` 回溯；裸 `sapper complete` 一律拦（M2、M10）
+- 一致：`txn.commit(key=None)` 锁内生成规范键并拒绝其他键冲突（M3）；
+  `night.verify` 严格 schema、有限数、整数 samples、duration 一致性、`--expect-commit`（M4/M5）；
+  `check_prompt` 与 `check_command` 分离，避免提示误伤（M9）；`g1` 逐项聚合（M8）
+- 文档：`RELEASE-1.2.1.md` 按真实状态标注 closed/partial；`TEST-RESULTS.md` 更新到 1.2.1
+- 测试：扩展 40、journal 16、r1core 27、r2r7 28，合计 130 例 + 16 runs
 
 ## 1.2.0 — 2026-11-08
 

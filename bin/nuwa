@@ -17,6 +17,9 @@ _PKG_DIR="$(cd "$_SELF_DIR/.." && pwd)"
 case "${1:-}" in
   ls|status|attach|budget|flag|complete|commit|recover|adopt|dispatch|run|metrics|report|verify|policy|fairness|plugin|soak|soak-night|soak-verify|migrate)
     if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
+      _lab="${SAPPER_HOME:-$HOME/sapper-lab}"
+      # shellcheck disable=SC1090
+      [[ -f "${NUWA_ENV:-$_lab/env.sh}" ]] && source "${NUWA_ENV:-$_lab/env.sh}"
       exec python3 "$_PKG_DIR/nuwa/cli.py" "$@"
     fi
     ;;
@@ -285,15 +288,24 @@ dispatch_one() {
   local t0; t0=$(date +%s)
   local out rc
   # 默认走 Python dispatch：渲染提示 → 引擎 → 幂等提交 → 账本结算。
-  # 没有可用引擎或显式 NUWA_SUBMIT_MODE=sapper 时才回退 sapper 内部提交，并记事件。
-  if [[ "${NUWA_SUBMIT_MODE:-cli}" == "cli" && -f "$_PKG_DIR/nuwa/cli.py" && -n "${NUWA_ENGINE:-}" ]]; then
+  # 只有显式 NUWA_SUBMIT_MODE=sapper 才走 sapper 内部提交（遗留模式，必须留痕）。
+  local mode="${NUWA_SUBMIT_MODE:-cli}"
+  if [[ "$mode" == "cli" ]]; then
+    if [[ ! -f "$_PKG_DIR/nuwa/cli.py" || -z "${NUWA_ENGINE:-}" ]]; then
+      log "ERROR: 事务提交需要 nuwa CLI 与可用引擎（NUWA_ENGINE）；仅调试可设 NUWA_SUBMIT_MODE=sapper" >&2
+      event dispatch_error "id=$id" "why=no_engine"
+      return 3
+    fi
     out=$(PYTHONPATH="$_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 "$_PKG_DIR/nuwa/cli.py" \
       dispatch "$id" --root "$PWD" --model "$model" --timeout "$to" 2>&1)
     rc=$?
-  else
+  elif [[ "$mode" == "sapper" ]]; then
     out=$(sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1)
     rc=$?
-    event dispatch_fallback "id=$id" "rc=$rc" "mode=${NUWA_SUBMIT_MODE:-cli}"
+    event dispatch_legacy "id=$id" "rc=$rc"
+  else
+    log "ERROR: NUWA_SUBMIT_MODE 只能是 cli 或 sapper（当前 $mode）" >&2
+    return 2
   fi
   local dt=$(( $(date +%s) - t0 ))
   printf '%s\n' "$out" | tail -6
@@ -447,6 +459,12 @@ while :; do
   fi
   (( ! loop )) && break
 done
+
+# 收工前修复未完成事务：预留不悬挂到下一轮
+if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
+  PYTHONPATH="$_PKG_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 "$_PKG_DIR/nuwa/cli.py" \
+    recover --root "$PWD" --repair >/dev/null 2>&1 || true
+fi
 
 # ---------------------------------------------------------------- 战报
 log "===== 战报 ====="

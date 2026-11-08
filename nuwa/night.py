@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import time
@@ -55,7 +56,13 @@ def run(base: str | Path, minutes: float, projects: int, interval: float = 30,
 def _number(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} 不是数值: {value!r}")
-    return float(value)
+    try:
+        out = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} 无法转换: {value!r}") from exc
+    if not math.isfinite(out):
+        raise ValueError(f"{field} 不是有限数: {value!r}")
+    return out
 
 
 def verify(base: str | Path, expect_commit: str | None = None) -> dict:
@@ -92,9 +99,13 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
 
         minutes = _number(rep.get("minutes"), "minutes")
         samples = _number(rep.get("samples"), "samples")
+        if not samples.is_integer():
+            raise ValueError(f"samples 不是整数: {samples!r}")
         duration = _number(rep.get("duration_seconds"), "duration_seconds")
         started = _number(rep.get("started_at"), "started_at")
         finished = _number(rep.get("finished_at"), "finished_at")
+        if abs((finished - started) - duration) > max(1.0, duration * 0.05):
+            raise ValueError("duration 与 started_at/finished_at 不一致")
 
         checks = {
             "mode": rep.get("mode") == "soak" and mode == "soak",

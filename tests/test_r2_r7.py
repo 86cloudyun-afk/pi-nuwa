@@ -137,10 +137,10 @@ class PolicyTest(unittest.TestCase):
         self.assertFalse(policy.verify_signature(b"data2", key, sig))
 
     def test_prompt_blocks_direct_commit(self):
-        ok, rule = policy.check_prompt("正常提示\nsapper done i001 --fact x")
+        ok, rule = policy.check_command("正常提示\nsapper done i001 --fact x")
         self.assertFalse(ok)
         self.assertEqual(rule, "P-006")
-        ok, rule = policy.check_prompt("sapper claim i001 --worker w")
+        ok, rule = policy.check_command("sapper claim i001 --worker w")
         self.assertTrue(ok)
 
     def test_prompt_allows_dry_run(self):
@@ -156,11 +156,11 @@ class PolicyTest(unittest.TestCase):
             "\\sapper done i001 --fact x",
             "sapper complete",
         ):
-            ok, rule = policy.check_prompt(text)
+            ok, rule = policy.check_command(text)
             self.assertFalse(ok, text)
             self.assertEqual(rule, "P-006", text)
-        ok, rule = policy.check_prompt("sapper complete --from f009")
-        self.assertTrue(ok, rule)
+        ok, rule = policy.check_command("sapper complete --from f009")
+        self.assertFalse(ok, rule)
 
     def test_path_blocks_real_budget_ledger(self):
         for path in ("/root/sapper-lab/budget/global.jsonl",

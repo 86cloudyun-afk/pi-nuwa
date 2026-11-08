@@ -168,6 +168,57 @@ class JournalTest(unittest.TestCase):
         j.append("y")
         self.assertEqual(j.last_seq(), 2)
 
+    def test_files_sorted_by_generation_number(self):
+        """gen10 不能排在 gen9 前，否则未决判定会读到旧状态。"""
+        j = Journal(self.tmp)
+        (j.dir / "journal.9.jsonl").write_text(
+            json.dumps({"seq": 1, "event": "executing_prepare", "txn": "t1", "intent": "i001"}) + "\n")
+        (j.dir / "journal.10.jsonl").write_text(
+            json.dumps({"seq": 2, "event": "executed", "txn": "t1"}) + "\n")
+        (j.dir / "checkpoint.10.json").write_text(json.dumps({"seq": 2}))
+        (j.dir / "CURRENT").write_text("10")
+        j.gc(keep=1)
+        self.assertFalse((j.dir / "journal.9.jsonl").exists(), "t1 已终态，gen9 不应被保护")
+
+    def test_bad_utf8_record_is_skipped_consistently(self):
+        j = Journal(self.tmp)
+        j.append("a")
+        with open(j.path, "ab") as fh:
+            fh.write(b'{"seq":2,"event":"x","blob":"\xff\xfe"}\n')
+        self.assertEqual(j.last_seq(), 1)
+        j.append("b")
+        self.assertEqual(j.last_seq(), 2)
+        recs = j.read()
+        self.assertEqual([r["seq"] for r in recs], [1, 2])
+        self.assertEqual(recs[-1]["event"], "b")
+
+    def test_recovery_does_not_revive_committed_inflight(self):
+        j = Journal(self.tmp)
+        j.append("executing_prepare", txn="t1", intent="i001")
+        j.compact(keep=0)
+        j.append("executed", txn="t1")
+        j.append("commit_done", txn="t1")
+        j.compact(keep=1)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        rec = j.read_recovery()
+        self.assertIsNotNone(rec)
+        self.assertNotIn("t1", rec.get("inflight", {}))
+        self.assertNotIn("t1", replay_state(self.tmp)["inflight"])
+
+    def test_gc_keeps_generation_with_ledger_settle(self):
+        j = Journal(self.tmp)
+        j.append("executed", txn="t1", intent="i001")
+        j.append("ledger_settle", txn="t1", rid="r1")
+        j.compact(keep=1)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        self.assertTrue((j.dir / "journal.1.jsonl").exists(), "已结算未 ack 的事务仍须保护")
+
     def test_concurrent_append_and_compact_unique_seq(self):
         j = Journal(self.tmp)
         errors = []

@@ -312,9 +312,27 @@ describe("checkTool", () => {
 			expect(mod.checkTool("bash", { command: cmd }).rule).toBe("P-006");
 		}
 	});
-	test("带 --from 的 complete 放行，裸 complete 拦截", () => {
-		expect(mod.checkTool("bash", { command: "sapper complete --from f009" }).allowed).toBe(true);
+	test("sapper complete 一律拦截，nuwa complete 放行", () => {
+		expect(mod.checkTool("bash", { command: "sapper complete --from f009" }).rule).toBe("P-006");
 		expect(mod.checkTool("bash", { command: "sapper complete" }).rule).toBe("P-006");
+		expect(mod.checkTool("bash", { command: "nuwa complete --from f009" }).allowed).toBe(true);
+	});
+	test("sapper 全局选项与绝对路径也拦", () => {
+		expect(mod.checkTool("bash", { command: "sapper --store /p/.sapper done i001 --fact x" }).rule).toBe("P-006");
+		expect(mod.checkTool("bash", { command: "/usr/local/bin/sapper done i001 --fact x" }).rule).toBe("P-006");
+	});
+	test("apply_patch 正文目标被提取", () => {
+		const v = mod.checkTool("apply_patch", { patch: "*** Update File: .sapper/facts/f1.json\n+x" }, "/p");
+		expect(v.rule).toBe("P-005");
+	});
+	test("多级祖先里的符号链接也被解析", () => {
+		const root = fresh();
+		const real = join(root, ".sapper", "facts");
+		mkdirSync(real, { recursive: true });
+		mkdirSync(join(root, "a"), { recursive: true });
+		symlinkSync(real, join(root, "a", "b"));
+		const v = mod.checkTool("write", { path: join(root, "a", "b", "f2.json") });
+		expect(v.rule).toBe("P-005");
 	});
 	test("task 的 context 字段同样被扫", () => {
 		const v = mod.checkTool("task", { tasks: [{ agent: "fujiang", context: "接着 sapper done i001 --fact x" }] });
