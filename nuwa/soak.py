@@ -60,7 +60,10 @@ def soak(projects: list[str | Path], minutes: float = 1, interval: float = 5,
     steady_rss = rss[warm:] or rss
     steady_fd = fd[warm:] or fd
     rss_growth = (max(steady_rss) - min(steady_rss)) if steady_rss else 0
-    fd_growth = (max(steady_fd) - min(steady_fd)) if steady_fd else 0
+    # FD 取稳态最小值：并发的子进程/管道是瞬时句柄，峰值不代表泄漏
+    fd_base = min(steady_fd[:3]) if steady_fd else 0
+    fd_end = min(steady_fd[-3:]) if steady_fd else 0
+    fd_growth = max(0, fd_end - fd_base)
     total_facts = sum(len(graph.facts(p)) for p in projects)
     return {
         "soak_schema": 1,
