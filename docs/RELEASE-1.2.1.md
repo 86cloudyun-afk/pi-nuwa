@@ -266,6 +266,14 @@
 | B30 | shell 回滚失败后仍记已打回 | `completion_ok` 检查 `revert_completion` 退出码，失败记 `revert_failed` 并继续等 |
 | B23 | 同 UID 可读 token 直接提交 | guard 增加第二因子：父进程 cmdline 必须是 `nuwa/cli.py` 或 `bin/nuwa`；测试用临时 `nuwa/cli.py` 验证 |
 
+## 第三十一轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| M64 | guard 的 PPID 规则误拦 `python -m nuwa.cli` | PPID cmdline 增加 `-m nuwa.cli` 匹配 |
+| B25 | `goal.json` 缺失/损坏、fact 文件名与 id 错配仍可 verified=true | `readGraph` 检查 goal.json 可解析、fact.id 与文件名一致，否则 corrupt |
+| B30 | `completion_ok` 回滚失败与正常继续共用返回 1，最终可 exit 0 | 回滚失败设 `failed=1`，最终退出非零 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

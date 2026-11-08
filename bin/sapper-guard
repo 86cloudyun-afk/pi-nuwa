@@ -30,7 +30,7 @@ TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
 PPID_CMD="$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null || true)"
 TRUSTED=0
 case "$PPID_CMD" in
-  *nuwa/cli.py*|*bin/nuwa*) TRUSTED=1 ;;
+  *nuwa/cli.py*|*bin/nuwa*|*"-m nuwa.cli"*|*" -m nuwa.cli "*) TRUSTED=1 ;;
 esac
 ALLOWED=0
 if [[ -n "$TOKEN" && "${NUWA_SUBMIT_ALLOWED:-}" == "$TOKEN" && $TRUSTED -eq 1 ]]; then

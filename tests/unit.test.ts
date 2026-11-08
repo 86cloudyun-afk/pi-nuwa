@@ -38,6 +38,9 @@ function makeGraph(root: string, opts: {
 			id: it.id, status: it.status, from: ["f001"], description: it.id,
 		}));
 	}
+	writeFileSync(join(s, "facts", "goal.json"), JSON.stringify({
+		id: "goal", kind: "goal", description: "goal",
+	}));
 	for (const f of opts.facts ?? []) {
 		writeFileSync(join(s, "facts", `${f.id}.json`), JSON.stringify({
 			id: f.id, kind: f.kind, description: f.id,

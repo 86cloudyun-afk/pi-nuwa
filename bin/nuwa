@@ -400,6 +400,7 @@ completion_ok() {
   if ! revert_completion; then
     log "回滚失败：完成边未清理"
     event revert_failed "round=${round:-0}"
+    failed=1
     return 1
   fi
   log "完成被拒绝：无证据，已打回 active"

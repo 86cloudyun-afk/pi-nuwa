@@ -462,17 +462,28 @@ export function readGraph(root: string): Graph | null {
 		for (const f of readdirSync(join(root, ".sapper", "facts"))) {
 			if (!f.endsWith(".json") || f === "goal.json") continue;
 			facts++;
-			const fact = readJson<{ kind?: string }>(join(root, ".sapper", "facts", f));
+			try {
+				if (!readJson(join(root, ".sapper", "facts", f))) corrupt = true;
+			} catch {
+				corrupt = true;
+			}
+			const fact = readJson<{ id?: string; kind?: string }>(join(root, ".sapper", "facts", f));
 			if (!fact) {
 				corrupt = true;
 				continue;
 			}
+			if (fact.id && fact.id !== f.replace(/\.json$/, "")) corrupt = true;
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
 			if (fact?.kind) kinds[f.replace(/\.json$/, "")] = fact.kind;
 		}
 	} catch {
-		/* ignore */
+		corrupt = true;
+	}
+	try {
+		if (!readJson(join(root, ".sapper", "facts", "goal.json"))) corrupt = true;
+	} catch {
+		corrupt = true;
 	}
 	const strong: Record<string, true> = { flag: true, vuln: true, loot: true };
 	verified = !corrupt && goalEdges.length > 0 && goalEdges.every((edge) =>
