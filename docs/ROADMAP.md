@@ -52,7 +52,7 @@
 | 全局预算 | `$SAPPER_HOME/budget/global.jsonl` | **唯一权威**，`global.lock` 串行化 | 快照校验后重放；失败冻结全部新 dispatch |
 | 图 | `<proj>/.sapper/` | sapper 自身 | 常规只读；R1 提交修复在项目锁内受控写 JSON，写完必须 `sapper validate` |
 | 交接 | `<proj>/.nuwa/handoff.json` | 派生 | 可重建 |
-| 会话状态 | `cache/nuwa-loop/<hash>.json` | 可重建 | schema < current → 先迁移（2→3 保留 turns/spentTokens/armedAt）；schema > current → fail-closed（写 `state_schema_too_new`，拒绝上膛，不清空）；仅 JSON 损坏才重置并写 `state_reset` |
+| 会话状态 | `cache/nuwa-loop/<hash>.json` | 可重建 | schema < current → 先迁移（2→3 保留 turns/spentTokens/armedAt）；schema > current → 0.9+ 在加载前 fail-closed（写 `state_schema_too_new`，拒绝上膛，不清空）；0.3.x 的 loadState 会返回空状态，因此回滚时不得指向 schema 3 目录（用独立 state dir 或先降级迁移）；仅 JSON 损坏才重置并写 `state_reset` |
 
 权威类损坏且无重放依据：保留现场、冻结新 dispatch、退出码 6；恢复动作写 journal。
 
@@ -76,7 +76,7 @@
 - Bloom 仅作快速否定：Bloom 判"不存在"→ 新事务；"可能存在"→ 必须查索引；索引查不到 → **按新事务处理**，绝不跳过。
 - 压缩保留 checkpoint + `seq > checkpoint.seq` 的记录 + `unresolved` 完整记录 + 全量索引。
 压缩下界 = `min(所有活跃快照的 cut_seq[p], checkpoint.seq)`；`snapshots.idx` 登记每个快照的 cut 与引用计数，仍有快照引用时不得删除其后的记录，引用归零后才可 GC。
-代际文件：`checkpoint.<gen>.json`、`index.<gen>.idx`、`journal.<gen>.jsonl` 一律不覆盖；每代写完 fsync 后，原子更新 `CURRENT`（tmp+rename）指向 gen；上一代保留到下一次压缩成功，截断只作用于 gen-2 及更早。恢复读 `CURRENT`；文件缺失或三者不一致则回退上一代并写 `compaction_rolled_back`。
+代际文件：`checkpoint.<gen>.json`、`index.<gen>.idx`、`journal.<gen>.jsonl` 一律不覆盖；每代写完 fsync 后，原子更新 `CURRENT`（tmp+rename）指向 gen；上一代保留到下一次压缩成功，截断只作用于 gen-2 及更早。切代时把 `seq > checkpoint.<gen-1>.seq` 的记录写入 `journal.<gen-1>.tail.jsonl`，保留到 gen+1。回退上一代 = `checkpoint.<gen-1>` + `journal.<gen-1>` + tail，按 seq 去重；因此切代后新增的 `commit_done` 不会丢失。
 重放断言：run/账本/facts 与压缩前一致，且无重复 `commit_done`。
 
 ## 4. 各阶段
@@ -172,7 +172,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 预检：spawn 前估算 input tokens `ceil(prompt_chars/4)`；若超过 reserve 则拒绝或排队。支持输出上限的引擎传 `max_output_tokens = reserve - input_est`。
 - `per_task_cap = reserve`；timeout 由 `NUWA_TASK_TIMEOUT` 单独设定。
 - 结算：`overspend = max(0, actual - reserve) / reserve`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`，项目暂停且门禁失败。
-- 账本可用余额 = `remaining_global`，恒不为负；短期负实际余额必须在下一结算周期补平。
+- 准入保证 `sum(reserve)*1.05 <= global_cap` 时不透支。若引擎突破硬上限导致 `actual > 1.05*reserve`，记 `major_overrun`，`remaining_global` 允许为负，项目立即冻结并禁止新 dispatch；只能通过 `nuwa budget add <n>` 或提高 cap 补平，补平前门禁失败。
 - 在途：单项目 ≤ `--parallel`，全局 ≤ `NUWA_GLOBAL_CONCURRENCY`。
 - 暂停：`overdraft` 或人工暂停期间 wall 不计时（记录 pause/resume 时间戳）。
 
@@ -323,8 +323,8 @@ reserve → executing_prepare → executing → executed → commit_prepare
 3. 获取 `global.lock`，再按固定顺序获取各项目锁（barrier）；记录 `global_cut_seq` 与每个项目 journal 的 `cut_seq[p]`；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
 4. 在各项目锁内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；导出完成后校验每个项目 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
 5. 复制 artifact 原始字节到 `snapshot/artifacts/`（默认开启；关闭时标 `evidence_incomplete`）。
-6. 写 `SNAPSHOT.json`：各文件 sha256、facts 数、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.jsonl`（冻结期间已接受的 commit/结算请求）。
-7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
+6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.jsonl`（冻结期间已接受的 commit/结算请求）。
+7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。恢复分两段断言：`restore` 后 facts 与余额必须等于 `at_cut_*`；重放 queue 后必须等于 `at_cut_* + queue 产生的增量`，两段分别校验。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
 
 **增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；旧扩展遇到 schema 3 必须 fail-closed（拒绝上膛并写 `state_schema_too_new`），不得静默重置。
 
@@ -354,7 +354,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 长测协议：
 - 命令：`nuwa soak --minutes 4320 --projects 4 --concurrency 2 --min-dispatch-per-hour 60`；产物必须写 `MODE=soak` 与 `COMMIT=<sha>`，上传前完成
-- 采样间隔 30s；PID 范围 = 各项目进程树
+- 采样间隔 30s；PID 范围 = 各项目进程树；**所有判据按项目分别计算**（每项目 RSS 斜率、FD 差、dispatch/hour、facts 增长），任一项目不达标即失败；全局汇总只作展示，不得掩盖单项目停滞
 - 有效运行 ≥259200 秒；提前退出、采样间隔 >60s，判失败
 - **RSS**：预热 20% 后对 RSS(KB)-时间(min) 最小二乘，斜率 <1024 KB/min
 - **FD**：`max(后10个采样) - min(预热后前10个采样) ≤ 0`
