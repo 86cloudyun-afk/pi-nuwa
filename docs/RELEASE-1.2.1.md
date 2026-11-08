@@ -381,6 +381,13 @@
 | B46 | Python `_evidence` 的 goal 未校验对象类型/id | 要求 `isinstance(goal, dict)` 且 `goal.id == "goal"`；edge.from 成员必须是字符串 |
 | B25 | shell facts 文件身份、from 成员类型；扩展 to/worker/source_intent 类型 | shell 校验 fact.id 与文件名、from 成员字符串；扩展校验 to/worker/source_intent 类型 |
 
+## 第四十六轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B47 | 真实 open/claimed intent 的 `to` 为 null，被类型检查判坏 | `to` 允许 `null/undefined/string`，不再把 null 视为损坏 |
+| B25 | shell 外层未校验 from 数组/成员类型 | 外层解析 goal edge 时先校验 `from` 为字符串数组 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

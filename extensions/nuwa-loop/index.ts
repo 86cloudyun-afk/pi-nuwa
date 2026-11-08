@@ -469,7 +469,7 @@ export function readGraph(root: string): Graph | null {
 			if (!it.id || it.id !== f.replace(/\.json$/, "")
 				|| !it.description || !it.created_at) corrupt = true;
 			if (!Array.isArray(it.from) || it.from.length === 0) corrupt = true;
-			if (it.to !== undefined && typeof it.to !== "string") corrupt = true;
+			if (it.to !== undefined && it.to !== null && typeof it.to !== "string") corrupt = true;
 			if (it.worker !== undefined && it.worker !== null
 				&& typeof it.worker !== "string") corrupt = true;
 			if (it.from !== undefined) {

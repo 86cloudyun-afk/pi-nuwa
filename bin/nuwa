@@ -403,6 +403,9 @@ for path in glob.glob(".sapper/intents/*.json"):
     except Exception:
         raise SystemExit(1)
     if it.get("to") == "goal":
+        if not isinstance(it.get("from"), list) or not all(
+                isinstance(x, str) for x in it.get("from") or []):
+            print("no"); raise SystemExit
         edges.append((path, it))
 # 锁内重判：等待锁期间产生的有效完成不能删。
 try:
