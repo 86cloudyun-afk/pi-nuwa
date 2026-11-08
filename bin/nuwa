@@ -405,7 +405,8 @@ while :; do
   # 只有 frontier 为空时才让 reason 生成新意图，省一轮模型调用
   ids="$(frontier_ids)"
   if [[ -z "$ids" ]]; then
-    sapper dispatch reason --model "$model" --timeout "$(( remaining < 240 ? remaining : 240 ))" 2>&1 | tail -1
+    NUWA_SUBMIT_ALLOWED="$(cat "$LAB_DIR/.submit_token" 2>/dev/null || true)" \
+      sapper dispatch reason --model "$model" --timeout "$(( remaining < 240 ? remaining : 240 ))" 2>&1 | tail -1
     ids="$(frontier_ids)"
   fi
 

@@ -288,7 +288,7 @@ def cmd_complete(args) -> int:
             return 4
         kinds[fid] = kind
     joined = ",".join(ids)
-    r = graph.sapper(root, ["complete", "--from", joined])
+    r = graph.sapper(root, ["complete", "--from", joined], allow_submit=True)
     if r.returncode != 0:
         print((r.stdout + r.stderr).strip()[:400], file=sys.stderr)
         return 1

@@ -91,7 +91,7 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
         args = ["intent", "--from", ",".join(map(str, from_ids)), desc]
         if title:
             args += ["-t", str(title)]
-        r = graph.sapper(root, args)
+        r = graph.sapper(root, args, allow_submit=True)
         if r.returncode != 0:
             journal.append("reason_intent_failed", round=round_no, error=(r.stdout + r.stderr)[:200])
             continue

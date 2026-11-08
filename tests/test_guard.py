@@ -51,8 +51,9 @@ class GuardTest(unittest.TestCase):
     def test_blocks_complete(self):
         self.assertEqual(self.run_guard("complete", "--from", "f001").returncode, 7)
 
-    def test_allows_reason(self):
-        self.assertNotEqual(self.run_guard("dispatch", "reason", "--model", "fake").returncode, 7)
+    def test_allows_reason_internal(self):
+        self.assertNotEqual(
+            self.run_guard("dispatch", "reason", "--model", "fake", allowed=True).returncode, 7)
 
     def test_allows_internal_commit(self):
         self.assertNotEqual(
@@ -72,6 +73,15 @@ class GuardTest(unittest.TestCase):
     def test_blocks_dispatch_with_options(self):
         self.assertEqual(
             self.run_guard("dispatch", "--model", "fake", "i001").returncode, 7)
+
+    def test_blocks_fact_from_intent(self):
+        self.assertEqual(self.run_guard("fact", "x", "--from-intent", "i001").returncode, 7)
+
+    def test_blocks_dispatch_reason(self):
+        self.assertEqual(self.run_guard("dispatch", "reason", "--model", "fake").returncode, 7)
+
+    def test_allows_fact_without_from_intent(self):
+        self.assertNotEqual(self.run_guard("fact", "x", "-k", "host").returncode, 7)
 
     def test_blocks_forged_env(self):
         env = dict(self.env)

@@ -100,7 +100,7 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
             args = ["done", intent_id, "--fact", desc, "-k", kind, "--worker", worker]
             if doc:
                 args += ["--doc", doc]
-            r = graph.sapper(root, args)
+            r = graph.sapper(root, args, allow_submit=True)
             if r.returncode != 0:
                 raise CommitError((r.stdout + r.stderr).strip()[:500])
             fact = graph.find_fact_by_key(root, key)

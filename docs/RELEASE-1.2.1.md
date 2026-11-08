@@ -163,6 +163,14 @@
 | B24 | 真实 sapper 在 `$SAPPER_HOME/bin` 时跳过安装；PATH 顺序不利 | install 先备份/改名 `sapper.real` 再装 guard；`bin/nuwa` 在子命令 exec 前把 `$SAPPER_HOME/bin` 放到 PATH 最前 |
 | B25 | guard 放行 `dispatch reason`；真实 complete 绕过校验 | `complete` 一律拦；`dispatch i<N>` 无论前置选项都拦；`reason` 保留（只生成意图） |
 
+## 第十八轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B25 | `dispatch reason` 可写完成状态 | 无 token 时 `reason` 与 `i<N>` 一并拦；内部调用显式带 token |
+| B26 | `fact --from-intent` 等直接结案入口绕过 guard | guard 拦 `fact --from-intent`；`auto`/`brainstorm-pick` 不在当前 CLI 子命令表 |
+| B23 | token 注入面过宽 | `graph.sapper(allow_submit=False)` 默认不注入；只有 done/complete/reason 提交链传 True |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

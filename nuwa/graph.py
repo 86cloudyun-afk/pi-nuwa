@@ -110,14 +110,18 @@ def annotate_fact(root: str | Path, fact_id: str, key: str) -> None:
     _atomic_json(p, data)
 
 
-def sapper(root: str | Path, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+def sapper(root: str | Path, args: list[str], timeout: int = 120,
+           allow_submit: bool = False) -> subprocess.CompletedProcess:
     env = dict(os.environ)
-    # nuwa 是唯一合法提交入口；guard 用 0600 token 放行，调用者无法伪造。
-    try:
-        env["NUWA_SUBMIT_ALLOWED"] = (
-            sapper_home() / ".submit_token").read_text(encoding="utf-8").strip()
-    except OSError:
-        env["NUWA_SUBMIT_ALLOWED"] = ""
+    # 只有提交链调用才注入 0600 token；其余调用不携带，缩小传播面。
+    if allow_submit:
+        try:
+            env["NUWA_SUBMIT_ALLOWED"] = (
+                sapper_home() / ".submit_token").read_text(encoding="utf-8").strip()
+        except OSError:
+            env["NUWA_SUBMIT_ALLOWED"] = ""
+    else:
+        env.pop("NUWA_SUBMIT_ALLOWED", None)
     return subprocess.run(["sapper", *args], cwd=str(root), env=env,
                           capture_output=True, text=True, timeout=timeout)
 

@@ -57,12 +57,23 @@ case "$cmd" in
     (( ALLOWED == 1 )) || block "$cmd"
     ;;
   dispatch)
-    # 扫描 dispatch 之后所有 token，前置选项不能遮住 intent。
+    # 扫描 dispatch 之后所有 token，前置选项不能遮住 intent/reason。
     for (( j = cmd_idx + 1; j < ${#args[@]}; j++ )); do
       if [[ "${args[$j]}" =~ ^i[0-9]+$ ]]; then
         (( ALLOWED == 1 )) || block "dispatch ${args[$j]}"
-        break
+      elif [[ "${args[$j]}" == "reason" ]]; then
+        (( ALLOWED == 1 )) || block "dispatch reason"
       fi
+    done
+    ;;
+  fact)
+    # fact --from-intent 会原子结案，必须走 nuwa commit。
+    for (( j = cmd_idx + 1; j < ${#args[@]}; j++ )); do
+      case "${args[$j]}" in
+        --from-intent|--from-intent=*|--from-i|--from-i=*|--from-in*)
+          (( ALLOWED == 1 )) || block "fact ${args[$j]}"
+          ;;
+      esac
     done
     ;;
 esac
