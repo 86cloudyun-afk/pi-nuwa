@@ -76,7 +76,7 @@
 - Bloom 仅作快速否定：Bloom 判"不存在"→ 新事务；"可能存在"→ 必须查索引；索引查不到 → **按新事务处理**，绝不跳过。
 - 压缩保留 checkpoint + `seq > checkpoint.seq` 的记录 + `unresolved` 完整记录 + 全量索引。
 压缩下界 = `min(所有活跃快照的 cut_seq[p], checkpoint.seq)`；`snapshots.idx` 登记每个快照的 cut 与引用计数，仍有快照引用时不得删除其后的记录，引用归零后才可 GC。
-代际文件：`checkpoint.<gen>.json`、`index.<gen>.idx`、`journal.<gen>.jsonl` 一律不覆盖；每代写完 fsync 后，原子更新 `CURRENT`（tmp+rename）指向 gen；上一代保留到下一次压缩成功，截断只作用于 gen-2 及更早。切代后，新记录**同时追加**到 `journal.<gen>.jsonl` 与 `journal.<gen-1>.tail.jsonl`，直到 gen+1 压缩成功。回退上一代 = `checkpoint.<gen-1>` + `journal.<gen-1>` + tail（含切代后的全部记录），按 seq 去重；因此切代后新增的 `commit_done` 不会丢失。
+代际文件：`checkpoint.<gen>.json`、`index.<gen>.idx`、`journal.<gen>.jsonl` 一律不覆盖；每代写完 fsync 后，原子更新 `CURRENT`（tmp+rename）指向 gen；上一代保留到下一次压缩成功，截断只作用于 gen-2 及更早。切代后，新记录**同时追加**到 `journal.<gen>.jsonl` 与 `journal.<gen-1>.tail.jsonl`，直到 gen+1 压缩成功。双写顺序固定为「先 tail + fsync，再 primary + fsync」；重启时按 seq 对账，缺失一侧从另一侧补齐，再进入恢复。回退上一代 = `checkpoint.<gen-1>` + `journal.<gen-1>` + tail（含切代后的全部记录），按 seq 去重；因此切代后新增的 `commit_done` 不会丢失。
 重放断言：run/账本/facts 与压缩前一致，且无重复 `commit_done`。
 
 ## 4. 各阶段
@@ -100,7 +100,7 @@
 
 **幂等键写进 fact 本身**：
 
-- fact 的 `description` 末尾追加 ` [nuwa:<完整 dispatch_key>]`（64 hex）。
+- fact 的 `description` 末尾追加 ` [nuwa:<完整 dispatch_key>]`（规范串 `sha256:<64 hex>`，与索引一致）。
 - 恢复按完整键精确匹配；`x-nuwa-key` 为同值辅助字段。
 - 显示层可截断前 8 位，但判定只用完整键。
 - 由于键随 fact 一次写入，不存在"fact 已落盘、键未落盘"的窗口。
@@ -183,7 +183,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 在途：单项目 ≤ `--parallel`，全局 ≤ `NUWA_GLOBAL_CONCURRENCY`。
 - 暂停：`overdraft` 或人工暂停期间 wall 不计时（记录 pause/resume 时间戳）。
 
-- 预留生命周期：`reserved`（执行中）→ `pending_settlement`（executed 后额度仍占用）→ `settled`（释放）。只有 `reserved`、锁空闲、无 executed 记录、且无 `result.json`/artifact 才可 `reclaim`；若锁空闲但 `result.json` 存在，先补 `executed(ok)` 再结算，禁止直接回收。`pending_settlement` 必须等结算完成才释放额度，避免提前释放造成双花。
+- 预留生命周期：`reserved`（执行中）→ `pending_settlement`（executed 后额度仍占用）→ `settled`（释放）。只有 `reserved`、锁空闲、无 executed 记录、且无 `result.json`/artifact 才可 `reclaim`；若锁空闲但 `result.json` 存在，先按 R1 规则校验（完成标记 + exit 0 + artifact）补 `executed(ok/crashed)` 再结算，禁止直接回收。`pending_settlement` 必须等结算完成才释放额度，避免提前释放造成双花。
 - 续租：`executing` 期间每 2 分钟 `renew`；TTL 10 分钟。
 - 迟到结算：`late_settle` 按 `rid` 匹配，不重复扣。
 - 超支：三类均以各自额度为分母（tokens/dispatches 用 reserve，wall 用 wall_cap）；`overspend = max(0, actual - quota)/quota`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`、项目暂停、门禁失败。
@@ -335,7 +335,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 6. 写 `SNAPSHOT.json`：各文件 sha256、`at_cut_facts`、`at_cut_balance`、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数，含 `state_seq`）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）、`queue.<snapshot_id>.jsonl`（barrier 内复制的前缀，不打包活文件）。
 7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。恢复分两段断言：`restore` 后 facts 与余额必须等于 `at_cut_*`；重放 queue 后必须等于 `at_cut_* + queue 产生的增量`，两段分别校验。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照；单独 restore 快照时，按快照内的 `queue.jsonl` 重放这批已接受请求，再按 `rid` 去重。
 
-**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、**已有 fact 的变更记录**（`{fact_id, rev, changed_fields, ts}`，覆盖补证/置信度/矛盾标记）、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 中 `state_seq > snapshot_state_seq` 的变化（turns/spentTokens/armedAt）、以及 `qseq > queue_cut_seq` 且尚未写入 journal/账本的队列条目（按 txn_id 去重）；队列每条带单调 `qseq`，不用时间戳裁切。回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`（按 `fact_id+rev` 应用变更，rev 大者胜）。恢复断言除数量外，还要比对每个 fact 的字段级校验和。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9 支持 `loop_schema <= 3`（3 由它引入），仅 `>3` 时 fail-closed（拒绝上膛并写 `state_schema_too_new`）；0.3.x 支持 `<=2`，遇 3 会清空，故回滚不得指向 schema 3 目录。
+**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、**已有 fact 的变更记录**（`{fact_id, rev, changed_fields, ts}`，覆盖补证/置信度/矛盾标记）、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 中 `state_seq > snapshot_state_seq` 的变化（turns/spentTokens/armedAt）、以及 `qseq > queue_cut_seq` 且尚未写入 journal/账本的队列条目（按 txn_id 去重）；队列每条带单调 `qseq`，不用时间戳裁切。回滚**全程保持 freeze**：冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`（按 `fact_id+rev` 应用；队列部分在 import 时读取 `qseq > queue_cut_seq` 的当前队列，冻结期间队列只追加不移除，因此导出后新接受的请求也不会漏）→ 解冻。恢复断言除数量外，还要比对每个 fact 的字段级校验和。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；0.9 支持 `loop_schema <= 3`（3 由它引入），仅 `>3` 时 fail-closed（拒绝上膛并写 `state_schema_too_new`）；0.3.x 支持 `<=2`，遇 3 会清空，故回滚不得指向 schema 3 目录。
 
 **初始化/迁移样本**：
 
