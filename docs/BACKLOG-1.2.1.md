@@ -7,10 +7,10 @@
 
 | ID | 证据 | 风险 | 下一步 |
 |---|---|---|---|
-| M5 | `nuwa/night.py:106`、`:136` | `verdict` 的 RSS/FD 仍是 soak 自报；journal 锚点只证明事件发生 | 用 `/proc/<pid>/status` 独立采样重算 verdict，报告存原始采样 |
-| M17 | `nuwa/txn.py:181`、`nuwa/journal.py:290` | 恢复摘要与账本口径在 `reserve_committed` 前后仍有默认值差异 | 摘要 inflight 强制携带 rid/tokens；repair 缺失字段时拒绝结算而非用 4000 |
-| M20 | `nuwa/dispatch.py:77`、`:112` | 同 intent 并发准入靠 inflight 锁，窗口未完全消除 | 在 `txn.lock` 内做 reserve+executing_prepare，或引入 intent 级 flock |
-| M21 | `tests/test_r1_dispatch.py:51`、`tests/test_r1_core.py:203` | 并发测试缺确定性交错；部分反例在旧实现也能过 | 用 `threading.Barrier` + 注入点做确定性并发；为每个反例保存旧实现失败日志 |
+| M5 | 已修：`night.run` 写 `samples.jsonl`，`verify` 重算 RSS/FD growth 并与 REPORT 对比 | 剩余：verdict 其余判据仍为自报 | 1.3 补 per-project 采样 |
+| M17 | 已修：`reserve_committed` 带 tokens，repair 只结算 `has_reserve` 且取摘要 tokens | 剩余：摘要 inflight 的默认值 | 1.3 补缺失字段拒绝结算 |
+| M20 | 已修：`txn.lock` 内复查未终态事务，排除当前 txn | 剩余：reserve 与 prepare 之间仍有极窄窗口 | 1.3 引入 intent 级 flock |
+| M21 | 已修：journal 并发用例加 `Barrier`；新增 reserve tokens 反例 | 剩余：其余套件的交错 | 1.3 为 crash_matrix 加确定性注入 |
 | M22 | `nuwa/ledger.py:77`、`:112` | `has_reserve` 对 reclaim/renew/重复 rid 的边界 | 账本增加 `rid` 状态机视图，单测覆盖 reserve→reclaim→reserve |
 | M25 | `nuwa/graph.py:105` | 同一 fact 多 marker 的冲突裁决 | 规定「首个 `x-nuwa-key` 为权威」，正文多 marker 只做审计线索 |
 | M27 | `nuwa/journal.py:319`、`:446` | `replay_state` 与 `_summarize` 的终态归并仍有细节差异 | 抽公共 `apply_event(state, rec)`，两条路径共用 |

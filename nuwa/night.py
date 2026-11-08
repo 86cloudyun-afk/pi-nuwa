@@ -45,6 +45,11 @@ def run(base: str | Path, minutes: float, projects: int, interval: float = 30,
     res["started_at"] = started
     res["finished_at"] = time.time()
     res["duration_seconds"] = res["finished_at"] - started
+    raw = res.pop("samples_raw", [])
+    (base / "samples.jsonl").write_text(
+        "\n".join(json.dumps(s, ensure_ascii=False) for s in raw) + ("\n" if raw else ""),
+        encoding="utf-8")
+    res["samples_file"] = "samples.jsonl"
     res["commit"] = _commit()
     (base / "REPORT.json").write_text(json.dumps(res, ensure_ascii=False, indent=2),
                                       encoding="utf-8")
@@ -114,6 +119,29 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
                 elif '"event": "commit_done"' in line:
                     journal_commits += 1
         facts = _number(rep.get("facts", 0), "facts")
+        samples_file = base / str(rep.get("samples_file") or "samples.jsonl")
+        try:
+            raw = [json.loads(line) for line in
+                   samples_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except (OSError, json.JSONDecodeError):
+            raw = []
+        recalc_ok = False
+        if raw:
+            try:
+                rss = [int(s["rss_kb"]) for s in raw]
+                fds = [int(s["fds"]) for s in raw]
+                warm = max(1, len(raw) // 5)
+                steady_rss = rss[warm:] or rss
+                steady_fd = fds[warm:] or fds
+                rss_growth = max(steady_rss) - min(steady_rss)
+                fd_growth = max(0, min(steady_fd[-3:]) - min(steady_fd[:3]))
+                recalc_ok = (
+                    abs(rss_growth - _number(rep.get("rss_growth_kb"), "rss_growth_kb"))
+                    <= max(1024, rss_growth * 0.1)
+                    and fd_growth == int(_number(rep.get("fd_growth"), "fd_growth"))
+                )
+            except (KeyError, TypeError, ValueError):
+                recalc_ok = False
 
         minutes = _number(rep.get("minutes"), "minutes")
         samples = _number(rep.get("samples"), "samples")
@@ -134,6 +162,7 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             "verdict": True,
             "duration": finished >= started and duration >= minutes * 60 * 0.9,
             "journal": journal_dispatches > 0 and abs(facts - journal_commits) <= 2,
+            "samples_recalc": recalc_ok,
         }
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,
                 "commit": commit, "report": str(rep_path),

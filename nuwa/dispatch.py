@@ -13,7 +13,7 @@ from pathlib import Path
 from . import graph, txn, policy
 from .journal import Journal
 from .ledger import Ledger
-from .locks import is_locked
+from .locks import FileLock, is_locked
 from .paths import ensure_nuwa
 
 REPO = Path(__file__).resolve().parents[1]
@@ -118,10 +118,18 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     _crash("after_reserve")
     journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id,
                    tokens=tokens)
-    journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
-                   attempt_seq=attempt, key=key, tokens=tokens)
-    # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。
-    graph.set_intent_field(root, intent_id, "x-nuwa-attempt", attempt + 1)
+    with FileLock(nd / "txn.lock", blocking=True):
+        pending_intents = {p.get("intent") for p in txn.recover(root)["pending"]
+                           if p.get("txn") != txn_id}
+        if intent_id in pending_intents:
+            journal.append("dispatch_rejected", txn=txn_id, rid=rid,
+                           intent=intent_id, why="pending_txn")
+            ledger.settle(rid, 0, status="rejected")
+            raise DispatchError(f"intent 有未终态事务: {intent_id}")
+        journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
+                       attempt_seq=attempt, key=key, tokens=tokens)
+        # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。
+        graph.set_intent_field(root, intent_id, "x-nuwa-attempt", attempt + 1)
 
     art = nd / "artifacts" / txn_id
     art.mkdir(parents=True, exist_ok=True)

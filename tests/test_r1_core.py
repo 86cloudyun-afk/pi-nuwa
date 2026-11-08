@@ -272,9 +272,11 @@ class JournalTest(unittest.TestCase):
     def test_concurrent_append_and_compact_unique_seq(self):
         j = Journal(self.tmp)
         errors = []
+        barrier = threading.Barrier(4)
 
         def writer():
             try:
+                barrier.wait(timeout=10)
                 for _ in range(10):
                     j.append("w")
             except Exception as exc:  # noqa: BLE001
@@ -282,6 +284,7 @@ class JournalTest(unittest.TestCase):
 
         def compactor():
             try:
+                barrier.wait(timeout=10)
                 for _ in range(3):
                     j.compact(keep=0)
             except Exception as exc:  # noqa: BLE001
@@ -436,6 +439,16 @@ class TxnTest(unittest.TestCase):
             txn.commit(self.root, "i001", "second", k2)
         facts = [json.loads(p.read_text()) for p in self.facts()]
         self.assertEqual(len([f for f in facts if "nuwa:" in f["description"]]), 1)
+
+    def test_repair_uses_reserve_tokens(self):
+        led = Ledger(self.tmp)
+        led.set_cap(100000)
+        j = Journal(self.root)
+        j.append("reserve_pending", txn="t1", rid="r1", intent="i001", tokens=7777)
+        j.append("reserve_committed", txn="t1", rid="r1", intent="i001", tokens=7777)
+        led.reserve("r1", "p1", 7777)
+        txn.repair(self.root, led)
+        self.assertEqual(led.summary()["settled_total"], 7777)
 
     def test_repair_does_not_settle_rejected_reserve(self):
         led = Ledger(self.tmp)
