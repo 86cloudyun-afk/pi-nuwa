@@ -748,6 +748,15 @@ def cmd_dispatch(store: Store, args: list[str]) -> int:
         die(f"error: dispatch {target} failed (injected)")
 
     if dry:
+        print("## Graph")
+        print(f"project goal: {store.project().get('goal', '')}")
+        for it in store.list_intents()[:5]:
+            print(f"- {it['id']} [{it.get('status')}] {it.get('description', '')}")
+        print("## Current Intent")
+        if target.startswith("i"):
+            print(f"{target}: {store.get_intent(target).get('description', '') if store.get_intent(target) else ''}")
+        else:
+            print(f"{target}: (dispatch kind)")
         print(f"[dispatch] dry-run target={target} model={model} timeout={timeout}")
         return 0
 

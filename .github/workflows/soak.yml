@@ -1,0 +1,40 @@
+name: soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "长测分钟数"
+        required: true
+        default: "4320"
+  schedule:
+    - cron: "0 3 * * 0"
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4500
+    env:
+      SAPPER_REF: c91881dc1629409bbf278577dfdaa6b8f383b438
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run soak
+        run: |
+          python3 tests/soak.py --minutes "${{ github.event.inputs.minutes || '4320' }}" \
+            --interval 30 --instances 4 --out soak-report
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report
+          path: soak-report/
+
+      - name: Bind report to commit
+        run: |
+          echo "${{ github.sha }}" > soak-report/COMMIT

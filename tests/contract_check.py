@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -39,6 +40,14 @@ def run(bin_dir: Path, args: list[str], cwd: Path, timeout: int = 30) -> subproc
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
     return subprocess.run(["sapper", *args], cwd=str(cwd), env=env,
                           capture_output=True, text=True, timeout=timeout)
+
+
+def tree_hash(root: Path) -> str:
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*.json")):
+        h.update(str(p.relative_to(root)).encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()
 
 
 def check(name: str, real: subprocess.CompletedProcess, fake: subprocess.CompletedProcess,
@@ -127,18 +136,33 @@ def main() -> int:
             results.append({"name": f"done_positive_{name}", "ok": ok,
                             "detail": "" if ok else f"facts {before}->{after}, intent={intent.get('status')}"})
 
-        # 未知字段保留：sapper 不应清掉外部写入的附加字段
+        # 未知字段保留：经过 validate 与一次写操作后仍在
         for name in ("real", "fake"):
             b = rb if name == "real" else fb
-            fp = tmp / name / ".sapper" / "facts" / "f001.json"
+            root = tmp / name
+            fp = root / ".sapper" / "facts" / "f001.json"
             d = json.loads(fp.read_text())
             d["x-nuwa-probe"] = {"keep": True}
             fp.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-            run(b, ["validate"], tmp / name)
-            d2 = json.loads(fp.read_text())
+            run(b, ["validate"], root)
+            run(b, ["done", "i001", "--fact", "post-write probe", "-k", "note"], root)
+            fp2 = root / ".sapper" / "facts" / "f001.json"
+            d2 = json.loads(fp2.read_text()) if fp2.exists() else {}
             ok = d2.get("x-nuwa-probe", {}).get("keep") is True
             results.append({"name": f"unknown_field_preserved_{name}", "ok": ok,
-                            "detail": "" if ok else "field dropped"})
+                            "detail": "" if ok else "field dropped after write"})
+
+        # dry-run 渲染与零写入：用未结案的新 intent，输出含意图标记，且内容哈希不变
+        for name in ("real", "fake"):
+            b = rb if name == "real" else fb
+            root = tmp / name
+            run(b, ["intent", "--from", "f001", "dry run probe"], root)
+            before = tree_hash(root / ".sapper")
+            r = run(b, ["dispatch", "i003", "--dry-run"], root)
+            after = tree_hash(root / ".sapper")
+            ok = r.returncode == 0 and "Intent" in r.stdout and before == after
+            results.append({"name": f"dry_run_zero_write_{name}", "ok": ok,
+                            "detail": "" if ok else f"rc={r.returncode}, hash {before[:8]}->{after[:8]}"})
 
         # validate 成功输出前缀一致
         r_val = run(rb, ["validate"], tmp / "real")

@@ -9,7 +9,7 @@
 | 混沌 | `tests/test_chaos.py` | 8 | ~16s | 坏状态会不会挂 |
 | 并发 | `tests/test_concurrency.py` | 5 | ~90s | 锁与并行对不对 |
 | 端到端 | `tests/test_e2e_deterministic.py` | 4 | ~2min | 整条链路通不通 |
-| 小长测 | `bin/soak.py` | 1 | 可配 | 有没有慢性泄漏 |
+| 小长测 | `tests/soak.py` | 1 | 可配 | 有没有慢性泄漏 |
 
 ## 单元（bun）
 
@@ -86,8 +86,9 @@ python3 tests/soak.py --minutes 10 --interval 5 --instances 2
 ## 多类型同时压测（matrix）
 
 ```bash
-python3 tests/matrix.py --replicas 2 --minutes 1
-python3 tests/matrix.py --skip-orchestration --http-workers 4 --http-seconds 10
+# 仓库内：脚本在 sandbox/bin/matrix.py，部署后位于 /srv/nuwa-sandbox/bin/matrix.py
+python3 sandbox/bin/matrix.py --replicas 2 --minutes 1
+python3 sandbox/bin/matrix.py --skip-orchestration --http-workers 4 --http-seconds 10
 ```
 
 两段：
@@ -98,9 +99,9 @@ python3 tests/matrix.py --skip-orchestration --http-workers 4 --http-seconds 10
 ## 总编排
 
 ```bash
-./tests/run.sh                      # 全部，小长测 5 分钟
-./tests/run.sh --soak-minutes 15
-./tests/run.sh --only shell,chaos
+./tests/run.sh                      # 契约 + 五套 + 门禁（固定顺序，无参数）
+# 沙盒层（C 层、靶场、矩阵、小长测）
+/srv/nuwa-sandbox/bin/sandbox.sh suite --soak-minutes 5
 ```
 
 每段输出 `PASS/FAIL` 与耗时，报告落在 `reports/run-all-<ts>/`。

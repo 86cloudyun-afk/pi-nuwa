@@ -68,4 +68,32 @@
 
 ## Round 6 — 2026-11-08
 
+- 结论：**fail**，75/100
+- 阻塞 6 项：spawn 成功到 executing 落盘之间的重叠执行；前 8 位键碰撞；intent_verify 缺恢复动作、crashed/timeout 与 commit 分支冲突；per_task_cap 未受全局余量约束；快照缺共同写入栅栏；门禁只校验清单存在不校验阶段脚本
+- 修订：inflight flock 作为存活唯一依据；完整 64 hex 键写进 description；恢复表补 intent_verify 与 crashed 分支；per_task_cap 取四者最小并压到 reserve×1.05；快照改为冻结+结算队列栅栏并移入 R6；门禁改为 expected 清单 + 非空校验
+- 同步：契约扩到 11 项（正向结案、未知字段保留、版本字符串记录）
+
+## Round 7 — 2026-11-08
+
+- 结论：**fail**，82/100
+- 阻塞 5 项：父进程建锁、子进程后加锁的窗口；子进程已产出 artifact 但未写 executed 的恢复缺失；reserve 与 cap 互相定义导致两项目合计超全局；置信度 rubric 缺取值与示例；freeze 未拦 commit 路径
+- 修订：`nuwa-worker-lock` 先加锁再 exec；恢复表补「锁空闲且有 artifact → executed(ok)」；`reserve` 作为唯一硬上限、准入按预留总和；置信度给出三维取值表与三个示例；freeze 拦 commit 全路径 + 项目锁 barrier + pre/post seq 校验
+- 同步：会话状态改为「先迁移、失败才重置」；HMAC 密钥与旧账本接管规则
+
+## Round 8 — 2026-11-08
+
+- 结论：**fail**，77/100
+- 阻塞 6 项：保留 `sapper done`/`sapper dispatch` 旧路径导致无键 fact；事务锁不能阻止暂停后苏醒的旧 wrapper；done 的两次写入之间崩溃只补 to 不补 status；reserve 取 p95×1.05 实际超 5.94%；置信度示例算术错误；freeze 等待 commit 队列为空造成死锁
+- 修订：R1 改为提交所有权（`nuwa dispatch/commit` 独占 fact 创建，禁直连）；改为**意图级锁** + wrapper 内 attempt_seq 复核；intent 修复必须写全 status/to/done_at/worker；预留即硬上限、超支以预留为分母、timeout 与 token 上限分离；置信度示例改为 1.00/0.65/0.35 并注明硬拒绝；freeze 只等 executed，队列解冻后按新 seq 归入增量
+- 同步：R2 验收不再依赖 R6 快照；门禁加入不可删核心锚点；快照打包会话缓存/HMAC 密钥/组件版本；补加权公平与模型路由验收；TESTING 文档与固定顺序执行器对齐
+
+## Round 9 — 2026-11-08
+
+- 结论：**fail**，78/100
+- 阻塞 4 项：executed(crashed) 后再次崩溃会跳过结算；超支口径同时写"恒为 0"与"允许 5%"；项目锁与全局锁获取顺序相反形成死锁；增量导出用单一 cut_seq 裁切两个独立序列
+- 修订：executed 增加 `settled/rid`，恢复先结算再重派；tokens/dispatches 以预留为分母、wall 以 wall_cap 为分母；全系统固定锁序 global→project；快照记录 `global_cut_seq` 与每项目 `cut_seq[p]`
+- 同步：wrapper 写 `result.json` 完成标记；公平性加 2:1:1 权重容差；R5 矩阵改 `nuwa dispatch`；契约加 dry-run 零写入（13 项）
+
+## Round 10 — 2026-11-08
+
 （待填）

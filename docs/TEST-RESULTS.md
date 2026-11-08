@@ -110,7 +110,7 @@ CI 工作流 `.github/workflows/test.yml` 在每次 push 时复跑这五套（bu
 ## 九、0.3.1 增量
 
 - `bin/nuwa --version`：`nuwa 0.3.1`
-- 契约检查：真实 sapper 与 fake-sapper **7/7 一致**（version/setup/frontier_empty/frontier_format/claim_requires_worker/done_requires_fact/validate_ok）
+- 契约检查：真实 sapper 与 fake-sapper **13/13 一致**（version/setup/frontier_empty/frontier_format/claim_requires_worker/done_requires_fact/done_positive×2/unknown_field_preserved×2/dry_run_zero_write×2/validate_ok）
 - C 层会话断言：`armed=True blocks=1 increasing=True` → PASS
 - 门禁入口：`tests/run.sh` 现在依次跑 契约 → 单元 → 协议 → 混沌 → 并发 → E2E → gates
 - CI 固定 sapper `c91881dc1629409bbf278577dfdaa6b8f383b438`

@@ -1,29 +1,43 @@
 #!/usr/bin/env bash
-# 阶段门禁：按 expected 清单校验脚本存在且非空，再逐个执行。
-# expected 每行一个门禁名（不含 g 前缀与 .sh 后缀），例如 baseline。
-# 新增阶段时，同一 PR 内把门禁名加入 expected。
+# 阶段门禁：核心锚点 + expected 清单 + 非空校验 + 执行。
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
+# 不可删除的核心锚点：任何阶段都必须存在
+REQUIRED_CORE=(0_baseline)
 EXPECTED="gates/expected"
+
 fail=0
 declare -a names=()
 
-if [[ -f "$EXPECTED" ]]; then
-  while IFS= read -r line; do
-    [[ -z "${line// }" || "${line:0:1}" == "#" ]] && continue
-    names+=("$line")
-  done <"$EXPECTED"
-else
+if [[ ! -f "$EXPECTED" ]]; then
   echo "gates: 缺少 $EXPECTED" >&2
   exit 1
 fi
+
+while IFS= read -r line; do
+  [[ -z "${line// }" || "${line:0:1}" == "#" ]] && continue
+  names+=("$line")
+done <"$EXPECTED"
 
 if (( ${#names[@]} == 0 )); then
   echo "gates: expected 为空" >&2
   exit 1
 fi
 
+# 核心锚点必须在清单中
+for c in "${REQUIRED_CORE[@]}"; do
+  found=0
+  for n in "${names[@]}"; do
+    [[ "$n" == "$c" ]] && found=1
+  done
+  if (( found == 0 )); then
+    echo "gates: 核心门禁 $c 不在 expected 中" >&2
+    fail=1
+  fi
+done
+
+# 每个清单项必须有非空脚本
 for n in "${names[@]}"; do
   f="gates/g${n}.sh"
   if [[ ! -s "$f" ]]; then
@@ -32,7 +46,7 @@ for n in "${names[@]}"; do
   fi
 done
 
-# 额外脚本也执行（不在 expected 里的，不强制）
+# 执行所有实际存在的脚本
 shopt -s nullglob
 for f in gates/g*.sh; do
   printf '\n== %s ==\n' "$f"

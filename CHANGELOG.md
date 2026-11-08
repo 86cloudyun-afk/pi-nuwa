@@ -3,7 +3,7 @@
 ## 0.3.1 — 2026-11-08
 
 - `bin/nuwa --version`
-- `tests/contract_check.py`：真实 sapper 与 fake-sapper 的 7 项契约对照
+- `tests/contract_check.py`：真实 sapper 与 fake-sapper 的 13 项契约对照（含正向结案、未知字段保留、dry-run 零写入、版本记录）
 - `tests/gates/run.sh`：阶段门禁入口，按 `g*.sh` 聚合退出码
 - E2E 在真实 sapper 缺失时拒绝静默回退（`NUWA_ALLOW_FAKE_SAPPER=1` 才允许）
 - CI 固定 sapper 到 `c91881dc`

@@ -36,9 +36,9 @@
 |---|---|---|---|
 | `.nuwa/journal.jsonl` | **权威**，append-only | 项目生命周期内不轮转；仅按 checkpoint 压缩 | 恢复唯一依据 |
 | `.nuwa/events.jsonl` | 诊断 | 50MB / 7 天 / 7 份 | 报告明细、排障 |
-| `.nuwa/artifacts/<txn>/` | 执行结果原始字节 | 30 天后销毁 | 恢复与重放 |
+| `.nuwa/artifacts/<txn>/` | 执行结果原始字节 | 30 天后销毁；**被未提交事务引用的必须保留至 commit_done 或废弃** | 恢复与重放 |
 | `.nuwa/dispatch_keys.idx` | 精确去重索引（每行一个完整 key） | 随 checkpoint 增量维护 | 去重确认层 |
-| `.nuwa/inflight/<txn>.lock` | 子进程存活锁 | 事务结束删除 | 存活判定与重叠防护 |
+| `.nuwa/inflight/<intent>.lock` | 意图级存活锁 | 意图结束删除 | 存活判定与重叠防护 |
 
 恢复只读 journal + 精确索引；报告计数以 journal 为准；events 轮转时标 `detail_truncated`。
 
@@ -52,7 +52,7 @@
 | 全局预算 | `$SAPPER_HOME/budget/global.jsonl` | **唯一权威**，`global.lock` 串行化 | 快照校验后重放；失败冻结全部新 dispatch |
 | 图 | `<proj>/.sapper/` | sapper 自身 | 常规只读；R1 提交修复在项目锁内受控写 JSON，写完必须 `sapper validate` |
 | 交接 | `<proj>/.nuwa/handoff.json` | 派生 | 可重建 |
-| 会话状态 | `cache/nuwa-loop/<hash>.json` | 可重建 | 版本不匹配即重置 |
+| 会话状态 | `cache/nuwa-loop/<hash>.json` | 可重建 | schema < current → 先迁移（2→3 保留 turns/spentTokens/armedAt）；迁移失败或 schema > current → 重置并写 `state_reset` |
 
 权威类损坏且无重放依据：保留现场、冻结新 dispatch、退出码 6；恢复动作写 journal。
 
@@ -74,7 +74,9 @@
 
 - `dispatch_keys.idx` 是**精确**去重层：每行一个完整 `sha256:<64 hex>`，排序后二分查找。812 条约 58KB，成本可接受。
 - Bloom 仅作快速否定：Bloom 判"不存在"→ 新事务；"可能存在"→ 必须查索引；索引查不到 → **按新事务处理**，绝不跳过。
-- 压缩保留 checkpoint + `seq > checkpoint.seq` 的记录 + `unresolved` 完整记录 + 全量索引。重放断言：run/账本/facts 与压缩前一致，且无重复 `commit_done`。
+- 压缩保留 checkpoint + `seq > checkpoint.seq` 的记录 + `unresolved` 完整记录 + 全量索引。
+压缩下界 = `min(所有活跃快照的 cut_seq[p], checkpoint.seq)`；`snapshots.idx` 登记每个快照的 cut 与引用计数，仍有快照引用时不得删除其后的记录，引用归零后才可 GC。
+重放断言：run/账本/facts 与压缩前一致，且无重复 `commit_done`。
 
 ## 4. 各阶段
 
@@ -88,7 +90,8 @@
 - 最小账本：`reserve/settle/reclaim/opening_balance`
 - 执行结果 artifact、inflight 锁
 - `nuwa --resume <name>`
-- **幂等提交**：`nuwa commit --key <dispatch_key>`，项目锁内执行
+- **提交所有权**：R1 起所有 fact 创建走 `nuwa dispatch <id>` / `nuwa commit`，由 nuwa 渲染提示（`sapper dispatch --dry-run`）、调用引擎、按幂等键提交；SKILL 与续跑指令同步改写，禁止在女娲流程内直接调用 `sapper done` 或 `sapper dispatch <id>`（`sapper` 仅用于建图、查询、校验）
+- **幂等提交**：`nuwa commit --key <dispatch_key>`，按固定锁序 `global.lock → 项目锁` 执行；全系统禁止反向获取
 - **接管契约**：首次接管已有 0.3.1 项目时，写 `adopt` 记录（现有 facts/intents 快照、spent 未知则 `opening_balance=0` 且标 `estimated`），不重置既有计数
 - `tests/contract_check.py`、`tests/gates/run.sh`、`tests/gates/expected`
 
@@ -101,11 +104,13 @@
 
 **进程存活与重叠防护**：
 
-- 父进程在 spawn 前创建 `.nuwa/inflight/<txn>.lock`，把 fd 传给子进程。
-- 子进程持有 `flock(LOCK_EX)` 直到退出；父进程不持有。
-- 存活判定 = 尝试 `flock(LOCK_EX|LOCK_NB)`：拿不到 → 子进程活着；拿得到 → 已死。
-- 重派前必须先拿到旧锁（证明旧子进程已退出），再创建新 txn；因此不会重叠执行。
-- `executing` 记录含 `pid` 与 `pid_starttime`，仅作诊断；存活以锁为准。
+- spawn 的是 `nuwa-worker-lock` 包装器：它先打开 **意图级锁** `.nuwa/inflight/<intent>.lock`、取得 `flock(LOCK_EX)`、写 `ready` 文件（pid + starttime + attempt_seq），然后 **fork 子进程执行业务命令并 wait**（不 exec，保证包装器存活到命令结束）；命令退出后写 `result.json`（exit_code + 完成标记），再释放锁。
+- 包装器在 exec 前重读 intent，若 `attempt_seq` 与自身不符则直接退出（不执行）；因此被判定死亡后恢复的旧 wrapper 即使醒来也拿不到锁或版本不符。
+- 父进程等待 `ready`（超时 5s）。拿到 ready 才写 `executing`；超时则 kill 并按启动失败处理。
+- 业务命令正常退出后，wrapper 写 `result.json`（exit_code + 完成标记）；异常退出不写。恢复只有同时看到 marker 与 exit 0 才判 ok，否则按 crashed 处理。
+- 存活判定 = 尝试 `flock(LOCK_EX|LOCK_NB)`：拿不到 → 活；拿得到 → 死。锁在任何业务代码之前取得，不存在"进程已跑、锁未持有"的窗口。
+- 重派前必须先拿到旧锁（证明旧子进程已退出），再创建新 txn。
+- `pid/starttime` 仅诊断。
 
 **事务状态机**：
 
@@ -117,7 +122,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - `attempt_seq` 每 intent 从 0 递增；`dispatch_key = sha256(project|intent|attempt_seq)`。
 - `executing_prepare`：spawn 前写，无 pid，含 txn_id、key。
 - `executing`：spawn 成功后写，含 pid、pid_starttime。
-- `executed`：进程退出或确认死亡后**必写**，`status: ok|crashed|timeout`，含 exit_code、artifact（可为 null）、tokens（实际或估算）。
+- `executed`：进程退出或确认死亡后**必写**，`status: ok|crashed|timeout`，含 exit_code、artifact（可为 null）、tokens（实际或估算）、`settled:false`、`rid`。
 - `commit_prepare`：fact 内容、kind、doc、rid。
 
 **恢复规则**：
@@ -125,13 +130,13 @@ reserve → executing_prepare → executing → executed → commit_prepare
 | 最后状态 | 动作 |
 |---|---|
 | reserve | 释放 intent、回滚预留，`attempt_seq` 不变 |
-| executing_prepare | 尝试拿 inflight 锁：拿不到 → 等待/接管；拿到且无 artifact → 写 `executed{crashed}` → 结算估算 tokens → 释放并以 `attempt_seq+1` 重派 |
-| executing | 同上，以锁为准；pid 仅诊断 |
-| executed(ok) | 校验 artifact/exit_code → commit_prepare |
-| executed(crashed/timeout) | 结算已在 executed 完成 → release intent → 以 `attempt_seq+1` 重派（不做 commit） |
+| executing_prepare | 等 `ready` ≤5s；锁被持 → 活；锁空闲：有 `result.json` 且 exit 0 → `executed{ok}`；否则 `executed{crashed}` → 结算 → 释放并以 `attempt_seq+1` 重派 |
+| executing | 同上，以锁为准；pid 仅诊断；**有 `result.json` 且 exit 0 才能按 ok 恢复，部分输出按 crashed 处理** |
+| executed(ok) | 校验 `result.json` 完成标记 + exit_code + artifact → commit_prepare |
+| executed(crashed/timeout) | 若 `settled=false` → 结算并写 `settled:true`（按 rid 幂等）→ release intent → `attempt_seq+1` 重派（不做 commit） |
 | commit_prepare | 扫描完整键；命中复用，否则 `sapper done`（描述自带键）→ done_apply |
-| done_apply | 修补 intent 的 `to`（必要时）→ `sapper validate` → intent_verify |
-| intent_verify | 校验 intent.to 指向存在的 fact → ledger_settle |
+| done_apply | 修补 intent：`status=done`、`to=<fact>`、`done_at`、`worker`（缺一不可）→ `sapper validate` → intent_verify |
+| intent_verify | 校验 `intent.status==done` 且 `intent.to` 指向存在的 fact → ledger_settle |
 | ledger_settle | 按 rid 幂等结算 → commit_done |
 | commit_done | 补 ack，不重派 |
 
@@ -158,16 +163,19 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 **准入与硬上限**：
 
-- `per_task_cap = min(NUWA_TASK_CAP, remaining_project, remaining_global, ceil(reserve*1.05))`
-- 准入：`reserve <= remaining_global - outstanding_reserved` 且 `reserve <= remaining_project`；否则排队。
-- 单任务执行时把 `per_task_cap` 传给引擎 timeout 与 token 上限强制执行；超出即终止并记 `capped`。
+- `reserve = min(ceil(p95*1.05), NUWA_TASK_CAP, remaining_project, remaining_global - sum(outstanding_reserved)*1.05)`
+- 准入：`reserve >= MIN_VIABLE` 且 `sum(outstanding_reserved)*1.05 + reserve <= global_cap`；为实际超预留留 5% 头寸。
+- 预检：spawn 前估算 input tokens `ceil(prompt_chars/4)`；若超过 reserve 则拒绝或排队。支持输出上限的引擎传 `max_output_tokens = reserve - input_est`。
+- `per_task_cap = reserve`；timeout 由 `NUWA_TASK_TIMEOUT` 单独设定。
+- 结算：`overspend = max(0, actual - reserve) / reserve`。≤5% 记 `minor_overrun` 并继续；>5% 记 `major_overrun`，项目暂停且门禁失败。
+- 账本可用余额 = `global_cap - sum(outstanding_reserved)*1.05`，恒不为负；短期负实际余额必须在下一结算周期补平。
 - 在途：单项目 ≤ `--parallel`，全局 ≤ `NUWA_GLOBAL_CONCURRENCY`。
 - 暂停：`overdraft` 或人工暂停期间 wall 不计时（记录 pause/resume 时间戳）。
 
 - 预留续租：`executing` 期间每 2 分钟 `renew`；TTL 10 分钟；锁判死即 `reclaim`。
 - 迟到结算：`late_settle` 按 `rid` 匹配，不重复扣。
-- 超支：三类分别算，任一 >5% 失败；单任务因 `per_task_cap` 最多超预留 5%。
-- 公平性：三个等权、持续就绪项目共享 60s 窗口；活跃区间取 dispatch 区间并集，分母为三者之和；每项目 ≥25%，≥10 次 dispatch。
+- 超支：tokens/dispatches 以各自预留为分母（硬上限保证恒为 0）；wall 以 `wall_cap` 为分母，`max(0, wall_actual-wall_cap)/wall_cap ≤5%`。三类分别判定。
+- 公平性：三个持续就绪项目共享 60s 窗口；每项目按并发槽位累计 busy 秒（sum over slots，不用并集），分母为三者之和；等权 1:1:1 各 33%±5pp，加权 2:1:1 为 50%/25%/25%±5pp；每项目 ≥10 次 dispatch。
 - 退避：1/2/4/8s，上限 60s；重试使用新 `attempt_seq`。
 
 交付：
@@ -177,10 +185,11 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 模型路由：reason 强模型、explore 廉价模型、失败链式回退
 
 验收：
-- 公平性命令输出三项目占比与 dispatch 数，断言达标
+- 公平性：等权 1:1:1（各 33%±5pp）与加权 2:1:1（50%/25%/25%，±5pp）两组，输出三项目占比与 dispatch 数，断言达标；权重失效必须被检出
+- 路由：reason 使用强模型、explore 使用廉价模型；强模型失败时按链回退，事件记录 `model` 与 `fallback_from`
 - 准入拒绝、硬上限截断（含 `per_task_cap` 由全局余量决定）、暂停不计 wall 三类用例通过
 - 429 轮换后重复 fact 0
-- 账本并发扣减无负数；快照与 journal 重放一致
+- 账本并发扣减无负数；journal 重放与账本一致（跨项目快照一致性属 R6 验收）
 
 ### R3 证据质量与反幻觉（0.6.0）
 
@@ -215,7 +224,16 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - **目标绑定**：`target` 与 intent 目标一致。
 - **断言**：`op` 限 `contains/regex/eq/gt/lt`；默认对 artifact 前 1MB 求值，超限置 `truncated` 并拒绝依赖截断部分的断言。
 - **新鲜度**：`captured_at` 距 `done` ≤30 分钟。
-- **置信度**：存于 `fact["x-nuwa"]["confidence"]`，由验收器按固定 rubric 计算：断言强度 0.4 + 新鲜度 0.3 + 可复现性 0.3。`<0.6` note；`[0.6,0.8)` fact 不参与 completed；`≥0.8` 可参与。
+- **置信度**：存于 `fact["x-nuwa"]["confidence"]`，由验收器按固定 rubric 计算：
+
+  | 维度 | 取值 |
+  |---|---|
+  | 断言强度 | `eq` 0.40；`contains/regex` 0.35；`gt/lt` 0.30；无断言 0 |
+  | 新鲜度 | `≤5min` 0.30；`≤30min` 0.20；`>30min` 0 |
+  | 可复现性 | 命令 + exit 0 + 哈希匹配 0.30；缺一项 0.10；缺两项 0 |
+
+  总分 0–1.0。示例：`eq + 3min + 完整 = 0.40+0.30+0.30 = 1.00`；`contains + 20min + 缺哈希 = 0.35+0.20+0.10 = 0.65`；`contains + 40min + 缺哈希 = 0.35+0+0.10 = 0.45`（若命令缺失则命中硬拒绝，直接拒绝）。
+  门限：`<0.6` 只记 note；`[0.6,0.8)` 记 fact 不参与 completed；`≥0.8` 且无五类硬拒绝才可参与 completed。
 - **人工覆盖**：`--force-confidence` 只影响阈值判定，对五类硬拒绝无效；覆盖记录 actor/reason，24h 后失效。
 - **旧 fact**：`evidence_state: legacy`，不参与 completed；补证后升级。
 
@@ -262,7 +280,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 | 执行路径 | 入口 | 强制点 | 加载失败 |
 |---|---|---|---|
-| bash 循环 | `bin/nuwa` → `sapper dispatch` → engine wrapper | engine wrapper | fail-closed |
+| bash 循环 | `bin/nuwa` → `nuwa dispatch` → engine wrapper（sapper 仅 `--dry-run` 渲染） | engine wrapper | fail-closed |
 | 会话内子代理 | `task(agent=fujiang)` | `nuwa-loop` 的 `tool_call` 前置 + 子代理 wrapper | fail-closed |
 | 出网 | 任意路径 | 项目级 netns + 防火墙规则（代理环境只是便利） | fail-closed |
 
@@ -271,7 +289,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 - 出网：netns / uid 防火墙规则；忽略代理变量的进程同样受约束
 - 脱敏过滤器：日志、events、报告、fact 预览；`redact_spec` 版本化
 - 权限审计：状态目录 0700、artifact/账本 0600；30 天后销毁 artifact
-- HMAC 签名账本默认启用（1.0 起必选）
+- HMAC 签名账本默认启用（1.0 起必选）；密钥在 `$SAPPER_HOME/keys/audit.key`（0600），随快照备份；旧无签名账本接管时标 `unsigned_legacy=true`，从接管点开始签名；密钥缺失时 `audit verify` fail-closed
 
 验收：
 - canary 注入 10 处（命令、输出、fact 预览、日志、报告），派生副本零泄漏
@@ -296,15 +314,15 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 **快照一致性协议**（R6 交付）：
 
-1. 短暂获取 `global.lock`：置 `freeze=true`，记录 `freeze_seq`，释放。冻结后**新 dispatch 拒绝、新结算入队**。
-2. 等待 inflight 到 `executed`（不结算），最长 120s；超时则 kill 子进程、写 `executed{crashed}` 并入队结算。
-3. 确认结算队列已排空到冻结点（队列只记录、不落账），再次获取 `global.lock`，导出 **`global.jsonl` 全量到 `global_seq`**，释放。
-4. 逐项目记录 `cut_seq`，导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`。
+1. 短暂获取 `global.lock`：写 `$SAPPER_HOME/budget/freeze.json`（`freeze=true`、owner pid、expires 10min），记录 `freeze_seq`，释放。启动时发现过期 freeze → 写 `freeze_recovered` 并清除；commit/结算队列持久化在 `queue.jsonl`，启动时重放。冻结后**新 dispatch 拒绝；commit 全路径与新结算一律入队**。
+2. 等待 inflight 全部到达 `executed`（只等执行结束，**不等 commit 队列**），最长 120s；超时则 kill 子进程、写 `executed{crashed}` 并入队。
+3. 获取 `global.lock`，再按固定顺序获取各项目锁（barrier）；记录 `global_cut_seq` 与每个项目 journal 的 `cut_seq[p]`；导出 **`global.jsonl` 全量到 `global_cut_seq`**。
+4. 在各项目锁内导出 `sapper export`、journal 尾部、run、budget 视图、checkpoint、`dispatch_keys.idx`；导出完成后校验每个项目 `post_seq == cut_seq[p]`，不一致则失败重试；释放锁。
 5. 复制 artifact 原始字节到 `snapshot/artifacts/`（默认开启；关闭时标 `evidence_incomplete`）。
-6. 写 `SNAPSHOT.json`：各文件 sha256、facts 数、artifact 数、`global_seq`、`snapshot_id`。
-7. 清除 `freeze`，排空结算队列（按 rid 幂等落账）。
+6. 写 `SNAPSHOT.json`：各文件 sha256、facts 数、artifact 数、`global_seq`、`snapshot_id`；同时打包 `cache/nuwa-loop/*.json`（会话计数）、`keys/audit.key`（HMAC 密钥）、`components.json`（CLI/扩展/skill 版本）。
+7. 清除 `freeze`，按顺序排空 commit 队列与结算队列（按 rid 幂等落账）。排队中的 commit 在解冻后获得新的 `seq`，全部 `> cut_seq`，因此属于增量而非快照。
 
-**增量与回滚**：`export-delta` 导出 `seq > cut_seq` 的 journal、新 facts、账本条目、intent 迁移、新 artifact；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重。
+**增量与回滚**：`export-delta` 按项目导出 `seq > cut_seq[p]` 的 journal、新 facts、intent 迁移、新 artifact，按账本导出 `seq > global_cut_seq` 的条目，并导出 `cache/nuwa-loop/*.json` 的计数变化（turns/spentTokens/armedAt）；回滚顺序为 冻结 → 导出增量 → `restore`（校验 sha256 与 artifact 数）→ `import-delta`。降级转换：新字段写入 `x-nuwa`，账本增量以 `opening_balance` 入账，已结算 `rid` 集合随快照保存并去重；`loop_schema 3→2` 保留 turns/spentTokens/armedAt，丢弃 evidence 引用；旧扩展遇到 schema 3 必须 fail-closed（拒绝上膛并写 `state_schema_too_new`），不得静默重置。
 
 **初始化/迁移样本**：
 
@@ -351,13 +369,13 @@ reserve → executing_prepare → executing → executed → commit_prepare
 ## 5. 横切约束
 
 - **测试先行**：每阶段先加失败用例，再实现。
-- **阶段门禁**：CI 与本地都执行 `tests/run.sh`（契约 → 五套 → `gates/run.sh`）。`gates/expected` 是门禁清单：每个阶段名必须在清单中，且对应 `gates/g<name>.sh` 存在且非空；缺项或空脚本一律失败。新增阶段时同一变更内更新 `expected` 与门禁脚本。CI 设 `NUWA_REQUIRE_GATES=1`。
+- **阶段门禁**：CI 与本地都执行 `tests/run.sh`（契约 → 五套 → `gates/run.sh`）。CI 作业超时 10 分钟；72h 长测是独立 `soak.yml`（`timeout-minutes: 4500`），产物 `soak-report` 与 commit sha 绑定，发布要求报告 commit 与发布 commit 一致。 `gates/run.sh` 内置**不可删除的核心锚点** `REQUIRED_CORE=(0_baseline)`，`expected` 必须是核心锚点的超集；每个名称对应 `gates/g<name>.sh` 必须存在且非空；`NUWA_REQUIRE_GATES=1` 时任何缺项失败。新增阶段时同一变更内更新 `expected` 与门禁脚本；删除清单项不能绕过核心锚点。
 - **场景到命令**：
 
 | 阶段 | 验收命令（阶段内交付） | 阈值 |
 |---|---|---|
 | R1 | `nuwa ls --json`；`tests/crash_inject.py --points 7 --repeat 20` | 一致 ≤2s；同 intent 活子进程 ≤1；重复 fact 0 |
-| R2 | `nuwa budget fairness --projects 3 --seconds 60` | 每项目 ≥25%，≥10 dispatch |
+| R2 | `nuwa budget fairness --projects 3 --weights 2:1:1 --seconds 60` | 50/25/25 ±5pp；等权 33% ±5pp；≥10 dispatch |
 | R3 | `nuwa verify --samples 5 --expect reject`；固定样本集 100 | 5/5 拒绝；p95 <2s |
 | R4 | `nuwa metrics --json`；`nuwa report --offline` | 对账 ≤1；断网可开 |
 | R5 | `nuwa policy check --matrix`；`tests/canary.py` | blocked=0；派生副本泄漏 0 |
@@ -373,7 +391,7 @@ reserve → executing_prepare → executing → executed → commit_prepare
 
 | 风险 | 触发信号 | 影响 | 立即动作 | 恢复验证 |
 |---|---|---|---|---|
-| sapper 上游漂移 | `contract_check.py` 失败；版本字符串变化 | 派发/结案失效 | 回退固定 ref | 契约 11/11 |
+| sapper 上游漂移 | `contract_check.py` 失败；版本字符串变化 | 派发/结案失效 | 回退固定 ref | 契约 13/13（含 dry-run 零写入） |
 | omp 扩展 API 变化 | 启动版本检查失败；`session_stop` 不触发 | 续跑失效 | 切兼容层，降级 bash 循环 | 会话 block 用例 |
 | 多项目锁竞争 | `nuwa ls` waiting >30s | 吞吐下降 | 降并发，检查 registry pid | 8 项目推进 |
 | 模型成本失控 | 账本 1 小时增幅 >预算 20% | 超支 | 路由降级 + 硬上限 | overspend ≤5% |
