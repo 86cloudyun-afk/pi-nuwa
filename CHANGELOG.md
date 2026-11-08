@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — 2026-11-08
+
+- `bin/nuwa --version`
+- `tests/contract_check.py`：真实 sapper 与 fake-sapper 的 7 项契约对照
+- `tests/gates/run.sh`：阶段门禁入口，按 `g*.sh` 聚合退出码
+- E2E 在真实 sapper 缺失时拒绝静默回退（`NUWA_ALLOW_FAKE_SAPPER=1` 才允许）
+- CI 固定 sapper 到 `c91881dc`
+
 ## 0.3.0 — 2026-11-08
 
 测试机制补齐。五套测试 + 两个替身 + 八类靶场 + 小长测，全部在沙盒机执行。

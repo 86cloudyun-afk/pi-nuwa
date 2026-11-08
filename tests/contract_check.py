@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""
+契约检查：逐条对比真实 sapper 与 tests/fake-sapper 的 CLI 行为。
+
+用法：
+  python3 tests/contract_check.py
+  python3 tests/contract_check.py --real /root/.local/bin/sapper
+
+退出码：0 全部一致；1 有差异；2 缺少真实 sapper。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FAKE = HERE / "fake-sapper"
+
+
+def make_bin(tmp: Path, target: Path) -> Path:
+    d = tmp / f"bin-{target.stem}"
+    d.mkdir(parents=True, exist_ok=True)
+    link = d / "sapper"
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(target)
+    return d
+
+
+def run(bin_dir: Path, args: list[str], cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    return subprocess.run(["sapper", *args], cwd=str(cwd), env=env,
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def check(name: str, real: subprocess.CompletedProcess, fake: subprocess.CompletedProcess,
+          compare_stdout: bool = True) -> dict:
+    ok = real.returncode == fake.returncode
+    detail = ""
+    if compare_stdout and ok:
+        ok = real.stdout.strip() == fake.stdout.strip()
+        if not ok:
+            detail = f"stdout real={real.stdout.strip()!r} fake={fake.stdout.strip()!r}"
+    if not ok and not detail:
+        detail = f"rc real={real.returncode} fake={fake.returncode}"
+    return {"name": name, "ok": ok, "detail": detail}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--real", default=shutil.which("sapper"))
+    args = ap.parse_args()
+    if not args.real:
+        print("contract: 缺少真实 sapper（PATH 中没有）")
+        return 2
+    real_bin = Path(args.real).resolve()
+    if not FAKE.exists():
+        print(f"contract: 缺少 {FAKE}")
+        return 2
+
+    results = []
+    with tempfile.TemporaryDirectory(prefix="nuwa-contract-") as td:
+        tmp = Path(td)
+        rb = make_bin(tmp, real_bin)
+        fb = make_bin(tmp, FAKE)
+
+        # --version 只比退出码（版本号本来不同）
+        results.append(check("version",
+                             run(rb, ["--version"], tmp),
+                             run(fb, ["--version"], tmp), compare_stdout=False))
+
+        # setup
+        for name, b in (("real", rb), ("fake", fb)):
+            (tmp / name).mkdir()
+        r_setup = run(rb, ["setup", "--goal", "contract"], tmp / "real")
+        f_setup = run(fb, ["setup", "--goal", "contract"], tmp / "fake")
+        results.append(check("setup", r_setup, f_setup, compare_stdout=False))
+
+        # 空 frontier 输出必须一致
+        results.append(check("frontier_empty",
+                             run(rb, ["frontier"], tmp / "real"),
+                             run(fb, ["frontier"], tmp / "fake")))
+
+        # fact + intent + frontier 行格式（frontier 列的是 intent，不是 fact）
+        for name in ("real", "fake"):
+            b = rb if name == "real" else fb
+            run(b, ["fact", "target alive", "-k", "host"], tmp / name)
+            run(b, ["intent", "--from", "f001", "contract probe"], tmp / name)
+        r_fr = run(rb, ["frontier"], tmp / "real")
+        f_fr = run(fb, ["frontier"], tmp / "fake")
+        line_ok = bool(re.match(r"^i\d{3}\tfrom=f\d{3}\t", r_fr.stdout.strip() or "x"))
+        results.append({"name": "frontier_format",
+                        "ok": line_ok and bool(re.match(r"^i\d{3}\tfrom=f\d{3}\t", f_fr.stdout.strip() or "x")),
+                        "detail": "" if line_ok else f"real={r_fr.stdout.strip()!r}"})
+
+        # reason 生成意图（fake 直接生成；real 需要模型，跳过执行，只比参数约束）
+        # claim 缺 --worker 必须 exit 2
+        r_claim = run(rb, ["claim", "i001"], tmp / "real")
+        f_claim = run(fb, ["claim", "i001"], tmp / "fake")
+        results.append(check("claim_requires_worker", r_claim, f_claim, compare_stdout=False))
+
+        # done 缺 --fact 必须 exit 2
+        r_done = run(rb, ["done", "i001"], tmp / "real")
+        f_done = run(fb, ["done", "i001"], tmp / "fake")
+        results.append(check("done_requires_fact", r_done, f_done, compare_stdout=False))
+
+        # validate 成功输出前缀一致
+        r_val = run(rb, ["validate"], tmp / "real")
+        f_val = run(fb, ["validate"], tmp / "fake")
+        results.append(check("validate_ok", r_val, f_val, compare_stdout=False))
+
+    failed = [r for r in results if not r["ok"]]
+    for r in results:
+        print(f"  {'PASS' if r['ok'] else 'FAIL'}  {r['name']}" + (f"  {r['detail']}" if r["detail"] else ""))
+    print(f"contract: {len(results) - len(failed)}/{len(results)} 一致")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

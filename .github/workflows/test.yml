@@ -8,6 +8,8 @@ on:
 jobs:
   suite:
     runs-on: ubuntu-latest
+    env:
+      SAPPER_REF: c91881dc1629409bbf278577dfdaa6b8f383b438
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -22,13 +24,20 @@ jobs:
 
       - name: Install sapper CLI
         run: |
-          git clone --depth 1 https://github.com/86cloudyun-afk/sapper-v2.git /tmp/sapper-v2
+          git clone https://github.com/86cloudyun-afk/sapper-v2.git /tmp/sapper-v2
+          git -C /tmp/sapper-v2 checkout "$SAPPER_REF"
           bash /tmp/sapper-v2/install.sh --cli-only
 
       - name: Unit tests
         run: |
           cd tests
           bun test unit.test.ts
+
+      - name: Contract check
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          cd tests
+          python3 contract_check.py
 
       - name: Protocol tests
         run: |

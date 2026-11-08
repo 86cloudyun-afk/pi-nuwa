@@ -12,11 +12,13 @@ run() {
   "$@" || { echo "  → FAIL"; fail=1; }
 }
 
+run contract python3 contract_check.py
 run unit bun test unit.test.ts
 run shell python3 test_nuwa_shell.py
 run chaos python3 test_chaos.py
 run concurrency python3 test_concurrency.py
 run e2e python3 test_e2e_deterministic.py
+run gates bash gates/run.sh
 
 printf '\n== 汇总 ==\n'
 [[ $fail -eq 0 ]] && echo "全部通过" || echo "有失败用例"

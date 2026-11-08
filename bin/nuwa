@@ -10,6 +10,8 @@
 #   5  另一个 nuwa 正在操作同一张图
 set -uo pipefail
 
+NUWA_VERSION="0.3.1"
+
 LAB_DIR="${SAPPER_HOME:-$HOME/sapper-lab}"
 ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
 # shellcheck disable=SC1090
@@ -38,6 +40,7 @@ usage() {
   --model M             dispatch 使用的模型（默认 deepseek-flash）
   --no-run              只建图出意图，不执行
   --no-view             不启动看板
+  --version             打印版本
   -h, --help            显示本帮助
 
 环境变量:
@@ -60,6 +63,7 @@ while (( $# )); do
     --parallel) parallel="${2:-3}"; shift 2 ;;
     --model) model="${2:-deepseek-flash}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
+    --version) echo "nuwa $NUWA_VERSION"; exit 0 ;;
     -*) log "ERROR: 未知参数 $1（--help 查看用法）" >&2; exit 2 ;;
     *) if [[ -z "$url" ]]; then url="$1"; elif [[ -z "$name" ]]; then name="$1"; else
          log "ERROR: 多余参数 $1" >&2; exit 2; fi; shift ;;
