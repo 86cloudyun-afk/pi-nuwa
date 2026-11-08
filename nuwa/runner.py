@@ -33,17 +33,19 @@ def _project_status(root: Path) -> str:
 def _evidence(root: Path) -> bool:
     facts = {f.get("id"): f for f in graph.facts(root)}
     refs: list[str] = []
+    edge = False
     for it in graph.intents(root):
-        if it.get("to") == "goal" and it.get("status") in ("complete", "done"):
-            refs.extend(str(x) for x in (it.get("from") or []))
-    if refs:
-        # 完成边存在时只认它引用的证据，且每个引用都必须是强证据。
-        return all(facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
-                   for fid in refs)
-    edge = any(it.get("to") == "goal" for it in graph.intents(root))
+        if it.get("to") == "goal":
+            edge = True
+            if it.get("status") in ("complete", "done"):
+                refs.extend(str(x) for x in (it.get("from") or []))
     if edge:
-        return False
-    return any(f.get("kind") in ("flag", "vuln", "loot") for f in facts.values())
+        # 有完成边时只认它引用的证据，且每个引用都必须是强证据。
+        return bool(refs) and all(
+            facts.get(fid, {}).get("kind") in ("flag", "vuln", "loot")
+            for fid in refs)
+    # 无完成边的 completed 是异常状态，不能用整图历史事实兜底。
+    return False
 
 
 def _revert(root: Path, why: str) -> None:
@@ -54,15 +56,19 @@ def _revert(root: Path, why: str) -> None:
     data["status"] = "active"
     data.pop("completed_at", None)
     data.pop("completed_from", None)
-    # 先删完成边，再写 active；否则中途退出会留下 completed + 无边的坏图。
-    for it in graph.intents(root):
-        if it.get("to") == "goal":
-            edge = Path(root) / ".sapper" / "intents" / f"{it['id']}.json"
-            try:
-                edge.unlink()
-            except FileNotFoundError:
-                pass
-    graph._atomic_json(p, data)
+    # 与真实 sapper 共用 .sapper/.lock：删边、写 active、validate 在同一临界区。
+    from .locks import FileLock
+    with FileLock(Path(root) / ".sapper" / ".lock", blocking=True):
+        for it in graph.intents(root):
+            if it.get("to") == "goal":
+                edge = Path(root) / ".sapper" / "intents" / f"{it['id']}.json"
+                try:
+                    edge.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return
+        graph._atomic_json(p, data)
     hp = Path(root) / ".sapper" / "hints.json"
     hints = graph._load(hp) or []
     hints.append({"content": f"完成被拒绝：{why}", "creator": "nuwa",

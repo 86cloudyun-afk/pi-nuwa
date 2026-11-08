@@ -53,6 +53,9 @@ class RunTest(unittest.TestCase):
         runner._revert(self.root, "test")
         self.assertEqual(graph.project(self.root).get("status"), "active")
         self.assertFalse(any(i.get("to") == "goal" for i in graph.intents(self.root)))
+        v = subprocess.run(["sapper", "validate"], cwd=self.root, env=self.env,
+                           capture_output=True, text=True)
+        self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
 
     def test_run_two_rounds(self):
         before = len(list((self.root / ".sapper" / "facts").glob("*.json")))

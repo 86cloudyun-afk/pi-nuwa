@@ -335,6 +335,8 @@ print("yes" if hit else "no")'
 }
 
 revert_completion() {
+  (
+  flock -x 8 || return 1
   python3 -c 'import datetime, glob, json, os
 # 先删除 to=goal 的完成边，再写 active；否则 validate 会持续报 completion edge。
 for path in glob.glob(".sapper/intents/*.json"):
@@ -361,6 +363,7 @@ except Exception:
     hints = []
 hints.append({"content": "完成被拒绝：没有任何 flag/vuln/loot 事实", "creator": "nuwa", "created_at": d["updated_at"]})
 json.dump(hints, open(h, "w"), ensure_ascii=False, indent=2)'
+  ) 8>"$dir/.sapper/.lock"
 }
 
 # 完成验收：返回 0 表示"真完成，应停机"；返回 1 表示继续（必要时已打回 active）

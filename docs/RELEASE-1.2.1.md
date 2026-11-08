@@ -207,6 +207,15 @@
 | B25 | 空引用退回整图、混合引用 any 放行 | 有完成边时只认其 `from`，且要求 all 都是 flag/vuln/loot；空 from 判失败 |
 | M53 | reason 的 `data.complete` 在 intents 缺失时提前返回 | 先处理 complete，再把 intents 归一为空列表 |
 
+## 第二十三轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B25 | 无完成边仍用整图历史证据兜底 | 无 `to=goal` 边时 `_evidence` 直接 False；有边时要求 `from` 非空且 all 强证据 |
+| B30 | 回滚删边/写 active 不在同一临界区 | Python 用 `.sapper/.lock` 包住删边+写 active；shell 用 `flock -x` 同锁；回滚测试补 validate |
+| M55 | 回滚测试空验收 | 增加 `sapper validate` 断言 |
+| M56 | `fleet` 只读查询被 guard 拦 | guard 放行 `fleet`，保留 `auto`/`brainstorm-pick`/`sweep`/`command`/`bench` |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
