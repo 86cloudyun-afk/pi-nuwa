@@ -91,18 +91,18 @@ const PATH_RULES: Array<[RegExp, string]> = [
  * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
  */
 const COMMIT_RE =
-	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:(?:--store(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+)))\s+){0,2})?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:(?:--store(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+)))\s+){0,4})?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
-/** 计算命令中 pos 位置之前的 cwd（只认行首/分隔符后的 cd）。 */
-function dirBefore(cmd: string, pos: number, baseDir: string): string {
+/** 命令中所有可能的 cwd：原目录与每个 cd 之后的目录。检查时取并集，避免时序漏检。 */
+function candidateDirs(cmd: string, baseDir: string): string[] {
+	const dirs = [baseDir];
 	let dir = baseDir;
-	for (const m of cmd.matchAll(/(?:^|[;&|]\s*)cd\s+([^\s;|&>]+)([^;&|]*)/g)) {
-		if (m.index === undefined || m.index >= pos) break;
-		if ((m[2] ?? "").includes(">")) continue;
+	for (const m of cmd.matchAll(/(?:^|[;&|]\s*)cd\s+([^\s;|&>]+)/g)) {
 		const target = m[1].replace(/^["']|["']$/g, "");
 		dir = isAbsolute(target) ? target : resolve(dir, target);
+		dirs.push(dir);
 	}
-	return dir;
+	return [...new Set(dirs)];
 }
 
 function collectShellTargets(cmd: string): Array<{ path: string; index: number }> {
@@ -227,10 +227,11 @@ export function checkTool(
 		if (!base.allowed) return base;
 		if (COMMIT_RE.test(cmd)) return { allowed: false, rule: "P-006" };
 		for (const target of collectShellTargets(cmd)) {
-			const shellDir = dirBefore(cmd, target.index, baseDir);
-			for (const candidate of resolvePath(target.path, shellDir)) {
-				for (const [re, rule] of PATH_RULES) {
-					if (re.test(candidate)) return { allowed: false, rule };
+			for (const shellDir of candidateDirs(cmd, baseDir)) {
+				for (const candidate of resolvePath(target.path, shellDir)) {
+					for (const [re, rule] of PATH_RULES) {
+						if (re.test(candidate)) return { allowed: false, rule };
+					}
 				}
 			}
 		}

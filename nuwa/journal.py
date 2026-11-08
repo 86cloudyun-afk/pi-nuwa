@@ -47,7 +47,17 @@ class Journal:
         rec = {"ts": time.time(), "event": event, **fields}
         with FileLock(self.lock_path, blocking=True):
             rec["seq"] = self._last_seq_locked() + 1
+            need_lf = False
+            try:
+                if self.path.exists() and self.path.stat().st_size > 0:
+                    with open(self.path, "rb") as fh:
+                        fh.seek(-1, os.SEEK_END)
+                        need_lf = fh.read(1) != b"\n"
+            except OSError:
+                need_lf = False
             with open(self.path, "a", encoding="utf-8") as fh:
+                if need_lf:
+                    fh.write("\n")
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -179,7 +189,21 @@ class Journal:
     def snapshot(self) -> tuple[dict | None, list[dict]]:
         """锁内一次性取 recovery 摘要与全量记录，避免 GC 插入造成半新半旧。"""
         with FileLock(self.lock_path, blocking=True):
-            return self.read_recovery(), self._read_locked(0)
+            return self.read_recovery(), self._all_records_locked()
+
+    def _all_records_locked(self) -> list[dict]:
+        """按文件顺序返回全部记录；无 seq 的记录也保留，供状态归并使用。"""
+        out: list[dict] = []
+        seen: set[int] = set()
+        for path in self._files():
+            for rec in self._iter_records(path):
+                seq = rec.get("seq")
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    if seq in seen:
+                        continue
+                    seen.add(seq)
+                out.append(rec)
+        return out
 
     def read_recovery(self) -> dict | None:
         try:

@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             if int(current) != args.attempt + 1:
                 return 3
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
+            return 3
         pid = os.getpid()
         _atomic(Path(args.ready), {
             "pid": pid, "starttime": _starttime(pid),
