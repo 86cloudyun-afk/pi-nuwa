@@ -183,8 +183,26 @@ function collectStrings(value: unknown, out: string[], depth = 0): void {
 function resolvePath(value: string, baseDir: string): string[] {
 	const raw = value.startsWith("file://") ? value.slice(7) : value;
 	const normalized = raw.replace(/\\/g, "/");
-	const abs = isAbsolute(normalized) ? normalized : resolve(baseDir, normalized);
-	const out = new Set<string>([abs]);
+	const abs = isAbsolute(normalized) ? normalized : join(baseDir, normalized);
+	const walk = (p: string): string => {
+		let cur = isAbsolute(p) ? "/" : baseDir;
+		for (const seg of p.split("/")) {
+			if (!seg || seg === ".") continue;
+			if (seg === "..") {
+				cur = dirname(cur);
+				continue;
+			}
+			const next = join(cur, seg);
+			try {
+				cur = realpathSync(next);
+			} catch {
+				cur = next;
+			}
+		}
+		return cur;
+	};
+	const real = walk(abs);
+	const out = new Set<string>([real]);
 	try {
 		out.add(realpathSync(abs));
 		return [...out];
@@ -433,9 +451,12 @@ export function readGraph(root: string): Graph | null {
 			if (!f.endsWith(".json")) continue;
 			const it = readJson<{ id?: string; status?: string; to?: string; from?: string[] }>(
 				join(root, ".sapper", "intents", f));
-			if (!it) {
+			if (!it || typeof it !== "object") {
 				corrupt = true;
 				continue;
+			}
+			if (it.status && !["open", "claimed", "done", "complete"].includes(it.status)) {
+				corrupt = true;
 			}
 			if (it.to === "goal") {
 				const refs = Array.isArray(it.from)
@@ -486,9 +507,9 @@ export function readGraph(root: string): Graph | null {
 	try {
 		const goal = readJson<{ id?: string; kind?: string; description?: string }>(
 			join(root, ".sapper", "facts", "goal.json"));
-		if (!goal || goal.id !== "goal" || (goal.kind && goal.kind !== "goal")) {
+		if (!goal || goal.id !== "goal") {
 			corrupt = true;
-		} else if (proj.goal && goal.description !== proj.goal) {
+		} else if (!proj.goal || goal.description !== proj.goal) {
 			corrupt = true;
 		}
 	} catch {

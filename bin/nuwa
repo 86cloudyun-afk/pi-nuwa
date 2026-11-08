@@ -361,16 +361,36 @@ revert_completion() {
   flock -x 8 || return 1
   python3 -c 'import datetime, glob, json, os
 # 先删除 to=goal 的完成边，再写 active；否则 validate 会持续报 completion edge。
+facts = {}
+for path in glob.glob(".sapper/facts/*.json"):
+    if path.endswith("goal.json"):
+        continue
+    try:
+        f = json.load(open(path)); facts[f.get("id")] = f
+    except Exception:
+        raise SystemExit(1)
+edges = []
 for path in glob.glob(".sapper/intents/*.json"):
     try:
         it = json.load(open(path))
     except Exception:
-        continue
+        raise SystemExit(1)
     if it.get("to") == "goal":
-        try:
-            os.remove(path)
-        except OSError:
-            raise SystemExit(1)
+        edges.append((path, it))
+# 锁内重判：等待锁期间产生的有效完成不能删。
+if edges and all(
+    e.get("status") == "complete"
+    and (e.get("from") or [])
+    and all(facts.get(r, {}).get("kind") in ("flag", "vuln", "loot")
+            for r in (e.get("from") or []))
+    for _, e in edges
+):
+    raise SystemExit(0)
+for path, _e in edges:
+    try:
+        os.remove(path)
+    except OSError:
+        raise SystemExit(1)
 p = ".sapper/project.json"
 d = json.load(open(p))
 d["status"] = "active"

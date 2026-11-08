@@ -290,6 +290,15 @@
 | B25 | 普通 fact 空 id、from 成员非字符串、schema 分叉 | fact.id 必须存在且等于文件名；from 成员非字符串置 corrupt |
 | B30 | shell 回滚 Python 非零被 validate=0 覆盖；Python 回滚失败仍返回 0 | shell `python3 ... || exit 1`；runner 回滚失败设 `exit_code=1` |
 
+## 第三十四轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B39 | goal kind 自创枚举会误拦真实 note/缺省 | goal 身份只校验 `id=goal` 与 `description == project.goal`，kind 不参与 |
+| B25 | project.goal 缺失跳过、intent 非法 status、非对象 JSON | 缺 goal 直接 corrupt；status 白名单；非对象记录置 corrupt |
+| B30 | 锁内直接删届时全部 goal 边；False 同时表示无变化与错误 | shell 锁内先重判有效完成（有效则 exit 0）；Python `_revert` 返回 `reverted/noop/failed` 三态 |
+| B40 | `resolve` 先折叠 `..` 再 realpath，链接后 `..` 偏离 shell 语义 | `resolvePath` 改为逐段 realpath 的 `walk`，先跟随链接再处理 `..` |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

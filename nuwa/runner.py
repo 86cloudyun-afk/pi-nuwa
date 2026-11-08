@@ -48,16 +48,16 @@ def _evidence(root: Path) -> bool:
     return True
 
 
-def _revert(root: Path, why: str) -> bool:
+def _revert(root: Path, why: str) -> str:
     p = Path(root) / ".sapper" / "project.json"
     from .locks import FileLock
     with FileLock(Path(root) / ".sapper" / ".lock", blocking=True):
         data = graph._load(p) or {}
         if data.get("status") != "completed":
-            return False
+            return "noop"
         if _evidence(root):
             # 等待锁期间可能已有新的有效完成，不能误删。
-            return False
+            return "noop"
         # 与真实 sapper 共用 .sapper/.lock：删边、写 active、hint 都在锁内。
         for it in graph.intents(root):
             if it.get("to") == "goal":
@@ -67,7 +67,7 @@ def _revert(root: Path, why: str) -> bool:
                 except FileNotFoundError:
                     pass
                 except OSError:
-                    return False
+                    return "failed"
         data["status"] = "active"
         data.pop("completed_at", None)
         data.pop("completed_from", None)
@@ -77,7 +77,7 @@ def _revert(root: Path, why: str) -> bool:
         hints.append({"content": f"完成被拒绝：{why}", "creator": "nuwa",
                       "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         graph._atomic_json(hp, hints)
-    return True
+    return "reverted"
 
 
 def _write_run(root: Path, **fields) -> None:
@@ -207,11 +207,14 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                     if _evidence(root):
                         journal.append("project_completed", round=round_no)
                         break
-                    if _revert(root, "没有任何 flag/vuln/loot 事实"):
+                    _rev = _revert(root, "没有任何 flag/vuln/loot 事实")
+                    if _rev == "reverted":
                         journal.append("completion_rejected", round=round_no)
-                    else:
+                    elif _rev == "failed":
                         journal.append("revert_failed", round=round_no)
                         exit_code = 1
+                    else:
+                        journal.append("revert_noop", round=round_no)
                 journal.append("frontier_empty", round=round_no)
                 break
             batch = ids[: max(1, parallel * 2)]
@@ -229,11 +232,14 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                 if _evidence(root):
                     journal.append("project_completed", round=round_no)
                     break
-                if _revert(root, "没有任何 flag/vuln/loot 事实"):
+                _rev = _revert(root, "没有任何 flag/vuln/loot 事实")
+                if _rev == "reverted":
                     journal.append("completion_rejected", round=round_no)
-                else:
+                elif _rev == "failed":
                     journal.append("revert_failed", round=round_no)
                     exit_code = 1
+                else:
+                    journal.append("revert_noop", round=round_no)
 
             facts = graph.facts(root)
             sig = "|".join(str(x) for x in (
