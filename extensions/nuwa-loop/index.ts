@@ -456,6 +456,7 @@ export function readGraph(root: string): Graph | null {
 	const intentRefs: string[][] = [];
 	const doneRefs: string[] = [];
 	const intentIds = new Set<string>();
+	const intentTo = new Map<string, string>();
 	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
@@ -472,6 +473,7 @@ export function readGraph(root: string): Graph | null {
 			if (!it.id || it.id !== f.replace(/\.json$/, "")
 				|| !it.description || !it.created_at) corrupt = true;
 			if (it.id) intentIds.add(it.id);
+			if (it.id && typeof it.to === "string") intentTo.set(it.id, it.to);
 			if (!Array.isArray(it.from) || it.from.length === 0) corrupt = true;
 			if (it.status === "done" || it.status === "complete") {
 				if (typeof it.to !== "string" || !it.to) corrupt = true;
@@ -530,8 +532,9 @@ export function readGraph(root: string): Graph | null {
 				|| !fact.description || !fact.created_at || !fact.creator) corrupt = true;
 			if ("source_intent" in fact && fact.source_intent !== null
 				&& typeof fact.source_intent !== "string") corrupt = true;
-			if (typeof fact.source_intent === "string" && !intentIds.has(fact.source_intent)) {
-				corrupt = true;
+			if (typeof fact.source_intent === "string") {
+				if (!intentIds.has(fact.source_intent)) corrupt = true;
+				else if (intentTo.get(fact.source_intent) !== fact.id) corrupt = true;
 			}
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
@@ -629,7 +632,9 @@ export function revertCompletion(root: string, why: string): boolean {
 			rmSync(g.path);
 			removed.push(g);
 		} catch {
-			for (const r of removed) writeFileSync(r.path, r.body);
+			for (const r of removed) {
+			try { writeFileSync(r.path, r.body); } catch { /* 恢复尽力而为 */ }
+		}
 			try { rmSync(tmp); } catch { /* tmp 已不存在 */ }
 			return false;
 		}
@@ -637,7 +642,9 @@ export function revertCompletion(root: string, why: string): boolean {
 	try {
 		renameSync(tmp, p);
 	} catch {
-		for (const r of removed) writeFileSync(r.path, r.body);
+		for (const r of removed) {
+			try { writeFileSync(r.path, r.body); } catch { /* 恢复尽力而为 */ }
+		}
 		try { rmSync(tmp); } catch { /* tmp 已不存在 */ }
 		return false;
 	}

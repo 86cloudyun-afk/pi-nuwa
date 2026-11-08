@@ -67,10 +67,16 @@ def render_prompt(root: Path, intent_id: str, timeout: int = 60) -> str:
 
 
 def _bind_source(root: str | Path, fact_id: str, intent_id: str) -> None:
+    if not graph._safe_id(fact_id):
+        raise DispatchError(f"非法 fact id: {fact_id}")
     fp = Path(root) / ".sapper" / "facts" / f"{fact_id}.json"
     data = json.loads(fp.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("id") != fact_id:
+        raise DispatchError(f"fact 身份不匹配: {fact_id}")
     data["source_intent"] = intent_id
-    fp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp = fp.with_name(fp.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, fp)
 
 
 def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",

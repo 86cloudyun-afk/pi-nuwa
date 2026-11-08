@@ -483,6 +483,15 @@
 - **M75**：reason 加预算预留/结算。
 - **M21**：补 TS 回滚 goal edge 用例。
 
+## 第五十七轮补充
+
+- **M88**：`_bind_source` 校验 fact id 与文件身份，tmp + `os.replace` 原子写。
+- **M31**：verify 核对 `samples.jsonl` 数量与 t 单调。
+- **M61**：intent.to 与 fact.source_intent 双向匹配。
+- **M5**：退出码必须为真 0，且覆盖全部项目。
+- **M75**：reason 按输出长度估算实际 tokens 结算。
+- **M59**：TS 恢复循环单次写失败不中断。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
