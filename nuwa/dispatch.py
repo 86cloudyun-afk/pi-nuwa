@@ -107,8 +107,22 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     txn_id = f"t-{uuid.uuid4().hex[:12]}"
     rid = f"r-{uuid.uuid4().hex[:12]}"
     _crash("before_reserve")
-    journal.append("reserve_pending", txn=txn_id, rid=rid, intent=intent_id,
-                   attempt_seq=attempt, tokens=tokens, project=project)
+    # 准入标记与 pending 检查在同一把 txn.lock 内：先写者赢，后到者直接拒绝。
+    with FileLock(nd / "txn.lock", blocking=True):
+        pending_intents = {p.get("intent") for p in txn.recover(root)["pending"]
+                           if p.get("txn") != txn_id}
+        if intent_id in pending_intents:
+            journal.append("dispatch_rejected", txn=txn_id, rid=rid,
+                           intent=intent_id, why="pending_txn")
+            journal.append("ack", txn=txn_id, intent=intent_id, status="rejected")
+            raise DispatchError(f"intent 有未终态事务: {intent_id}")
+        journal.append("reserve_pending", txn=txn_id, rid=rid, intent=intent_id,
+                       attempt_seq=attempt, tokens=tokens, project=project)
+        journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
+                       attempt_seq=attempt, key=key, tokens=tokens)
+        # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。
+        graph.set_intent_field(root, intent_id, "x-nuwa-attempt", attempt + 1)
+
     ok, remaining = ledger.admit_reserve(rid, project, tokens)
     if not ok:
         journal.append("reserve_rejected", txn=txn_id, rid=rid, intent=intent_id,
@@ -118,18 +132,6 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     _crash("after_reserve")
     journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id,
                    tokens=tokens)
-    with FileLock(nd / "txn.lock", blocking=True):
-        pending_intents = {p.get("intent") for p in txn.recover(root)["pending"]
-                           if p.get("txn") != txn_id}
-        if intent_id in pending_intents:
-            journal.append("dispatch_rejected", txn=txn_id, rid=rid,
-                           intent=intent_id, why="pending_txn")
-            ledger.settle(rid, 0, status="rejected")
-            raise DispatchError(f"intent 有未终态事务: {intent_id}")
-        journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
-                       attempt_seq=attempt, key=key, tokens=tokens)
-        # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。
-        graph.set_intent_field(root, intent_id, "x-nuwa-attempt", attempt + 1)
 
     art = nd / "artifacts" / txn_id
     art.mkdir(parents=True, exist_ok=True)

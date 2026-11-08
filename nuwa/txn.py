@@ -44,7 +44,8 @@ TXN_PENDING = (
     "reserve_pending", "reserve_committed", "executing_prepare", "executing",
     "executed", "commit_prepare", "done_apply", "ledger_settle",
 )
-TXN_DONE = ("commit_done", "ack", "reserve_rejected", "recovered_crashed")
+TXN_DONE = ("commit_done", "ack", "reserve_rejected", "dispatch_rejected",
+            "recovered_crashed")
 
 
 def _crash(point: str) -> None:

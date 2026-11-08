@@ -119,6 +119,17 @@
 | B7 | Python 剥离规则缺 `sapper` 前缀；值匹配吞分隔符 | Python 与 TS 同步前缀；选项值限定 `[^\s;&|()]+` |
 | 锁泄漏 | SIGKILL 后子进程继承 bin/nuwa 的锁 fd，残留 `.nuwa.lock` | dispatch/repair 子进程统一 `9>&-` |
 
+## 第十三轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B19 | 两个 dispatch 在 txn.lock 外各写 reserve_pending，互相看到对方 pending 而双输 | pending 检查与 `reserve_pending`/`executing_prepare` 同锁；`dispatch_rejected` 写 ack 并纳入终态 |
+| B7 | 剥离选项时消费双引号内的命令替换 | 选项值排除 `$` 与反引号，含替换的值不剥离 |
+| M5 | verdict 的 RSS/FD 自报 | `night.run` 写 `samples.jsonl`；verify 重算 growth 并与 REPORT 对比 |
+| M17 | repair 缺省 tokens | `reserve_committed` 带 tokens，repair 取摘要值 |
+| M20 | 同 intent 并发 | txn.lock 内单赢家准入 |
+| M21 | 并发测试无屏障 | `threading.Barrier` + reserve tokens 反例 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

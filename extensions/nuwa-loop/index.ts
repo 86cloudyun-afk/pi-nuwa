@@ -92,7 +92,7 @@ const PATH_RULES: Array<[RegExp, string]> = [
  */
 // 只在命令分隔符之后剥离开关，避免删除引号内的可执行文本或跨分隔符吞 token。
 const GLOBAL_OPT_RE =
-	/(^|[;&|()\n]|\bsapper\s+)(\s*)((?:(?:--store|-s)(?:=(?:"[^"]*"|'[^']*'|[^\s;&|()]+)|\s+(?:"[^"]*"|'[^']*'|[^\s;&|()]+)|[^\s;&|()]+)?\s*)+)/g;
+	/(^|[;&|()\n]|\bsapper\s+)(\s*)((?:(?:--store|-s)(?:=(?:"[^"$`]*"|'[^'$`]*'|[^\s;&|()$`]+)|\s+(?:"[^"$`]*"|'[^'$`]*'|[^\s;&|()$`]+)|[^\s;&|()$`]+)?\s*)+)/g;
 
 function stripGlobalOptions(cmd: string): string {
 	return cmd.replace(GLOBAL_OPT_RE, "$1$2");

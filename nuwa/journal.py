@@ -31,7 +31,8 @@ PENDING_EVENTS = (
     "ledger_settle",
 )
 FINAL_EVENTS = ("commit_done", "ack")
-DONE_EVENTS = ("commit_done", "ack", "reserve_rejected", "recovered_crashed")
+DONE_EVENTS = ("commit_done", "ack", "reserve_rejected", "dispatch_rejected",
+               "recovered_crashed")
 
 
 class Journal:
