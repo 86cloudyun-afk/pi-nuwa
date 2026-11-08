@@ -85,8 +85,10 @@ fi
 ln -sfn "$AGENT_HOME/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest"
 
 # ---------------------------------------------------------------- 入口
-say "[4/6] 安装 nuwa 入口"
+say "[4/6] 安装 nuwa 入口与 Python 包"
 install -m 0755 "$REPO_DIR/bin/nuwa" "$SAPPER_HOME/bin/nuwa"
+mkdir -p "$SAPPER_HOME/nuwa"
+cp -R "$REPO_DIR/nuwa/." "$SAPPER_HOME/nuwa/"
 
 # ---------------------------------------------------------------- 执行引擎（P0-0.6）
 say "[5/6] 配置 SAPPER_BIN 执行引擎"

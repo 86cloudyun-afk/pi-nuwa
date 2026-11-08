@@ -10,6 +10,17 @@
 #   5  另一个 nuwa 正在操作同一张图
 set -uo pipefail
 
+# R1 子命令走 Python CLI；其余参数保持旧 URL 语义
+case "${1:-}" in
+  ls|status|attach|budget|commit|recover|adopt)
+    _self_dir="$(cd "$(dirname "$0")" && pwd)"
+    _pkg_dir="$(cd "$_self_dir/.." && pwd)"
+    if [[ -f "$_pkg_dir/nuwa/cli.py" ]]; then
+      exec python3 "$_pkg_dir/nuwa/cli.py" "$@"
+    fi
+    ;;
+esac
+
 NUWA_VERSION="0.3.1"
 
 LAB_DIR="${SAPPER_HOME:-$HOME/sapper-lab}"

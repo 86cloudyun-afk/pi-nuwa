@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0-dev — 2026-11-08
+
+R1 运行时（Python 包 `nuwa/`）：
+
+- `journal.py`：append-only 权威事件流、并发 seq、checkpoint + CURRENT 指针、重放摘要
+- `ledger.py`：全局账本 `global.jsonl`、reserve/renew/reclaim/settle/opening_balance、准入与剩余额度
+- `locks.py`：`run.lock` / `txn.lock` / `inflight/<intent>.lock`，flock 封装与存活探测
+- `txn.py`：幂等键、`commit`（key 扫描 + sapper done + intent 修补 + validate）、`repair`、`adopt`
+- `worker.py`：先加锁、写 ready、fork+wait、写 result，锁 fd 随子进程保留
+- `dispatch.py`：渲染提示 → 引擎 → executed → 解析 payload → 幂等提交 → 结算
+- `runner.py`：round 循环、reason 批量幂等、并行 dispatch、证据闸门、run.json、resume 计数
+- `cli.py`：`ls / status / attach / budget / commit / dispatch / run / recover / adopt`
+- 测试：core 11 + dispatch 2 + run 1 + multi 1 = 15 例，全部在 us3 通过
+- 门禁：`g1_r1.sh` 接入 `tests/run.sh` 与 `gates/expected`
+
 ## 0.3.1 — 2026-11-08
 
 - `bin/nuwa --version`
