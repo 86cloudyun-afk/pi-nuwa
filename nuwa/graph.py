@@ -99,9 +99,12 @@ def annotate_fact(root: str | Path, fact_id: str, key: str) -> None:
     data = _load(p)
     if not data:
         return
-    if data.get("x-nuwa-key") and data["x-nuwa-key"] != key:
-        return  # 已有其他键，保留首个权威键
-    data["x-nuwa-key"] = key
+    desc = data.get("description") or ""
+    marker = f"[nuwa:{key}]"
+    if marker not in desc:
+        data["description"] = f"{desc} {marker}".strip()
+    if not data.get("x-nuwa-key"):
+        data["x-nuwa-key"] = key
     _atomic_json(p, data)
 
 

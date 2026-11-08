@@ -211,6 +211,16 @@ class JournalTest(unittest.TestCase):
         j.append("y")
         self.assertEqual(j.last_seq(), 9)
 
+    def test_snapshot_ignores_bad_seq(self):
+        j = Journal(self.tmp)
+        j.append("a")
+        with open(j.path, "ab") as fh:
+            fh.write(b'{"seq":"bad","event":"x"}\n')
+        st = replay_state(self.tmp)
+        self.assertEqual(st["last_seq"], 1)
+        rec = txn.recover(self.tmp)
+        self.assertEqual(rec["last_seq"], 1)
+
     def test_recovery_merges_settled_and_committed_across_files(self):
         j = Journal(self.tmp)
         j.append("commit_done", txn="t1")

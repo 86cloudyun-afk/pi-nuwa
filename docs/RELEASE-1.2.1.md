@@ -80,6 +80,18 @@
 | M25 | `annotate_fact` 覆盖已有辅助键 | 已有其他键时保留首个权威键 |
 | M26 | worker 版本读取异常直接放行 | 改为 fail-closed 返回 3 |
 
+## 第九轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B17 | snapshot 保留 `seq="bad"` 让 recover 抛 ValueError / last_seq 类型污染 | `recover`/`replay_state` 只接受正整数 seq，base last_seq 转换包 try |
+| B6 | `cd` 失败后停在父目录，候选集漏父目录 | `candidateDirs` 加入每个 cd 目标及其父目录 |
+| B7 | 固定上限 4 漏第五个选项 | 上限放宽到 8 |
+| M25 | 辅助键不覆盖导致新键无法落盘 | 正文追加 marker，`x-nuwa-key` 保留首个权威键 |
+
+**真实 sapper 已装**：`~/.local/bin/sapper` 1.0.0，`contract_check` 13/13；全量
+`tests/run.sh` 退出码 0（140 例 + 16 runs）。
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

@@ -1,7 +1,7 @@
 # 测试结果（1.2.1）
 
 日期：2026-11-08
-环境：本机仓库布局，Python 3.14.7，bun 1.4.4，flock；真实 sapper 不在 PATH。
+环境：本机仓库布局，Python 3.14.7，bun 1.4.4，flock；真实 sapper 1.0.0 已装 `~/.local/bin/sapper`。
 原则：可离线、零模型成本；E2E 通过 `NUWA_ALLOW_FAKE_SAPPER=1` 使用替身。
 
 ## 一、套件
@@ -13,24 +13,24 @@
 | `test_chaos.py` | 8 | 8 pass | 坏图/锁/只读/SIGKILL |
 | `test_concurrency.py` | 5 | 5 pass | 单赢家/跨项目/锁清理 |
 | `test_e2e_deterministic.py` | 4 | 4 pass | 替身引擎 |
-| `test_r1_core.py` | 34 | 34 pass | journal 19 + 账本/事务 15 |
+| `test_r1_core.py` | 35 | 35 pass | journal 20 + 账本/事务 15 |
 | `test_r1_dispatch.py` | 2 | 2 pass | 预留/幂等 |
 | `test_r1_run.py` | 1 | 1 pass | round 循环 |
 | `test_r1_multi.py` | 1 | 1 pass | 四项目并发 |
 | `test_r2_r7.py` | 28 | 28 pass | 公平/证据/指标/策略/插件/夜跑 |
 | `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
 
-合计 **139 例 + 16 runs**。
+合计 **140 例 + 16 runs**。
 
 ## 二、门禁
 
 | 门禁 | 结果 | 说明 |
 |---|---|---|
-| `g0_baseline` | FAIL（环境） | `contract_check` 缺真实 sapper，退出 2 |
+| `g0_baseline` | pass | `contract_check` 13/13（真实 sapper 1.0.0） |
 | `g1_r1` | pass | 逐项聚合，任一套件失败都会非零 |
 | `g2_r2r7` | pass | 28 例 |
 
-`tests/run.sh` 最终 `EXIT=1` 仅由 `contract` 缺依赖导致；其余套件均 `OK`。
+`tests/run.sh` 最终 `EXIT=0`；全部套件与门禁通过。
 
 ## 三、审计反例
 
@@ -43,5 +43,5 @@
 
 ## 四、仍然缺的读数
 
-- 真实 sapper 的 `contract_check` 与 real 崩溃组；需 CI 固定 ref。
+- real 崩溃组仍用替身注入点；真实 sapper 的 4 点崩溃注入需要固定 ref 的 CI 环境。
 - 72h soak 需要自托管 runner 实际执行；本机只验证入口与报告校验。

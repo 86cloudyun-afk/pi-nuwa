@@ -91,7 +91,7 @@ const PATH_RULES: Array<[RegExp, string]> = [
  * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
  */
 const COMMIT_RE =
-	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:(?:--store(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+)))\s+){0,4})?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:(?:--store(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+)))\s+){0,8})?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
 /** 命令中所有可能的 cwd：原目录与每个 cd 之后的目录。检查时取并集，避免时序漏检。 */
 function candidateDirs(cmd: string, baseDir: string): string[] {
@@ -101,6 +101,7 @@ function candidateDirs(cmd: string, baseDir: string): string[] {
 		const target = m[1].replace(/^["']|["']$/g, "");
 		dir = isAbsolute(target) ? target : resolve(dir, target);
 		dirs.push(dir);
+		dirs.push(dirname(dir)); // cd 失败时会停在父目录，候选集要覆盖
 	}
 	return [...new Set(dirs)];
 }

@@ -425,10 +425,15 @@ def replay_state(root: str | Path) -> dict:
         ended = set(base.get("ended", []))
         state["inflight"] = {k: v for k, v in base.get("inflight", {}).items()
                              if k not in ended}
-        state["last_seq"] = int(base.get("last_seq", 0) or 0)
+        try:
+            state["last_seq"] = int(base.get("last_seq", 0) or 0)
+        except (TypeError, ValueError):
+            state["last_seq"] = 0
     for rec in records:
         ev = rec.get("event")
-        state["last_seq"] = rec.get("seq", state["last_seq"])
+        seq = rec.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+            state["last_seq"] = max(int(state["last_seq"]), seq)
         txn = rec.get("txn")
         if ev == "executing_prepare":
             state["inflight"][txn] = {"intent": rec.get("intent"), "state": "prepare"}

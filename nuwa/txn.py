@@ -152,9 +152,14 @@ def recover(root: str | Path) -> dict:
                 pending[txn] = {"txn": txn, "state": info.get("state", "recovered"),
                                 "intent": info.get("intent"), "rid": info.get("rid"),
                                 "tokens": info.get("tokens")}
-    last = int(base.get("last_seq", 0) or 0) if base else 0
+    try:
+        last = int(base.get("last_seq", 0) or 0) if base else 0
+    except (TypeError, ValueError):
+        last = 0
     for rec in records:
-        last = max(last, int(rec.get("seq", 0) or 0))
+        seq = rec.get("seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+            last = max(last, seq)
         txn = rec.get("txn")
         ev = rec.get("event")
         if not txn or txn in finished:
