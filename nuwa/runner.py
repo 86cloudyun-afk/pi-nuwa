@@ -47,7 +47,16 @@ def _evidence(root: Path) -> bool:
     if (not isinstance(goal, dict) or goal.get("id") != "goal"
             or not proj.get("goal") or goal.get("description") != proj.get("goal")):
         return False
-    edges = [it for it in graph.intents(root) if it.get("to") == "goal"]
+    edges = []
+    try:
+        for ip in (Path(root) / ".sapper" / "intents").glob("*.json"):
+            it = graph._load(ip)
+            if not isinstance(it, dict) or it.get("id") != ip.stem:
+                return False
+            if it.get("to") == "goal":
+                edges.append(it)
+    except OSError:
+        return False
     if not edges:
         # 无完成边的 completed 是异常状态，不能用整图历史事实兜底。
         return False

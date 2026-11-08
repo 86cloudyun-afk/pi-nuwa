@@ -411,6 +411,12 @@
 | B49 | 普通 fact 扫描仍跳过全部 `*goal.json` | 只跳过精确 `.sapper/facts/goal.json` |
 | B25 | 外层 intent/锁内 fact 身份、Python 普通节点身份 | 三处均校验 id 与文件名；Python `_evidence` 改目录遍历 |
 
+## 第五十轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B25 | Python `_evidence` 用 `graph.intents` 丢失文件名 | 改为遍历 `.sapper/intents/*.json`，校验 id 与文件名后再取 goal 边 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
