@@ -334,13 +334,13 @@ for p in glob.glob(".sapper/facts/*.json"):
     try:
         f = json.load(open(p)); facts[f.get("id")] = f
     except Exception:
-        pass
+        print("no"); raise SystemExit
 edges = []
 for p in glob.glob(".sapper/intents/*.json"):
     try:
         it = json.load(open(p))
     except Exception:
-        continue
+        print("no"); raise SystemExit
     if it.get("to") == "goal":
         edges.append(it)
 if not edges:
@@ -431,6 +431,7 @@ print("%s|%s|%s|%s|%s|%s" % (p.get("status"), o, c, d, ef, fl))'
 }
 
 round=0
+failed=0
 last_sig=""
 stall=0
 deadline=$(( $(date +%s) + minutes * 60 ))
@@ -515,7 +516,6 @@ if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
     recover --root "$PWD" --repair >/dev/null 2>&1 || true)
 fi
 
-failed=0
 [[ -f .nuwa-dispatch-failed ]] && failed=1
 
 # ---------------------------------------------------------------- 战报

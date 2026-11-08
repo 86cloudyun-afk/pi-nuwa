@@ -481,7 +481,9 @@ export function readGraph(root: string): Graph | null {
 		corrupt = true;
 	}
 	try {
-		if (!readJson(join(root, ".sapper", "facts", "goal.json"))) corrupt = true;
+		const goal = readJson<{ id?: string; kind?: string }>(
+			join(root, ".sapper", "facts", "goal.json"));
+		if (!goal || goal.id !== "goal" || goal.kind !== "goal") corrupt = true;
 	} catch {
 		corrupt = true;
 	}

@@ -274,6 +274,14 @@
 | B25 | `goal.json` 缺失/损坏、fact 文件名与 id 错配仍可 verified=true | `readGraph` 检查 goal.json 可解析、fact.id 与文件名一致，否则 corrupt |
 | B30 | `completion_ok` 回滚失败与正常继续共用返回 1，最终可 exit 0 | 回滚失败设 `failed=1`，最终退出非零 |
 
+## 第三十二轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B30 | 战报前 `failed=0` 覆盖回滚失败标记 | `failed` 在循环前初始化，战报前只读标记不重置 |
+| B25 | `goal.json` 只检查可解析，未验身份/kind | 要求 `goal.id=="goal"` 且 `goal.kind=="goal"`，否则 corrupt |
+| B25 | shell 静默跳过损坏 fact/intent | 解析失败直接输出 `no` |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
