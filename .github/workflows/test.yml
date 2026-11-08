@@ -28,37 +28,9 @@ jobs:
           git -C /tmp/sapper-v2 checkout "$SAPPER_REF"
           bash /tmp/sapper-v2/install.sh --cli-only
 
-      - name: Unit tests
-        run: |
-          cd tests
-          bun test unit.test.ts
-
-      - name: Contract check
+      - name: Full suite (contract + five suites + gates)
+        env:
+          NUWA_REQUIRE_GATES: "1"
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          cd tests
-          python3 contract_check.py
-
-      - name: Protocol tests
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          cd tests
-          python3 test_nuwa_shell.py
-
-      - name: Chaos tests
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          cd tests
-          python3 test_chaos.py
-
-      - name: Concurrency tests
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          cd tests
-          python3 test_concurrency.py
-
-      - name: Deterministic E2E
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          cd tests
-          python3 test_e2e_deterministic.py
+          ./tests/run.sh

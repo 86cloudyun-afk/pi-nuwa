@@ -50,4 +50,22 @@
 
 ## Round 3 — 2026-11-08
 
+- 结论：**fail**，70/100
+- 阻塞 5 项：R1 恢复依赖 R2/R3 的能力（依赖倒置）；执行结果到 executed 之间的崩溃窗口；checkpoint 缺去重水位；快照跨项目一致性；72h 长测缺回归指标与统计窗口
+- 修订：R1 内置最小账本与结果 artifact；R6 承担快照回滚；checkpoint 补 intents/dispatch_keys/unresolved；长测补 RSS 斜率、FD 算法、滚动窗口
+
+## Round 4 — 2026-11-08
+
+- 结论：**fail**，80/100
+- 阻塞 5 项：fact 已建、intent 未更新的窗口；tokens 计费与"失败不计 tokens"冲突；快照持 global.lock 等待结算造成自锁；快照缺 checkpoint 与 artifact；门禁绕过 tests/run.sh 与 gates
+- 修订：commit 改 saga；tokens 在 executed 计费；快照改两阶段冻结；快照清单补 checkpoint/artifact；CI 与 suite 统一入口
+
+## Round 5 — 2026-11-08
+
+- 结论：**fail**，70/100
+- 阻塞 6 项：done 后写幂等键的窗口；spawn 前写 pid；Bloom 误命中跳过新事务；崩溃未写 executed 导致漏计费；快照缺 global.jsonl 全量与 artifact 字节；0.3.1 无账本读取能力却要求降级验证
+- 修订：幂等标记写进 fact description；executing_prepare/executing 两段式 + pid_starttime；精确索引 dispatch_keys.idx；任何 spawn 必写 executed；快照复制 global.jsonl 与 artifact；降级基线改为 0.9.0
+
+## Round 6 — 2026-11-08
+
 （待填）

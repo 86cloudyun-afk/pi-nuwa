@@ -72,10 +72,13 @@ def main() -> int:
         rb = make_bin(tmp, real_bin)
         fb = make_bin(tmp, FAKE)
 
-        # --version 只比退出码（版本号本来不同）
-        results.append(check("version",
-                             run(rb, ["--version"], tmp),
-                             run(fb, ["--version"], tmp), compare_stdout=False))
+        # --version：退出码一致 + 真实版本字符串符合 semver 并被记录
+        r_ver = run(rb, ["--version"], tmp)
+        f_ver = run(fb, ["--version"], tmp)
+        ver_line = r_ver.stdout.strip()
+        results.append({"name": "version",
+                        "ok": r_ver.returncode == f_ver.returncode and bool(re.match(r"^sapper \d+\.\d+\.\d+", ver_line)),
+                        "detail": f"real={ver_line!r}"})
 
         # setup
         for name, b in (("real", rb), ("fake", fb)):
@@ -111,6 +114,31 @@ def main() -> int:
         r_done = run(rb, ["done", "i001"], tmp / "real")
         f_done = run(fb, ["done", "i001"], tmp / "fake")
         results.append(check("done_requires_fact", r_done, f_done, compare_stdout=False))
+
+        # 正向结案：done 必须同时更新 intent 与新建 fact
+        for name in ("real", "fake"):
+            b = rb if name == "real" else fb
+            run(b, ["intent", "--from", "f001", "positive case"], tmp / name)
+            before = len(list((tmp / name / ".sapper" / "facts").glob("*.json")))
+            run(b, ["done", "i002", "--fact", "positive conclusion", "-k", "note"], tmp / name)
+            after = len(list((tmp / name / ".sapper" / "facts").glob("*.json")))
+            intent = json.loads((tmp / name / ".sapper" / "intents" / "i002.json").read_text())
+            ok = after == before + 1 and intent.get("status") == "done" and intent.get("to")
+            results.append({"name": f"done_positive_{name}", "ok": ok,
+                            "detail": "" if ok else f"facts {before}->{after}, intent={intent.get('status')}"})
+
+        # 未知字段保留：sapper 不应清掉外部写入的附加字段
+        for name in ("real", "fake"):
+            b = rb if name == "real" else fb
+            fp = tmp / name / ".sapper" / "facts" / "f001.json"
+            d = json.loads(fp.read_text())
+            d["x-nuwa-probe"] = {"keep": True}
+            fp.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+            run(b, ["validate"], tmp / name)
+            d2 = json.loads(fp.read_text())
+            ok = d2.get("x-nuwa-probe", {}).get("keep") is True
+            results.append({"name": f"unknown_field_preserved_{name}", "ok": ok,
+                            "detail": "" if ok else "field dropped"})
 
         # validate 成功输出前缀一致
         r_val = run(rb, ["validate"], tmp / "real")
