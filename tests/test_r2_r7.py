@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 
-from nuwa import evidence, fairness, metrics, plugins, policy, soak  # noqa: E402
+from nuwa import evidence, fairness, metrics, plugins, policy, soak, migrate  # noqa: E402
 from nuwa.journal import Journal  # noqa: E402
 
 
@@ -145,6 +145,27 @@ class PluginTest(unittest.TestCase):
         self.assertNotIn("old-engine", names)
         p = [x for x in found if x["name"] == "fake-engine"][0]
         self.assertEqual(plugins.run(p, "hello"), "ok:hello")
+
+
+class MigrationTest(unittest.TestCase):
+    def test_loop_state_2_to_3(self):
+        tmp = Path(tempfile.mkdtemp(prefix="r6-migrate-"))
+        try:
+            d = tmp / "cache" / "nuwa-loop"
+            d.mkdir(parents=True)
+            f = d / "s1.json"
+            f.write_text(json.dumps({"schema": 2, "turns": 3, "spentTokens": 9}))
+            res = migrate.migrate_loop_state(write=True, home=tmp)
+            self.assertEqual(res["migrated"], ["s1.json"])
+            data = json.loads(f.read_text())
+            self.assertEqual(data["schema"], 3)
+            self.assertEqual(data["turns"], 3)
+            self.assertTrue((d / "s1.json.bak").exists())
+            res2 = migrate.migrate_loop_state(write=True, home=tmp)
+            self.assertEqual(res2["migrated"], [])
+            self.assertEqual(res2["skipped"], ["s1.json"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class SoakTest(unittest.TestCase):

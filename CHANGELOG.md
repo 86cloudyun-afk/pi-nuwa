@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0 — 2026-11-08
+
+- R1 补齐：journal 归档压缩（`journal.<gen>.jsonl` + checkpoint + CURRENT）、崩溃注入 4 点、repair 恢复
+- R5：渲染提示注入门（`policy.check_prompt`），命中 deny 规则即阻断 dispatch 并记 `policy_block`
+- R6：`loop_schema 2→3` 写入迁移 + 自动备份，`migrate --dry-run/--write`
+- 压力测试：16 项目 × 3 分钟并发，读数见 `docs/RELEASE-1.0.md`
+- 门禁：g1 增加崩溃注入，g2 含迁移测试
+
 ## 1.0.0-rc1 — 2026-11-08
 
 - R2：`nuwa fairness` 加权调度、账本准入、超支口径

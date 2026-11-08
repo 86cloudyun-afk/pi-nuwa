@@ -11,12 +11,12 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from nuwa import graph, registry, txn, runner, dispatch as dispatch_mod  # type: ignore
-    from nuwa import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod  # type: ignore
+    from nuwa import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod  # type: ignore
     from nuwa.ledger import Ledger  # type: ignore
     from nuwa.paths import find_project, pointer_path  # type: ignore
 else:
     from . import graph, registry, txn, runner, dispatch as dispatch_mod
-    from . import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod
+    from . import evidence, fairness, metrics, plugins as plugins_mod, policy, soak as soak_mod, migrate as migrate_mod
     from .ledger import Ledger
     from .paths import find_project, pointer_path
 
@@ -238,8 +238,10 @@ def cmd_migrate(args) -> int:
         proj = root / ".sapper" / "project.json"
         if proj.exists():
             detected["graph"] = "sapper-managed"
+    result = migrate_mod.migrate_loop_state(write=not args.dry_run)
     print(json.dumps({"from": args.source, "dry_run": args.dry_run,
-                      "detected": detected}, ensure_ascii=False, indent=2))
+                      "detected": detected, "loop_state": result},
+                     ensure_ascii=False, indent=2))
     return 0
 
 

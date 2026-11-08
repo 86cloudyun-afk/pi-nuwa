@@ -6,3 +6,4 @@ python3 tests/test_r1_core.py
 python3 tests/test_r1_dispatch.py
 python3 tests/test_r1_run.py
 python3 tests/test_r1_multi.py
+python3 tests/crash_inject.py

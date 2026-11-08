@@ -42,23 +42,56 @@ class Journal:
                 continue
         return 0
 
+    def _files(self) -> list[Path]:
+        files = [self.path] if self.path.exists() else []
+        files += sorted(self.dir.glob("journal.*.jsonl"))
+        return files
+
     def read(self, since_seq: int = 0) -> list[dict]:
+        recs: list[dict] = []
+        for path in self._files():
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if int(rec.get("seq", 0)) > since_seq:
+                            recs.append(rec)
+            except FileNotFoundError:
+                continue
+        recs.sort(key=lambda r: int(r.get("seq", 0)))
+        seen: set[int] = set()
         out: list[dict] = []
-        try:
-            with open(self.path, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if int(rec.get("seq", 0)) > since_seq:
-                        out.append(rec)
-        except FileNotFoundError:
-            pass
+        for r in recs:
+            seq = int(r.get("seq", 0))
+            if seq in seen:
+                continue
+            seen.add(seq)
+            out.append(r)
         return out
+
+    def compact(self) -> Path:
+        """把当前 journal 归档为 journal.<gen>.jsonl，开新文件。历史仍可重放。"""
+        gen = self.current_gen() + 1
+        if self.path.exists() and self.path.stat().st_size > 0:
+            os.replace(self.path, self.dir / f"journal.{gen}.jsonl")
+        self.path.touch()
+        ck = self.dir / f"checkpoint.{gen}.json"
+        tmp = ck.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"checkpoint_schema": 1, "gen": gen,
+                                   "seq": self.last_seq()}, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, ck)
+        cur = self.dir / "CURRENT"
+        cur_tmp = cur.with_suffix(".tmp")
+        cur_tmp.write_text(str(gen), encoding="utf-8")
+        os.replace(cur_tmp, cur)
+        return ck
 
     def write_checkpoint(self, payload: dict) -> Path:
         """写 checkpoint.<gen>.json，原子更新 CURRENT 指针。"""

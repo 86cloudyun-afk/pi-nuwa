@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import graph, txn
+from . import graph, txn, policy
 from .journal import Journal
 from .ledger import Ledger
 from .paths import ensure_nuwa
@@ -21,6 +21,11 @@ DEFAULT_TOKENS = 4000
 
 class DispatchError(RuntimeError):
     pass
+
+
+def _crash(point: str) -> None:
+    if os.environ.get("NUWA_CRASH_POINT") == point:
+        os._exit(137)
 
 
 def _balanced_json(text: str) -> dict | None:
@@ -86,9 +91,11 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
 
     txn_id = f"t-{uuid.uuid4().hex[:12]}"
     rid = f"r-{uuid.uuid4().hex[:12]}"
+    _crash("before_reserve")
     journal.append("reserve_pending", txn=txn_id, rid=rid, intent=intent_id,
                    attempt_seq=attempt, tokens=tokens, project=project)
     ledger.reserve(rid, project, tokens)
+    _crash("after_reserve")
     journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id)
     journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
                    attempt_seq=attempt, key=key)
@@ -101,6 +108,12 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     err = art / "stderr.txt"
 
     prompt = render_prompt(root, intent_id)
+    ok, rule = policy.check_prompt(prompt)
+    if not ok:
+        journal.append("policy_block", txn=txn_id, intent=intent_id, rule=rule)
+        ledger.settle(rid, 0, status="blocked")
+        raise DispatchError(f"策略拦截: {rule}")
+    _crash("after_prepare")
     eng = engine or os.environ.get("NUWA_ENGINE", "omp-claude")
     worker_cmd = [sys.executable, str(WORKER),
                   "--lock", str(nd / "inflight" / f"{intent_id}.lock"),
@@ -128,6 +141,7 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
 
     if status == "ok" and (not result.exists() or json.loads(result.read_text()).get("exit_code") != 0):
         status = "crashed"
+    _crash("after_execute")
     journal.append("executed", txn=txn_id, rid=rid, intent=intent_id,
                    status=status, exit_code=rc, artifact=str(art), duration_ms=dur,
                    tokens=tokens, settled=False)

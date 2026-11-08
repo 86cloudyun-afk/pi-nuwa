@@ -34,6 +34,14 @@ def check_command(command: str) -> tuple[bool, str | None]:
     return True, None
 
 
+def check_prompt(prompt: str) -> tuple[bool, str | None]:
+    """在派发前扫描渲染提示，拦截被注入的危险命令模式。"""
+    for pattern, rule_id in DENY_RULES:
+        if re.search(pattern, prompt):
+            return False, rule_id
+    return True, None
+
+
 def allowed_by_allowlist(command: str) -> bool:
     return any(re.search(pattern, command) for pattern, _ in ALLOW_RULES)
 
