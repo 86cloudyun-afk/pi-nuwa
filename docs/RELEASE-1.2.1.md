@@ -245,6 +245,19 @@
 | B30 | `_revert` 锁内未重判证据；调用方丢弃 False；shell 吞删除错误 | 锁内重判 `_evidence`，有效完成不删；调用方记 `revert_failed`；shell 删除失败退出 1 并跑 validate |
 | M58 | 测试夹具覆盖 verdict 被指伪造 | 夹具只用于 verify 判定测试；`test_night_smoke` 继续测真实采样 |
 
+## 第二十八轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B25 | 扩展先过滤 status，complete 与 done/open→goal 并存仍 verified=true；from 类型异常中止扫描 | 收集全部 `to=goal` 边，逐边要求 status=complete、from 为数组且非空、全强证据 |
+| B30 | 扩展回滚遗留 goal 边；shell validate 失败被 log 吞 | 扩展 `revertCompletion` 先删边再写 active；shell `validate` 失败 `exit 1` |
+
+## 第二十九轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| 锁泄漏（三） | `$(...) 9>&-` 的重定向未覆盖 `$()` 子 shell，SIGKILL 后子 shell 仍持锁 | 改为 `out=$(exec 9>&-; cmd ...)`；repair 用 `(exec 9>&-; ...)` |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

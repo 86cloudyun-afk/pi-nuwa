@@ -25,6 +25,7 @@ import {
 	readFileSync,
 	readdirSync,
 	readlinkSync,
+	rmSync,
 	realpathSync,
 	statSync,
 	writeFileSync,
@@ -425,15 +426,18 @@ export function readGraph(root: string): Graph | null {
 	let done = 0;
 	let claimed = 0;
 	const openIds: string[] = [];
-	const goalEdges: string[][] = [];
+	const goalEdges: Array<{ status?: string; refs: string[] }> = [];
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
 			if (!f.endsWith(".json")) continue;
 			const it = readJson<{ id?: string; status?: string; to?: string; from?: string[] }>(
 				join(root, ".sapper", "intents", f));
 			if (!it) continue;
-			if (it.to === "goal" && it.status === "complete") {
-				goalEdges.push((it.from ?? []).map(String));
+			if (it.to === "goal") {
+				goalEdges.push({
+					status: it.status,
+					refs: Array.isArray(it.from) ? it.from.map(String) : [],
+				});
 			}
 			if (it.status === "open") {
 				open++;
@@ -463,8 +467,9 @@ export function readGraph(root: string): Graph | null {
 		/* ignore */
 	}
 	const strong: Record<string, true> = { flag: true, vuln: true, loot: true };
-	verified = goalEdges.length > 0 && goalEdges.every((refs) =>
-		refs.length > 0 && refs.every((id) => strong[kinds[id] ?? ""] === true));
+	verified = goalEdges.length > 0 && goalEdges.every((edge) =>
+		edge.status === "complete" && edge.refs.length > 0 &&
+		edge.refs.every((id) => strong[kinds[id] ?? ""] === true));
 	let viewUrl: string | null = null;
 	try {
 		const v = readFileSync(join(root, ".sapper", "view.url"), "utf8").trim();
@@ -502,6 +507,18 @@ export function revertCompletion(root: string, why: string): boolean {
 	delete proj.completed_from;
 	proj.updated_at = new Date().toISOString();
 	try {
+		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
+			if (!f.endsWith(".json")) continue;
+			const ip = join(root, ".sapper", "intents", f);
+			const it = readJson<{ to?: string }>(ip);
+			if (it?.to === "goal") {
+				try {
+					rmSync(ip);
+				} catch {
+					return false;
+				}
+			}
+		}
 		writeFileSync(p, JSON.stringify(proj, null, 2));
 	} catch {
 		return false;
