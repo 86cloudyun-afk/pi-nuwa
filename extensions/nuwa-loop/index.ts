@@ -438,10 +438,13 @@ export function readGraph(root: string): Graph | null {
 				continue;
 			}
 			if (it.to === "goal") {
-				goalEdges.push({
-					status: it.status,
-					refs: Array.isArray(it.from) ? it.from.map(String) : [],
-				});
+				const refs = Array.isArray(it.from)
+					? it.from.filter((x): x is string => typeof x === "string")
+					: [];
+				if (!Array.isArray(it.from) || refs.length !== (it.from ?? []).length) {
+					corrupt = true;
+				}
+				goalEdges.push({ status: it.status, refs });
 			}
 			if (it.status === "open") {
 				open++;
@@ -472,7 +475,7 @@ export function readGraph(root: string): Graph | null {
 				corrupt = true;
 				continue;
 			}
-			if (fact.id && fact.id !== f.replace(/\.json$/, "")) corrupt = true;
+			if (!fact.id || fact.id !== f.replace(/\.json$/, "")) corrupt = true;
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
 			if (fact?.kind) kinds[f.replace(/\.json$/, "")] = fact.kind;
@@ -481,9 +484,13 @@ export function readGraph(root: string): Graph | null {
 		corrupt = true;
 	}
 	try {
-		const goal = readJson<{ id?: string; kind?: string }>(
+		const goal = readJson<{ id?: string; kind?: string; description?: string }>(
 			join(root, ".sapper", "facts", "goal.json"));
-		if (!goal || goal.id !== "goal" || goal.kind !== "goal") corrupt = true;
+		if (!goal || goal.id !== "goal" || (goal.kind && goal.kind !== "goal")) {
+			corrupt = true;
+		} else if (proj.goal && goal.description !== proj.goal) {
+			corrupt = true;
+		}
 	} catch {
 		corrupt = true;
 	}

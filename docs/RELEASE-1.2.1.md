@@ -282,6 +282,14 @@
 | B25 | `goal.json` 只检查可解析，未验身份/kind | 要求 `goal.id=="goal"` 且 `goal.kind=="goal"`，否则 corrupt |
 | B25 | shell 静默跳过损坏 fact/intent | 解析失败直接输出 `no` |
 
+## 第三十三轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B39 | 强制 `kind=goal` 与真实 goal fact 协议冲突（真实 goal 省略 kind） | 只要求 `id=goal`；kind 缺省允许，存在时必须为 goal；description 与 project.goal 一致 |
+| B25 | 普通 fact 空 id、from 成员非字符串、schema 分叉 | fact.id 必须存在且等于文件名；from 成员非字符串置 corrupt |
+| B30 | shell 回滚 Python 非零被 validate=0 覆盖；Python 回滚失败仍返回 0 | shell `python3 ... || exit 1`；runner 回滚失败设 `exit_code=1` |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

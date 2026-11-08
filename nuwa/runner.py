@@ -211,6 +211,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                         journal.append("completion_rejected", round=round_no)
                     else:
                         journal.append("revert_failed", round=round_no)
+                        exit_code = 1
                 journal.append("frontier_empty", round=round_no)
                 break
             batch = ids[: max(1, parallel * 2)]
@@ -232,6 +233,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                     journal.append("completion_rejected", round=round_no)
                 else:
                     journal.append("revert_failed", round=round_no)
+                    exit_code = 1
 
             facts = graph.facts(root)
             sig = "|".join(str(x) for x in (

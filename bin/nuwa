@@ -384,7 +384,7 @@ try:
 except Exception:
     hints = []
 hints.append({"content": "完成被拒绝：没有任何 flag/vuln/loot 事实", "creator": "nuwa", "created_at": d["updated_at"]})
-json.dump(hints, open(h, "w"), ensure_ascii=False, indent=2)'
+json.dump(hints, open(h, "w"), ensure_ascii=False, indent=2)' || exit 1
   sapper validate >/dev/null 2>&1 || exit 1
   ) 8>"$dir/.sapper/.lock"
 }

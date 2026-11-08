@@ -39,7 +39,7 @@ function makeGraph(root: string, opts: {
 		}));
 	}
 	writeFileSync(join(s, "facts", "goal.json"), JSON.stringify({
-		id: "goal", kind: "goal", description: "goal",
+		id: "goal", description: opts.goal ?? "unit goal", creator: "system",
 	}));
 	for (const f of opts.facts ?? []) {
 		writeFileSync(join(s, "facts", `${f.id}.json`), JSON.stringify({
