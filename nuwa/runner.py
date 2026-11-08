@@ -31,7 +31,17 @@ def _project_status(root: Path) -> str:
 
 
 def _evidence(root: Path) -> bool:
-    facts = {f.get("id"): f for f in graph.facts(root)}
+    facts = {}
+    try:
+        for fp in (Path(root) / ".sapper" / "facts").glob("*.json"):
+            if fp.name == "goal.json":
+                continue
+            f = graph._load(fp)
+            if not isinstance(f, dict) or f.get("id") != fp.stem:
+                return False
+            facts[f["id"]] = f
+    except OSError:
+        return False
     goal = graph.get_fact(root, "goal")
     proj = graph.project(root)
     if (not isinstance(goal, dict) or goal.get("id") != "goal"

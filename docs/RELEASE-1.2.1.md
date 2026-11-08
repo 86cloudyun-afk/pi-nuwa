@@ -404,6 +404,13 @@
 | B25 | shell 锁内未校验 fact 文件身份 | 锁内 intent/fact 均校验 id 与文件名 |
 | B30 | Python 用内嵌 id 构造删除路径，可能删错文件 | 改为遍历实际 intent 文件路径删除 |
 
+## 第四十九轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B49 | 普通 fact 扫描仍跳过全部 `*goal.json` | 只跳过精确 `.sapper/facts/goal.json` |
+| B25 | 外层 intent/锁内 fact 身份、Python 普通节点身份 | 三处均校验 id 与文件名；Python `_evidence` 改目录遍历 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
