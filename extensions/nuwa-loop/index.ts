@@ -91,13 +91,14 @@ const PATH_RULES: Array<[RegExp, string]> = [
  * 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
  */
 const COMMIT_RE =
-	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:--store(?:=\S+|\s+(?:"[^"]*"|'[^']*'|\S+))|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+)))\s+)?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
+	/(?:^|[;&|()\n\r\t"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+(?:(?:(?:--store(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))|-s(?:\S+|\s+(?:"[^"]*"|'[^']*'|\S+)))\s+){0,2})?(?:done\s+\S+|dispatch\s+i\d+|complete\b)/i;
 
 /** 计算命令中 pos 位置之前的 cwd（只认行首/分隔符后的 cd）。 */
 function dirBefore(cmd: string, pos: number, baseDir: string): string {
 	let dir = baseDir;
-	for (const m of cmd.matchAll(/(?:^|[;&|(]\s*)cd\s+([^\s;|&]+)/g)) {
+	for (const m of cmd.matchAll(/(?:^|[;&|]\s*)cd\s+([^\s;|&>]+)([^;&|]*)/g)) {
 		if (m.index === undefined || m.index >= pos) break;
+		if ((m[2] ?? "").includes(">")) continue;
 		const target = m[1].replace(/^["']|["']$/g, "");
 		dir = isAbsolute(target) ? target : resolve(dir, target);
 	}

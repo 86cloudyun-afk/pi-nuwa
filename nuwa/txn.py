@@ -109,7 +109,11 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
             graph.patch_intent(root, intent_id, fact_id, worker=worker)
 
         _crash("after_done")
-        ok, msg = graph.validate(root)
+        try:
+            ok, msg = graph.validate(root)
+        except Exception:
+            _restore_intent(root, intent_id, before)
+            raise
         if not ok:
             _restore_intent(root, intent_id, before)
             raise CommitError(f"validate 失败: {msg}")

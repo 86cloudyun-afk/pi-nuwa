@@ -66,6 +66,12 @@ class Journal:
                     start = max(0, size - window)
                     fh.seek(start)
                     data = fh.read()
+                    if start > 0:
+                        cut = data.find(b"\n")
+                        if cut < 0:
+                            window *= 2
+                            continue
+                        data = data[cut + 1:]
                     for raw in reversed(data.split(b"\n")):
                         try:
                             line = raw.decode("utf-8")

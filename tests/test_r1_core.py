@@ -200,6 +200,17 @@ class JournalTest(unittest.TestCase):
         self.assertEqual(j.last_seq(), 9)
         self.assertEqual(len(j.read()), 2)
 
+    def test_tail_seq_skips_window_fragment(self):
+        """窗口起点落在坏行中间时，残片不能当作合法 seq。"""
+        j = Journal(self.tmp)
+        for i in range(1, 9):
+            j.append("x", i=i)
+        with open(j.path, "ab") as fh:
+            fh.write(b"BAD" + b" " * 9000 + b'{"seq":1}\n')
+        self.assertEqual(j.last_seq(), 8)
+        j.append("y")
+        self.assertEqual(j.last_seq(), 9)
+
     def test_recovery_merges_settled_and_committed_across_files(self):
         j = Journal(self.tmp)
         j.append("commit_done", txn="t1")

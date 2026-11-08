@@ -60,6 +60,15 @@
 | M20 | attempt 不递增，迟到 worker 无法拒绝 | dispatch 写 `x-nuwa-attempt=attempt+1`；worker 拿锁后比对版本；done intent 直接复用 |
 | B13 | validate 失败后 intent 已改盘 | 提交前快照 intent，validate 失败恢复 |
 
+## 第七轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B5 | 尾窗起点落在坏行中间时残片被当合法 seq | 窗口 `start>0` 时跳过第一条不完整行 |
+| B6 | `$(cd ...)` 与 `cd x > file` 的 cwd 时序 | `dirBefore` 不进入 `$()`，带重定向的 cd 不应用 |
+| B7 | `--store="含空格"` 等号值、连续选项、长空白 | 等号值支持引号；选项组有限重复 `{0,2}` |
+| B15 | `validate` 抛异常时不回滚 intent | validate 包 try，异常同样 `_restore_intent` |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
