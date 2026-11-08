@@ -40,6 +40,13 @@ class CommitError(RuntimeError):
     pass
 
 
+TXN_PENDING = (
+    "reserve_pending", "reserve_committed", "executing_prepare", "executing",
+    "executed", "commit_prepare", "done_apply", "ledger_settle",
+)
+TXN_DONE = ("commit_done", "ack", "reserve_rejected", "recovered_crashed")
+
+
 def _crash(point: str) -> None:
     if os.environ.get("NUWA_CRASH_POINT") == point:
         os._exit(137)
@@ -60,19 +67,26 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
         if key is None:
             key = dispatch_key(project_name, intent_id, attempt_of(intent))
 
+        done_to = intent.get("to") if intent.get("status") == "done" else None
+        if done_to:
+            done_fact = graph.get_fact(root, done_to)
+            if done_fact:
+                done_keys = set(re.findall(r"\[nuwa:(sha256:[0-9a-f]{64})\]",
+                                           done_fact.get("description") or ""))
+                aux = done_fact.get("x-nuwa-key")
+                if isinstance(aux, str) and aux:
+                    done_keys.add(aux)
+                if done_keys and key not in done_keys:
+                    raise CommitError(
+                        f"intent 已由其他键完成: {sorted(done_keys)[0]}")
+
         existing = graph.find_fact_by_key(root, key)
         reused = existing is not None
 
-        if not reused and intent.get("status") == "done" and intent.get("to"):
-            fact = graph.get_fact(root, intent["to"])
-            if fact:
-                keys = re.findall(r"\[nuwa:(sha256:[0-9a-f]{64})\]",
-                                  fact.get("description") or "")
-                if keys and key not in keys:
-                    raise CommitError(f"intent 已由其他键完成: {keys[0]}")
-                graph.annotate_fact(root, fact["id"], key)
-                existing = fact
-                reused = True
+        if not reused and done_to:
+            graph.annotate_fact(root, done_to, key)
+            existing = graph.get_fact(root, done_to)
+            reused = existing is not None
 
         if reused:
             fact_id = existing["id"]
@@ -102,44 +116,55 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
         return {"intent": intent_id, "fact": fact_id, "reused": reused, "key": key}
 
 
+def _snapshot_state(j: Journal) -> tuple[dict | None, list[dict], set[str]]:
+    base, records = j.snapshot()
+    finished: set[str] = set()
+    if base:
+        finished |= set(base.get("committed", []))
+        finished |= set(base.get("ended", []))
+    return base, records, finished
+
+
 def recover(root: str | Path) -> dict:
-    """从 journal 汇总未完成事务；返回待处理清单（不自动重派）。"""
+    """从 recovery 摘要 + journal 汇总未完成事务；不自动重派。"""
     root = Path(root).resolve()
     j = Journal(root)
+    base, records, finished = _snapshot_state(j)
     pending: dict[str, dict] = {}
-    for rec in j.read():
+    last = int(base.get("last_seq", 0) or 0) if base else 0
+    for rec in records:
+        last = max(last, int(rec.get("seq", 0) or 0))
         txn = rec.get("txn")
         ev = rec.get("event")
-        if not txn:
+        if not txn or txn in finished:
             continue
-        if ev in ("reserve", "executing_prepare", "executing", "executed",
-                  "commit_prepare", "done_apply"):
+        if ev in TXN_PENDING:
             pending[txn] = {"txn": txn, "state": ev, "intent": rec.get("intent"),
                             "seq": rec.get("seq")}
-        elif ev in ("commit_done", "ack"):
+        elif ev in TXN_DONE:
             pending.pop(txn, None)
-    return {"pending": list(pending.values()), "last_seq": j.last_seq()}
+    return {"pending": list(pending.values()), "last_seq": last}
 
 
 def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
-    """恢复未完成事务：锁空闲且无成功结果时释放 intent 并结算为 crashed。"""
+    """恢复未完成事务：只结算真实存在且未结算的预留，并写 ack 终态。"""
     root = Path(root).resolve()
     nd = ensure_nuwa(root)
     journal = Journal(root)
     led = ledger or Ledger()
+    _base, records, finished = _snapshot_state(journal)
     pending: dict[str, dict] = {}
-    for rec in journal.read():
+    for rec in records:
         txn_id = rec.get("txn")
         ev = rec.get("event")
-        if not txn_id:
+        if not txn_id or txn_id in finished:
             continue
-        if ev in ("reserve_pending", "reserve_committed", "executing_prepare",
-                  "executing", "executed", "commit_prepare", "done_apply"):
+        if ev in TXN_PENDING:
             pending[txn_id] = {
                 "txn": txn_id, "intent": rec.get("intent"), "rid": rec.get("rid"),
                 "tokens": rec.get("tokens", 4000), "state": ev,
             }
-        elif ev in ("commit_done", "ack"):
+        elif ev in TXN_DONE:
             pending.pop(txn_id, None)
 
     repaired = []
@@ -153,9 +178,13 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
             if it and it.get("status") == "claimed":
                 graph.sapper(root, ["release", intent])
         rid = info.get("rid")
-        if rid:
-            led.settle(rid, info.get("tokens", 4000), status="crashed")
+        tokens = info.get("tokens", 4000)
+        if rid and led.has_reserve(rid):
+            led.settle(rid, tokens, status="crashed")
+            journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent,
+                           tokens=tokens, status="crashed")
         journal.append("recovered_crashed", txn=txn_id, intent=intent, rid=rid)
+        journal.append("ack", txn=txn_id, intent=intent, status="crashed")
         repaired.append(txn_id)
     return {"repaired": repaired, "count": len(repaired)}
 

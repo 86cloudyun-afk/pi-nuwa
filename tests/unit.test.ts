@@ -317,6 +317,15 @@ describe("checkTool", () => {
 		expect(mod.checkTool("bash", { command: "sapper complete" }).rule).toBe("P-006");
 		expect(mod.checkTool("bash", { command: "nuwa complete --from f009" }).allowed).toBe(true);
 	});
+	test("bash 写入图/账本路径被拦", () => {
+		expect(mod.checkTool("bash", { command: "echo x > .sapper/facts/f1.json" }, "/p").rule).toBe("P-005");
+		expect(mod.checkTool("bash", { command: "cp /tmp/x .nuwa/journal.jsonl" }, "/p").rule).toBe("P-007");
+		expect(mod.checkTool("bash", { command: "echo x > /tmp/notes.txt" }, "/p").allowed).toBe(true);
+	});
+	test("sapper --store= 与 -s 形式被拦", () => {
+		expect(mod.checkTool("bash", { command: "sapper --store=/p/.sapper done i001 --fact x" }).rule).toBe("P-006");
+		expect(mod.checkTool("bash", { command: "sapper -s/p/.sapper done i001 --fact x" }).rule).toBe("P-006");
+	});
 	test("sapper 全局选项与绝对路径也拦", () => {
 		expect(mod.checkTool("bash", { command: "sapper --store /p/.sapper done i001 --fact x" }).rule).toBe("P-006");
 		expect(mod.checkTool("bash", { command: "/usr/local/bin/sapper done i001 --fact x" }).rule).toBe("P-006");

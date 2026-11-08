@@ -115,6 +115,14 @@ class Ledger:
             return self._append_locked({"type": "settle", "rid": rid,
                                         "tokens_actual": int(tokens_actual), "status": status})
 
+    def has_reserve(self, rid: str) -> bool:
+        """该 rid 是否真实预留且尚未结算；repair 只结算真实存在的预留。"""
+        with FileLock(self.lock_path, blocking=True):
+            recs = self._records_locked()
+        reserved = any(r.get("type") == "reserve" and r.get("rid") == rid for r in recs)
+        settled = any(r.get("type") == "settle" and r.get("rid") == rid for r in recs)
+        return reserved and not settled
+
     def admit_reserve(self, rid: str, project: str, tokens: int,
                       dispatches: int = 1, ttl: int = 600,
                       project_remaining: int | None = None) -> tuple[bool, int]:

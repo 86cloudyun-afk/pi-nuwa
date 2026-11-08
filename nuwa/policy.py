@@ -20,7 +20,8 @@ ALLOW_RULES = [
 # 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
 PROMPT_RULES = [
     (r"(?:^|[;&|()\n\r\t\"'`\s]|\$\()\s*\\?(?:\S*[\\/])?sapper\s+"
-     r"(?:(?:--store|-s)\s+\S+\s+)?(?:done\s+\S+|dispatch\s+i\d+|complete\b)", "P-006"),
+     r"(?:(?:--store(?:[=\s]+\S+)?|-s\S*)\s*)?"
+     r"(?:done\s+\S+|dispatch\s+i\d+|complete\b)", "P-006"),
 ]
 
 # 写类工具的目标路径：图与权威状态只能由 CLI 改（路径需先归一为绝对路径）。

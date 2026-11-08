@@ -12,6 +12,7 @@ from pathlib import Path
 from . import graph, txn, policy
 from .journal import Journal
 from .ledger import Ledger
+from .locks import is_locked
 from .paths import ensure_nuwa
 
 REPO = Path(__file__).resolve().parents[1]
@@ -75,6 +76,8 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     intent = graph.get_intent(root, intent_id)
     if not intent:
         raise DispatchError(f"intent 不存在: {intent_id}")
+    if is_locked(nd / "inflight" / f"{intent_id}.lock"):
+        raise DispatchError(f"intent 正在执行: {intent_id}")
 
     attempt = txn.attempt_of(intent)
     key = txn.dispatch_key(project, intent_id, attempt)
@@ -94,6 +97,7 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     if not ok:
         journal.append("reserve_rejected", txn=txn_id, rid=rid, intent=intent_id,
                        remaining=remaining)
+        journal.append("ack", txn=txn_id, intent=intent_id, status="rejected")
         raise DispatchError(f"预算不足: remaining={remaining} need={tokens}")
     _crash("after_reserve")
     journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id)
@@ -165,9 +169,16 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
         journal.append("ack", txn=txn_id, intent=intent_id, status=status)
         raise DispatchError(f"dispatch 失败: status={status} rc={rc}")
 
-    payload = parse_engine_stdout(out.read_text(encoding="utf-8", errors="replace"))
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    desc = data.get("description") if isinstance(data, dict) else None
+    try:
+        payload = parse_engine_stdout(out.read_text(encoding="utf-8", errors="replace"))
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        desc = data.get("description") if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001  解析异常同样要结算并写终态
+        ledger.settle(rid, tokens, status="crashed")
+        journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,
+                       tokens=tokens, status="crashed")
+        journal.append("ack", txn=txn_id, intent=intent_id, status="crashed")
+        raise
     if not desc:
         ledger.settle(rid, tokens, status="crashed")
         journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent_id,

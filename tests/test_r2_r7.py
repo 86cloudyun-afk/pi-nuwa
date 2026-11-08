@@ -272,6 +272,10 @@ class NightTest(unittest.TestCase):
                 {"mode": "soak", "minutes": 1, "samples": 2,
                  "verdict": {"all_zero": "false", "rss_ok": True, "fd_ok": True, "facts_ok": True}},
                 {"mode": "soak", "minutes": 1, "samples": 2, "verdict": ["ok"]},
+                {"mode": "soak", "minutes": float("inf"), "samples": 2,
+                 "verdict": {"all_zero": True, "rss_ok": True, "fd_ok": True, "facts_ok": True}},
+                {"mode": "soak", "minutes": 1, "samples": 2.5,
+                 "verdict": {"all_zero": True, "rss_ok": True, "fd_ok": True, "facts_ok": True}},
             ]
             for body in cases:
                 (tmp / "REPORT.json").write_text(json.dumps(body), encoding="utf-8")

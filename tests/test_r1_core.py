@@ -378,6 +378,51 @@ class TxnTest(unittest.TestCase):
         project = json.loads((self.root / ".sapper" / "project.json").read_text())
         self.assertEqual(project["status"], "completed")
 
+    def test_commit_rejects_other_key_when_done(self):
+        k1 = txn.dispatch_key("p1", "i001", 0)
+        txn.commit(self.root, "i001", "first", k1)
+        k2 = txn.dispatch_key("p1", "i001", 1)
+        with self.assertRaises(txn.CommitError):
+            txn.commit(self.root, "i001", "second", k2)
+        facts = [json.loads(p.read_text()) for p in self.facts()]
+        self.assertEqual(len([f for f in facts if "nuwa:" in f["description"]]), 1)
+
+    def test_repair_does_not_settle_rejected_reserve(self):
+        led = Ledger(self.tmp)
+        led.set_cap(1000)
+        j = Journal(self.root)
+        j.append("reserve_pending", txn="t1", rid="r1", intent="i001", tokens=4000)
+        j.append("reserve_rejected", txn="t1", rid="r1", intent="i001")
+        j.append("ack", txn="t1", intent="i001", status="rejected")
+        txn.repair(self.root, led)
+        self.assertEqual(led.summary()["settled_total"], 0)
+
+    def test_ack_clears_inflight_in_recovery(self):
+        j = Journal(self.tmp)
+        j.append("executing_prepare", txn="t1", intent="i001")
+        j.append("ack", txn="t1", intent="i001", status="crashed")
+        j.compact(keep=0)
+        j.append("x")
+        j.compact(keep=1)
+        j.append("y")
+        j.compact(keep=1)
+        rec = j.read_recovery()
+        self.assertNotIn("t1", rec.get("inflight", {}))
+
+    def test_complete_multiple_facts(self):
+        self._run(["sapper", "flag", "flag{a}"])
+        self._run(["sapper", "flag", "flag{b}"])
+        flags = [json.loads(p.read_text()) for p in self.facts()
+                 if json.loads(p.read_text()).get("kind") == "flag"]
+        ids = [f["id"] for f in flags]
+        r = subprocess.run(
+            [sys.executable, "-m", "nuwa.cli", "complete", "--root", str(self.root),
+             "--from", *ids],
+            env={**self.env, "PYTHONPATH": str(REPO)}, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        project = json.loads((self.root / ".sapper" / "project.json").read_text())
+        self.assertEqual(project["status"], "completed")
+
     def test_adopt_once(self):
         a = txn.adopt(self.root)
         b = txn.adopt(self.root)

@@ -161,6 +161,19 @@ with open(tmp, "w", encoding="utf-8") as f:
 os.replace(tmp, path)
 PY
 
+# ---------------------------------------------------------------- 后台模式
+if (( detach )); then
+  logfile="$dir/nuwa.log"
+  extra=(); (( view )) || extra+=(--no-view)
+  (( run )) || extra+=(--no-run)
+  (( loop )) || extra+=(--no-loop)
+  nohup "$0" "$url" "$name" --minutes "$minutes" --parallel "$parallel" \
+    --model "$model" "${extra[@]}" >>"$logfile" 2>&1 &
+  echo "[nuwa] detached pid=$! log=$logfile dir=$dir"
+  echo "[nuwa] 看板: 启动后写入 $dir/VIEW.txt"
+  exit 0
+fi
+
 # ---------------------------------------------------------------- 项目锁（P1-1.2）
 LOCK_FILE="$dir/.nuwa.lock"
 exec 9>"$LOCK_FILE"
@@ -184,17 +197,6 @@ on_signal() {
 }
 trap cleanup_lock EXIT
 trap on_signal INT TERM
-
-# ---------------------------------------------------------------- 后台模式
-if (( detach )); then
-  logfile="$dir/nuwa.log"
-  extra=(); (( view )) || extra+=(--no-view)
-  nohup "$0" "$url" "$name" --loop --minutes "$minutes" --parallel "$parallel" \
-    --model "$model" "${extra[@]}" >>"$logfile" 2>&1 &
-  echo "[nuwa] detached pid=$! log=$logfile dir=$dir"
-  echo "[nuwa] 看板: 启动后写入 $dir/VIEW.txt"
-  exit 0
-fi
 
 DISPATCH_TIMEOUT="${NUWA_DISPATCH_TIMEOUT:-${SAPPER_TIMEOUT:-300}}"
 [[ "$DISPATCH_TIMEOUT" =~ ^[0-9]+$ ]] && (( DISPATCH_TIMEOUT > 0 )) || DISPATCH_TIMEOUT=300
@@ -300,9 +302,9 @@ dispatch_one() {
       dispatch "$id" --root "$PWD" --model "$model" --timeout "$to" 2>&1)
     rc=$?
   elif [[ "$mode" == "sapper" ]]; then
+    event dispatch_legacy "id=$id" "mode=sapper"
     out=$(sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1)
     rc=$?
-    event dispatch_legacy "id=$id" "rc=$rc"
   else
     log "ERROR: NUWA_SUBMIT_MODE 只能是 cli 或 sapper（当前 $mode）" >&2
     return 2
@@ -310,6 +312,7 @@ dispatch_one() {
   local dt=$(( $(date +%s) - t0 ))
   printf '%s\n' "$out" | tail -6
   event dispatch_end "id=$id" "rc=$rc" "dur=${dt}s"
+  (( rc == 0 )) || : > "$PWD/.nuwa/dispatch_failed" 2>/dev/null || true
   return $rc
 }
 
@@ -466,6 +469,9 @@ if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
     recover --root "$PWD" --repair >/dev/null 2>&1 || true
 fi
 
+failed=0
+[[ -f .nuwa/dispatch_failed ]] && failed=1
+
 # ---------------------------------------------------------------- 战报
 log "===== 战报 ====="
 sapper status | sed -n '1,12p'
@@ -473,3 +479,5 @@ sapper status | sed -n '1,12p'
 log "继续: cd $dir && nuwa \"$url\" --loop --minutes 60 --parallel 3"
 event report_done "rounds=$round"
 exit 0
+
+(( failed == 0 )) || exit 1

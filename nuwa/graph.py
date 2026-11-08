@@ -55,6 +55,9 @@ def find_fact_by_key(root: str | Path, key: str) -> dict | None:
     for f in facts(root):
         if marker in (f.get("description") or ""):
             return f
+        # 辅助字段与正文 marker 必须同权，否则旧 fact 会被当成未提交而重复执行。
+        if f.get("x-nuwa-key") == key:
+            return f
     return None
 
 

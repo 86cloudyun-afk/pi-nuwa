@@ -71,9 +71,15 @@ class Journal:
                         except UnicodeDecodeError:
                             continue
                         try:
-                            return int(json.loads(line).get("seq", 0))
-                        except (json.JSONDecodeError, ValueError, TypeError):
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
                             continue
+                        if not isinstance(obj, dict):
+                            continue
+                        seq = obj.get("seq")
+                        if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+                            return seq
+                        continue
                     if start == 0:
                         return 0
                     window *= 2
@@ -102,9 +108,10 @@ class Journal:
 
     # ---------------------------------------------------------------- 读
     def _files(self) -> list[Path]:
-        files = [self.path] if self.path.exists() else []
-        # 按代号数字排序：字典序会把 gen10 排在 gen9 前，重放时终态会倒退。
-        files += sorted(self.dir.glob("journal.*.jsonl"), key=self._gen_of)
+        # 归档按代号数字升序，当前活动文件最后：旧代不能覆盖新代的终态。
+        files = sorted(self.dir.glob("journal.*.jsonl"), key=self._gen_of)
+        if self.path.exists():
+            files.append(self.path)
         return files
 
     def _gen_of(self, path: Path) -> int:
@@ -250,9 +257,11 @@ class Journal:
         return floor
 
     def _summarize_locked(self) -> dict:
-        state: dict = {"inflight": {}, "settled": [], "committed": [], "last_seq": 0}
+        state: dict = {"inflight": {}, "settled": [], "committed": [],
+                       "ended": [], "last_seq": 0}
         settled: set[str] = set()
         committed: set[str] = set()
+        ended: set[str] = set()
         for rec in self._read_locked(0):
             state["last_seq"] = rec.get("seq", state["last_seq"])
             ev = rec.get("event")
@@ -261,29 +270,35 @@ class Journal:
                 state["inflight"][txn] = {"intent": rec.get("intent"), "state": "prepare"}
             elif ev == "executing":
                 state["inflight"].setdefault(txn, {})["state"] = "executing"
-            elif ev in ("executed", "commit_done"):
+            elif ev in ("executed", "commit_done", "ack"):
                 state["inflight"].pop(txn, None)
+            if ev == "ack" and txn:
+                ended.add(str(txn))
             if ev == "ledger_settle" and rec.get("rid"):
                 settled.add(str(rec.get("rid")))
             if ev in ("commit_done", "done_apply") and txn:
                 committed.add(str(txn))
         state["settled"] = sorted(settled)
         state["committed"] = sorted(committed)
+        state["ended"] = sorted(ended)
         return state
 
     def _write_recovery_locked(self) -> None:
         old = self.read_recovery() or {}
         cur = self._summarize_locked()
         committed = set(old.get("committed", [])) | set(cur["committed"])
+        ended = set(old.get("ended", [])) | set(cur.get("ended", []))
         inflight = {**old.get("inflight", {}), **cur["inflight"]}
-        # 终态删除信息不能被旧摘要的并集复活。
-        inflight = {k: v for k, v in inflight.items() if k not in committed}
+        # 终态删除信息不能被旧摘要的并集复活；ack 同样是终态。
+        inflight = {k: v for k, v in inflight.items()
+                    if k not in committed and k not in ended}
         merged = {
             "recovery_schema": 1,
             "gen": self.current_gen(),
             "last_seq": max(int(old.get("last_seq", 0) or 0), int(cur["last_seq"] or 0)),
             "settled": sorted(set(old.get("settled", [])) | set(cur["settled"])),
             "committed": sorted(committed),
+            "ended": sorted(ended),
             "inflight": inflight,
         }
         tmp = self.recovery_path.with_suffix(".tmp")
@@ -363,7 +378,9 @@ def replay_state(root: str | Path) -> dict:
     if base:
         state["settled"] = set(base.get("settled", []))
         state["committed"] = set(base.get("committed", []))
-        state["inflight"] = dict(base.get("inflight", {}))
+        ended = set(base.get("ended", []))
+        state["inflight"] = {k: v for k, v in base.get("inflight", {}).items()
+                             if k not in ended}
         state["last_seq"] = int(base.get("last_seq", 0) or 0)
     for rec in records:
         ev = rec.get("event")
@@ -373,7 +390,7 @@ def replay_state(root: str | Path) -> dict:
             state["inflight"][txn] = {"intent": rec.get("intent"), "state": "prepare"}
         elif ev == "executing":
             state["inflight"].setdefault(txn, {})["state"] = "executing"
-        elif ev in ("executed", "commit_done"):
+        elif ev in ("executed", "commit_done", "ack"):
             state["inflight"].pop(txn, None)
         if ev == "ledger_settle":
             state["settled"].add(rec.get("rid"))

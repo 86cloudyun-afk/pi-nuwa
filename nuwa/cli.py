@@ -263,13 +263,17 @@ def cmd_complete(args) -> int:
     if not root:
         print("nuwa: 不在 sapper 项目内", file=sys.stderr)
         return 2
-    ids = [x for x in re.split(r"[,\s]+", args.from_fact.strip()) if x]
+    raw = args.from_fact if isinstance(args.from_fact, list) else [args.from_fact]
+    ids = [x for item in raw for x in re.split(r"[,\s]+", str(item)) if x]
     if not ids:
         print("nuwa: --from 为空", file=sys.stderr)
         return 2
+    facts_by_id = {f.get("id"): f for f in graph.facts(root)}
+    done_intents = {it.get("to") for it in graph.intents(root)
+                    if it.get("status") == "done" and it.get("to")}
     kinds = {}
     for fid in ids:
-        fact = graph.get_fact(root, fid)
+        fact = facts_by_id.get(fid)
         if not fact:
             print(f"nuwa: fact 不存在: {fid}", file=sys.stderr)
             return 2
@@ -278,11 +282,10 @@ def cmd_complete(args) -> int:
             print(f"nuwa: 证据类型不足: {fid}={kind}（需要 flag/vuln/loot）", file=sys.stderr)
             return 3
         desc = fact.get("description") or ""
-        for marker in re.findall(r"\[nuwa:(sha256:[0-9a-f]{64})\]", desc):
-            if not any(marker in (f.get("description") or "")
-                       for f in graph.facts(root)):
-                print(f"nuwa: 证据键无法回溯: {marker}", file=sys.stderr)
-                return 4
+        markers = re.findall(r"\[nuwa:(sha256:[0-9a-f]{64})\]", desc)
+        if markers and fid not in done_intents:
+            print(f"nuwa: 证据键没有对应的已完成 intent: {fid}", file=sys.stderr)
+            return 4
         kinds[fid] = kind
     joined = ",".join(ids)
     r = graph.sapper(root, ["complete", "--from", joined])
@@ -371,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_flag)
 
     s = sub.add_parser("complete")
-    s.add_argument("--from", dest="from_fact", required=True)
+    s.add_argument("--from", dest="from_fact", nargs="+", required=True)
     s.add_argument("--root", default=None)
     s.set_defaults(func=cmd_complete)
 
