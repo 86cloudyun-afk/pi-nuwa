@@ -4,6 +4,8 @@
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 export NUWA_WORK="${NUWA_WORK:-$(cd .. && pwd)}"
+# 清理一天前的 nuwa 测试临时目录，避免 /tmp 越跑越乱
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'nuwa-*' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
 
 fail=0
 run() {
