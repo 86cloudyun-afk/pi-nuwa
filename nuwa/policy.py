@@ -19,11 +19,11 @@ ALLOW_RULES = [
 # 提交所有权：fact 只能经 nuwa commit 产生。分隔符覆盖 ; & | ( ) 换行引号反引号，
 # 允许反斜杠转义与 $() 包装；带 --from <fact> 的 complete 是证据入账后的合法完成。
 GLOBAL_OPT_RE = re.compile(
-    r'(?:--store|-s)(?:=(?:"[^"]*"|\'[^\']*\'|\S+)|\s+(?:"[^"]*"|\'[^\']*\'|\S+)|\S+)?\s*')
+    r'(^|[;&|()\n])(\s*)((?:(?:--store|-s)(?:=(?:"[^"]*"|\'[^\']*\'|\S+)|\s+(?:"[^"]*"|\'[^\']*\'|\S+)|\S+)?\s*)+)')
 
 
 def strip_global_options(cmd: str) -> str:
-    return GLOBAL_OPT_RE.sub(" ", cmd)
+    return GLOBAL_OPT_RE.sub(r"\1\2", cmd)
 
 
 PROMPT_RULES = [

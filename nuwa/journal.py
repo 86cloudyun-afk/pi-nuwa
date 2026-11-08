@@ -108,7 +108,7 @@ class Journal:
         for p in self.dir.glob("checkpoint.*.json"):
             try:
                 best = max(best, int(json.loads(p.read_text(encoding="utf-8")).get("seq", 0)))
-            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            except (OSError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
                 continue
         return best
 

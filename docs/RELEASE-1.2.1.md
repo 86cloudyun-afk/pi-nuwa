@@ -101,6 +101,16 @@
 | B6 | 失败 `cd` 的虚拟目录推进，真实 cwd 落在候选集外 | `candidateDirs` 为每个 cd 目标加入整条祖先链 |
 | B7 | 固定选项上限漏第 N 个 | 改为先剥离全部 `--store/-s`，再匹配提交命令 |
 
+## 第十一轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B7 | 无边界剥离会删除引号内文本、跨分隔符吞 token；task 分支用旧正则 | 只在分隔符或 `sapper ` 后剥离选项；task/bash 统一走 `stripGlobalOptions` + `COMMIT_RE` |
+| B6 | 失败 cd 的兄弟分支仍可能漏 | `candidateDirs` 对每个 cd 目标基于所有当前候选解析并加入祖先链 |
+| B17 | checkpoint 高水位转换漏 OverflowError | `_checkpoint_high` 捕获 OverflowError |
+
+剩余 M 项登记到 `docs/BACKLOG-1.2.1.md`。
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。
