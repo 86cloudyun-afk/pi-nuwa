@@ -78,7 +78,8 @@ class Chaos(unittest.TestCase):
         r = self.run_nuwa("http://127.0.0.1:19999", "p1", "--no-view", "--no-run",
                           env={**self.env, "FAKE_EMPTY_FRONTIER": "1"})
         self.assertEqual(r.returncode, 0, f"陈旧锁应被忽略:\n{r.stdout}\n{r.stderr}")
-        self.assertFalse(lock.exists(), "正常退出后应清理自己的锁")
+        self.assertTrue(not lock.exists() or not lock.read_text().strip(),
+                        "正常退出后应清空自己的锁")
 
     # ---------------------------------------------------------------- 3
     def test_live_lock_blocks(self):

@@ -95,7 +95,9 @@ class Concurrency(unittest.TestCase):
         p = self.spawn("p1", {**self.base_env, "FAKE_COMPLETE_AFTER": "2"})
         p.communicate(timeout=90)
         self.assertEqual(p.returncode, 0)
-        self.assertFalse((d / ".nuwa.lock").exists(), "正常退出后锁应被删除")
+        lock = d / ".nuwa.lock"
+        self.assertTrue(not lock.exists() or not lock.read_text().strip(),
+                        "正常退出后锁应被清空")
 
     # ---------------------------------------------------------------- 4
     def test_lock_removed_after_sigterm(self):
@@ -108,12 +110,14 @@ class Concurrency(unittest.TestCase):
         time.sleep(1)
         lock = d / ".nuwa.lock"
         if lock.exists():
-            pid = int(lock.read_text().strip() or "0")
-            alive = True
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                alive = False
+            raw = lock.read_text().strip()
+            pid = int(raw) if raw.isdigit() else 0
+            alive = pid > 0
+            if alive:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    alive = False
             self.assertFalse(alive, "SIGTERM 后锁里不应是活进程")
         # 下一次必须能接管
         r = subprocess.run(

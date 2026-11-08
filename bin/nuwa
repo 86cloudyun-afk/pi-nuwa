@@ -181,10 +181,11 @@ LOCK_FILE="$dir/.nuwa.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   # SIGKILL 可能留下继承锁 fd 的 nuwa 孤儿；只清理 cmdline 含 nuwa 的进程。
+  holder="$(cat "$LOCK_FILE" 2>/dev/null || true)"
   for pdir in /proc/[0-9]*; do
     [[ -d "$pdir" ]] || continue
     pid="${pdir#/proc/}"
-    [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+    [[ "$pid" == "$$" || "$pid" == "$PPID" || "$pid" == "$holder" ]] && continue
     ppid="$(awk '{print $4}' "$pdir/stat" 2>/dev/null || true)"
     [[ "$ppid" == "1" ]] || continue
     cmd="$(tr '\0' ' ' < "$pdir/cmdline" 2>/dev/null || true)"
@@ -209,7 +210,10 @@ python3() { command python3 "$@" 9>&-; }
 # 退出时只清自己持有的锁，避免误删别人的
 cleanup_lock() {
   [[ -f "$LOCK_FILE" ]] || return 0
-  [[ "$(cat "$LOCK_FILE" 2>/dev/null)" == "$$" ]] && rm -f "$LOCK_FILE"
+  # 保留 inode，只清空内容：unlink 后新进程会锁到不同 inode，破坏互斥。
+  if [[ "$(cat "$LOCK_FILE" 2>/dev/null)" == "$$" ]]; then
+    : >"$LOCK_FILE"
+  fi
 }
 # TERM/INT 必须真的退出：先清锁，再收掉仍在跑的 dispatch 子进程
 on_signal() {

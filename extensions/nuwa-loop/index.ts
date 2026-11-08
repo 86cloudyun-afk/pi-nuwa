@@ -493,7 +493,7 @@ export function readGraph(root: string): Graph | null {
 	let flags = 0;
 	let effective = 0;
 	let verified = false;
-	const kinds: Record<string, string> = {};
+	const kinds: Record<string, string> = Object.create(null);
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "facts"))) {
 			if (!f.endsWith(".json") || f === "goal.json") continue;
