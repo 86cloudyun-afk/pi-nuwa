@@ -453,6 +453,8 @@ export function readGraph(root: string): Graph | null {
 	const openIds: string[] = [];
 	const goalEdges: Array<{ status?: string; refs: string[] }> = [];
 	const intentRefs: string[][] = [];
+	const doneRefs: string[] = [];
+	const intentIds = new Set<string>();
 	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
@@ -468,9 +470,11 @@ export function readGraph(root: string): Graph | null {
 			}
 			if (!it.id || it.id !== f.replace(/\.json$/, "")
 				|| !it.description || !it.created_at) corrupt = true;
+			if (it.id) intentIds.add(it.id);
 			if (!Array.isArray(it.from) || it.from.length === 0) corrupt = true;
 			if (it.status === "done" || it.status === "complete") {
 				if (typeof it.to !== "string" || !it.to) corrupt = true;
+				else if (it.to !== "goal") doneRefs.push(it.to);
 			} else if (it.to !== undefined && it.to !== null) {
 				corrupt = true;
 			}
@@ -515,13 +519,17 @@ export function readGraph(root: string): Graph | null {
 			} catch {
 				corrupt = true;
 			}
-			const fact = readJson<{ id?: string; kind?: string }>(join(root, ".sapper", "facts", f));
+			const fact = readJson<{ id?: string; kind?: string; source_intent?: string }>(
+				join(root, ".sapper", "facts", f));
 			if (!fact) {
 				corrupt = true;
 				continue;
 			}
 			if (!fact.id || fact.id !== f.replace(/\.json$/, "")
 				|| !fact.description || !fact.created_at || !fact.creator) corrupt = true;
+			if (typeof fact.source_intent === "string" && !intentIds.has(fact.source_intent)) {
+				corrupt = true;
+			}
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
 			kinds[f.replace(/\.json$/, "")] = fact.kind ?? "";
@@ -548,6 +556,9 @@ export function readGraph(root: string): Graph | null {
 		for (const id of refs) {
 			if (!(id in kinds)) corrupt = true;
 		}
+	}
+	for (const id of doneRefs) {
+		if (!(id in kinds)) corrupt = true;
 	}
 	const isStrong = (kind?: string): boolean =>
 		kind === "flag" || kind === "vuln" || kind === "loot";

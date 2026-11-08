@@ -10,7 +10,7 @@ find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -user "$(id -u)" \
      -o -name 'nuwa-guard-*' -o -name 'nuwa-unit-*' -o -name 'nuwa-night-*' \
      -o -name 'nuwa-qa-*' -o -name 'nuwa-soak-*' -o -name 'nuwa-crash-*' \
      -o -name 'nuwa-multi-*' -o -name 'nuwa-dispatch-*' \) \
-  -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+  -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 
 fail=0
 run() {

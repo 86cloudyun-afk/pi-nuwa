@@ -37,16 +37,19 @@ class GuardTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_guard(self, *args, allowed=False):
+    def run_guard(self, *args, allowed=False, cwd=None):
         env = dict(self.env)
         if allowed:
             env["NUWA_SUBMIT_ALLOWED"] = "testtoken"
         return subprocess.run(["sapper", *args], env=env, capture_output=True,
-                              text=True, timeout=30)
+                              text=True, timeout=30,
+                              cwd=str(cwd or self.tmp))
 
     def test_allows_dry_run(self):
-        self.assertNotEqual(
-            self.run_guard("dispatch", "i001", "--dry-run").returncode, 7)
+        subprocess.run(["sapper", "setup", "--goal", "g"], cwd=self.tmp,
+                       env=self.env, check=True, capture_output=True, text=True)
+        self.assertEqual(
+            self.run_guard("dispatch", "i001", "--dry-run").returncode, 0)
 
     def test_blocks_done(self):
         self.assertEqual(self.run_guard("done", "i001", "--fact", "x").returncode, 7)
@@ -122,7 +125,13 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(self.run_guard("dispatch", "reason", "--model", "fake").returncode, 7)
 
     def test_allows_fact_without_from_intent(self):
-        self.assertNotEqual(self.run_guard("fact", "x", "-k", "host").returncode, 7)
+        proj = self.tmp / "proj3"
+        proj.mkdir()
+        env = dict(self.env)
+        subprocess.run(["sapper", "setup", "--goal", "g"], cwd=proj, env=env,
+                       check=True, capture_output=True, text=True)
+        self.assertEqual(
+            self.run_guard("fact", "x", "-k", "host", cwd=proj).returncode, 0)
 
     def test_allows_fleet_status(self):
         self.assertEqual(self.run_guard("fleet", "status").returncode, 0)

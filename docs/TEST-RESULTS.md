@@ -19,9 +19,9 @@
 | `test_r1_multi.py` | 1 | 1 pass | 四项目并发 |
 | `test_r2_r7.py` | 29 | 29 pass | 公平/证据/指标/策略/插件/夜跑 |
 | `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
-| `test_guard.py` | 17 | 17 pass | 执行层提交闸门（含 fleet 放行） |
+| `test_guard.py` | 18 | 18 pass | 执行层提交闸门（含 fleet、dry-run、fact 放行） |
 
-合计 **164 例 + 16 runs**。
+合计 **167 例 + 16 runs**。
 
 ## 二、门禁
 
@@ -29,7 +29,7 @@
 |---|---|---|
 | `g0_baseline` | pass | `contract_check` 13/13（真实 sapper 1.0.0） |
 | `g1_r1` | pass | 逐项聚合，任一套件失败都会非零 |
-| `g2_r2r7` | pass | 28 例 |
+| `g2_r2r7` | pass | 29 例 |
 
 `tests/run.sh` 最终 `EXIT=0`；全部套件与门禁通过。
 

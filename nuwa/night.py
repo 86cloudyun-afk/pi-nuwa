@@ -113,18 +113,24 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
         for proj in projects:
             base_seq = int(base_map.get(str(proj), 0) or 0)
             jp = Path(str(proj)) / ".nuwa" / "journal.jsonl"
-            try:
-                lines = jp.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for line in lines:
+            recs: dict[int, dict] = {}
+            for fp in sorted(jp.parent.glob("journal*.jsonl")):
                 try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
+                    lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
                     continue
-                if int(rec.get("seq", 0) or 0) <= base_seq:
+                for line in lines:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    seq = rec.get("seq")
+                    if isinstance(seq, int) and not isinstance(seq, bool):
+                        recs[seq] = rec
+            for seq in sorted(recs):
+                if seq <= base_seq:
                     continue
-                ev = rec.get("event")
+                ev = recs[seq].get("event")
                 if ev == "executing_prepare":
                     journal_dispatches += 1
                 elif ev == "commit_done":
@@ -168,6 +174,9 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
         if abs((finished - started) - duration) > max(1.0, duration * 0.05):
             raise ValueError("duration 与 started_at/finished_at 不一致")
 
+        interval = _number(rep.get("interval", 0), "interval")
+        exit_codes = rep.get("exit_codes") or {}
+        errors = rep.get("errors") or {}
         checks = {
             "mode": rep.get("mode") == "soak" and mode == "soak",
             "commit": bool(rep.get("commit")) and rep.get("commit") == commit
@@ -179,6 +188,10 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             "journal": (journal_dispatches > 0
                         and abs(facts_delta - journal_commits) <= 2),
             "samples_recalc": recalc_ok,
+            "resource": recalc_ok and rss_growth < 100 * 1024 and fd_growth <= 2,
+            "exit_codes": isinstance(exit_codes, dict) and not errors
+            and all(int(v) == 0 for v in exit_codes.values()),
+            "span": interval > 0 and duration >= samples * interval * 0.8,
         }
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,
                 "commit": commit, "report": str(rep_path),

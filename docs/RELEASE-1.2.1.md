@@ -461,6 +461,14 @@
 - **M20**：attempt 已持久递增，worker 拿锁后按版本拒绝；同 intent 的并发准入仍靠 inflight 锁，非分布式锁。
 - **真实 sapper**：`contract_check` 与 real 崩溃组仍需要 PATH 中的真实实现。
 
+## 第五十五轮补充
+
+- **M44**：清理窗口改为 `-mtime +7`，覆盖 72h 长测活跃目录。
+- **M31**：`journal_base` 按项目增量；verify 读 `journal*.jsonl` 各代际并按 seq 去重；新增 `span` 判据。
+- **M47**：dry-run、fact 正例断言真实 rc=0。
+- **M17/M22**：repair 合并摘要 inflight、保留零值 tokens；renew 只对打开预留生效，settle 只看最后生命周期。
+- **M61**：扩展校验 done/complete 的 `to` 必须命中 fact，`source_intent` 必须命中 intent。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

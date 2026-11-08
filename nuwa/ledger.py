@@ -114,14 +114,30 @@ class Ledger:
         })
 
     def renew(self, rid: str, ttl: int = 600) -> dict:
-        return self._append({"type": "renew", "rid": rid, "expires_at": time.time() + ttl})
+        """只续当前仍打开的预留；已 settle/reclaim 的 rid 报错，避免幽灵预留。"""
+        with FileLock(self.lock_path, blocking=True):
+            state = None
+            for rec in self._records_locked():
+                if rec.get("rid") != rid:
+                    continue
+                if rec.get("type") in ("reserve", "renew"):
+                    state = "reserve"
+                elif rec.get("type") in ("settle", "reclaim"):
+                    state = "closed"
+            if state != "reserve":
+                raise ValueError(f"renew 无有效预留: {rid}")
+            return self._append_locked({"type": "renew", "rid": rid,
+                                        "expires_at": time.time() + ttl})
 
     def settle(self, rid: str, tokens_actual: int, status: str = "ok") -> dict:
         """按 rid 幂等：同一预留重复结算不重复扣账。"""
         with FileLock(self.lock_path, blocking=True):
+            last = None
             for rec in self._records_locked():
-                if rec.get("type") == "settle" and rec.get("rid") == rid:
-                    return rec
+                if rec.get("rid") == rid:
+                    last = rec
+            if last is not None and last.get("type") == "settle":
+                return last
             return self._append_locked({"type": "settle", "rid": rid,
                                         "tokens_actual": int(tokens_actual), "status": status})
 
