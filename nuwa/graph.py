@@ -110,6 +110,8 @@ def annotate_fact(root: str | Path, fact_id: str, key: str) -> None:
 
 def sapper(root: str | Path, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
     env = dict(os.environ)
+    # nuwa 是唯一合法提交入口；guard 靠这个标记放行内部调用。
+    env["NUWA_SUBMIT_ALLOWED"] = "1"
     return subprocess.run(["sapper", *args], cwd=str(root), env=env,
                           capture_output=True, text=True, timeout=timeout)
 

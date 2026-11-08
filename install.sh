@@ -87,6 +87,14 @@ ln -sfn "$AGENT_HOME/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest"
 # ---------------------------------------------------------------- 入口
 say "[4/6] 安装 nuwa 入口与 Python 包"
 install -m 0755 "$REPO_DIR/bin/nuwa" "$SAPPER_HOME/bin/nuwa"
+
+# 执行层提交闸门：真实 sapper 链到 sapper.real，sapper 指向 guard。
+_real_sapper="$(command -v sapper || true)"
+if [[ -n "$_real_sapper" && "$_real_sapper" != "$SAPPER_HOME/bin/sapper" ]]; then
+  ln -sf "$_real_sapper" "$SAPPER_HOME/bin/sapper.real"
+  install -m 0755 "$REPO_DIR/bin/sapper-guard" "$SAPPER_HOME/bin/sapper"
+  echo "installed: sapper guard -> $SAPPER_HOME/bin/sapper (real: $_real_sapper)"
+fi
 install -m 0755 "$REPO_DIR/bin/nuwa-soak-night.sh" "$SAPPER_HOME/bin/nuwa-soak-night"
 mkdir -p "$SAPPER_HOME/nuwa"
 cp -R "$REPO_DIR/nuwa/." "$SAPPER_HOME/nuwa/"

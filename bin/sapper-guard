@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# sapper-guard — 执行层提交闸门。
+#
+# 扩展层的 shell 解析只能覆盖字面量；真正的最后一道闸门在 CLI 入口：
+# 除 nuwa CLI 内部（NUWA_SUBMIT_ALLOWED=1）外，done / dispatch <intent> / complete
+# 一律拒绝。这样即使命令经过引号、$()、env、xargs 等包装，也无法绕过提交所有权。
+#
+# 安装：install.sh 把真实 sapper 链接为 sapper.real，并把本脚本装到
+#       $SAPPER_HOME/bin/sapper（该目录在 bin/nuwa 的 PATH 最前）。
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+REAL="${SAPPER_REAL:-}"
+if [[ -z "$REAL" ]]; then
+  for cand in "$SELF_DIR/sapper.real" "$HOME/.local/bin/sapper.real" "$HOME/.local/bin/sapper"; do
+    if [[ -x "$cand" && "$cand" != "$SELF_DIR/sapper" && "$cand" != "$0" ]]; then
+      REAL="$cand"
+      break
+    fi
+  done
+fi
+if [[ -z "$REAL" || ! -x "$REAL" ]]; then
+  echo "sapper-guard: 找不到真实 sapper（设置 SAPPER_REAL）" >&2
+  exit 3
+fi
+
+# 解析第一个非选项参数作为子命令；--store/-s 的值跳过。
+args=("$@")
+cmd=""
+cmd_idx=-1
+i=0
+while (( i < ${#args[@]} )); do
+  a="${args[$i]}"
+  case "$a" in
+    --store|-s) (( i += 2 )); continue ;;
+    --store=*|-s?*) (( i += 1 )); continue ;;
+    -*) (( i += 1 )); continue ;;
+    *) cmd="$a"; cmd_idx=$i; break ;;
+  esac
+done
+
+if [[ "${NUWA_SUBMIT_ALLOWED:-0}" != "1" ]]; then
+  case "$cmd" in
+    done|complete)
+      echo "sapper-guard: 提交所有权：$cmd 只能经 nuwa commit/complete" >&2
+      exit 7
+      ;;
+    dispatch)
+      next="${args[$((cmd_idx + 1))]:-}"
+      if [[ "$next" =~ ^i[0-9]+$ ]]; then
+        echo "sapper-guard: 提交所有权：dispatch $next 只能经 nuwa dispatch" >&2
+        exit 7
+      fi
+      ;;
+  esac
+fi
+
+exec "$REAL" "$@"

@@ -25,6 +25,7 @@ run r1dispatch python3 test_r1_dispatch.py
 run r1run python3 test_r1_run.py
 run r1multi python3 test_r1_multi.py
 run crash python3 crash_matrix.py --fake-repeat 2 --real-repeat 1
+run guard python3 test_guard.py
 run r2r7 python3 test_r2_r7.py
 run gates bash gates/run.sh
 

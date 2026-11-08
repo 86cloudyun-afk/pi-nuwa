@@ -145,6 +145,15 @@
 | B20 | 拒绝后 `ack` 前退出，旧 inflight 在 recovery 合并时复活 | `reserve_rejected`/`dispatch_rejected` 写入 `ended` 墓碑，摘要与 replay 共用 |
 | B21 | 引号/空格后的 `$` 守卫漏检，task 分支缺守卫 | 守卫改为 `[^;|&]*[$`]`，bash 与 task 共用 `hasUnresolvedStore` |
 
+## 第十六轮补充
+
+| 项 | 内容 |
+|---|---|
+| 执行层闸门 | 新增 `bin/sapper-guard`：真实 sapper 链为 `sapper.real`，`sapper` 指向 guard；`done`/`dispatch i<N>`/`complete` 在 `NUWA_SUBMIT_ALLOWED!=1` 时退出 7 |
+| 内部放行 | `graph.sapper` 与 `bin/nuwa` 的 legacy 分支显式设置 `NUWA_SUBMIT_ALLOWED=1` |
+| 安装 | `install.sh` 自动建立 `sapper.real` 并安装 guard 到 `$SAPPER_HOME/bin/sapper` |
+| 测试 | `tests/test_guard.py` 7 例：done/dispatch/complete/--store 前缀被拦，reason/version/内部提交放行 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

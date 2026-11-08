@@ -303,7 +303,7 @@ dispatch_one() {
     rc=$?
   elif [[ "$mode" == "sapper" ]]; then
     event dispatch_legacy "id=$id" "mode=sapper"
-    out=$(sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1 9>&-)
+    out=$(NUWA_SUBMIT_ALLOWED=1 sapper dispatch "$id" --claim --model "$model" --skip-permissions --timeout "$to" 2>&1 9>&-)
     rc=$?
   else
     log "ERROR: NUWA_SUBMIT_MODE 只能是 cli 或 sapper（当前 $mode）" >&2
