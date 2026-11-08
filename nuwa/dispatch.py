@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -81,9 +82,14 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     if intent.get("status") == "done" and intent.get("to"):
         done_fact = graph.get_fact(root, intent["to"])
         if done_fact:
+            keys = re.findall(r"\[nuwa:([^\]]+)\]", done_fact.get("description") or "")
+            aux = done_fact.get("x-nuwa-key")
+            if isinstance(aux, str) and aux:
+                keys.append(aux)
+            key = keys[0] if keys else txn.dispatch_key(
+                project, intent_id, txn.attempt_of(intent))
             return {"intent": intent_id, "fact": done_fact["id"], "reused": True,
-                    "key": txn.dispatch_key(project, intent_id,
-                                            txn.attempt_of(intent))}
+                    "key": key}
 
     attempt = txn.attempt_of(intent)
     key = txn.dispatch_key(project, intent_id, attempt)
@@ -110,7 +116,8 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
         journal.append("ack", txn=txn_id, intent=intent_id, status="rejected")
         raise DispatchError(f"预算不足: remaining={remaining} need={tokens}")
     _crash("after_reserve")
-    journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id)
+    journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id,
+                   tokens=tokens)
     journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
                    attempt_seq=attempt, key=key, tokens=tokens)
     # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。
@@ -168,8 +175,14 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
         status = "crashed"
     dur = int((time.time() - t0) * 1000)
 
-    if status == "ok" and (not result.exists() or json.loads(result.read_text()).get("exit_code") != 0):
-        status = "crashed"
+    if status == "ok":
+        try:
+            ok_result = result.exists() and json.loads(
+                result.read_text(encoding="utf-8")).get("exit_code") == 0
+        except (OSError, json.JSONDecodeError):
+            ok_result = False
+        if not ok_result:
+            status = "crashed"
     _crash("after_execute")
     journal.append("executed", txn=txn_id, rid=rid, intent=intent_id,
                    status=status, exit_code=rc, artifact=str(art), duration_ms=dur,

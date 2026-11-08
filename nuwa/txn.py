@@ -195,7 +195,7 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
             if it and it.get("status") == "claimed":
                 graph.sapper(root, ["release", intent])
         rid = info.get("rid")
-        tokens = info.get("tokens", 4000)
+        tokens = info.get("tokens") or 4000
         if rid and led.has_reserve(rid):
             led.settle(rid, tokens, status="crashed")
             journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent,

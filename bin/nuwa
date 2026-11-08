@@ -312,7 +312,7 @@ dispatch_one() {
   local dt=$(( $(date +%s) - t0 ))
   printf '%s\n' "$out" | tail -6
   event dispatch_end "id=$id" "rc=$rc" "dur=${dt}s"
-  (( rc == 0 )) || : > "$PWD/.nuwa/dispatch_failed" 2>/dev/null || true
+  (( rc == 0 )) || : > "$PWD/.nuwa-dispatch-failed" 2>/dev/null || true
   return $rc
 }
 
@@ -470,7 +470,7 @@ if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
 fi
 
 failed=0
-[[ -f .nuwa/dispatch_failed ]] && failed=1
+[[ -f .nuwa-dispatch-failed ]] && failed=1
 
 # ---------------------------------------------------------------- 战报
 log "===== 战报 ====="

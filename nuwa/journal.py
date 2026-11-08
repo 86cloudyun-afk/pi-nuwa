@@ -133,7 +133,7 @@ class Journal:
         with fh:
             for raw in fh:
                 try:
-                    line = raw.decode("utf-8").strip()
+                    line = raw.decode("utf-8").strip(" \t\r\n")
                 except UnicodeDecodeError:
                     # 与 _tail_seq 同一口径：坏编码整行跳过，不能被 replace 洗成合法事件。
                     continue
