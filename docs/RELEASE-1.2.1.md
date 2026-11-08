@@ -388,6 +388,14 @@
 | B47 | 真实 open/claimed intent 的 `to` 为 null，被类型检查判坏 | `to` 允许 `null/undefined/string`，不再把 null 视为损坏 |
 | B25 | shell 外层未校验 from 数组/成员类型 | 外层解析 goal edge 时先校验 `from` 为字符串数组 |
 
+## 第四十七轮补充
+
+| ID | 问题 | 处理 |
+|---|---|---|
+| B48 | `to:null` 放宽后，异常 done/complete + to:null 被接纳 | 状态关系：done/complete 必须 `to` 非空字符串；open/claimed 必须 `to` 为 null/undefined |
+| B25 | shell 外层 from 直接迭代（dict 迭代键） | 外层校验 `from` 为字符串数组 |
+| B30 | shell 锁内缺 project.status 重判 | 锁内读 project，status != completed 直接 exit 0 |
+
 ## 仍然存在的边界
 
 - **TOCTOU**：扩展在 `tool_call` 检查路径，宿主在检查之后写入；检查后替换链接仍可能绕过。

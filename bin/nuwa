@@ -369,6 +369,9 @@ for p in glob.glob(".sapper/intents/*.json"):
     except Exception:
         print("no"); raise SystemExit
     if it.get("to") == "goal":
+        refs = it.get("from")
+        if not isinstance(refs, list) or not all(isinstance(x, str) for x in refs):
+            print("no"); raise SystemExit
         edges.append(it)
 if not edges:
     print("no"); raise SystemExit
@@ -413,6 +416,8 @@ try:
     goal_fact = json.load(open(".sapper/facts/goal.json"))
 except Exception:
     raise SystemExit(1)
+if proj.get("status") != "completed":
+    raise SystemExit(0)
 goal_ok = (goal_fact.get("id") == "goal" and proj.get("goal")
            and goal_fact.get("description") == proj.get("goal"))
 if goal_ok and edges and all(

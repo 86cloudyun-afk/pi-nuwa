@@ -36,6 +36,7 @@ function makeGraph(root: string, opts: {
 	for (const it of opts.intents ?? []) {
 		writeFileSync(join(s, "intents", `${it.id}.json`), JSON.stringify({
 			id: it.id, status: it.status, from: ["f001"], description: it.id,
+			to: it.status === "done" ? "f001" : null,
 			created_at: "2026-01-01T00:00:00Z",
 		}));
 	}
