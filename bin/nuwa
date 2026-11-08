@@ -348,6 +348,17 @@ for p in glob.glob(".sapper/facts/*.json"):
         f = json.load(open(p)); facts[f.get("id")] = f
     except Exception:
         print("no"); raise SystemExit
+try:
+    proj = json.load(open(".sapper/project.json"))
+except Exception:
+    print("no"); raise SystemExit
+goal_fact = None
+for path in glob.glob(".sapper/facts/*.json"):
+    if path.endswith("goal.json"):
+        goal_fact = json.load(open(path))
+if (not goal_fact or goal_fact.get("id") != "goal" or not proj.get("goal")
+        or goal_fact.get("description") != proj.get("goal")):
+    print("no"); raise SystemExit
 edges = []
 for p in glob.glob(".sapper/intents/*.json"):
     try:

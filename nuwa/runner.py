@@ -32,6 +32,11 @@ def _project_status(root: Path) -> str:
 
 def _evidence(root: Path) -> bool:
     facts = {f.get("id"): f for f in graph.facts(root)}
+    goal = facts.get("goal")
+    proj = graph.project(root)
+    if (not goal or not proj.get("goal")
+            or goal.get("description") != proj.get("goal")):
+        return False
     edges = [it for it in graph.intents(root) if it.get("to") == "goal"]
     if not edges:
         # 无完成边的 completed 是异常状态，不能用整图历史事实兜底。

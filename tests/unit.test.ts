@@ -36,14 +36,17 @@ function makeGraph(root: string, opts: {
 	for (const it of opts.intents ?? []) {
 		writeFileSync(join(s, "intents", `${it.id}.json`), JSON.stringify({
 			id: it.id, status: it.status, from: ["f001"], description: it.id,
+			created_at: "2026-01-01T00:00:00Z",
 		}));
 	}
 	writeFileSync(join(s, "facts", "goal.json"), JSON.stringify({
 		id: "goal", description: opts.goal ?? "unit goal", creator: "system",
+		created_at: "2026-01-01T00:00:00Z", source_intent: null,
 	}));
 	for (const f of opts.facts ?? []) {
 		writeFileSync(join(s, "facts", `${f.id}.json`), JSON.stringify({
 			id: f.id, kind: f.kind, description: f.id,
+			created_at: "2026-01-01T00:00:00Z", creator: "test",
 		}));
 	}
 	if (opts.lockPid) writeFileSync(join(s, "..", ".nuwa.lock"), `${opts.lockPid}\n`);
@@ -135,6 +138,7 @@ describe("readGraph", () => {
 		});
 		writeFileSync(join(root, ".sapper", "intents", "i004.json"), JSON.stringify({
 			id: "i004", status: "complete", to: "goal", from: ["f004"],
+			description: "done", created_at: "2026-01-01T00:00:00Z",
 		}));
 		const g = mod.readGraph(root)!;
 		expect(g.open).toBe(1);

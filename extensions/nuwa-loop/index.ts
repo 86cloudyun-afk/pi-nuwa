@@ -452,6 +452,7 @@ export function readGraph(root: string): Graph | null {
 	let claimed = 0;
 	const openIds: string[] = [];
 	const goalEdges: Array<{ status?: string; refs: string[] }> = [];
+	const intentRefs: string[][] = [];
 	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
@@ -465,10 +466,12 @@ export function readGraph(root: string): Graph | null {
 			if (!it.status || !["open", "claimed", "done", "complete"].includes(it.status)) {
 				corrupt = true;
 			}
+			if (!it.id || !it.description || !it.created_at) corrupt = true;
 			if (it.from !== undefined) {
 				const refs = Array.isArray(it.from)
 					? it.from.filter((x): x is string => typeof x === "string") : [];
 				if (!Array.isArray(it.from) || refs.length !== it.from.length) corrupt = true;
+				intentRefs.push(refs);
 			}
 			if (it.to === "goal") {
 				const refs = Array.isArray(it.from)
@@ -508,7 +511,8 @@ export function readGraph(root: string): Graph | null {
 				corrupt = true;
 				continue;
 			}
-			if (!fact.id || fact.id !== f.replace(/\.json$/, "")) corrupt = true;
+			if (!fact.id || fact.id !== f.replace(/\.json$/, "")
+				|| !fact.description || !fact.created_at || !fact.creator) corrupt = true;
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
 			if (fact?.kind) kinds[f.replace(/\.json$/, "")] = fact.kind;
@@ -519,13 +523,19 @@ export function readGraph(root: string): Graph | null {
 	try {
 		const goal = readJson<{ id?: string; kind?: string; description?: string }>(
 			join(root, ".sapper", "facts", "goal.json"));
-		if (!goal || goal.id !== "goal") {
+		if (!goal || goal.id !== "goal" || !goal.description
+			|| !goal.created_at || !goal.creator) {
 			corrupt = true;
 		} else if (!proj.goal || goal.description !== proj.goal) {
 			corrupt = true;
 		}
 	} catch {
 		corrupt = true;
+	}
+	for (const refs of intentRefs) {
+		for (const id of refs) {
+			if (!(id in kinds)) corrupt = true;
+		}
 	}
 	const isStrong = (kind?: string): boolean =>
 		kind === "flag" || kind === "vuln" || kind === "loot";
