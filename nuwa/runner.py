@@ -302,6 +302,10 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     finally:
         try:
             if freeze_failed:
+                try:
+                    journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
+                except Exception:  # noqa: BLE001
+                    pass
                 raise RuntimeError("reason 冻结失败，保留待恢复")
             led.settle(rid, tokens_actual, status=settle_status)
             journal.append("ack", txn=rid, intent="reason", status=settle_status)

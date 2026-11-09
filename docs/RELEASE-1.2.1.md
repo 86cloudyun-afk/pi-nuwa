@@ -678,6 +678,16 @@
 - **M94**：引擎异常分支冻结失败也置标志并保留 pending。
 - **M46**：install.sh 启用 `set -euo pipefail`。
 
+## 第八十七轮补充
+
+- **M94**：冻结失败保留 pending 前先落 usage。
+- **M104**：备份清理按行读取，含空格路径不拆分。
+- **M102**：repair 对 60 秒内的成功 artifact 跳过，避让父提交窗口。
+
+## 第八十八轮补充
+
+- **M102**：worker 写 `parent_pid`，repair 仅在父进程存活时跳过，父崩溃后正常恢复。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

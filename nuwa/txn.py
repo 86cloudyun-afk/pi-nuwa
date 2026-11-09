@@ -325,6 +325,19 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                            rid=info.get("rid"))
             continue
         if succeeded:
+            ppid = res.get("parent_pid")
+            alive = False
+            if isinstance(ppid, int) and not isinstance(ppid, bool) and ppid > 0:
+                try:
+                    os.kill(ppid, 0)
+                    alive = True
+                except OSError:
+                    alive = False
+            if alive:
+                journal.append("recovered_skipped", txn=txn_id, intent=intent,
+                               rid=info.get("rid"))
+                continue
+        if succeeded:
             rid = info.get("rid")
             tokens = info.get("tokens")
             if tokens is None:

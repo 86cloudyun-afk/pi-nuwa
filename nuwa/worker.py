@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
             rc = proc.wait()
         _atomic(Path(args.result), {
             "exit_code": rc, "started_at": started, "finished_at": time.time(),
-            "attempt": args.attempt, "pid": pid,
+            "attempt": args.attempt, "pid": pid, "parent_pid": os.getppid(),
         })
     return rc
 
