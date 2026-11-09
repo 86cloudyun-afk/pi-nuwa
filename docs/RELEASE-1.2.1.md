@@ -581,6 +581,13 @@
 - **M92**：repair 对无账本预留的 reason_reserve 只跳过，不 ack。
 - **M75**：`reason_usage` 落 journal，repair 按实际用量结算。
 
+## 第七十二轮补充
+
+- **M95**：`reason_rejected`/`reason_skipped` 纳入终态集合。
+- **M94**：超支写 `.nuwa/reason.freeze`，后续 reason 直接拒绝。
+- **M92**：reason 锁先于全局预留获取。
+- **M75**：`reason_usage` 在应用图前落盘。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

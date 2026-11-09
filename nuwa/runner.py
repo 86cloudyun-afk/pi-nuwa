@@ -198,6 +198,10 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
 
 
 def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
+    nd = ensure_nuwa(root)
+    if (nd / "reason.freeze").exists():
+        journal.append("reason_frozen", round=round_no)
+        return
     led = Ledger()
     rid = f"r-reason-{time.time_ns()}"
     render = graph.sapper(root, ["dispatch", "reason", "--dry-run"])
@@ -206,21 +210,23 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         journal.append("reason_render_failed", round=round_no)
         return
     need = max(4000, prompt_len // 4 + 2000)
-    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
-    ok, remaining = led.admit_reserve(rid, str(root), need)
-    if not ok:
-        journal.append("reason_rejected", txn=rid, rid=rid, remaining=remaining)
-        return
-    tokens_actual = 0
-    settle_status = "ok"
-    nd = ensure_nuwa(root)
     rlock = FileLock(nd / "inflight" / "reason.lock", blocking=False)
     try:
         rlock.__enter__()
     except LockTimeout:
-        led.settle(rid, 0, status="blocked")
         journal.append("reason_busy", round=round_no, rid=rid)
         return
+    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
+    ok, remaining = led.admit_reserve(rid, str(root), need)
+    if not ok:
+        journal.append("reason_rejected", txn=rid, rid=rid, remaining=remaining)
+        try:
+            rlock.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    tokens_actual = 0
+    settle_status = "ok"
     try:
         try:
             raw = call(render.stdout, model=model, timeout=240,
@@ -234,14 +240,19 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                                 (prompt_len + len(partial)) // 4)
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return
+        journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
         _apply_reason(root, payload, round_no, journal)
     finally:
         try:
-            journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
             led.settle(rid, tokens_actual, status=settle_status)
             if tokens_actual > need * 1.05:
                 journal.append("reason_overrun", round=round_no, rid=rid,
                                tokens=tokens_actual, reserved=need)
+                try:
+                    (nd / "reason.freeze").write_text(
+                        f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
+                except OSError:
+                    pass
                 raise RuntimeError("reason 超支，暂停派发")
             journal.append("ack", txn=rid, intent="reason", status=settle_status)
             journal.append("reason_budget_settled", round=round_no, rid=rid)

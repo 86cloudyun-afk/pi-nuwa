@@ -33,7 +33,7 @@ PENDING_EVENTS = (
 )
 FINAL_EVENTS = ("commit_done", "ack")
 DONE_EVENTS = ("commit_done", "ack", "reserve_rejected", "dispatch_rejected",
-               "recovered_crashed")
+               "recovered_crashed", "reason_rejected", "reason_skipped")
 
 
 class Journal:
