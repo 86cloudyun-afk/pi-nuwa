@@ -739,6 +739,11 @@
 
 - **M75**：`bin/nuwa` URL reason 调用前用 Ledger 检查全局余额，不足则跳过。
 
+## 第一百轮补充
+
+- **M110**：repair 以 `parse_engine_stdout` 的 description 为准，尾部附加文本不再误判空。
+- **M75**：URL 循环改调 `runner._reason`，统一预算/usage/settle 路径。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

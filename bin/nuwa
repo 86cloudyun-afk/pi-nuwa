@@ -539,7 +539,13 @@ while :; do
       event reason_budget_skipped "round=$round"
     else
       NUWA_SUBMIT_ALLOWED="$(cat "$LAB_DIR/.submit_token" 2>/dev/null || true)" \
-        sapper dispatch reason --model "$model" --timeout "$(( remaining < 240 ? remaining : 240 ))" 2>&1 | tail -1
+        PYTHONPATH="$_PKG_DIR" python3 -c '
+import sys
+from pathlib import Path
+from nuwa import runner
+from nuwa.journal import Journal
+runner._reason(Path(sys.argv[1]), sys.argv[2], 0, Journal(Path(sys.argv[1])))
+' "$dir" "$model" 2>&1 | tail -1
       ids="$(frontier_ids)"
     fi
   fi

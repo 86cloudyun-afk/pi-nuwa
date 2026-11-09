@@ -317,22 +317,6 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 text = (out_path.read_text(encoding="utf-8", errors="replace").strip()
                         if out_path.exists() else "")
                 empty_obj = False
-                if text.startswith(("{", "[")):
-                    try:
-                        obj = json.loads(text)
-                        inner = obj.get("result") if isinstance(obj, dict) else None
-                        empty_obj = not bool(obj)
-                        if isinstance(inner, (dict, list)) and not inner:
-                            empty_obj = True
-                        elif isinstance(inner, str):
-                            try:
-                                if json.loads(inner) in ({}, [], "", None):
-                                    empty_obj = True
-                            except (ValueError, TypeError):
-                                if not inner.strip():
-                                    empty_obj = True
-                    except (ValueError, TypeError):
-                        empty_obj = True
                 valid = False
                 try:
                     from . import dispatch as dmod
@@ -342,6 +326,7 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                         valid = bool(data.get("description"))
                     else:
                         valid = bool(payload.get("description"))
+                    empty_obj = not valid
                 except Exception:  # noqa: BLE001
                     valid = False
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
