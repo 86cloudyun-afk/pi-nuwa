@@ -662,6 +662,11 @@
 - **M46**：扩展/备份/skill 复制失败 `exit 1`。
 - **M102**：backlog 补问题定义与 1.3 计划。
 
+## 第八十四轮补充
+
+- **M94**：冻结失败时保留 pending，不 settle/ack。
+- **M74**：repair 验收与 dispatch 一致，要求 description（含 data.description）。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

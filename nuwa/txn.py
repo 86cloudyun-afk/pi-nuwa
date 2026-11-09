@@ -309,9 +309,9 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 try:
                     from . import dispatch as dmod
                     payload = dmod.parse_engine_stdout(text)
+                    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
                     valid = bool(payload) and bool(
-                        payload.get("description") or payload.get("facts")
-                        or payload.get("intents") or payload.get("complete"))
+                        payload.get("description") or data.get("description"))
                 except Exception:  # noqa: BLE001
                     valid = False
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0

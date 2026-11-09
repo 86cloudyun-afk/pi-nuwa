@@ -198,6 +198,7 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
 
 
 def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
+    freeze_failed = False
     nd = ensure_nuwa(root)
     if (nd / "reason.freeze").exists():
         journal.append("reason_frozen", round=round_no)
@@ -252,6 +253,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                 except OSError as exc:
                     journal.append("reason_freeze_failed", round=round_no, rid=rid,
                                    error=str(exc)[:200])
+                    freeze_failed = True
                     raise RuntimeError("reason 超支但冻结失败") from exc
             raise
         except (EngineError, dispatch_mod.DispatchError) as exc:
@@ -279,6 +281,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                 except OSError as exc:
                     journal.append("reason_freeze_failed", round=round_no, rid=rid,
                                    error=str(exc)[:200])
+                    freeze_failed = True
                     raise RuntimeError("reason 超支但冻结失败") from exc
                 journal.append("reason_overrun", round=round_no, rid=rid,
                                tokens=tokens_actual, reserved=need)
@@ -286,6 +289,8 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         _apply_reason(root, payload, round_no, journal)
     finally:
         try:
+            if freeze_failed:
+                raise RuntimeError("reason 冻结失败，保留待恢复")
             led.settle(rid, tokens_actual, status=settle_status)
             journal.append("ack", txn=rid, intent="reason", status=settle_status)
             if tokens_actual > need * 1.05:
