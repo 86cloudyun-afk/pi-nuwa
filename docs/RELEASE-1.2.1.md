@@ -588,6 +588,14 @@
 - **M92**：reason 锁先于全局预留获取。
 - **M75**：`reason_usage` 在应用图前落盘。
 
+## 第七十三轮补充
+
+- **M93**：journal/ledger 异常时释放 reason 锁。
+- **M95**：摘要终态包含 reason_rejected/skipped。
+- **M94**：超支先写 freeze，再落 usage。
+- **M75**：异常分支也写 reason_usage。
+- **M96**：夜跑 commit 取 Nuwa 源码仓库 HEAD，不取目标仓库。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

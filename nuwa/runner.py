@@ -216,8 +216,15 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     except LockTimeout:
         journal.append("reason_busy", round=round_no, rid=rid)
         return
-    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
-    ok, remaining = led.admit_reserve(rid, str(root), need)
+    try:
+        journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
+        ok, remaining = led.admit_reserve(rid, str(root), need)
+    except Exception:
+        try:
+            rlock.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     if not ok:
         journal.append("reason_rejected", txn=rid, rid=rid, remaining=remaining)
         try:
@@ -238,8 +245,15 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             partial = getattr(exc, "partial", "") or ""
             tokens_actual = max(tokens_actual,
                                 (prompt_len + len(partial)) // 4)
+            journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return
+        if tokens_actual > need * 1.05:
+            try:
+                (nd / "reason.freeze").write_text(
+                    f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
+            except OSError:
+                pass
         journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
         _apply_reason(root, payload, round_no, journal)
     finally:

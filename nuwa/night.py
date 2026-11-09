@@ -28,8 +28,9 @@ def prepare(base: str | Path, projects: int) -> list[str]:
 
 def _commit() -> str:
     try:
-        return subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                              text=True, timeout=5).stdout.strip()
+        src = Path(__file__).resolve().parent.parent
+        return subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:  # noqa: BLE001
         return ""
 

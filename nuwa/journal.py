@@ -322,10 +322,12 @@ class Journal:
                 elif ev == "executing":
                     state["inflight"].setdefault(txn, {})["state"] = "executing"
                 elif ev in ("executed", "commit_done", "ack", "reserve_rejected",
-                            "dispatch_rejected", "recovered_crashed"):
+                            "dispatch_rejected", "recovered_crashed",
+                            "reason_rejected", "reason_skipped"):
                     state["inflight"].pop(txn, None)
                 if ev in ("ack", "recovered_crashed", "reserve_rejected",
-                          "dispatch_rejected") and txn:
+                          "dispatch_rejected", "reason_rejected",
+                          "reason_skipped") and txn:
                     ended.add(str(txn))
                 if ev == "ledger_settle" and rec.get("rid"):
                     settled.add(str(rec.get("rid")))
@@ -459,9 +461,11 @@ def replay_state(root: str | Path) -> dict:
         elif ev == "executing":
             state["inflight"].setdefault(txn, {})["state"] = "executing"
         elif ev in ("executed", "commit_done", "ack", "reserve_rejected",
-                    "dispatch_rejected", "recovered_crashed"):
+                    "dispatch_rejected", "recovered_crashed",
+                    "reason_rejected", "reason_skipped"):
             state["inflight"].pop(txn, None)
-        if ev in ("ack", "reserve_rejected", "dispatch_rejected") and txn:
+        if ev in ("ack", "reserve_rejected", "dispatch_rejected",
+                  "reason_rejected", "reason_skipped") and txn:
             state.setdefault("ended", set()).add(txn)
         if ev == "ledger_settle":
             state["settled"].add(rec.get("rid"))
