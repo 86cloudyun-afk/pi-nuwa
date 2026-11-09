@@ -508,6 +508,12 @@
 - **M75**：reason 失败以 `status=error` 结算。
 - **M61**：归属反查保持“source 存在才比对”，避免旧图误杀；严格缺省检查留待 1.3。
 
+## 第六十轮补充
+
+- **M32**：复用分支的恢复移入 txn.lock 内；done/to 一致直接快返。
+- **M31**：`samples_span` 要求 t 覆盖 duration 的 80%，并校验有限数/区间。
+- **M75**：引擎失败时按输入长度计入 tokens，status=error。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

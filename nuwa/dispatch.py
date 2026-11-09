@@ -147,13 +147,17 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                 and intent["to"] != existing["id"]):
             raise DispatchError(
                 f"intent 已由其他 fact 完成: {intent['to']} != {existing['id']}")
-        prev_source = existing.get("source_intent")
-        prev_intent = graph.get_intent(root, intent_id) or {}
-        try:
-            with FileLock(nd / "txn.lock", blocking=True):
-                if prev_source not in (None, intent_id):
-                    raise DispatchError(
-                        f"fact 已绑定其他意图: {prev_source} != {intent_id}")
+        with FileLock(nd / "txn.lock", blocking=True):
+            cur_fact = graph.get_fact(root, existing["id"]) or {}
+            prev_source = cur_fact.get("source_intent")
+            prev_intent = graph.get_intent(root, intent_id) or {}
+            if prev_source not in (None, intent_id):
+                raise DispatchError(
+                    f"fact 已绑定其他意图: {prev_source} != {intent_id}")
+            if prev_intent.get("status") == "done" and prev_intent.get("to") == existing["id"]:
+                return {"intent": intent_id, "fact": existing["id"],
+                        "reused": True, "key": key}
+            try:
                 if not prev_source:
                     _bind_source(root, existing["id"], intent_id)
                 graph.patch_intent(root, intent_id, existing["id"])
@@ -162,14 +166,11 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                     raise DispatchError(f"复用后图校验失败: {msg}")
                 journal.append("commit_done", txn=key, intent=intent_id,
                                fact=existing["id"], reused=True, project=project)
-        except Exception:
-            with FileLock(nd / "txn.lock", blocking=True):
-                cur = graph.get_intent(root, intent_id) or {}
-                if not (cur.get("status") == "done" and cur.get("to") == existing["id"]):
-                    if prev_source is None:
-                        _unbind_source(root, existing["id"])
-                    _restore_intent(root, intent_id, prev_intent)
-            raise
+            except Exception:
+                if prev_source is None:
+                    _unbind_source(root, existing["id"])
+                _restore_intent(root, intent_id, prev_intent)
+                raise
         return {"intent": intent_id, "fact": existing["id"], "reused": True, "key": key}
 
     txn_id = f"t-{uuid.uuid4().hex[:12]}"
