@@ -744,6 +744,11 @@
 - **M110**：repair 以 `parse_engine_stdout` 的 description 为准，尾部附加文本不再误判空。
 - **M75**：URL 循环改调 `runner._reason`，统一预算/usage/settle 路径。
 
+## 第一百零一轮补充
+
+- **M112**：`bin/nuwa` 把实际 round 传给 `_reason`，避免固定 0 去重。
+- **M113**：`_reason` 接受 timeout，`bin/nuwa` 传剩余时间上限。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

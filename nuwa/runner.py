@@ -197,7 +197,8 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
     return created
 
 
-def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
+def _reason(root: Path, model: str, round_no: int, journal: Journal,
+            timeout: int = 240) -> None:
     freeze_failed = False
     nd = ensure_nuwa(root)
     if (nd / "reason.freeze").exists():
@@ -239,7 +240,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     settle_status = "ok"
     try:
         try:
-            raw = call(render.stdout, model=model, timeout=240,
+            raw = call(render.stdout, model=model, timeout=timeout,
                        pass_fds=(rlock.fd,))
             tokens_actual = max(0, (prompt_len + len(raw)) // 4)
             payload = dispatch_mod.parse_engine_stdout(raw)

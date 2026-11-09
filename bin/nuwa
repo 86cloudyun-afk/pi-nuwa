@@ -544,8 +544,8 @@ import sys
 from pathlib import Path
 from nuwa import runner
 from nuwa.journal import Journal
-runner._reason(Path(sys.argv[1]), sys.argv[2], 0, Journal(Path(sys.argv[1])))
-' "$dir" "$model" 2>&1 | tail -1
+runner._reason(Path(sys.argv[1]), sys.argv[2], int(sys.argv[3]), Journal(Path(sys.argv[1])), int(sys.argv[4]))
+' "$dir" "$model" "$round" "$(( remaining < 240 ? remaining : 240 ))" 2>&1 | tail -1
       ids="$(frontier_ids)"
     fi
   fi
