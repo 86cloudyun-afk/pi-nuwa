@@ -190,9 +190,7 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             "minutes": minutes > 0,
             "samples": samples >= 2,
             "verdict": True,
-            "duration": finished >= started and (
-                duration >= minutes * 60 * 0.9 if minutes >= 2
-                else duration >= 0.25),
+            "duration": finished >= started and duration >= minutes * 60 * 0.9,
             "journal": (journal_dispatches > 0
                         and abs(facts_delta - journal_commits) <= 2),
             "samples_recalc": recalc_ok,
@@ -218,8 +216,7 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             and all(int(progress.get(str(p), 0)) >= 1 for p in projects),
             "project_duration": isinstance(durations, dict)
             and {str(p) for p in projects}.issubset(set(durations))
-            and all(_number(v, "duration") >= (
-                minutes * 60 * 0.8 if minutes >= 2 else 0.2)
+            and all(_number(v, "duration") >= minutes * 60 * 0.8
                     for v in durations.values()),
             "samples_head": len(raw) < 2 or duration < 60
             or (isinstance(raw[0].get("t"), (int, float))
