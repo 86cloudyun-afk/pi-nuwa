@@ -803,6 +803,16 @@
 
 - **M114**：锁路径统一因 chaos 锁测试兼容回退，保留 1.3 项。
 
+## 第一百一十三轮补充
+
+- **M112**：纯 Python 项目缺 round 文件时创建并写回。
+- **M114**：URL/Python 统一 `.nuwa/run.lock`，chaos 测试同步。
+
+## 第一百一十四轮补充
+
+- **M112**：缺 round 文件时创建并写回。
+- **M114**：URL/Python 统一 `.nuwa/run.lock`，chaos 测试同步。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
