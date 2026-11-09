@@ -23,6 +23,9 @@
 | M34 | `extensions/nuwa-loop/index.ts:246` | `candidateDirs` 祖先链带来的路径检查放大 | 缓存 resolve 结果；候选数上限 + 超限 fail-closed |
 | M35/M36 | `nuwa/txn.py:75`、`nuwa/ledger.py:143` | 基线遗留的账本/事务边界 | 并入 M17/M22 一起处理 |
 
+| M102 | `worker.py:69` / `txn.py:317` / `dispatch.py:185` | 父进程提交前 repair 提前 ack，后续 attempt 键冲突 | 1.3 统一 worker 退出/提交状态机 |
+| M103 | `runner.py` overrun 分支 vs `ack` | 超支结算后缺 ack 终态 | 已在第七十七轮把 ack 提前到 settle 后 |
+
 ## 既定接受边界（审计已排除为 blocking）
 
 | ID | 边界 | 缓解 |

@@ -656,6 +656,12 @@
 - **M74**：parse 后要求 payload 含 description/facts/intents/complete。
 - **M94**：repair 冻结失败直接中断，不再继续 ack。
 
+## 第八十三轮补充
+
+- **M103**：settle 后先写 ack，再处理 overrun。
+- **M46**：扩展/备份/skill 复制失败 `exit 1`。
+- **M102**：backlog 补问题定义与 1.3 计划。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

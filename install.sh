@@ -66,19 +66,19 @@ mkdir -p "$AGENT_HOME/extensions" "$AGENT_HOME/cache" "$SAPPER_HOME/bin" "$HOME/
 say "[2/6] 安装 nuwa-loop 扩展"
 if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
   BAK="$AGENT_HOME/extensions/nuwa-loop.bak-$(date +%Y%m%dT%H%M%S)"
-  cp -R "$AGENT_HOME/extensions/nuwa-loop" "$BAK"
+  cp -R "$AGENT_HOME/extensions/nuwa-loop" "$BAK" || exit 1
   say "  已备份到 $(basename "$BAK")"
   # 只保留最近 5 份
   ls -dt "$AGENT_HOME"/extensions/nuwa-loop.bak-* 2>/dev/null | tail -n +6 | xargs -r rm -rf
 fi
 rm -rf "$AGENT_HOME/extensions/nuwa-loop"
-cp -R "$REPO_DIR/extensions/nuwa-loop" "$AGENT_HOME/extensions/nuwa-loop"
+cp -R "$REPO_DIR/extensions/nuwa-loop" "$AGENT_HOME/extensions/nuwa-loop" || exit 1
 
 # ---------------------------------------------------------------- skill
 say "[3/6] 安装 nuwa-pentest skill"
 mkdir -p "$AGENT_HOME/skills"
 rm -rf "$AGENT_HOME/skills/nuwa-pentest"
-cp -R "$REPO_DIR/skills/nuwa-pentest" "$AGENT_HOME/skills/nuwa-pentest"
+cp -R "$REPO_DIR/skills/nuwa-pentest" "$AGENT_HOME/skills/nuwa-pentest" || exit 1
 if [[ -e "$HOME/.claude/skills/nuwa-pentest" && ! -L "$HOME/.claude/skills/nuwa-pentest" ]]; then
   mv "$HOME/.claude/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest.bak-$(date +%s)"
 fi

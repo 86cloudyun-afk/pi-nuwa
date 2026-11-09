@@ -287,6 +287,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     finally:
         try:
             led.settle(rid, tokens_actual, status=settle_status)
+            journal.append("ack", txn=rid, intent="reason", status=settle_status)
             if tokens_actual > need * 1.05:
                 journal.append("reason_overrun", round=round_no, rid=rid,
                                tokens=tokens_actual, reserved=need)
@@ -296,7 +297,6 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                 except OSError:
                     pass
                 raise RuntimeError("reason 超支，暂停派发")
-            journal.append("ack", txn=rid, intent="reason", status=settle_status)
             journal.append("reason_budget_settled", round=round_no, rid=rid)
         finally:
             try:
