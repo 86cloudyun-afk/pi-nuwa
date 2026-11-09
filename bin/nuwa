@@ -531,7 +531,7 @@ while :; do
   # 只有 frontier 为空时才让 reason 生成新意图，省一轮模型调用
   ids="$(frontier_ids)"
   if [[ -z "$ids" ]]; then
-    if [[ -f "$LAB_DIR/.nuwa/reason.freeze" ]]; then
+    if [[ -f "$dir/.nuwa/reason.freeze" ]]; then
       log "reason 冻结，跳过本轮生成"
       event reason_frozen "round=$round"
     else

@@ -47,6 +47,7 @@ class RunTest(unittest.TestCase):
         return r
 
     def test_reason_engine_missing_does_not_crash(self):
+        self._run(["sapper", "done", "i001", "--fact", "seed"])
         old = os.environ.get("NUWA_ENGINE")
         os.environ["NUWA_ENGINE"] = "/nonexistent/nuwa-engine"
         try:

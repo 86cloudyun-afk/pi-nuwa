@@ -717,6 +717,12 @@
 - **M75**：`bin/nuwa` 默认 URL 循环在 reason.freeze 存在时跳过生成。
 - **M21**：新增引擎缺失不崩溃测试。
 
+## 第九十五轮补充
+
+- **M75**：`bin/nuwa` freeze 检查改用项目目录 `$dir`。
+- **M21**：引擎缺失测试先完成 i001，清空 frontier 以触达 reason 分支。
+- **M102**：repair 跳过 `reserve_pending`（预留未提交）。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

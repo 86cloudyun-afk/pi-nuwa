@@ -276,6 +276,8 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 pass
     repaired = []
     for txn_id, info in pending.items():
+        if info.get("state") == "reserve_pending":
+            continue
         intent = info.get("intent")
         try:
             for rec2 in journal.snapshot()[1]:
