@@ -254,13 +254,16 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return
+        journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
         if tokens_actual > need * 1.05:
             try:
                 (nd / "reason.freeze").write_text(
                     f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
             except OSError:
                 pass
-        journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
+            journal.append("reason_overrun", round=round_no, rid=rid,
+                           tokens=tokens_actual, reserved=need)
+            raise RuntimeError("reason 超支，暂停派发")
         _apply_reason(root, payload, round_no, journal)
     finally:
         try:
@@ -316,7 +319,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
         stall = 0
         last_sig = ""
         exit_code = 0
-    except Exception:
+    except BaseException:
         try:
             lock.__exit__(None, None, None)
         except Exception:  # noqa: BLE001

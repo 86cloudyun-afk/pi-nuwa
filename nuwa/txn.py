@@ -285,8 +285,14 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 out_path = nd / "artifacts" / txn_id / "stdout.txt"
                 text = (out_path.read_text(encoding="utf-8", errors="replace").strip()
                         if out_path.exists() else "")
+                empty_obj = False
+                if text.startswith(("{", "[")):
+                    try:
+                        empty_obj = not bool(json.loads(text))
+                    except (ValueError, TypeError):
+                        empty_obj = True
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
-                             and bool(text) and text not in ("{}", "[]"))
+                             and bool(text) and not empty_obj)
             except (OSError, json.JSONDecodeError, ValueError):
                 succeeded = False
         if succeeded:
@@ -311,7 +317,9 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
             if it and it.get("status") == "claimed":
                 graph.sapper(root, ["release", intent])
         rid = info.get("rid")
-        reserved = info.get("tokens") or 4000
+        reserved = info.get("tokens")
+        if reserved is None:
+            reserved = 4000
         tokens = usage.get(txn_id, reserved)
         if info.get("state") == "reason_reserve" and rid and not led.has_reserve(rid):
             if tokens > reserved * 1.05:
