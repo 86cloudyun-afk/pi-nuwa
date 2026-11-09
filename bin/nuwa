@@ -511,7 +511,7 @@ print("%s|%s|%s|%s|%s|%s" % (p.get("status"), o, c, d, ef, fl))'
 }
 
 mkdir -p "$dir/.nuwa"
-PYTHONPATH="$_PKG_DIR" python3 -c 'import sys; from pathlib import Path; from nuwa import txn; txn.repair(Path(sys.argv[1]))' "$dir" 2>/dev/null || { log "repair 失败"; exit 1; }
+PYTHONPATH="$_PKG_DIR" python3 -c 'import sys; from pathlib import Path; from nuwa import txn; txn.repair(Path(sys.argv[1]))' "$dir" 2>/dev/null || log "repair 失败（继续）"
 round="$(python3 -c '
 import json, sys
 from pathlib import Path
@@ -523,7 +523,9 @@ except (OSError, ValueError):
     pass
 b = 0
 try:
-    b = int(json.loads((d / "run.json").read_text()).get("round", 0))
+    obj = json.loads((d / "run.json").read_text())
+    if isinstance(obj, dict):
+        b = int(obj.get("round", 0))
 except (OSError, ValueError, TypeError):
     pass
 print(max(a, b))
