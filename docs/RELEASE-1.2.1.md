@@ -527,6 +527,13 @@
 - **M61**：goal.source_intent 的 intent.to 必须为 goal。
 - **M75**：reason 预留写 `reason_reserve` 事件，repair 可回收。
 
+## 第六十三轮补充
+
+- **M90**：reason 持 `inflight/reason.lock`，repair 不会提前结算；结算后写 ack 终态。
+- **M32**：`txn.commit` 复用绑定后 patch 异常时删除 source_intent。
+- **M31**：新增 `samples_head`，头部 5% 缺样判失败。
+- **M61**：goal 显式 source 且有多个 complete goal 边判冲突。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

@@ -44,6 +44,21 @@ def _bind_source(root: str | Path, fact_id: str, intent_id: str) -> None:
     os.replace(tmp, fp)
 
 
+def _unbind_source(root: str | Path, fact_id: str) -> None:
+    if not graph._safe_id(fact_id):
+        return
+    fp = Path(root) / ".sapper" / "facts" / f"{fact_id}.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict) and data.get("id") == fact_id:
+        data.pop("source_intent", None)
+        tmp = fp.with_name(fp.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, fp)
+
+
 def dispatch_key(project: str, intent: str, attempt_seq: int) -> str:
     raw = f"{project}|{intent}|{attempt_seq}".encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -113,7 +128,12 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
                 raise CommitError(f"fact 已绑定其他意图: {src} != {intent_id}")
             if not src:
                 _bind_source(root, fact_id, intent_id)
-            graph.patch_intent(root, intent_id, fact_id, worker=worker)
+            try:
+                graph.patch_intent(root, intent_id, fact_id, worker=worker)
+            except Exception:
+                if not src:
+                    _unbind_source(root, fact_id)
+                raise
         else:
             desc = f"{fact_text} [nuwa:{key}]"
             args = ["done", intent_id, "--fact", desc, "-k", kind, "--worker", worker]

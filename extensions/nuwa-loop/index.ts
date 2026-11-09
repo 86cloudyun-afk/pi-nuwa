@@ -458,6 +458,7 @@ export function readGraph(root: string): Graph | null {
 	const intentIds = new Set<string>();
 	const intentTo = new Map<string, string>();
 	const sourceByFact = new Map<string, string>();
+	const goalSourceIds: string[] = [];
 	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
@@ -498,6 +499,7 @@ export function readGraph(root: string): Graph | null {
 					corrupt = true;
 				}
 				goalEdges.push({ status: it.status, refs });
+				if (it.status === "complete" && it.id) goalSourceIds.push(it.id);
 			}
 			if (it.status === "open") {
 				open++;
@@ -559,6 +561,7 @@ export function readGraph(root: string): Graph | null {
 		} else if (typeof goal.source_intent === "string") {
 			if (!intentIds.has(goal.source_intent)) corrupt = true;
 			else if (intentTo.get(goal.source_intent) !== "goal") corrupt = true;
+			else if (goalSourceIds.length > 1) corrupt = true;
 		}
 	} catch {
 		corrupt = true;

@@ -207,6 +207,14 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     tokens_actual = 0
     prompt_len = 0
     settle_status = "ok"
+    nd = ensure_nuwa(root)
+    rlock = FileLock(nd / "inflight" / "reason.lock", blocking=False)
+    try:
+        rlock.__enter__()
+    except LockTimeout:
+        led.settle(rid, 0, status="blocked")
+        journal.append("reason_busy", round=round_no, rid=rid)
+        return
     journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=4000)
     try:
         r = graph.sapper(root, ["dispatch", "reason", "--dry-run"])
@@ -226,7 +234,12 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         _apply_reason(root, payload, round_no, journal)
     finally:
         led.settle(rid, tokens_actual, status=settle_status)
+        journal.append("ack", txn=rid, intent="reason", status=settle_status)
         journal.append("reason_budget_settled", round=round_no, rid=rid)
+        try:
+            rlock.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def run(root: str | Path, minutes: int = 60, parallel: int = 2,
