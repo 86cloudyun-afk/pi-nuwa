@@ -111,7 +111,8 @@ fi
 install -m 0755 "$REPO_DIR/bin/nuwa-soak-night.sh" "$SAPPER_HOME/bin/nuwa-soak-night"
 mkdir -p "$SAPPER_HOME/nuwa"
 if cp -R "$REPO_DIR/nuwa/." "$SAPPER_HOME/nuwa/"; then
-  git -C "$REPO_DIR" rev-parse HEAD > "$SAPPER_HOME/COMMIT" 2>/dev/null || true
+  git -C "$REPO_DIR" rev-parse HEAD > "$SAPPER_HOME/COMMIT" 2>/dev/null \
+    || rm -f "$SAPPER_HOME/COMMIT"
 fi
 
 # ---------------------------------------------------------------- 执行引擎（P0-0.6）

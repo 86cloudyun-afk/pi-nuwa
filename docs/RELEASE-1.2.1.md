@@ -611,6 +611,12 @@
 - **M94**：repair 无预留但 usage 超支时补 freeze。
 - **M96**：install.sh 仅在 nuwa 复制成功后写 COMMIT。
 
+## 第七十六轮补充
+
+- **M94**：repair 先算 `reserved/tokens`，消除 UnboundLocalError。
+- **M96**：COMMIT 写入失败时删除旧标记。
+- **M74**：stdout 为空/`{}`/`[]` 不判成功。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

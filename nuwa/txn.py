@@ -283,8 +283,10 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
             try:
                 res = json.loads(result_path.read_text(encoding="utf-8"))
                 out_path = nd / "artifacts" / txn_id / "stdout.txt"
+                text = (out_path.read_text(encoding="utf-8", errors="replace").strip()
+                        if out_path.exists() else "")
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
-                             and out_path.exists() and out_path.stat().st_size > 0)
+                             and bool(text) and text not in ("{}", "[]"))
             except (OSError, json.JSONDecodeError, ValueError):
                 succeeded = False
         if succeeded:
@@ -309,9 +311,8 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
             if it and it.get("status") == "claimed":
                 graph.sapper(root, ["release", intent])
         rid = info.get("rid")
-        tokens = info.get("tokens")
-        if tokens is None:
-            tokens = 4000
+        reserved = info.get("tokens") or 4000
+        tokens = usage.get(txn_id, reserved)
         if info.get("state") == "reason_reserve" and rid and not led.has_reserve(rid):
             if tokens > reserved * 1.05:
                 try:
@@ -321,8 +322,6 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                     pass
             journal.append("recovered_skipped", txn=txn_id, intent=intent, rid=rid)
             continue
-        tokens = usage.get(txn_id, tokens)
-        reserved = info.get("tokens") or 4000
         if info.get("state") == "reason_reserve" and tokens > reserved * 1.05:
             try:
                 (nd / "reason.freeze").write_text(
