@@ -201,6 +201,11 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             and duration >= max(0.0, (samples - 1) * interval * 0.8),
             "samples_density": interval <= 0
             or samples >= max(2.0, duration / interval * 0.8),
+            "samples_span": len(raw) < 2 or interval <= 0
+            or duration < interval * 2
+            or (isinstance(raw[-1].get("t"), (int, float))
+                and isinstance(raw[0].get("t"), (int, float))
+                and raw[-1]["t"] - raw[0]["t"] >= (len(raw) - 1) * interval * 0.5),
         }
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,
                 "commit": commit, "report": str(rep_path),

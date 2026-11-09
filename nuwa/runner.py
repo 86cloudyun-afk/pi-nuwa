@@ -185,6 +185,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         journal.append("reason_budget_rejected", round=round_no, remaining=remaining)
         return
     tokens_actual = 0
+    settle_status = "ok"
     try:
         r = graph.sapper(root, ["dispatch", "reason", "--dry-run"])
         if r.returncode != 0:
@@ -195,11 +196,12 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             tokens_actual = max(0, (len(r.stdout) + len(raw)) // 4)
             payload = dispatch_mod.parse_engine_stdout(raw)
         except (EngineError, dispatch_mod.DispatchError) as exc:
+            settle_status = "error"
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return
         _apply_reason(root, payload, round_no, journal)
     finally:
-        led.settle(rid, tokens_actual, status="ok")
+        led.settle(rid, tokens_actual, status=settle_status)
         journal.append("reason_budget_settled", round=round_no, rid=rid)
 
 

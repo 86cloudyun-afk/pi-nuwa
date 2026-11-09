@@ -163,9 +163,12 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                 journal.append("commit_done", txn=key, intent=intent_id,
                                fact=existing["id"], reused=True, project=project)
         except Exception:
-            if prev_source is None:
-                _unbind_source(root, existing["id"])
-            _restore_intent(root, intent_id, prev_intent)
+            with FileLock(nd / "txn.lock", blocking=True):
+                cur = graph.get_intent(root, intent_id) or {}
+                if not (cur.get("status") == "done" and cur.get("to") == existing["id"]):
+                    if prev_source is None:
+                        _unbind_source(root, existing["id"])
+                    _restore_intent(root, intent_id, prev_intent)
             raise
         return {"intent": intent_id, "fact": existing["id"], "reused": True, "key": key}
 

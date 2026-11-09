@@ -501,6 +501,13 @@
 - **M32**：复用分支失败回滚 fact.source_intent 与 intent 状态/to。
 - **M74**：repair 成功还需 stdout 非空。
 
+## 第五十九轮补充
+
+- **M32**：回滚在 txn.lock 内复查，B 已成功则不撤销。
+- **M31**：新增 `samples_span`，t 全 0 不再通过。
+- **M75**：reason 失败以 `status=error` 结算。
+- **M61**：归属反查保持“source 存在才比对”，避免旧图误杀；严格缺省检查留待 1.3。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
