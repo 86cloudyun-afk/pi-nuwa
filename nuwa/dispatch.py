@@ -191,7 +191,8 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
             journal.append("ack", txn=txn_id, intent=intent_id, status="rejected")
             raise DispatchError(f"intent 有未终态事务: {intent_id}")
         journal.append("reserve_pending", txn=txn_id, rid=rid, intent=intent_id,
-                       attempt_seq=attempt, tokens=tokens, project=project)
+                       attempt_seq=attempt, tokens=tokens, project=project,
+                       ts=time.time())
         journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
                        attempt_seq=attempt, key=key, tokens=tokens)
         # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。

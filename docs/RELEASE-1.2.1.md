@@ -723,6 +723,10 @@
 - **M21**：引擎缺失测试先完成 i001，清空 frontier 以触达 reason 分支。
 - **M102**：repair 跳过 `reserve_pending`（预留未提交）。
 
+## 第九十六轮补充
+
+- **M108**：`reserve_pending` 记录 ts；repair 仅在 60 秒内跳过，超时按孤儿恢复。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

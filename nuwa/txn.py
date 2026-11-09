@@ -247,6 +247,7 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 "txn": txn, "intent": info.get("intent"), "rid": info.get("rid"),
                 "tokens": info.get("tokens", 4000),
                 "state": info.get("state", "recovered"),
+                "ts": info.get("ts"),
             }
     for rec in records:
         txn_id = rec.get("txn")
@@ -263,6 +264,7 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 "tokens": rec_tokens if rec_tokens is not None
                 else prev.get("tokens", 4000),
                 "state": ev,
+                "ts": rec.get("ts") if rec.get("ts") is not None else prev.get("ts"),
             }
         elif ev in TXN_DONE:
             pending.pop(txn_id, None)
@@ -277,7 +279,12 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
     repaired = []
     for txn_id, info in pending.items():
         if info.get("state") == "reserve_pending":
-            continue
+            try:
+                age = time.time() - float(info.get("ts") or 0)
+            except (TypeError, ValueError, OverflowError):
+                age = 0.0
+            if age < 60:
+                continue
         intent = info.get("intent")
         try:
             for rec2 in journal.snapshot()[1]:
