@@ -18,7 +18,7 @@ if [[ "${1:-}" == "--rollback" ]]; then
   else AGENT_HOME="$HOME/.pi/agent"; fi
   BAK=""
   while IFS= read -r -d '' cand; do BAK="$cand"; break; done \
-    < <(find "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-loop.bak-*' -print0 | sort -zr)
+    < <(find -L "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-loop.bak-*' -print0 | sort -zr)
   [[ -n "$BAK" ]] || die "没有可回滚的备份" 3
   rm -rf "$AGENT_HOME/extensions/nuwa-loop"
   cp -R "$BAK" "$AGENT_HOME/extensions/nuwa-loop"
@@ -71,7 +71,7 @@ if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
   cp -R "$AGENT_HOME/extensions/nuwa-loop" "$BAK" || exit 1
   say "  已备份到 $(basename "$BAK")"
   # 只保留最近 5 份
-  find "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-loop.bak-*' -print0 \
+  find -L "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-loop.bak-*' -print0 \
     | sort -z -r | tail -z -n +6 | xargs -0 -r rm -rf --
 fi
 rm -rf "$AGENT_HOME/extensions/nuwa-loop"
