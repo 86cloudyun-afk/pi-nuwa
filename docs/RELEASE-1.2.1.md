@@ -514,6 +514,12 @@
 - **M31**：`samples_span` 要求 t 覆盖 duration 的 80%，并校验有限数/区间。
 - **M75**：引擎失败时按输入长度计入 tokens，status=error。
 
+## 第六十一轮补充
+
+- **M89**：`_apply_reason` 回滚先备份 goal 边；删边或原子写失败恢复已删边。
+- **M31**：新增 `samples_gap`，中间空窗 >3 interval 判失败。
+- **M21**：补 marker 复用分支测试（source_intent 绑定 + intent done）。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

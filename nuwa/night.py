@@ -201,6 +201,11 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             and duration >= max(0.0, (samples - 1) * interval * 0.8),
             "samples_density": interval <= 0 or duration < 60
             or samples >= max(2.0, duration / interval * 0.8),
+            "samples_gap": len(raw) < 2 or interval <= 0 or duration < 60
+            or all(isinstance(a.get("t"), (int, float))
+                   and isinstance(b.get("t"), (int, float))
+                   and b["t"] - a["t"] <= interval * 3
+                   for a, b in zip(raw, raw[1:])),
             "samples_span": len(raw) < 2 or interval <= 0
             or duration < 60
             or (all(isinstance(x.get("t"), (int, float))

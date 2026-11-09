@@ -87,20 +87,40 @@ def _revert(root: Path, why: str) -> str:
             # 等待锁期间可能已有新的有效完成，不能误删。
             return "noop"
         # 与真实 sapper 共用 .sapper/.lock：删边、写 active、hint 都在锁内。
+        edges = []
         for ipath in sorted((Path(root) / ".sapper" / "intents").glob("*.json")):
             it = graph._load(ipath) or {}
             if it.get("to") == "goal":
-                edge = ipath
                 try:
-                    edge.unlink()
-                except FileNotFoundError:
-                    pass
+                    edges.append((ipath, ipath.read_text(encoding="utf-8")))
                 except OSError:
                     return "failed"
+        removed = []
+        for ipath, body in edges:
+            try:
+                ipath.unlink()
+                removed.append((ipath, body))
+            except FileNotFoundError:
+                removed.append((ipath, body))
+            except OSError:
+                for p2, b2 in removed:
+                    try:
+                        p2.write_text(b2, encoding="utf-8")
+                    except OSError:
+                        pass
+                return "failed"
         data["status"] = "active"
         data.pop("completed_at", None)
         data.pop("completed_from", None)
-        graph._atomic_json(p, data)
+        try:
+            graph._atomic_json(p, data)
+        except Exception:
+            for p2, b2 in removed:
+                try:
+                    p2.write_text(b2, encoding="utf-8")
+                except OSError:
+                    pass
+            return "failed"
         hp = Path(root) / ".sapper" / "hints.json"
         hints = graph._load(hp) or []
         hints.append({"content": f"完成被拒绝：{why}", "creator": "nuwa",

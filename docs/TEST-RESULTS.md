@@ -14,14 +14,14 @@
 | `test_concurrency.py` | 5 | 5 pass | 单赢家/跨项目/锁清理 |
 | `test_e2e_deterministic.py` | 4 | 4 pass | 替身引擎 |
 | `test_r1_core.py` | 41 | 41 pass | journal 23 + 账本/事务 18 |
-| `test_r1_dispatch.py` | 2 | 2 pass | 预留/幂等 |
+| `test_r1_dispatch.py` | 3 | 3 pass | 预留/幂等 + marker 复用 |
 | `test_r1_run.py` | 3 | 3 pass | round 循环 + goal edge 回滚 + 合法完成保留 |
 | `test_r1_multi.py` | 1 | 1 pass | 四项目并发 |
 | `test_r2_r7.py` | 29 | 29 pass | 公平/证据/指标/策略/插件/夜跑 |
 | `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
 | `test_guard.py` | 18 | 18 pass | 执行层提交闸门（含 fleet、dry-run、fact 放行） |
 
-合计 **168 例 + 16 runs**。
+合计 **169 例 + 16 runs**。
 
 ## 二、门禁
 

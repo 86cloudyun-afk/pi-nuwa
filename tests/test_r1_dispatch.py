@@ -70,6 +70,20 @@ class DispatchTest(unittest.TestCase):
         self.assertIn("commit_done", journal)
         self.assertIn("ledger_settle", journal)
 
+    def test_reuse_marker_fact_binds_source(self):
+        intent_obj = json.loads(
+            (self.root / ".sapper" / "intents" / "i001.json").read_text())
+        key = txn.dispatch_key(self.root.name, "i001", txn.attempt_of(intent_obj))
+        self._run(["sapper", "fact", f"done [nuwa:{key}]", "-k", "host"])
+        r = dispatch.dispatch(self.root, "i001", engine="fake-claude")
+        self.assertTrue(r["reused"])
+        fact = json.loads(
+            (self.root / ".sapper" / "facts" / f"{r['fact']}.json").read_text())
+        self.assertEqual(fact.get("source_intent"), "i001")
+        intent = json.loads((self.root / ".sapper" / "intents" / "i001.json").read_text())
+        self.assertEqual(intent["status"], "done")
+        self.assertEqual(intent["to"], r["fact"])
+
     def test_budget_blocks(self):
         Ledger().set_cap(1000)
         with self.assertRaises(dispatch.DispatchError):
