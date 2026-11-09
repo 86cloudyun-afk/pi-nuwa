@@ -121,6 +121,7 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
             existing = graph.get_fact(root, done_to)
             reused = existing is not None
 
+        bound_fact = None
         if reused:
             fact_id = existing["id"]
             src = existing.get("source_intent")
@@ -128,6 +129,7 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
                 raise CommitError(f"fact 已绑定其他意图: {src} != {intent_id}")
             if not src:
                 _bind_source(root, fact_id, intent_id)
+                bound_fact = fact_id
             try:
                 graph.patch_intent(root, intent_id, fact_id, worker=worker)
             except Exception:
@@ -153,9 +155,13 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
             ok, msg = graph.validate(root)
         except Exception:
             _restore_intent(root, intent_id, before)
+            if bound_fact:
+                _unbind_source(root, bound_fact)
             raise
         if not ok:
             _restore_intent(root, intent_id, before)
+            if bound_fact:
+                _unbind_source(root, bound_fact)
             raise CommitError(f"validate 失败: {msg}")
         _crash("after_validate")
 

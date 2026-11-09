@@ -177,6 +177,7 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
         interval = _number(rep.get("interval", 0), "interval")
         exit_codes = rep.get("exit_codes") or {}
         errors = rep.get("errors") or {}
+        durations = rep.get("durations") or {}
         checks = {
             "mode": rep.get("mode") == "soak" and mode == "soak",
             "commit": bool(rep.get("commit")) and rep.get("commit") == commit
@@ -206,6 +207,10 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
                    and isinstance(b.get("t"), (int, float))
                    and b["t"] - a["t"] <= interval * 3
                    for a, b in zip(raw, raw[1:])),
+            "project_duration": isinstance(durations, dict)
+            and {str(p) for p in projects}.issubset(set(durations))
+            and all(_number(v, "duration") >= minutes * 60 * 0.5
+                    for v in durations.values()),
             "samples_head": len(raw) < 2 or duration < 60
             or (isinstance(raw[0].get("t"), (int, float))
                 and raw[0]["t"] <= duration * 0.05),
