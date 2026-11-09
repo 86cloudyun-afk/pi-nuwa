@@ -254,13 +254,15 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return
-        journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
-        if tokens_actual > need * 1.05:
+        overrun = tokens_actual > need * 1.05
+        if overrun:
             try:
                 (nd / "reason.freeze").write_text(
                     f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
             except OSError:
                 pass
+        journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
+        if overrun:
             journal.append("reason_overrun", round=round_no, rid=rid,
                            tokens=tokens_actual, reserved=need)
             raise RuntimeError("reason 超支，暂停派发")

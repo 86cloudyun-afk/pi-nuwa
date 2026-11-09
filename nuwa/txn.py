@@ -294,7 +294,9 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                         obj = json.loads(text)
                         inner = obj.get("result") if isinstance(obj, dict) else None
                         empty_obj = not bool(obj) or (
-                            isinstance(inner, (dict, list, str)) and not inner)
+                            isinstance(inner, (dict, list)) and not inner) or (
+                            isinstance(inner, str)
+                            and inner.strip() in ("", "{}", "[]"))
                     except (ValueError, TypeError):
                         empty_obj = True
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0

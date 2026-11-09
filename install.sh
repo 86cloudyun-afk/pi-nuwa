@@ -110,11 +110,13 @@ elif [[ -n "$_real_sapper" && "$_real_sapper" != "$_guard" ]]; then
 fi
 install -m 0755 "$REPO_DIR/bin/nuwa-soak-night.sh" "$SAPPER_HOME/bin/nuwa-soak-night"
 mkdir -p "$SAPPER_HOME/nuwa"
-if cp -R "$REPO_DIR/nuwa/." "$SAPPER_HOME/nuwa/"; then
-  if ! git -C "$REPO_DIR" rev-parse HEAD > "$SAPPER_HOME/COMMIT" 2>/dev/null; then
-    rm -f "$SAPPER_HOME/COMMIT"
-    exit 1
-  fi
+if ! cp -R "$REPO_DIR/nuwa/." "$SAPPER_HOME/nuwa/"; then
+  rm -f "$SAPPER_HOME/COMMIT"
+  exit 1
+fi
+if ! git -C "$REPO_DIR" rev-parse HEAD > "$SAPPER_HOME/COMMIT" 2>/dev/null; then
+  rm -f "$SAPPER_HOME/COMMIT"
+  exit 1
 fi
 
 # ---------------------------------------------------------------- 执行引擎（P0-0.6）

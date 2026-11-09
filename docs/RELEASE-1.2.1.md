@@ -632,6 +632,12 @@
 - **M74**：`{"result":"{}"}` 等嵌套空对象判失败。
 - **M101**：repair 成功分支前先检查 inflight 锁。
 
+## 第七十九轮补充
+
+- **M74**：嵌套 `result` 为 `{}`/`[]`/空串判失败。
+- **M96**：nuwa 复制失败删除 COMMIT 并 exit 1。
+- **M94**：超支先写 freeze，再写 usage。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
