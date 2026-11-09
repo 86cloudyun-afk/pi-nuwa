@@ -308,8 +308,10 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 valid = False
                 try:
                     from . import dispatch as dmod
-                    dmod.parse_engine_stdout(text)
-                    valid = True
+                    payload = dmod.parse_engine_stdout(text)
+                    valid = bool(payload) and bool(
+                        payload.get("description") or payload.get("facts")
+                        or payload.get("intents") or payload.get("complete"))
                 except Exception:  # noqa: BLE001
                     valid = False
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
@@ -344,16 +346,20 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 try:
                     (nd / "reason.freeze").write_text(
                         f"overrun {tokens}>{reserved}\n", encoding="utf-8")
-                except OSError:
-                    pass
+                except OSError as exc:
+                    journal.append("reason_freeze_failed", txn=txn_id, rid=rid,
+                                   error=str(exc)[:200])
+                    raise
             journal.append("recovered_skipped", txn=txn_id, intent=intent, rid=rid)
             continue
         if info.get("state") == "reason_reserve" and tokens > reserved * 1.05:
             try:
                 (nd / "reason.freeze").write_text(
                     f"overrun {tokens}>{reserved}\n", encoding="utf-8")
-            except OSError:
-                pass
+            except OSError as exc:
+                journal.append("reason_freeze_failed", txn=txn_id, rid=rid,
+                               error=str(exc)[:200])
+                raise
         if rid and led.has_reserve(rid):
             led.settle(rid, tokens, status="crashed")
             journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent,

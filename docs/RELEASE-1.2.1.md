@@ -650,6 +650,12 @@
 - **M46**：nuwa 入口安装失败 `exit 1`。
 - **M94**：冻结写入失败记录并抛错，不再静默继续。
 
+## 第八十二轮补充
+
+- **M75**：usage 与 freeze 在 finally 中双写，避免互相跳过。
+- **M74**：parse 后要求 payload 含 description/facts/intents/complete。
+- **M94**：repair 冻结失败直接中断，不再继续 ack。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
