@@ -200,8 +200,10 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
 def _reason(root: Path, model: str, round_no: int, journal: Journal,
             timeout: int = 240) -> None:
     try:
-        watermark = int((Path(root) / ".nuwa" / "round").read_text().strip())
+        wm_path = Path(root) / ".nuwa" / "round"
+        watermark = int(wm_path.read_text().strip())
         round_no = max(round_no, watermark)
+        wm_path.write_text(str(round_no + 1), encoding="utf-8")
     except (OSError, ValueError):
         pass
     freeze_failed = False
