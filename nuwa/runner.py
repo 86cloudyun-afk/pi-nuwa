@@ -268,8 +268,14 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                 try:
                     (nd / "reason.freeze").write_text(
                         f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
-                except OSError:
-                    pass
+                except OSError as fexc:
+                    freeze_failed = True
+                    try:
+                        journal.append("reason_freeze_failed", round=round_no, rid=rid,
+                                       error=str(fexc)[:200])
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise RuntimeError("reason 超支但冻结失败") from fexc
             journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return

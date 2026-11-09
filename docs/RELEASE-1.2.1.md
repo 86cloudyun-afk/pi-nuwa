@@ -673,6 +673,11 @@
 - **M74**：payload 有 data 时优先校验 data.description。
 - **M102**：repair 对 commit_prepare/done_apply 状态跳过，不提前 ack。
 
+## 第八十六轮补充
+
+- **M94**：引擎异常分支冻结失败也置标志并保留 pending。
+- **M46**：install.sh 启用 `set -euo pipefail`。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

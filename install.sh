@@ -2,7 +2,7 @@
 # pi-nuwa 安装器：把扩展、skill、入口脚本放到 agent 会加载的位置。
 #
 # 退出码：0 成功 / 1 依赖缺失 / 2 参数错误 / 3 回滚失败
-set -uo pipefail
+set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAPPER_HOME="${SAPPER_HOME:-$HOME/sapper-lab}"
@@ -127,7 +127,7 @@ if [[ ! -x "$ENGINE" ]]; then
 #!/usr/bin/env bash
 # omp-claude — 让 sapper 的 `claude` 调用面落到 omp 上。
 # sapper dispatch 会把 prompt 通过 stdin/参数传给该引擎；这里保持与原 claude CLI 兼容。
-set -uo pipefail
+set -euo pipefail
 exec omp --print --dangerously-skip-permissions "$@" 2>/dev/null || exec omp -p "$@"
 EOF
   chmod 0755 "$ENGINE"
