@@ -46,6 +46,18 @@ class RunTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r
 
+    def test_reason_engine_missing_does_not_crash(self):
+        old = os.environ.get("NUWA_ENGINE")
+        os.environ["NUWA_ENGINE"] = "/nonexistent/nuwa-engine"
+        try:
+            code = runner.run(self.root, minutes=1, parallel=1, model="fake")
+            self.assertIn(code, (0, 5))
+        finally:
+            if old is None:
+                os.environ.pop("NUWA_ENGINE", None)
+            else:
+                os.environ["NUWA_ENGINE"] = old
+
     def test_revert_removes_goal_edge(self):
         from nuwa import graph
         self._run(["sapper", "complete", "--from", "f001", "--note", "done"])

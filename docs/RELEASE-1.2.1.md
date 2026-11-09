@@ -712,6 +712,11 @@
 
 - **M75**：引擎启动 OSError 按输入计费并 settle error。
 
+## 第九十四轮补充
+
+- **M75**：`bin/nuwa` 默认 URL 循环在 reason.freeze 存在时跳过生成。
+- **M21**：新增引擎缺失不崩溃测试。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
