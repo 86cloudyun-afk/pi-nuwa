@@ -305,8 +305,15 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                                     empty_obj = True
                     except (ValueError, TypeError):
                         empty_obj = True
+                valid = False
+                try:
+                    from . import dispatch as dmod
+                    dmod.parse_engine_stdout(text)
+                    valid = True
+                except Exception:  # noqa: BLE001
+                    valid = False
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
-                             and bool(text) and not empty_obj)
+                             and bool(text) and not empty_obj and valid)
             except (OSError, json.JSONDecodeError, ValueError):
                 succeeded = False
         if succeeded:

@@ -249,8 +249,10 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                 try:
                     (nd / "reason.freeze").write_text(
                         f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
-                except OSError:
-                    pass
+                except OSError as exc:
+                    journal.append("reason_freeze_failed", round=round_no, rid=rid,
+                                   error=str(exc)[:200])
+                    raise RuntimeError("reason 超支但冻结失败") from exc
             raise
         except (EngineError, dispatch_mod.DispatchError) as exc:
             settle_status = "error"
@@ -271,8 +273,10 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             try:
                 (nd / "reason.freeze").write_text(
                     f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
-            except OSError:
-                pass
+            except OSError as exc:
+                journal.append("reason_freeze_failed", round=round_no, rid=rid,
+                               error=str(exc)[:200])
+                raise RuntimeError("reason 超支但冻结失败") from exc
         journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
         if overrun:
             journal.append("reason_overrun", round=round_no, rid=rid,

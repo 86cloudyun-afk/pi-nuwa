@@ -644,6 +644,12 @@
 - **M46**：guard/soak-night 安装失败 `exit 1`。
 - **M94**：中断与引擎异常分支也先写 freeze。
 
+## 第八十一轮补充
+
+- **M74**：repair 成功需通过 `parse_engine_stdout`，与正常派发一致。
+- **M46**：nuwa 入口安装失败 `exit 1`。
+- **M94**：冻结写入失败记录并抛错，不再静默继续。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

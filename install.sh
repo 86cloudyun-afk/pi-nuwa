@@ -86,7 +86,7 @@ ln -sfn "$AGENT_HOME/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest"
 
 # ---------------------------------------------------------------- 入口
 say "[4/6] 安装 nuwa 入口与 Python 包"
-install -m 0755 "$REPO_DIR/bin/nuwa" "$SAPPER_HOME/bin/nuwa"
+install -m 0755 "$REPO_DIR/bin/nuwa" "$SAPPER_HOME/bin/nuwa" || exit 1
 
 # 执行层提交闸门：真实 sapper 链到 sapper.real，sapper 指向 guard。
 TOKEN_FILE="$SAPPER_HOME/.submit_token"
