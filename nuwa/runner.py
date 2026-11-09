@@ -207,6 +207,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     tokens_actual = 0
     prompt_len = 0
     settle_status = "ok"
+    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=4000)
     try:
         r = graph.sapper(root, ["dispatch", "reason", "--dry-run"])
         prompt_len = len(r.stdout or "")

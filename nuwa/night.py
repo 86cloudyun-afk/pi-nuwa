@@ -206,6 +206,9 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
                    and isinstance(b.get("t"), (int, float))
                    and b["t"] - a["t"] <= interval * 3
                    for a, b in zip(raw, raw[1:])),
+            "samples_tail": len(raw) < 2 or duration < 60
+            or (isinstance(raw[-1].get("t"), (int, float))
+                and raw[-1]["t"] >= duration * 0.95),
             "samples_span": len(raw) < 2 or interval <= 0
             or duration < 60
             or (all(isinstance(x.get("t"), (int, float))

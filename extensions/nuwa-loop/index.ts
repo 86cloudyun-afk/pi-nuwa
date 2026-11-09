@@ -556,9 +556,9 @@ export function readGraph(root: string): Graph | null {
 		} else if ("source_intent" in goal && goal.source_intent !== null
 			&& typeof goal.source_intent !== "string") {
 			corrupt = true;
-		} else if (typeof goal.source_intent === "string"
-			&& !intentIds.has(goal.source_intent)) {
-			corrupt = true;
+		} else if (typeof goal.source_intent === "string") {
+			if (!intentIds.has(goal.source_intent)) corrupt = true;
+			else if (intentTo.get(goal.source_intent) !== "goal") corrupt = true;
 		}
 	} catch {
 		corrupt = true;

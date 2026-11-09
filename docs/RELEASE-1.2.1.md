@@ -520,6 +520,13 @@
 - **M31**：新增 `samples_gap`，中间空窗 >3 interval 判失败。
 - **M21**：补 marker 复用分支测试（source_intent 绑定 + intent done）。
 
+## 第六十二轮补充
+
+- **M32**：`txn.commit` 复用 marker fact 时绑定 source_intent 并检查冲突。
+- **M31**：新增 `samples_tail`，尾部 5% 缺样判失败。
+- **M61**：goal.source_intent 的 intent.to 必须为 goal。
+- **M75**：reason 预留写 `reason_reserve` 事件，repair 可回收。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

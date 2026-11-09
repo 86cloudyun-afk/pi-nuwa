@@ -31,6 +31,19 @@ def attempt_of(intent: dict) -> int:
     return value
 
 
+def _bind_source(root: str | Path, fact_id: str, intent_id: str) -> None:
+    if not graph._safe_id(fact_id):
+        raise CommitError(f"非法 fact id: {fact_id}")
+    fp = Path(root) / ".sapper" / "facts" / f"{fact_id}.json"
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("id") != fact_id:
+        raise CommitError(f"fact 身份不匹配: {fact_id}")
+    data["source_intent"] = intent_id
+    tmp = fp.with_name(fp.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, fp)
+
+
 def dispatch_key(project: str, intent: str, attempt_seq: int) -> str:
     raw = f"{project}|{intent}|{attempt_seq}".encode()
     return "sha256:" + hashlib.sha256(raw).hexdigest()
@@ -41,6 +54,7 @@ class CommitError(RuntimeError):
 
 
 TXN_PENDING = (
+    "reason_reserve",
     "reserve_pending", "reserve_committed", "executing_prepare", "executing",
     "executed", "commit_prepare", "done_apply", "ledger_settle",
 )
@@ -94,6 +108,11 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
 
         if reused:
             fact_id = existing["id"]
+            src = existing.get("source_intent")
+            if src not in (None, intent_id):
+                raise CommitError(f"fact 已绑定其他意图: {src} != {intent_id}")
+            if not src:
+                _bind_source(root, fact_id, intent_id)
             graph.patch_intent(root, intent_id, fact_id, worker=worker)
         else:
             desc = f"{fact_text} [nuwa:{key}]"
