@@ -112,7 +112,8 @@ install -m 0755 "$REPO_DIR/bin/nuwa-soak-night.sh" "$SAPPER_HOME/bin/nuwa-soak-n
 mkdir -p "$SAPPER_HOME/nuwa"
 if cp -R "$REPO_DIR/nuwa/." "$SAPPER_HOME/nuwa/"; then
   if ! git -C "$REPO_DIR" rev-parse HEAD > "$SAPPER_HOME/COMMIT" 2>/dev/null; then
-    rm -f "$SAPPER_HOME/COMMIT" || exit 1
+    rm -f "$SAPPER_HOME/COMMIT"
+    exit 1
   fi
 fi
 

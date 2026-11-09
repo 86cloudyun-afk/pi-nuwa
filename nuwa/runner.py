@@ -219,7 +219,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     try:
         journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
         ok, remaining = led.admit_reserve(rid, str(root), need)
-    except Exception:
+    except BaseException:
         try:
             rlock.__exit__(None, None, None)
         except Exception:  # noqa: BLE001

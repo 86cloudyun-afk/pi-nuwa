@@ -625,6 +625,13 @@
 - **M98**：初始化捕获 BaseException 释放锁。
 - **M74**：空 JSON 对象/数组不判成功。
 
+## 第七十八轮补充
+
+- **M100**：reason 预留阶段的 journal/ledger 异常按 BaseException 释放锁。
+- **M96**：COMMIT 写入失败删除旧标记并 exit 1。
+- **M74**：`{"result":"{}"}` 等嵌套空对象判失败。
+- **M101**：repair 成功分支前先检查 inflight 锁。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

@@ -277,6 +277,9 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
     repaired = []
     for txn_id, info in pending.items():
         intent = info.get("intent")
+        lock = nd / "inflight" / f"{intent}.lock"
+        if intent and is_locked(lock):
+            continue
         result_path = nd / "artifacts" / txn_id / "result.json"
         succeeded = False
         if result_path.exists():
@@ -288,7 +291,10 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 empty_obj = False
                 if text.startswith(("{", "[")):
                     try:
-                        empty_obj = not bool(json.loads(text))
+                        obj = json.loads(text)
+                        inner = obj.get("result") if isinstance(obj, dict) else None
+                        empty_obj = not bool(obj) or (
+                            isinstance(inner, (dict, list, str)) and not inner)
                     except (ValueError, TypeError):
                         empty_obj = True
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
@@ -308,9 +314,6 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                            rid=rid, artifact=str(result_path))
             journal.append("ack", txn=txn_id, intent=intent, status="ok")
             repaired.append(txn_id)
-            continue
-        lock = nd / "inflight" / f"{intent}.lock"
-        if intent and is_locked(lock):
             continue
         if intent:
             it = graph.get_intent(root, intent)
