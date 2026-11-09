@@ -148,6 +148,8 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
             if not fact:
                 raise CommitError("sapper done 成功但未找到带 key 的 fact")
             fact_id = fact["id"]
+            if (graph.get_fact(root, fact_id) or {}).get("source_intent") == intent_id:
+                bound_fact = fact_id
             graph.patch_intent(root, intent_id, fact_id, worker=worker)
 
         _crash("after_done")

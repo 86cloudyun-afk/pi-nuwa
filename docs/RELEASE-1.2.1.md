@@ -558,6 +558,11 @@
 - **M61**：marker 识别同时看 `x-nuwa-key` 与正文 `[nuwa:...]`。
 - **M75**：`EngineError` 携带部分输出，reason 失败按输入+部分输出计费。
 
+## 第六十八轮补充
+
+- **M32**：新建 fact 分支也记录绑定的 fact，validate 失败时回滚 source。
+- **M75**：reason 先 dry-run 取输入长度，按 `max(4000, input/4+2000)` 预留。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

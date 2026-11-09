@@ -200,12 +200,17 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
 def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
     led = Ledger()
     rid = f"r-reason-{time.time_ns()}"
-    ok, remaining = led.admit_reserve(rid, str(root), 4000)
+    render = graph.sapper(root, ["dispatch", "reason", "--dry-run"])
+    prompt_len = len(render.stdout or "")
+    if render.returncode != 0:
+        journal.append("reason_render_failed", round=round_no)
+        return
+    need = max(4000, prompt_len // 4 + 2000)
+    ok, remaining = led.admit_reserve(rid, str(root), need)
     if not ok:
         journal.append("reason_budget_rejected", round=round_no, remaining=remaining)
         return
     tokens_actual = 0
-    prompt_len = 0
     settle_status = "ok"
     nd = ensure_nuwa(root)
     rlock = FileLock(nd / "inflight" / "reason.lock", blocking=False)
@@ -215,17 +220,12 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         led.settle(rid, 0, status="blocked")
         journal.append("reason_busy", round=round_no, rid=rid)
         return
-    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=4000)
+    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
     try:
-        r = graph.sapper(root, ["dispatch", "reason", "--dry-run"])
-        prompt_len = len(r.stdout or "")
-        if r.returncode != 0:
-            journal.append("reason_render_failed", round=round_no)
-            return
         try:
-            raw = call(r.stdout, model=model, timeout=240,
+            raw = call(render.stdout, model=model, timeout=240,
                        pass_fds=(rlock.fd,))
-            tokens_actual = max(0, (len(r.stdout) + len(raw)) // 4)
+            tokens_actual = max(0, (prompt_len + len(raw)) // 4)
             payload = dispatch_mod.parse_engine_stdout(raw)
         except (EngineError, dispatch_mod.DispatchError) as exc:
             settle_status = "error"
