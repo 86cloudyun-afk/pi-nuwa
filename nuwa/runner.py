@@ -242,6 +242,10 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                        pass_fds=(rlock.fd,))
             tokens_actual = max(0, (prompt_len + len(raw)) // 4)
             payload = dispatch_mod.parse_engine_stdout(raw)
+        except KeyboardInterrupt:
+            settle_status = "error"
+            tokens_actual = max(tokens_actual, prompt_len // 4)
+            raise
         except (EngineError, dispatch_mod.DispatchError) as exc:
             settle_status = "error"
             partial = getattr(exc, "partial", "") or ""
@@ -290,27 +294,34 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
     except LockTimeout:
         return 5
 
-    journal = Journal(root)
-    journal.append("run_start", project=root.name, resume=resume,
-                   minutes=minutes, parallel=parallel)
-    txn.adopt(root)
-    txn.repair(root)
-    prev = {}
-    if resume:
+    try:
+        journal = Journal(root)
+        journal.append("run_start", project=root.name, resume=resume,
+                       minutes=minutes, parallel=parallel)
+        txn.adopt(root)
+        txn.repair(root)
+        prev = {}
+        if resume:
+            try:
+                prev = json.loads((nd / "run.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                prev = {}
+        _write_run(root, status="running", pid=os.getpid(),
+                   round=int(prev.get("round", 0)), turns=int(prev.get("turns", 0)),
+                   deadline=time.time() + minutes * 60)
+        deadline = time.time() + minutes * 60
+        max_rounds = int(os.environ.get("NUWA_MAX_ROUNDS", "0"))
+        round_no = int(prev.get("round", 0))
+        turns = int(prev.get("turns", 0))
+        stall = 0
+        last_sig = ""
+        exit_code = 0
+    except Exception:
         try:
-            prev = json.loads((nd / "run.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            prev = {}
-    _write_run(root, status="running", pid=os.getpid(),
-               round=int(prev.get("round", 0)), turns=int(prev.get("turns", 0)),
-               deadline=time.time() + minutes * 60)
-    deadline = time.time() + minutes * 60
-    max_rounds = int(os.environ.get("NUWA_MAX_ROUNDS", "0"))
-    round_no = int(prev.get("round", 0))
-    turns = int(prev.get("turns", 0))
-    stall = 0
-    last_sig = ""
-    exit_code = 0
+            lock.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
     try:
         while time.time() < deadline:
             round_no += 1

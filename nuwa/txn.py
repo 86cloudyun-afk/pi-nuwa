@@ -313,6 +313,12 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
         if tokens is None:
             tokens = 4000
         if info.get("state") == "reason_reserve" and rid and not led.has_reserve(rid):
+            if tokens > reserved * 1.05:
+                try:
+                    (nd / "reason.freeze").write_text(
+                        f"overrun {tokens}>{reserved}\n", encoding="utf-8")
+                except OSError:
+                    pass
             journal.append("recovered_skipped", txn=txn_id, intent=intent, rid=rid)
             continue
         tokens = usage.get(txn_id, tokens)

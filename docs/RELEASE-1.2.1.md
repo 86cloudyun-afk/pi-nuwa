@@ -604,6 +604,13 @@
 - **M96**：`_commit` 优先读安装 `COMMIT`；install.sh 写入。
 - **M94**：repair 发现 usage 超预留时补写 freeze。
 
+## 第七十五轮补充
+
+- **M98**：run 初始化异常释放 run.lock。
+- **M75**：KeyboardInterrupt 也按输入计费并 settle error。
+- **M94**：repair 无预留但 usage 超支时补 freeze。
+- **M96**：install.sh 仅在 nuwa 复制成功后写 COMMIT。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
