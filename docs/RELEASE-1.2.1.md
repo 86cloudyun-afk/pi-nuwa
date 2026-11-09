@@ -754,6 +754,12 @@
 - **M111**：guard 信任链增加祖父进程检查，覆盖 `python3 -c` 调 runner 的路径。
 - **M112**：`bin/nuwa` 从 run.json 恢复 round，重启后不复用首轮键。
 
+## 第一百零三轮补充
+
+- **M112**：URL 循环把 round 写入 `.nuwa/round`，重启不重复首轮。
+- **M113**：`_reason` 用 deadline 计算剩余 timeout。
+- **M75/M94**：URL 启动先 `txn.repair` 再进入循环。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

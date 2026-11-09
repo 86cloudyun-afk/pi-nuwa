@@ -510,13 +510,16 @@ fl = sum(1 for f in facts if f.get("kind") == "flag")
 print("%s|%s|%s|%s|%s|%s" % (p.get("status"), o, c, d, ef, fl))'
 }
 
-round="$(python3 -c 'import json,sys; from pathlib import Path; p=Path(sys.argv[1])/".nuwa"/"run.json"; print(int(json.loads(p.read_text()).get("round",0)))' "$dir" 2>/dev/null || echo 0)"
+mkdir -p "$dir/.nuwa"
+PYTHONPATH="$_PKG_DIR" python3 -c 'import sys; from pathlib import Path; from nuwa import txn; txn.repair(Path(sys.argv[1]))' "$dir" 2>/dev/null || true
+round="$(cat "$dir/.nuwa/round" 2>/dev/null || python3 -c 'import json,sys; from pathlib import Path; p=Path(sys.argv[1])/".nuwa"/"run.json"; print(int(json.loads(p.read_text()).get("round",0)))' "$dir" 2>/dev/null || echo 0)"
 failed=0
 last_sig=""
 stall=0
 deadline=$(( $(date +%s) + minutes * 60 ))
 while :; do
   round=$((round + 1))
+  printf '%s\n' "$round" > "$dir/.nuwa/round"
   remaining=$(( deadline - $(date +%s) ))
   if (( remaining <= 0 )); then
     completion_ok && event project_completed "round=$round" "why=budget"

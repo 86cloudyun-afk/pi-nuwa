@@ -219,6 +219,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal,
         journal.append("reason_busy", round=round_no, rid=rid)
         return
     try:
+        deadline = time.time() + timeout
         journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
         ok, remaining = led.admit_reserve(rid, str(root), need)
     except BaseException:
@@ -240,7 +241,8 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal,
     settle_status = "ok"
     try:
         try:
-            raw = call(render.stdout, model=model, timeout=timeout,
+            remaining = max(1, int(deadline - time.time()))
+            raw = call(render.stdout, model=model, timeout=remaining,
                        pass_fds=(rlock.fd,))
             tokens_actual = max(0, (prompt_len + len(raw)) // 4)
             payload = dispatch_mod.parse_engine_stdout(raw)
