@@ -460,6 +460,7 @@ export function readGraph(root: string): Graph | null {
 	const sourceByFact = new Map<string, string>();
 	const goalSourceIds: string[] = [];
 	const toCount = new Map<string, number>();
+	const markerFacts = new Set<string>();
 	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
@@ -544,6 +545,7 @@ export function readGraph(root: string): Graph | null {
 				else if (intentTo.get(fact.source_intent) !== fact.id) corrupt = true;
 				if (fact.id) sourceByFact.set(fact.id, fact.source_intent);
 			}
+			if (typeof fact["x-nuwa-key"] === "string" && fact.id) markerFacts.add(fact.id);
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
 			kinds[f.replace(/\.json$/, "")] = fact.kind ?? "";
@@ -584,7 +586,9 @@ export function readGraph(root: string): Graph | null {
 		if (to === "goal") continue;
 		const src = sourceByFact.get(to);
 		if (src !== undefined && src !== iid) corrupt = true;
-		if (src === undefined && (toCount.get(to) ?? 0) > 1) corrupt = true;
+		if (src === undefined && ((toCount.get(to) ?? 0) > 1 || markerFacts.has(to))) {
+			corrupt = true;
+		}
 	}
 	const isStrong = (kind?: string): boolean =>
 		kind === "flag" || kind === "vuln" || kind === "loot";

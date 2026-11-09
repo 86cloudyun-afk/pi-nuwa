@@ -547,6 +547,11 @@
 - **M31**：逐项目时长阈值 0.8×minutes。
 - **M61**：缺省 source 的多 intent 指向同一 fact 判冲突；goal 无 source 且多完成边判冲突。
 
+## 第六十六轮补充
+
+- **M32**：`_restore_intent` 保留 `to:null`，清理本次新增的 done_at/worker；dispatch 与 txn 两处一致。
+- **M61**：新图 marker fact 的 done.to 必须有 source_intent；缺省且多指向仍判冲突。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

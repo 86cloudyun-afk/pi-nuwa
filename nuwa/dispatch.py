@@ -96,10 +96,13 @@ def _restore_intent(root: str | Path, intent_id: str, prev: dict) -> None:
     if not isinstance(data, dict):
         return
     data["status"] = prev.get("status")
-    if prev.get("to") is None:
-        data.pop("to", None)
-    else:
+    if "to" in prev:
         data["to"] = prev["to"]
+    else:
+        data.pop("to", None)
+    for k in ("done_at", "worker"):
+        if k not in prev:
+            data.pop(k, None)
     _write_json(fp, data)
 
 

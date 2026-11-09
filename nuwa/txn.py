@@ -172,8 +172,18 @@ def commit(root: str | Path, intent_id: str, fact_text: str, key: str | None,
 
 def _restore_intent(root: Path, intent_id: str, data: dict) -> None:
     p = root / ".sapper" / "intents" / f"{intent_id}.json"
+    restored = dict(data)
+    cur = None
+    try:
+        cur = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    if isinstance(cur, dict):
+        for k in ("done_at", "worker"):
+            if k not in restored and k in cur:
+                restored.pop(k, None)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(restored, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, p)
 
 
