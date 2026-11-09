@@ -694,6 +694,11 @@
 - **M94**：repair 每个事务前重读 journal 的 `reason_usage`。
 - **M104**：备份清理用 `find -print0`/`sort -z`，含换行路径不拆分。
 
+## 第九十轮补充
+
+- **M106**：回滚备份用 `find -print0` 读取，含换行路径不截断。
+- **M105**：真实 sapper PATH 切换需完整闸门配置，保持 1.3 验收项。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

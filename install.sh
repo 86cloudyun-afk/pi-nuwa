@@ -16,7 +16,9 @@ if [[ "${1:-}" == "--rollback" ]]; then
   if [[ -n "${PI_AGENT_HOME:-}" ]]; then AGENT_HOME="$PI_AGENT_HOME"
   elif [[ -d "$HOME/.omp/agent" ]]; then AGENT_HOME="$HOME/.omp/agent"
   else AGENT_HOME="$HOME/.pi/agent"; fi
-  BAK="$(ls -dt "$AGENT_HOME"/extensions/nuwa-loop.bak-* 2>/dev/null | head -1)"
+  BAK=""
+  while IFS= read -r -d '' cand; do BAK="$cand"; break; done \
+    < <(find "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-loop.bak-*' -print0 | sort -zr)
   [[ -n "$BAK" ]] || die "没有可回滚的备份" 3
   rm -rf "$AGENT_HOME/extensions/nuwa-loop"
   cp -R "$BAK" "$AGENT_HOME/extensions/nuwa-loop"
