@@ -459,6 +459,7 @@ export function readGraph(root: string): Graph | null {
 	const intentTo = new Map<string, string>();
 	const sourceByFact = new Map<string, string>();
 	const goalSourceIds: string[] = [];
+	const toCount = new Map<string, number>();
 	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
@@ -475,7 +476,10 @@ export function readGraph(root: string): Graph | null {
 			if (!it.id || it.id !== f.replace(/\.json$/, "")
 				|| !it.description || !it.created_at) corrupt = true;
 			if (it.id) intentIds.add(it.id);
-			if (it.id && typeof it.to === "string") intentTo.set(it.id, it.to);
+			if (it.id && typeof it.to === "string") {
+				intentTo.set(it.id, it.to);
+				if (it.to !== "goal") toCount.set(it.to, (toCount.get(it.to) ?? 0) + 1);
+			}
 			if (!Array.isArray(it.from) || it.from.length === 0) corrupt = true;
 			if (it.status === "done" || it.status === "complete") {
 				if (typeof it.to !== "string" || !it.to) corrupt = true;
@@ -562,6 +566,8 @@ export function readGraph(root: string): Graph | null {
 			if (!intentIds.has(goal.source_intent)) corrupt = true;
 			else if (intentTo.get(goal.source_intent) !== "goal") corrupt = true;
 			else if (goalSourceIds.length > 1) corrupt = true;
+		} else if (goalSourceIds.length > 1) {
+			corrupt = true;
 		}
 	} catch {
 		corrupt = true;
@@ -578,6 +584,7 @@ export function readGraph(root: string): Graph | null {
 		if (to === "goal") continue;
 		const src = sourceByFact.get(to);
 		if (src !== undefined && src !== iid) corrupt = true;
+		if (src === undefined && (toCount.get(to) ?? 0) > 1) corrupt = true;
 	}
 	const isStrong = (kind?: string): boolean =>
 		kind === "flag" || kind === "vuln" || kind === "loot";

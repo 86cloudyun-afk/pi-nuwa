@@ -53,7 +53,7 @@ def _unbind_source(root: str | Path, fact_id: str) -> None:
     except (OSError, json.JSONDecodeError):
         return
     if isinstance(data, dict) and data.get("id") == fact_id:
-        data.pop("source_intent", None)
+        data["source_intent"] = None
         tmp = fp.with_name(fp.name + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, fp)

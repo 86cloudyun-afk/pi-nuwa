@@ -209,7 +209,7 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
                    for a, b in zip(raw, raw[1:])),
             "project_duration": isinstance(durations, dict)
             and {str(p) for p in projects}.issubset(set(durations))
-            and all(_number(v, "duration") >= minutes * 60 * 0.5
+            and all(_number(v, "duration") >= minutes * 60 * 0.8
                     for v in durations.values()),
             "samples_head": len(raw) < 2 or duration < 60
             or (isinstance(raw[0].get("t"), (int, float))

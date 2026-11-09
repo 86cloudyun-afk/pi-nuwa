@@ -81,7 +81,7 @@ def _unbind_source(root: str | Path, fact_id: str) -> None:
     except (OSError, json.JSONDecodeError):
         return
     if isinstance(data, dict) and data.get("id") == fact_id:
-        data.pop("source_intent", None)
+        data["source_intent"] = None
         _write_json(fp, data)
 
 

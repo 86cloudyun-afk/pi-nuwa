@@ -540,6 +540,13 @@
 - **M32**：validate 失败时删除本次绑定的 source_intent。
 - **M31**：soak 记录逐项目时长，verify 要求 >= 0.5×minutes。
 
+## 第六十五轮补充
+
+- **M91**：`reason_reserve` 纳入 PENDING_EVENTS、恢复摘要与代际保护。
+- **M32**：source 回滚写 `null`，保留必填键。
+- **M31**：逐项目时长阈值 0.8×minutes。
+- **M61**：缺省 source 的多 intent 指向同一 fact 判冲突；goal 无 source 且多完成边判冲突。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

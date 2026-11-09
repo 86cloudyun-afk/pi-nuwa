@@ -21,6 +21,7 @@ from pathlib import Path
 from .locks import FileLock, LockTimeout  # noqa: F401  (LockTimeout 供调用方复用)
 
 PENDING_EVENTS = (
+    "reason_reserve",
     "reserve_pending",
     "reserve_committed",
     "executing_prepare",
@@ -308,7 +309,12 @@ class Journal:
                     state["last_seq"] = max(int(state["last_seq"]), seq)
                 ev = rec.get("event")
                 txn = rec.get("txn")
-                if ev == "executing_prepare":
+                if ev == "reason_reserve":
+                    state["inflight"].setdefault(txn, {
+                        "intent": "reason", "state": "reason",
+                        "rid": rec.get("rid"), "tokens": rec.get("tokens"),
+                    })
+                elif ev == "executing_prepare":
                     state["inflight"][txn] = {
                         "intent": rec.get("intent"), "state": "prepare",
                         "rid": rec.get("rid"), "tokens": rec.get("tokens"),
@@ -446,7 +452,9 @@ def replay_state(root: str | Path) -> dict:
         if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
             state["last_seq"] = max(int(state["last_seq"]), seq)
         txn = rec.get("txn")
-        if ev == "executing_prepare":
+        if ev == "reason_reserve":
+            state["inflight"].setdefault(txn, {"intent": "reason", "state": "reason"})
+        elif ev == "executing_prepare":
             state["inflight"][txn] = {"intent": rec.get("intent"), "state": "prepare"}
         elif ev == "executing":
             state["inflight"].setdefault(txn, {})["state"] = "executing"
