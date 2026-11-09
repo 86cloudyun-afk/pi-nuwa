@@ -688,6 +688,12 @@
 
 - **M102**：worker 写 `parent_pid`，repair 仅在父进程存活时跳过，父崩溃后正常恢复。
 
+## 第八十九轮补充
+
+- **M102**：`parent_pid > 1` 才判活，父被 init 收养后正常恢复。
+- **M94**：repair 每个事务前重读 journal 的 `reason_usage`。
+- **M104**：备份清理用 `find -print0`/`sort -z`，含换行路径不拆分。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

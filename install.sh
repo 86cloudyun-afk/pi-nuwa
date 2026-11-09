@@ -69,8 +69,8 @@ if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
   cp -R "$AGENT_HOME/extensions/nuwa-loop" "$BAK" || exit 1
   say "  已备份到 $(basename "$BAK")"
   # 只保留最近 5 份
-  ls -dt "$AGENT_HOME"/extensions/nuwa-loop.bak-* 2>/dev/null | tail -n +6 \
-    | while IFS= read -r old_bak; do rm -rf -- "$old_bak"; done
+  find "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-loop.bak-*' -print0 \
+    | sort -z -r | tail -z -n +6 | xargs -0 -r rm -rf --
 fi
 rm -rf "$AGENT_HOME/extensions/nuwa-loop"
 cp -R "$REPO_DIR/extensions/nuwa-loop" "$AGENT_HOME/extensions/nuwa-loop" || exit 1

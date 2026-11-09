@@ -277,6 +277,12 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
     repaired = []
     for txn_id, info in pending.items():
         intent = info.get("intent")
+        try:
+            for rec2 in journal.snapshot()[1]:
+                if rec2.get("event") == "reason_usage" and rec2.get("txn") == txn_id:
+                    usage[txn_id] = int(rec2.get("tokens", 0))
+        except Exception:  # noqa: BLE001
+            pass
         lock = nd / "inflight" / f"{intent}.lock"
         if intent and is_locked(lock):
             continue
@@ -327,7 +333,7 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
         if succeeded:
             ppid = res.get("parent_pid")
             alive = False
-            if isinstance(ppid, int) and not isinstance(ppid, bool) and ppid > 0:
+            if isinstance(ppid, int) and not isinstance(ppid, bool) and ppid > 1:
                 try:
                     os.kill(ppid, 0)
                     alive = True
