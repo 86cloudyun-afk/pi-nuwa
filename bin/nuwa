@@ -197,7 +197,13 @@ if [[ -f "$dir/.nuwa/run.lock" ]] && ! flock -n "$dir/.nuwa/run.lock" true 2>/de
 fi
 # 所有外部子进程都不继承锁 fd，SIGKILL 后不会残留 .nuwa.lock。
 sapper() { command sapper "$@" 9>&-; }
-python3() { command python3 "$@" 9>&9; }
+python3() {
+  if { true >&9; } 2>/dev/null; then
+    command python3 "$@" 9>&9
+  else
+    command python3 "$@" 9>&-
+  fi
+}
 # 退出时只清自己持有的锁，避免误删别人的
 cleanup_lock() {
   [[ -f "$LOCK_FILE" ]] || return 0

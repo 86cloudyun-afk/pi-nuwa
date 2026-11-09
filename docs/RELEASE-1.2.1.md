@@ -829,6 +829,11 @@
 
 - **M114**：shell 启动检查 `.nuwa/run.lock`；Python run 检查 `.nuwa.lock`（父进程为 bin/nuwa 时豁免），双入口互斥。
 
+## 第一百一十九轮补充
+
+- **M114**：取消 fd9/cmdline 豁免；Python run 直接检查 `.nuwa.lock`。
+- **M115**：python3 包装器仅在 fd9 有效时继承，否则显式关闭。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
