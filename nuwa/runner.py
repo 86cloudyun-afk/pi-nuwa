@@ -407,7 +407,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                     journal.append("budget_exhausted", round=round_no)
                     break
                 _reason(root, model, round_no, journal,
-                        timeout=min(240, remaining))
+                        timeout=min(240, max(30, remaining)))
                 ids = _ids(root)
             if not ids:
                 status = _project_status(root)
@@ -432,7 +432,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                 if rem <= 0:
                     raise RuntimeError("deadline exhausted")
                 return dispatch_mod.dispatch(root, intent_id, model=model,
-                                             timeout=min(300, rem))
+                                             timeout=min(300, max(30, rem)))
 
             with ThreadPoolExecutor(max_workers=parallel) as ex:
                 futs = [ex.submit(_dispatch_one, i) for i in batch]
