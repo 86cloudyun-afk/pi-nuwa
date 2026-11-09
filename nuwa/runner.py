@@ -361,16 +361,17 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
     root = Path(root).resolve()
     nd = ensure_nuwa(root)
     try:
+        lock = FileLock(nd / "run.lock", blocking=False)
+        lock.__enter__()
+    except LockTimeout:
+        return 5
+    try:
         ppid_cmd = Path(f"/proc/{os.getppid()}/cmdline").read_bytes().replace(
             b"\0", b" ").decode("utf-8", "replace")
     except OSError:
         ppid_cmd = ""
-    if "bin/nuwa" not in ppid_cmd and is_locked(nd / ".nuwa.lock"):
-        return 5
-    try:
-        lock = FileLock(nd / "run.lock", blocking=False)
-        lock.__enter__()
-    except LockTimeout:
+    if "bin/nuwa" not in ppid_cmd and is_locked(root / ".nuwa.lock"):
+        lock.__exit__(None, None, None)
         return 5
 
     try:

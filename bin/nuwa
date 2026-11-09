@@ -191,6 +191,10 @@ if ! flock -n 9; then
   fi
 fi
 printf '%s\n' "$$" >"$LOCK_FILE"
+if [[ -f "$dir/.nuwa/run.lock" ]] && ! flock -n "$dir/.nuwa/run.lock" true 2>/dev/null; then
+  exec 9>&-
+  die "项目已被 Python run 持有: $dir" 5
+fi
 # 所有外部子进程都不继承锁 fd，SIGKILL 后不会残留 .nuwa.lock。
 sapper() { command sapper "$@" 9>&-; }
 python3() { command python3 "$@" 9>&-; }
