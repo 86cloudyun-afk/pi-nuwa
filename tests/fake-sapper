@@ -227,7 +227,7 @@ class Store:
             "data": kw.get("data") or {},
             "doc": kw.get("doc") or "",
             "creator": kw.get("creator") or "user",
-            "from_intent": kw.get("from_intent"),
+            "source_intent": kw.get("from_intent"),
             "created_at": now_iso(),
         }
         self.save_fact(fact)

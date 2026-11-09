@@ -563,6 +563,12 @@
 - **M32**：新建 fact 分支也记录绑定的 fact，validate 失败时回滚 source。
 - **M75**：reason 先 dry-run 取输入长度，按 `max(4000, input/4+2000)` 预留。
 
+## 第六十九轮补充
+
+- **M75**：结算上限 clamp 到预留额度。
+- **M31**：soak 记录逐项目 facts 增量，verify 要求每项目 >=1。
+- **M21**：fake-sapper fact 写 `source_intent`，覆盖新建提交绑定分支。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

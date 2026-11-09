@@ -236,7 +236,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             return
         _apply_reason(root, payload, round_no, journal)
     finally:
-        led.settle(rid, tokens_actual, status=settle_status)
+        led.settle(rid, min(tokens_actual, need), status=settle_status)
         journal.append("ack", txn=rid, intent="reason", status=settle_status)
         journal.append("reason_budget_settled", round=round_no, rid=rid)
         try:

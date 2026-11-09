@@ -33,9 +33,11 @@ def soak(projects: list[str | Path], minutes: float = 1, interval: float = 5,
     results: dict[str, int] = {}
     errors: dict[str, str] = {}
     durations: dict[str, float] = {}
+    progress: dict[str, int] = {}
 
     def work(root: Path) -> None:
         t0 = time.time()
+        base_facts = len(graph.facts(root))
         try:
             results[str(root)] = runner.run(root, minutes=minutes,
                                             parallel=parallel, model=model)
@@ -43,6 +45,7 @@ def soak(projects: list[str | Path], minutes: float = 1, interval: float = 5,
             errors[str(root)] = str(exc)[:200]
         finally:
             durations[str(root)] = time.time() - t0
+            progress[str(root)] = len(graph.facts(root)) - base_facts
 
     threads = [threading.Thread(target=work, args=(Path(p),)) for p in projects]
     t0 = time.time()
@@ -85,6 +88,7 @@ def soak(projects: list[str | Path], minutes: float = 1, interval: float = 5,
         "facts_baseline": baseline,
         "journal_base": journal_base,
         "durations": durations,
+        "progress": progress,
         "exit_codes": results,
         "errors": errors,
         "facts": total_facts,
