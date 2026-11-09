@@ -703,6 +703,11 @@
 
 - **M107**：备份查找使用 `find -L`，跟随 extensions 目录符号链接。
 
+## 第九十二轮补充
+
+- **M94**：repair 在结算前二次重读 journal usage。
+- **M102**：ready 窗口检查因破坏 after_reserve 恢复测试回退，保留 1.3 状态机项。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

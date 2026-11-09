@@ -365,6 +365,12 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
         reserved = info.get("tokens")
         if reserved is None:
             reserved = 4000
+        try:
+            for rec3 in journal.snapshot()[1]:
+                if rec3.get("event") == "reason_usage" and rec3.get("txn") == txn_id:
+                    usage[txn_id] = int(rec3.get("tokens", 0))
+        except Exception:  # noqa: BLE001
+            pass
         tokens = usage.get(txn_id, reserved)
         if info.get("state") == "reason_reserve" and rid and not led.has_reserve(rid):
             if tokens > reserved * 1.05:
