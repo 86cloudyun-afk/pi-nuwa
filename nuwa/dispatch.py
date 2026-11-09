@@ -101,7 +101,9 @@ def _restore_intent(root: str | Path, intent_id: str, prev: dict) -> None:
     else:
         data.pop("to", None)
     for k in ("done_at", "worker"):
-        if k not in prev:
+        if k in prev:
+            data[k] = prev[k]
+        else:
             data.pop(k, None)
     _write_json(fp, data)
 

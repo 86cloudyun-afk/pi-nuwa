@@ -229,7 +229,9 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             payload = dispatch_mod.parse_engine_stdout(raw)
         except (EngineError, dispatch_mod.DispatchError) as exc:
             settle_status = "error"
-            tokens_actual = max(tokens_actual, prompt_len // 4)
+            partial = getattr(exc, "partial", "") or ""
+            tokens_actual = max(tokens_actual,
+                                (prompt_len + len(partial)) // 4)
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return
         _apply_reason(root, payload, round_no, journal)

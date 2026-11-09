@@ -180,8 +180,9 @@ def _restore_intent(root: Path, intent_id: str, data: dict) -> None:
         pass
     if isinstance(cur, dict):
         for k in ("done_at", "worker"):
-            if k not in restored and k in cur:
-                restored.pop(k, None)
+            if k in restored:
+                continue
+            restored.pop(k, None)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(restored, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, p)

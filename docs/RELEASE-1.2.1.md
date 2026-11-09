@@ -552,6 +552,12 @@
 - **M32**：`_restore_intent` 保留 `to:null`，清理本次新增的 done_at/worker；dispatch 与 txn 两处一致。
 - **M61**：新图 marker fact 的 done.to 必须有 source_intent；缺省且多指向仍判冲突。
 
+## 第六十七轮补充
+
+- **M32**：回滚恢复 worker 原值（含 null），不再统一改回 nuwa。
+- **M61**：marker 识别同时看 `x-nuwa-key` 与正文 `[nuwa:...]`。
+- **M75**：`EngineError` 携带部分输出，reason 失败按输入+部分输出计费。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

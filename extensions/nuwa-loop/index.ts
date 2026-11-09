@@ -530,7 +530,8 @@ export function readGraph(root: string): Graph | null {
 			} catch {
 				corrupt = true;
 			}
-			const fact = readJson<{ id?: string; kind?: string; source_intent?: string }>(
+			const fact = readJson<{ id?: string; kind?: string; source_intent?: string;
+				description?: string; "x-nuwa-key"?: string }>(
 				join(root, ".sapper", "facts", f));
 			if (!fact) {
 				corrupt = true;
@@ -545,7 +546,8 @@ export function readGraph(root: string): Graph | null {
 				else if (intentTo.get(fact.source_intent) !== fact.id) corrupt = true;
 				if (fact.id) sourceByFact.set(fact.id, fact.source_intent);
 			}
-			if (typeof fact["x-nuwa-key"] === "string" && fact.id) markerFacts.add(fact.id);
+			if (fact.id && (typeof fact["x-nuwa-key"] === "string"
+				|| /\[nuwa:[^\]]+\]/.test(fact.description ?? ""))) markerFacts.add(fact.id);
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
 			kinds[f.replace(/\.json$/, "")] = fact.kind ?? "";
