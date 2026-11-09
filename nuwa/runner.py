@@ -402,7 +402,9 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
             round_no += 1
             ids = _ids(root)
             if not ids:
-                _reason(root, model, round_no, journal)
+                remaining = max(1, int(deadline - time.time()))
+                _reason(root, model, round_no, journal,
+                        timeout=min(240, remaining))
                 ids = _ids(root)
             if not ids:
                 status = _project_status(root)
@@ -421,8 +423,10 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                 journal.append("frontier_empty", round=round_no)
                 break
             batch = ids[: max(1, parallel * 2)]
+            remaining = max(1, int(deadline - time.time()))
             with ThreadPoolExecutor(max_workers=parallel) as ex:
-                futs = [ex.submit(dispatch_mod.dispatch, root, i, model=model) for i in batch]
+                futs = [ex.submit(dispatch_mod.dispatch, root, i, model=model,
+                                  timeout=min(300, remaining)) for i in batch]
                 for f in futs:
                     try:
                         f.result()
