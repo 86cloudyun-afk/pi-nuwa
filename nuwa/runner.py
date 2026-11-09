@@ -13,7 +13,7 @@ from . import graph, txn
 from .engine import EngineError, call
 from .journal import Journal
 from .ledger import Ledger
-from .locks import FileLock, LockTimeout
+from .locks import FileLock, LockTimeout, is_locked
 from .paths import ensure_nuwa
 
 
@@ -360,6 +360,13 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
         max_stall: int = 5) -> int:
     root = Path(root).resolve()
     nd = ensure_nuwa(root)
+    try:
+        ppid_cmd = Path(f"/proc/{os.getppid()}/cmdline").read_bytes().replace(
+            b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        ppid_cmd = ""
+    if "bin/nuwa" not in ppid_cmd and is_locked(nd / ".nuwa.lock"):
+        return 5
     try:
         lock = FileLock(nd / "run.lock", blocking=False)
         lock.__enter__()
