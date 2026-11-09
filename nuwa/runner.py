@@ -241,7 +241,11 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal,
     settle_status = "ok"
     try:
         try:
-            remaining = max(1, int(deadline - time.time()))
+            remaining = int(deadline - time.time())
+            if remaining <= 0:
+                settle_status = "error"
+                journal.append("reason_timeout", round=round_no, rid=rid)
+                return
             raw = call(render.stdout, model=model, timeout=remaining,
                        pass_fds=(rlock.fd,))
             tokens_actual = max(0, (prompt_len + len(raw)) // 4)

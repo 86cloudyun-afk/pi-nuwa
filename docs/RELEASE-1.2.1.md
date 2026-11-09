@@ -760,6 +760,13 @@
 - **M113**：`_reason` 用 deadline 计算剩余 timeout。
 - **M75/M94**：URL 启动先 `txn.repair` 再进入循环。
 
+## 第一百零四轮补充
+
+- **M112**：round 取 `.nuwa/round` 与 run.json 最大值。
+- **M113**：deadline 到期不再启动引擎。
+- **M75/M94**：启动 repair 失败直接退出。
+- **M21**：数值反例补 projects，触达目标校验。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

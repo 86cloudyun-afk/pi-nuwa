@@ -292,9 +292,9 @@ class NightTest(unittest.TestCase):
                 {"mode": "soak", "minutes": 1, "samples": 2,
                  "verdict": {"all_zero": "false", "rss_ok": True, "fd_ok": True, "facts_ok": True}},
                 {"mode": "soak", "minutes": 1, "samples": 2, "verdict": ["ok"]},
-                {"mode": "soak", "minutes": float("inf"), "samples": 2,
+                {"mode": "soak", "minutes": float("inf"), "samples": 2, "projects": ["p1"],
                  "verdict": {"all_zero": True, "rss_ok": True, "fd_ok": True, "facts_ok": True}},
-                {"mode": "soak", "minutes": 1, "samples": 2.5,
+                {"mode": "soak", "minutes": 1, "samples": 2.5, "projects": ["p1"],
                  "verdict": {"all_zero": True, "rss_ok": True, "fd_ok": True, "facts_ok": True}},
             ]
             for body in cases:
