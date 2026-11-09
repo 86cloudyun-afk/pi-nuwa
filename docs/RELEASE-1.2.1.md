@@ -749,6 +749,11 @@
 - **M112**：`bin/nuwa` 把实际 round 传给 `_reason`，避免固定 0 去重。
 - **M113**：`_reason` 接受 timeout，`bin/nuwa` 传剩余时间上限。
 
+## 第一百零二轮补充
+
+- **M111**：guard 信任链增加祖父进程检查，覆盖 `python3 -c` 调 runner 的路径。
+- **M112**：`bin/nuwa` 从 run.json 恢复 round，重启后不复用首轮键。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

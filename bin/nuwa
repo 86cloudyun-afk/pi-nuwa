@@ -510,7 +510,7 @@ fl = sum(1 for f in facts if f.get("kind") == "flag")
 print("%s|%s|%s|%s|%s|%s" % (p.get("status"), o, c, d, ef, fl))'
 }
 
-round=0
+round="$(python3 -c 'import json,sys; from pathlib import Path; p=Path(sys.argv[1])/".nuwa"/"run.json"; print(int(json.loads(p.read_text()).get("round",0)))' "$dir" 2>/dev/null || echo 0)"
 failed=0
 last_sig=""
 stall=0

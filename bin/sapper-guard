@@ -32,6 +32,15 @@ TRUSTED=0
 case "$PPID_CMD" in
   *nuwa/cli.py*|*bin/nuwa*|*"-m nuwa.cli"*|*" -m nuwa.cli "*) TRUSTED=1 ;;
 esac
+if (( TRUSTED == 0 )); then
+  GPID="$(awk '{print $4}' "/proc/$PPID/stat" 2>/dev/null || true)"
+  if [[ "$GPID" =~ ^[0-9]+$ ]]; then
+    GPID_CMD="$(tr '\0' ' ' < "/proc/$GPID/cmdline" 2>/dev/null || true)"
+    case "$GPID_CMD" in
+      *nuwa/cli.py*|*bin/nuwa*|*"-m nuwa.cli"*|*" -m nuwa.cli "*) TRUSTED=1 ;;
+    esac
+  fi
+fi
 ALLOWED=0
 if [[ -n "$TOKEN" && "${NUWA_SUBMIT_ALLOWED:-}" == "$TOKEN" && $TRUSTED -eq 1 ]]; then
   ALLOWED=1
