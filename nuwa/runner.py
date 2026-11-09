@@ -202,14 +202,17 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal,
     wm_path = Path(root) / ".nuwa" / "round"
     try:
         wm_path.parent.mkdir(parents=True, exist_ok=True)
-        with FileLock(wm_path.with_name("round.lock"), blocking=True):
-            watermark = 0
-            try:
-                watermark = int(wm_path.read_text().strip())
-            except (OSError, ValueError):
-                pass
-            round_no = max(round_no, watermark)
-            wm_path.write_text(str(round_no + 1), encoding="utf-8")
+        try:
+            with FileLock(wm_path.with_name("round.lock"), blocking=False):
+                watermark = 0
+                try:
+                    watermark = int(wm_path.read_text().strip())
+                except (OSError, ValueError):
+                    pass
+                round_no = max(round_no, watermark)
+                wm_path.write_text(str(round_no + 1), encoding="utf-8")
+        except LockTimeout:
+            pass
     except OSError:
         pass
     freeze_failed = False
