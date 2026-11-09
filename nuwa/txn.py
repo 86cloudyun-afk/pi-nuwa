@@ -265,6 +265,8 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 else prev.get("tokens", 4000),
                 "state": ev,
                 "ts": rec.get("ts") if rec.get("ts") is not None else prev.get("ts"),
+                "ppid": rec.get("parent_pid") if rec.get("parent_pid") is not None
+                else prev.get("ppid"),
             }
         elif ev in TXN_DONE:
             pending.pop(txn_id, None)
@@ -284,6 +286,17 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
             except (TypeError, ValueError, OverflowError):
                 age = 0.0
             if age < 60:
+                continue
+        if info.get("state") == "executing_prepare":
+            ppid = info.get("ppid")
+            alive = False
+            if isinstance(ppid, int) and not isinstance(ppid, bool) and ppid > 1:
+                try:
+                    os.kill(ppid, 0)
+                    alive = True
+                except OSError:
+                    alive = False
+            if alive:
                 continue
         intent = info.get("intent")
         try:

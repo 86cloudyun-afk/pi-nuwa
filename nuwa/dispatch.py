@@ -194,7 +194,8 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                        attempt_seq=attempt, tokens=tokens, project=project,
                        ts=time.time())
         journal.append("executing_prepare", txn=txn_id, rid=rid, intent=intent_id,
-                       attempt_seq=attempt, key=key, tokens=tokens)
+                       attempt_seq=attempt, key=key, tokens=tokens,
+                       parent_pid=os.getpid())
         # attempt 持久递增：迟到的 worker 拿锁后会因版本不符直接退出。
         graph.set_intent_field(root, intent_id, "x-nuwa-attempt", attempt + 1)
 

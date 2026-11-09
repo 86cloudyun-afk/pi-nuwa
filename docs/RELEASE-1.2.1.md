@@ -727,6 +727,10 @@
 
 - **M108**：`reserve_pending` 记录 ts；repair 仅在 60 秒内跳过，超时按孤儿恢复。
 
+## 第九十七轮补充
+
+- **M102**：`executing_prepare` 记录 parent_pid；repair 仅在父存活时跳过，父崩溃后恢复。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
