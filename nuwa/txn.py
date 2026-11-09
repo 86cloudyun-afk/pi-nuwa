@@ -293,10 +293,16 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                     try:
                         obj = json.loads(text)
                         inner = obj.get("result") if isinstance(obj, dict) else None
-                        empty_obj = not bool(obj) or (
-                            isinstance(inner, (dict, list)) and not inner) or (
-                            isinstance(inner, str)
-                            and inner.strip() in ("", "{}", "[]"))
+                        empty_obj = not bool(obj)
+                        if isinstance(inner, (dict, list)) and not inner:
+                            empty_obj = True
+                        elif isinstance(inner, str):
+                            try:
+                                if json.loads(inner) in ({}, [], "", None):
+                                    empty_obj = True
+                            except (ValueError, TypeError):
+                                if not inner.strip():
+                                    empty_obj = True
                     except (ValueError, TypeError):
                         empty_obj = True
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0

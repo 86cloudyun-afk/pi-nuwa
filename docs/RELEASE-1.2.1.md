@@ -638,6 +638,12 @@
 - **M96**：nuwa 复制失败删除 COMMIT 并 exit 1。
 - **M94**：超支先写 freeze，再写 usage。
 
+## 第八十轮补充
+
+- **M74**：内层 `{ }`/`[ ]` 也按 JSON 解析判空。
+- **M46**：guard/soak-night 安装失败 `exit 1`。
+- **M94**：中断与引擎异常分支也先写 freeze。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

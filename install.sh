@@ -97,7 +97,7 @@ fi
 _guard="$(readlink -f "$REPO_DIR/bin/sapper-guard")"
 _real_sapper="$(readlink -f "$(command -v sapper || true)" 2>/dev/null || true)"
 if [[ -f "$SAPPER_HOME/bin/sapper" ]] && grep -q 'sapper-guard' "$SAPPER_HOME/bin/sapper" 2>/dev/null; then
-  install -m 0755 "$REPO_DIR/bin/sapper-guard" "$SAPPER_HOME/bin/sapper"
+  install -m 0755 "$REPO_DIR/bin/sapper-guard" "$SAPPER_HOME/bin/sapper" || exit 1
   echo "updated: sapper guard -> $SAPPER_HOME/bin/sapper"
 elif [[ -n "$_real_sapper" && "$_real_sapper" != "$_guard" ]]; then
   if [[ "$_real_sapper" == "$SAPPER_HOME/bin/sapper" ]]; then
@@ -105,10 +105,10 @@ elif [[ -n "$_real_sapper" && "$_real_sapper" != "$_guard" ]]; then
   else
     ln -sfn "$_real_sapper" "$SAPPER_HOME/bin/sapper.real"
   fi
-  install -m 0755 "$REPO_DIR/bin/sapper-guard" "$SAPPER_HOME/bin/sapper"
+  install -m 0755 "$REPO_DIR/bin/sapper-guard" "$SAPPER_HOME/bin/sapper" || exit 1
   echo "installed: sapper guard -> $SAPPER_HOME/bin/sapper (real: $_real_sapper)"
 fi
-install -m 0755 "$REPO_DIR/bin/nuwa-soak-night.sh" "$SAPPER_HOME/bin/nuwa-soak-night"
+install -m 0755 "$REPO_DIR/bin/nuwa-soak-night.sh" "$SAPPER_HOME/bin/nuwa-soak-night" || exit 1
 mkdir -p "$SAPPER_HOME/nuwa"
 if ! cp -R "$REPO_DIR/nuwa/." "$SAPPER_HOME/nuwa/"; then
   rm -f "$SAPPER_HOME/COMMIT"

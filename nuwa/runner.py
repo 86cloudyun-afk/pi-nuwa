@@ -245,12 +245,24 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         except KeyboardInterrupt:
             settle_status = "error"
             tokens_actual = max(tokens_actual, prompt_len // 4)
+            if tokens_actual > need * 1.05:
+                try:
+                    (nd / "reason.freeze").write_text(
+                        f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
+                except OSError:
+                    pass
             raise
         except (EngineError, dispatch_mod.DispatchError) as exc:
             settle_status = "error"
             partial = getattr(exc, "partial", "") or ""
             tokens_actual = max(tokens_actual,
                                 (prompt_len + len(partial)) // 4)
+            if tokens_actual > need * 1.05:
+                try:
+                    (nd / "reason.freeze").write_text(
+                        f"overrun {tokens_actual}>{need}\n", encoding="utf-8")
+                except OSError:
+                    pass
             journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])
             return
