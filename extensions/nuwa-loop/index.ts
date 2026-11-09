@@ -457,6 +457,7 @@ export function readGraph(root: string): Graph | null {
 	const doneRefs: string[] = [];
 	const intentIds = new Set<string>();
 	const intentTo = new Map<string, string>();
+	const sourceByFact = new Map<string, string>();
 	let corrupt = false;
 	try {
 		for (const f of readdirSync(join(root, ".sapper", "intents"))) {
@@ -535,6 +536,7 @@ export function readGraph(root: string): Graph | null {
 			if (typeof fact.source_intent === "string") {
 				if (!intentIds.has(fact.source_intent)) corrupt = true;
 				else if (intentTo.get(fact.source_intent) !== fact.id) corrupt = true;
+				if (fact.id) sourceByFact.set(fact.id, fact.source_intent);
 			}
 			if (fact.kind === "flag") flags++;
 			if (fact?.kind && fact.kind !== "note") effective++;
@@ -554,6 +556,9 @@ export function readGraph(root: string): Graph | null {
 		} else if ("source_intent" in goal && goal.source_intent !== null
 			&& typeof goal.source_intent !== "string") {
 			corrupt = true;
+		} else if (typeof goal.source_intent === "string"
+			&& !intentIds.has(goal.source_intent)) {
+			corrupt = true;
 		}
 	} catch {
 		corrupt = true;
@@ -565,6 +570,11 @@ export function readGraph(root: string): Graph | null {
 	}
 	for (const id of doneRefs) {
 		if (!(id in kinds)) corrupt = true;
+	}
+	for (const [iid, to] of intentTo) {
+		if (to === "goal") continue;
+		const src = sourceByFact.get(to);
+		if (src !== undefined && src !== iid) corrupt = true;
 	}
 	const isStrong = (kind?: string): boolean =>
 		kind === "flag" || kind === "vuln" || kind === "loot";
@@ -626,6 +636,12 @@ export function revertCompletion(root: string, why: string): boolean {
 	} catch {
 		return false;
 	}
+	const backup = join(root, ".sapper", `.revert-${process.pid}-${Date.now()}.json`);
+	try {
+		writeFileSync(backup, JSON.stringify(goalFiles));
+	} catch {
+		return false;
+	}
 	const removed: typeof goalFiles = [];
 	for (const g of goalFiles) {
 		try {
@@ -641,6 +657,7 @@ export function revertCompletion(root: string, why: string): boolean {
 	}
 	try {
 		renameSync(tmp, p);
+		try { rmSync(backup); } catch { /* 备份可留待恢复 */ }
 	} catch {
 		for (const r of removed) {
 			try { writeFileSync(r.path, r.body); } catch { /* 恢复尽力而为 */ }

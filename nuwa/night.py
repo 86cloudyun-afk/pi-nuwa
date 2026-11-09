@@ -199,6 +199,8 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             and {str(p) for p in projects}.issubset(set(exit_codes)),
             "span": interval > 0
             and duration >= max(0.0, (samples - 1) * interval * 0.8),
+            "samples_density": interval <= 0
+            or samples >= max(2.0, duration / interval * 0.8),
         }
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,
                 "commit": commit, "report": str(rep_path),

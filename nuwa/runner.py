@@ -192,7 +192,7 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             return
         try:
             raw = call(r.stdout, model=model, timeout=240)
-            tokens_actual = max(0, len(raw) // 4)
+            tokens_actual = max(0, (len(r.stdout) + len(raw)) // 4)
             payload = dispatch_mod.parse_engine_stdout(raw)
         except (EngineError, dispatch_mod.DispatchError) as exc:
             journal.append("reason_failed", round=round_no, error=str(exc)[:200])

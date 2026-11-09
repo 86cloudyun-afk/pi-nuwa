@@ -217,7 +217,9 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
         if result_path.exists():
             try:
                 res = json.loads(result_path.read_text(encoding="utf-8"))
-                succeeded = isinstance(res, dict) and res.get("exit_code") == 0
+                out_path = nd / "artifacts" / txn_id / "stdout.txt"
+                succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
+                             and out_path.exists() and out_path.stat().st_size > 0)
             except (OSError, json.JSONDecodeError, ValueError):
                 succeeded = False
         if succeeded:

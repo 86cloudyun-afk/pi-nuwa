@@ -492,6 +492,15 @@
 - **M75**：reason 按输出长度估算实际 tokens 结算。
 - **M59**：TS 恢复循环单次写失败不中断。
 
+## 第五十八轮补充
+
+- **M31**：新增 `samples_density`，按 duration/interval 反推最少采样数。
+- **M61**：done intent 的 to fact 归属反查；goal.source_intent 悬空判错。
+- **M75**：reason 计费含输入 prompt 长度。
+- **M59**：回滚前持久化 goal 边备份，rename 成功后清理。
+- **M32**：复用分支失败回滚 fact.source_intent 与 intent 状态/to。
+- **M74**：repair 成功还需 stdout 非空。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

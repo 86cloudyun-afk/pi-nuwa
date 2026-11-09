@@ -66,6 +66,43 @@ def render_prompt(root: Path, intent_id: str, timeout: int = 60) -> str:
     return r.stdout
 
 
+def _write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _unbind_source(root: str | Path, fact_id: str) -> None:
+    if not graph._safe_id(fact_id):
+        return
+    fp = Path(root) / ".sapper" / "facts" / f"{fact_id}.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict) and data.get("id") == fact_id:
+        data.pop("source_intent", None)
+        _write_json(fp, data)
+
+
+def _restore_intent(root: str | Path, intent_id: str, prev: dict) -> None:
+    if not graph._safe_id(intent_id):
+        return
+    fp = Path(root) / ".sapper" / "intents" / f"{intent_id}.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    data["status"] = prev.get("status")
+    if prev.get("to") is None:
+        data.pop("to", None)
+    else:
+        data["to"] = prev["to"]
+    _write_json(fp, data)
+
+
 def _bind_source(root: str | Path, fact_id: str, intent_id: str) -> None:
     if not graph._safe_id(fact_id):
         raise DispatchError(f"非法 fact id: {fact_id}")
@@ -74,9 +111,7 @@ def _bind_source(root: str | Path, fact_id: str, intent_id: str) -> None:
     if not isinstance(data, dict) or data.get("id") != fact_id:
         raise DispatchError(f"fact 身份不匹配: {fact_id}")
     data["source_intent"] = intent_id
-    tmp = fp.with_name(fp.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, fp)
+    _write_json(fp, data)
 
 
 def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
@@ -112,18 +147,26 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                 and intent["to"] != existing["id"]):
             raise DispatchError(
                 f"intent 已由其他 fact 完成: {intent['to']} != {existing['id']}")
-        with FileLock(nd / "txn.lock", blocking=True):
-            if existing.get("source_intent") not in (None, intent_id):
-                raise DispatchError(
-                    f"fact 已绑定其他意图: {existing.get('source_intent')} != {intent_id}")
-            if not existing.get("source_intent"):
-                _bind_source(root, existing["id"], intent_id)
-            graph.patch_intent(root, intent_id, existing["id"])
-            ok, msg = graph.validate(root)
-            if not ok:
-                raise DispatchError(f"复用后图校验失败: {msg}")
-            journal.append("commit_done", txn=key, intent=intent_id,
-                           fact=existing["id"], reused=True, project=project)
+        prev_source = existing.get("source_intent")
+        prev_intent = graph.get_intent(root, intent_id) or {}
+        try:
+            with FileLock(nd / "txn.lock", blocking=True):
+                if prev_source not in (None, intent_id):
+                    raise DispatchError(
+                        f"fact 已绑定其他意图: {prev_source} != {intent_id}")
+                if not prev_source:
+                    _bind_source(root, existing["id"], intent_id)
+                graph.patch_intent(root, intent_id, existing["id"])
+                ok, msg = graph.validate(root)
+                if not ok:
+                    raise DispatchError(f"复用后图校验失败: {msg}")
+                journal.append("commit_done", txn=key, intent=intent_id,
+                               fact=existing["id"], reused=True, project=project)
+        except Exception:
+            if prev_source is None:
+                _unbind_source(root, existing["id"])
+            _restore_intent(root, intent_id, prev_intent)
+            raise
         return {"intent": intent_id, "fact": existing["id"], "reused": True, "key": key}
 
     txn_id = f"t-{uuid.uuid4().hex[:12]}"
