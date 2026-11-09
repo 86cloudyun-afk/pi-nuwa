@@ -207,7 +207,7 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
         raise DispatchError(f"预算不足: remaining={remaining} need={tokens}")
     _crash("after_reserve")
     journal.append("reserve_committed", txn=txn_id, rid=rid, intent=intent_id,
-                   tokens=tokens)
+                   tokens=tokens, parent_pid=os.getpid())
 
     art = nd / "artifacts" / txn_id
     art.mkdir(parents=True, exist_ok=True)

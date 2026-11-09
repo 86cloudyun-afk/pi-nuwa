@@ -287,7 +287,7 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 age = 0.0
             if age < 60:
                 continue
-        if info.get("state") == "executing_prepare":
+        if info.get("state") in ("executing_prepare", "reserve_committed"):
             ppid = info.get("ppid")
             alive = False
             if isinstance(ppid, int) and not isinstance(ppid, bool) and ppid > 1:
