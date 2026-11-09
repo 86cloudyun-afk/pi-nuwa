@@ -575,6 +575,12 @@
 - **M93**：finally 内层保障 reason 锁释放。
 - **M75**：取消结算 clamp，超预留写 `reason_overrun`。
 
+## 第七十一轮补充
+
+- **M94**：超预留 5% 写 overrun 并抛错暂停。
+- **M92**：repair 对无账本预留的 reason_reserve 只跳过，不 ack。
+- **M75**：`reason_usage` 落 journal，repair 按实际用量结算。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

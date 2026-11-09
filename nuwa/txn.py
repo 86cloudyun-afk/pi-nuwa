@@ -267,6 +267,13 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
         elif ev in TXN_DONE:
             pending.pop(txn_id, None)
 
+    usage = {}
+    for rec in records:
+        if rec.get("event") == "reason_usage" and rec.get("txn"):
+            try:
+                usage[str(rec["txn"])] = int(rec.get("tokens", 0))
+            except (TypeError, ValueError):
+                pass
     repaired = []
     for txn_id, info in pending.items():
         intent = info.get("intent")
@@ -305,6 +312,10 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
         tokens = info.get("tokens")
         if tokens is None:
             tokens = 4000
+        if info.get("state") == "reason_reserve" and rid and not led.has_reserve(rid):
+            journal.append("recovered_skipped", txn=txn_id, intent=intent, rid=rid)
+            continue
+        tokens = usage.get(txn_id, tokens)
         if rid and led.has_reserve(rid):
             led.settle(rid, tokens, status="crashed")
             journal.append("ledger_settle", txn=txn_id, rid=rid, intent=intent,
