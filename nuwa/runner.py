@@ -226,11 +226,13 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             pass
         raise
     if not ok:
-        journal.append("reason_rejected", txn=rid, rid=rid, remaining=remaining)
         try:
-            rlock.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001
-            pass
+            journal.append("reason_rejected", txn=rid, rid=rid, remaining=remaining)
+        finally:
+            try:
+                rlock.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
         return
     tokens_actual = 0
     settle_status = "ok"
@@ -379,8 +381,10 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                 journal.append("stall_stop", round=round_no, stall=stall)
                 break
     finally:
-        _write_run(root, status="stopped", round=round_no, turns=turns,
-                   deadline=deadline)
-        journal.append("run_stop", round=round_no, turns=turns)
-        lock.__exit__(None, None, None)
+        try:
+            _write_run(root, status="stopped", round=round_no, turns=turns,
+                       deadline=deadline)
+            journal.append("run_stop", round=round_no, turns=turns)
+        finally:
+            lock.__exit__(None, None, None)
     return exit_code

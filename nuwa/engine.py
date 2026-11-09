@@ -21,7 +21,8 @@ def call(prompt: str, model: str = "deepseek-flash", timeout: int = 300,
         cmd += ["--append-system-prompt", system]
     try:
         p = subprocess.run(cmd, input=prompt, text=True, capture_output=True,
-                            timeout=timeout, pass_fds=pass_fds)
+                            timeout=timeout, pass_fds=pass_fds,
+                            encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired as exc:
         partial = exc.stdout or ""
         if isinstance(partial, bytes):

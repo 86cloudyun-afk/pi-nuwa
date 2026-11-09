@@ -596,6 +596,14 @@
 - **M75**：异常分支也写 reason_usage。
 - **M96**：夜跑 commit 取 Nuwa 源码仓库 HEAD，不取目标仓库。
 
+## 第七十四轮补充
+
+- **M97**：run 收尾写失败仍释放 run.lock。
+- **M93**：reason_rejected 写入异常也释放锁。
+- **M75**：引擎输出按 UTF-8 replace 解码，避免 UnicodeDecodeError。
+- **M96**：`_commit` 优先读安装 `COMMIT`；install.sh 写入。
+- **M94**：repair 发现 usage 超预留时补写 freeze。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

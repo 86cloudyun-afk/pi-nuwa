@@ -29,6 +29,9 @@ def prepare(base: str | Path, projects: int) -> list[str]:
 def _commit() -> str:
     try:
         src = Path(__file__).resolve().parent.parent
+        stamp = src / "COMMIT"
+        if stamp.exists():
+            return stamp.read_text(encoding="utf-8").strip()
         return subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
                               capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:  # noqa: BLE001
