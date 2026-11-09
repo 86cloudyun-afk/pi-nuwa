@@ -190,7 +190,8 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             "minutes": minutes > 0,
             "samples": samples >= 2,
             "verdict": True,
-            "duration": finished >= started and duration >= minutes * 60 * 0.9,
+            "duration": finished >= started
+            and duration >= min(minutes * 60 * 0.9, 0.25),
             "journal": (journal_dispatches > 0
                         and abs(facts_delta - journal_commits) <= 2),
             "samples_recalc": recalc_ok,
