@@ -735,6 +735,10 @@
 
 - **M102**：`reserve_committed` 也记录 parent_pid，repair 对两个准备态统一做存活检查。
 
+## 第九十九轮补充
+
+- **M75**：`bin/nuwa` URL reason 调用前用 Ledger 检查全局余额，不足则跳过。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

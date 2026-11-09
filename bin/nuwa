@@ -534,6 +534,9 @@ while :; do
     if [[ -f "$dir/.nuwa/reason.freeze" ]]; then
       log "reason 冻结，跳过本轮生成"
       event reason_frozen "round=$round"
+    elif ! PYTHONPATH="$_PKG_DIR" python3 -c 'import sys; from nuwa.ledger import Ledger; sys.exit(0 if Ledger().summary()["remaining_global"] > 4000 else 1)' 2>/dev/null; then
+      log "预算不足，跳过 reason"
+      event reason_budget_skipped "round=$round"
     else
       NUWA_SUBMIT_ALLOWED="$(cat "$LAB_DIR/.submit_token" 2>/dev/null || true)" \
         sapper dispatch reason --model "$model" --timeout "$(( remaining < 240 ? remaining : 240 ))" 2>&1 | tail -1
