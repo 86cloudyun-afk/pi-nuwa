@@ -259,6 +259,12 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
                         pass
                     raise RuntimeError("reason 超支但冻结失败") from exc
             raise
+        except OSError as exc:
+            settle_status = "error"
+            tokens_actual = max(tokens_actual, prompt_len // 4)
+            journal.append("reason_usage", txn=rid, rid=rid, tokens=tokens_actual)
+            journal.append("reason_failed", round=round_no, error=str(exc)[:200])
+            return
         except (EngineError, dispatch_mod.DispatchError) as exc:
             settle_status = "error"
             partial = getattr(exc, "partial", "") or ""
