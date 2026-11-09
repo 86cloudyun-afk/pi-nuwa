@@ -199,6 +199,11 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
 
 def _reason(root: Path, model: str, round_no: int, journal: Journal,
             timeout: int = 240) -> None:
+    try:
+        watermark = int((Path(root) / ".nuwa" / "round").read_text().strip())
+        round_no = max(round_no, watermark)
+    except (OSError, ValueError):
+        pass
     freeze_failed = False
     nd = ensure_nuwa(root)
     if (nd / "reason.freeze").exists():
