@@ -206,9 +206,10 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         journal.append("reason_render_failed", round=round_no)
         return
     need = max(4000, prompt_len // 4 + 2000)
+    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
     ok, remaining = led.admit_reserve(rid, str(root), need)
     if not ok:
-        journal.append("reason_budget_rejected", round=round_no, remaining=remaining)
+        journal.append("reason_rejected", txn=rid, rid=rid, remaining=remaining)
         return
     tokens_actual = 0
     settle_status = "ok"
@@ -220,7 +221,6 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
         led.settle(rid, 0, status="blocked")
         journal.append("reason_busy", round=round_no, rid=rid)
         return
-    journal.append("reason_reserve", txn=rid, rid=rid, intent="reason", tokens=need)
     try:
         try:
             raw = call(render.stdout, model=model, timeout=240,
@@ -236,13 +236,18 @@ def _reason(root: Path, model: str, round_no: int, journal: Journal) -> None:
             return
         _apply_reason(root, payload, round_no, journal)
     finally:
-        led.settle(rid, min(tokens_actual, need), status=settle_status)
-        journal.append("ack", txn=rid, intent="reason", status=settle_status)
-        journal.append("reason_budget_settled", round=round_no, rid=rid)
         try:
-            rlock.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001
-            pass
+            led.settle(rid, tokens_actual, status=settle_status)
+            if tokens_actual > need:
+                journal.append("reason_overrun", round=round_no, rid=rid,
+                               tokens=tokens_actual, reserved=need)
+            journal.append("ack", txn=rid, intent="reason", status=settle_status)
+            journal.append("reason_budget_settled", round=round_no, rid=rid)
+        finally:
+            try:
+                rlock.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def run(root: str | Path, minutes: int = 60, parallel: int = 2,

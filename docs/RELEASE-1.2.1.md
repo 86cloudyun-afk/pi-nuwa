@@ -569,6 +569,12 @@
 - **M31**：soak 记录逐项目 facts 增量，verify 要求每项目 >=1。
 - **M21**：fake-sapper fact 写 `source_intent`，覆盖新建提交绑定分支。
 
+## 第七十轮补充
+
+- **M92**：`reason_reserve` 先于全局预留落盘；拒绝时写 `reason_rejected`。
+- **M93**：finally 内层保障 reason 锁释放。
+- **M75**：取消结算 clamp，超预留写 `reason_overrun`。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
