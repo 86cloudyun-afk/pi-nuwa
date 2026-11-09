@@ -667,6 +667,12 @@
 - **M94**：冻结失败时保留 pending，不 settle/ack。
 - **M74**：repair 验收与 dispatch 一致，要求 description（含 data.description）。
 
+## 第八十五轮补充
+
+- **M94**：冻结失败先置标志，诊断写失败不影响保护。
+- **M74**：payload 有 data 时优先校验 data.description。
+- **M102**：repair 对 commit_prepare/done_apply 状态跳过，不提前 ack。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、

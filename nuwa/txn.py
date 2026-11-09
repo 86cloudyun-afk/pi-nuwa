@@ -309,15 +309,21 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                 try:
                     from . import dispatch as dmod
                     payload = dmod.parse_engine_stdout(text)
-                    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-                    valid = bool(payload) and bool(
-                        payload.get("description") or data.get("description"))
+                    data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+                    if data is not None:
+                        valid = bool(data.get("description"))
+                    else:
+                        valid = bool(payload.get("description"))
                 except Exception:  # noqa: BLE001
                     valid = False
                 succeeded = (isinstance(res, dict) and res.get("exit_code") == 0
                              and bool(text) and not empty_obj and valid)
             except (OSError, json.JSONDecodeError, ValueError):
                 succeeded = False
+        if succeeded and info.get("state") in ("commit_prepare", "done_apply"):
+            journal.append("recovered_skipped", txn=txn_id, intent=intent,
+                           rid=info.get("rid"))
+            continue
         if succeeded:
             rid = info.get("rid")
             tokens = info.get("tokens")
