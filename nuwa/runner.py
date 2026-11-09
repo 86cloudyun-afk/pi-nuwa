@@ -197,6 +197,15 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
     return created
 
 
+def _holds_shell_lock(root: Path) -> bool:
+    try:
+        st = os.fstat(9)
+        target = os.stat(root / ".nuwa.lock")
+    except OSError:
+        return False
+    return st.st_ino == target.st_ino and st.st_dev == target.st_dev
+
+
 def _reason(root: Path, model: str, round_no: int, journal: Journal,
             timeout: int = 240) -> None:
     wm_path = Path(root) / ".nuwa" / "round"
@@ -365,12 +374,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
         lock.__enter__()
     except LockTimeout:
         return 5
-    try:
-        ppid_cmd = Path(f"/proc/{os.getppid()}/cmdline").read_bytes().replace(
-            b"\0", b" ").decode("utf-8", "replace")
-    except OSError:
-        ppid_cmd = ""
-    if "bin/nuwa" not in ppid_cmd and is_locked(root / ".nuwa.lock"):
+    if is_locked(root / ".nuwa.lock") and not _holds_shell_lock(root):
         lock.__exit__(None, None, None)
         return 5
 
