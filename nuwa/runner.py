@@ -200,15 +200,16 @@ def _apply_reason(root: Path, payload: dict, round_no: int, journal: Journal) ->
 def _reason(root: Path, model: str, round_no: int, journal: Journal,
             timeout: int = 240) -> None:
     wm_path = Path(root) / ".nuwa" / "round"
-    watermark = 0
-    try:
-        watermark = int(wm_path.read_text().strip())
-    except (OSError, ValueError):
-        pass
-    round_no = max(round_no, watermark)
     try:
         wm_path.parent.mkdir(parents=True, exist_ok=True)
-        wm_path.write_text(str(round_no + 1), encoding="utf-8")
+        with FileLock(wm_path.with_name("round.lock"), blocking=True):
+            watermark = 0
+            try:
+                watermark = int(wm_path.read_text().strip())
+            except (OSError, ValueError):
+                pass
+            round_no = max(round_no, watermark)
+            wm_path.write_text(str(round_no + 1), encoding="utf-8")
     except OSError:
         pass
     freeze_failed = False

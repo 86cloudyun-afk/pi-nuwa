@@ -813,6 +813,10 @@
 - **M112**：缺 round 文件时创建并写回。
 - **M114**：URL/Python 统一 `.nuwa/run.lock`，chaos 测试同步。
 
+## 第一百一十五轮补充
+
+- **M112**：轮次水位读改写加 `round.lock`，并发分配不重复。
+
 ## 判据
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
