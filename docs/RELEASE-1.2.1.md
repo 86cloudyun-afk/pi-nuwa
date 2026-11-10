@@ -847,3 +847,11 @@
 - concurrency ×3、chaos ×3：全部通过。
 - night soak 4 项目 ×2 分钟 ×2：全部 verify ok。
 - 修复压测暴露的两处边界：预算末尾 dispatch timeout 不再判项目失败；短跑 night 资源/时长阈值放宽，长跑保持严格。
+
+
+## 发布终审与修复后压测（2026-11-10）
+
+- Kimi K3.1 Pro Highspeed 终审：approve 97，blocking=0，major=0。
+- 终审关闭 M115（Python 排队任务 deadline exhausted 归类）、M116（shell 仅按全局剩余预算吞 timeout）。
+- 修复后复压：FULL ×3（170 例 + 16 runs/轮）、crash_matrix --full（140 runs），全部 EXIT=0。
+- v1.2.1 标签与 Release 指向最终提交。
