@@ -838,3 +838,12 @@
 
 新增反例：尾部缺 seq、bash 重定向/复制、`--store=`/`-s`、预算拒绝 repair、ack 摘要、
 其他键冲突、多 fact 完成、Infinity/分数 samples。全量读数见 `docs/TEST-RESULTS.md`。
+
+
+## 高压测试（2026-11-10）
+
+- FULL 全量 ×5：170 例 + 16 runs/轮，全部 EXIT=0。
+- crash_matrix --full ×3：140 runs/轮，全部通过。
+- concurrency ×3、chaos ×3：全部通过。
+- night soak 4 项目 ×2 分钟 ×2：全部 verify ok。
+- 修复压测暴露的两处边界：预算末尾 dispatch timeout 不再判项目失败；短跑 night 资源/时长阈值放宽，长跑保持严格。
