@@ -447,7 +447,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                         turns += 1
                     except Exception as exc:  # noqa: BLE001
                         msg = str(exc)
-                        if "timeout" in msg and deadline - time.time() <= 10:
+                        if ("timeout" in msg or "deadline exhausted" in msg) and deadline - time.time() <= 10:
                             journal.append("dispatch_timeout", error=msg[:200])
                         else:
                             exit_code = 1
