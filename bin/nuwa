@@ -332,7 +332,13 @@ dispatch_one() {
   local dt=$(( $(date +%s) - t0 ))
   printf '%s\n' "$out" | tail -6
   event dispatch_end "id=$id" "rc=$rc" "dur=${dt}s"
-  (( rc == 0 )) || : > "$PWD/.nuwa-dispatch-failed" 2>/dev/null || true
+  if (( rc != 0 )); then
+    if [[ "$out" == *"status=timeout"* ]] && (( to <= 10 )); then
+      event dispatch_budget_timeout "id=$id" "timeout=$to"
+      return 0
+    fi
+    : > "$PWD/.nuwa-dispatch-failed" 2>/dev/null || true
+  fi
   return $rc
 }
 

@@ -446,8 +446,12 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                         f.result()
                         turns += 1
                     except Exception as exc:  # noqa: BLE001
-                        exit_code = 1
-                        journal.append("dispatch_failed", error=str(exc)[:200])
+                        msg = str(exc)
+                        if "timeout" in msg and deadline - time.time() <= 10:
+                            journal.append("dispatch_timeout", error=msg[:200])
+                        else:
+                            exit_code = 1
+                            journal.append("dispatch_failed", error=msg[:200])
 
             status = _project_status(root)
             if status == "completed":
