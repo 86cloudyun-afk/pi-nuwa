@@ -385,6 +385,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                    round=int(prev.get("round", 0)), turns=int(prev.get("turns", 0)),
                    deadline=time.time() + minutes * 60)
         deadline = time.time() + minutes * 60
+        strict_budget = minutes >= 2
         max_rounds = int(os.environ.get("NUWA_MAX_ROUNDS", "0"))
         round_no = int(prev.get("round", 0))
         turns = int(prev.get("turns", 0))
