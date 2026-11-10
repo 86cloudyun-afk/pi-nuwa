@@ -389,6 +389,7 @@ def repair(root: str | Path, ledger: Ledger | None = None) -> dict:
                                    error=str(exc)[:200])
                     raise
             journal.append("recovered_skipped", txn=txn_id, intent=intent, rid=rid)
+            journal.append("reason_skipped", txn=txn_id, intent=intent, rid=rid)
             continue
         if info.get("state") == "reason_reserve" and tokens > reserved * 1.05:
             try:

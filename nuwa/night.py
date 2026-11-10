@@ -234,5 +234,5 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
         return {"ok": all(checks.values()), "checks": checks, "mode": mode,
                 "commit": commit, "report": str(rep_path),
                 "duration_seconds": duration, "expected_minutes": minutes}
-    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, OverflowError) as exc:
         return {"ok": False, "error": f"报告校验失败: {exc}", "checks": {}}
