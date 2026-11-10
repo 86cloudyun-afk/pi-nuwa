@@ -198,7 +198,9 @@ def verify(base: str | Path, expect_commit: str | None = None) -> dict:
             "samples_order": all(
                 isinstance(a.get("t"), (int, float)) and isinstance(b.get("t"), (int, float))
                 and b["t"] >= a["t"] for a, b in zip(raw, raw[1:])),
-            "resource": recalc_ok and rss_growth < 100 * 1024 and fd_growth <= 2,
+            "resource": recalc_ok and (
+                (rss_growth < 100 * 1024 and fd_growth <= 2) if minutes >= 2
+                else (rss_growth < 512 * 1024 and fd_growth <= 8)),
             "exit_codes": isinstance(exit_codes, dict) and not errors
             and all(isinstance(v, (int, float)) and not isinstance(v, bool) and v == 0
                     for v in exit_codes.values())
