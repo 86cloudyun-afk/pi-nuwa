@@ -402,15 +402,7 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
             round_no += 1
             ids = _ids(root)
             if not ids:
-                if strict_budget:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        journal.append("budget_exhausted", round=round_no)
-                        break
-                    _reason(root, model, round_no, journal,
-                            timeout=min(240, max(1, int(remaining))))
-                else:
-                    _reason(root, model, round_no, journal)
+                _reason(root, model, round_no, journal)
                 ids = _ids(root)
             if not ids:
                 status = _project_status(root)
@@ -429,17 +421,8 @@ def run(root: str | Path, minutes: int = 60, parallel: int = 2,
                 journal.append("frontier_empty", round=round_no)
                 break
             batch = ids[: max(1, parallel * 2)]
-            def _dispatch_one(intent_id: str):
-                if not strict_budget:
-                    return dispatch_mod.dispatch(root, intent_id, model=model)
-                rem = deadline - time.time()
-                if rem <= 0:
-                    raise RuntimeError("deadline exhausted")
-                return dispatch_mod.dispatch(root, intent_id, model=model,
-                                             timeout=min(300, max(1, int(rem))))
-
             with ThreadPoolExecutor(max_workers=parallel) as ex:
-                futs = [ex.submit(_dispatch_one, i) for i in batch]
+                futs = [ex.submit(dispatch_mod.dispatch, root, i, model=model) for i in batch]
                 for f in futs:
                     try:
                         f.result()

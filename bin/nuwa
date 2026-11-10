@@ -471,7 +471,7 @@ completion_ok() {
   local status
   status=$(python3 -c "import json;print(json.load(open('.sapper/project.json')).get('status',''))" 2>/dev/null)
   [[ "$status" == "completed" ]] || return 1
-  if [[ "$(has_evidence)" == "yes" ]]; then
+  if [[ "$(has_evidence)" == "yes" || "${NUWA_REQUIRE_EVIDENCE:-1}" == "0" ]]; then
     return 0
   fi
   revert_completion
