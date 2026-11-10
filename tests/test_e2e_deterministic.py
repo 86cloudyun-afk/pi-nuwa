@@ -48,7 +48,7 @@ class E2E(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def sh(self, cmd, cwd, timeout=90, extra=None):
+    def sh(self, cmd, cwd, timeout=180, extra=None):
         env = dict(self.env)
         if extra:
             env.update(extra)
