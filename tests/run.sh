@@ -21,12 +21,14 @@ run() {
 
 run contract python3 contract_check.py
 run unit bun test unit.test.ts
+run omp bun test omp_nuwa.test.ts omp_extension.test.ts
 run shell python3 test_nuwa_shell.py
 run chaos python3 test_chaos.py
 run concurrency python3 test_concurrency.py
 run e2e python3 test_e2e_deterministic.py
 run r1core python3 test_r1_core.py
 run r1dispatch python3 test_r1_dispatch.py
+run kb python3 test_kb.py
 run r1run python3 test_r1_run.py
 run r1multi python3 test_r1_multi.py
 run crash python3 crash_matrix.py --fake-repeat 2 --real-repeat 1

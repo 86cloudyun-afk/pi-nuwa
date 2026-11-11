@@ -1,11 +1,28 @@
+# Changelog
+
+## 2.0.0 — 2026-11-12
+
+纯 omp 运行时重构：移除 CLI、Python、sapper 依赖，状态机与续跑循环收进扩展进程。
+
+- 新增 `omp/nuwa.ts`：11 个 `nuwa_*` 工具（init/plan/frontier/claim/commit/flag/complete/status/report/stop/kb），
+  单文件状态 `.nuwa/state.json`，journal 完整快照回放，`state.lock` 单写者锁。
+- 新增六阶段 32 条内置 playbook；`recon/surface/vuln/exploit/post/report`，阶段清空自动推进。
+- 新增证据闸门：非 note 事实必须带 command+output，echo/printf 不算证据，flag output 必须含完整值；
+  commit 与 flag 双层幂等（attempt 键 / value 哈希）。
+- 新增 `session_stop` 续跑：turns/minutes/tokens/stall/idle 五重预算，block 链超限切 continue；
+  directive 内置 claim→task(fujiang)→commit 协议与换路提示。
+- 新增工具层纪律 N-001..N-005：主线程禁扫描、CLI 退役、状态文件保护、task 必须 fujiang、子代理禁记账。
+- 新增 `.sapper` 迁移：`nuwa_init(migrate=true)` 重编号事实/意图并保持 from/to 引用。
+- 新增 `tests/omp_nuwa.test.ts`（34 例）与 `tests/omp_extension.test.ts`（5 例）；合计 39 pass。
+- `install.sh` 重写：只装 `nuwa-omp` + skill，退役 `nuwa-loop`，旧 CLI 改名 `nuwa.legacy`，支持 `--rollback`。
+- 文档重写：`docs/OMP-NATIVE.md`、`README.md`、`skills/nuwa-pentest/SKILL.md`。
+
 ## 1.2.2 — 2026-11-11
 
 - 修复 P-006：`hasUnresolvedStore` 不再把 `/root/sapper-lab/bin/nuwa` 等路径误判为 `sapper` 命令；仅匹配真正的 `sapper` 子命令加变量展开。
 - `session_stop` 增加 `stop_no_root` / `stop_no_graph` 诊断事件，避免“找不到图”时静默停机。
 - 补充两条 TS 策略回归：`sapper-lab` 路径放行、`sapper` 命令带变量仍拦截。
 - 全量 170 例 + 16 runs，45 TS 单测，EXIT=0。
-
-# Changelog
 
 ## 1.2.1 — 2026-11-08
 

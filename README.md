@@ -1,144 +1,146 @@
-# pi-nuwa · 女娲模式
+# pi-nuwa · 女娲模式 v2（omp 原生）
 
-把 sapper-v2 的「长任务不会停」补进 pi / omp 的会话内部。
+把「长任务不会停」做成 omp 会话内的运行时，而不是外部 CLI 循环。
 
-**女娲模式 = 一套渗透作战纪律（SKILL.md）+ 一个运行时续跑器（nuwa-loop 扩展）+ 一个一键入口（bin/nuwa）。**
+**女娲模式 = 一套渗透纪律（SKILL.md）+ 一个运行时状态机（nuwa-omp 扩展）+ 11 个 `nuwa_*` 工具。**
+没有 `bin/nuwa`，没有 Python，没有 sapper，没有 tmux/watchdog。
 
-## 它解决的是什么
+## 为什么 v1 要退役
 
-`SKILL.md` 只是提示词，不是运行时。sapper-v2 能无人值守跑 8 小时，靠的是外部 `watchdog.sh` bash 循环。而在 pi / omp 里没有任何东西会在 task 批次返回后重新拉起主代理——模型写完一段战报，turn 就 settle，一轮即停。
-
-`nuwa-loop` 监听 `session_stop`，读 `.sapper` 图状态；只要 `project.status != completed`，就返回 `decision: "block"` 把这一个 turn 顶回去，并注入下一步派单指令。
-
-选 `block` 不选 `continue`：omp 18.16.0 对 continue 有 `SESSION_STOP_CONTINUATION_CAP=8` 的硬上限（`src/session/agent-session.ts:493`）；`decision === "block"` 在 `:5820` 的判断里不受该上限约束。
+v1 靠 `bin/nuwa (bash) → nuwa/cli.py (Python) → sapper → omp-claude` 四层进程拼接。
+flock、journal 代际、sapper 图写入、引擎 stdout 解析，任何一层抖动都会让循环停住，而且现场难复现。
+v2 把这些全部收进 omp 进程：状态在 `.nuwa/state.json`，循环在 `session_stop`，执行在 `task(agent="fujiang")`。
 
 ## 组成
 
 | 路径 | 作用 |
 |---|---|
-| `extensions/nuwa-loop/index.ts` | 运行时续跑器：上膛、读图、注入续跑指令、停机 |
-| `skills/nuwa-pentest/SKILL.md` | 女娲渗透纪律：触发词、唯一入口、记账、收尾 |
-| `bin/nuwa` | 一键入口：建项目 → `sapper setup` → 落靶标事实 → 出意图 → 并行 dispatch → 看板 |
-| `env/env.example.sh` | 网关与模型环境模板（不含凭据） |
-| `install.sh` | 安装到 agent 加载目录，带备份与 `--rollback` |
-
-依赖：[sapper-v2](https://github.com/86cloudyun-afk/sapper-v2) 提供 `sapper` CLI 与事实-意图图。
+| `omp/nuwa.ts` | 运行时：状态机、账本、证据闸门、session_stop 续跑、tool_call 纪律 |
+| `skills/nuwa-pentest/SKILL.md` | 渗透纪律：触发词、每轮固定动作、证据规范 |
+| `install.sh` | 安装扩展 + skill；退役 nuwa-loop；旧 CLI 改名 `nuwa.legacy` |
+| `docs/OMP-NATIVE.md` | 架构、状态模型、工具参考、续跑算法、迁移、验收 |
+| `tests/omp_nuwa.test.ts` | 纯状态机单测（34 例） |
+| `tests/omp_extension.test.ts` | 扩展注册 / 生命周期 / 拦截 / 续跑集成测试 |
 
 ## 安装
 
 ```bash
 git clone https://github.com/86cloudyun-afk/pi-nuwa.git
 cd pi-nuwa
-./install.sh                      # 缺 sapper 会直接失败，不会假装成功
-$EDITOR ~/sapper-lab/env.sh       # 填 GLM_API_KEY / DEEPSEEK_API_KEY
-source ~/sapper-lab/env.sh && sapper-who
+./install.sh                 # 装到 ~/.omp/agent/extensions/nuwa-omp
+./install.sh --rollback      # 回滚扩展与 nuwa-loop
 ```
 
-安装器把扩展放到 `~/.omp/agent/extensions/nuwa-loop`（无 omp 时用 `~/.pi/agent`），skill 放到 `~/.pi/agent/skills/nuwa-pentest` 并软链到 `~/.claude/skills/nuwa-pentest`，入口放到 `~/sapper-lab/bin/nuwa`，并生成 `SAPPER_BIN` 指向的 `omp-claude` 引擎。
+依赖：omp ≥ 18.16.0。`nuwa_kb` 额外需要 `sqlite3` 与 `/data/nuwa-kb/kb.db`，缺失不影响其余工具。
 
 ## 使用
 
-会话里说「女娲模式」「开图」「接入 sapper」「开始打 <目标>」，或直接：
+会话里说「女娲模式，打 http://TARGET:PORT」，或直接：
 
-```bash
-~/sapper-lab/bin/nuwa "https://TARGET"
+```text
+nuwa_init(target="http://TARGET:PORT", mode="ctf", goal="打穿并拿 flag")
 ```
 
-只出意图不执行：`nuwa "https://TARGET" --no-run`。
-后台跑：`nuwa "https://TARGET" --detach --minutes 480`。
-已有图：直接 `sapper status` / `sapper frontier`，再逐条 dispatch。
+之后运行时自动推进：
 
-## 参数
+```text
+nuwa_status                     # 看板
+nuwa_frontier(limit=4)          # 本批可执行意图
+nuwa_claim(id="i001")           # 取 packet
+task({tasks:[{agent:"fujiang", name:"I001", task:"<packet>", solutionSpace:"one intent"}]})
+nuwa_commit(id="i001", kind="service", title="HTTP 200 nginx",
+            command="curl -k -sS -D - http://TARGET/",
+            output="HTTP/1.1 200 OK\nServer: nginx")
+nuwa_flag(value="flag{...}", command="...", output="...")
+nuwa_complete(from=["f012"])
+nuwa_report(write=true)
+```
+
+每轮结束 `session_stop` 会检查 frontier、预算与证据，返回 `decision:"block"` 注入下一批派单。
+不需要手动「继续」，也不允许一轮就收工。
+
+## 工具
+
+| 工具 | 作用 |
+|---|---|
+| `nuwa_init` | 建/恢复/迁移项目；播种 recon |
+| `nuwa_plan` | 播种阶段（recon/surface/vuln/exploit/post/report）或自定义意图 |
+| `nuwa_frontier` | 列 eligible 意图（依赖满足、未有效认领） |
+| `nuwa_claim` | 认领并返回完整 packet（目标/事实/命令/输出契约） |
+| `nuwa_commit` | 提交结果，生成 fact；幂等；可 blocked 收口 |
+| `nuwa_flag` | 立即入账 flag；output 必须含完整值 |
+| `nuwa_complete` | 完成验收；ctf 需 flag，pentest 需 vuln/loot/flag |
+| `nuwa_status` | ASCII 看板 |
+| `nuwa_report` | Markdown 报告，可写 `.nuwa/REPORT.md` |
+| `nuwa_stop` | 主动停机 |
+| `nuwa_kb` | 本地知识库（产品卡/CVE/PoC/ATT&CK） |
+
+## 证据闸门
+
+- 非 `note` 事实必须带 `command` + `output`；`echo/printf` 不算证据。
+- `flag` 的 `output` 必须包含完整 flag 值。
+- `commit` 按 `(project,intent,attempt,kind,title)` 幂等；`flag` 按 value 哈希幂等。
+- `nuwa_complete` 没有 `flag`（ctf）或 `vuln/loot`（pentest）时直接拒绝，并计入 `rejects`。
+
+## 阶段
+
+六阶段、32 条内置意图：
+
+```
+recon(6) → surface(6) → vuln(10) → exploit(5) → post(3) → report(2)
+```
+
+当前阶段全部 `done/blocked` 时自动切下一阶段并播种；也可 `nuwa_plan(phase="surface")` 手动提前。
+细节见 `docs/OMP-NATIVE.md` 第 7 节。
+
+## 纪律拦截
+
+| 规则 | 拦截 |
+|---|---|
+| N-001 | 主线程直接跑 nmap/ffuf/nuclei/sqlmap 等 → 必须走 fujiang 子代理 |
+| N-002 | `bin/nuwa` / `nuwa/cli.py` / `nuwa dispatch` → CLI 已退役 |
+| N-003 | 写 `.nuwa/state.json`、`journal*.jsonl`、`state.lock` → 只允许 `nuwa_*` |
+| N-004 | `task` 的 agent 不是 `fujiang` → 统一 fujiang |
+| N-005 | 子会话调用记账类 `nuwa_*` → 只有主线程能记账 |
+
+## 配置
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
 | `NUWA_LOOP` | `1` | `0` 关闭续跑 |
-| `NUWA_MAX_TURNS` | `120` | 单会话最大自动续跑轮数 |
-| `NUWA_MAX_STALL` | `10` | 会话内连续无有效变化上限 |
-| `NUWA_MAX_TOKENS` | `2000000` | 累计上下文消耗上限（估算） |
-| `NUWA_IDLE_LIMIT` | `3` | 连续空转轮数上限 |
-| `NUWA_GUARD_HOURS` | `12` | 上膛有效期 |
-| `NUWA_REQUIRE_EVIDENCE` | `1` | 无 flag/vuln/loot 事实时拒绝 completed |
-| `NUWA_JOURNAL_KEEP` | `2` | journal 压缩后保留的代际数；`0` 关闭自动 GC |
-| `NUWA_POLICY_ENFORCE` | `1` | `0` 关闭扩展侧工具策略拦截 |
-| `NUWA_PROJECT` | — | 显式指定 `.sapper` 所在项目根 |
-| `SAPPER_TIMEOUT` | `300` | 单次 dispatch 超时（`NUWA_DISPATCH_TIMEOUT` 可覆盖） |
-| `PI_AGENT_HOME` | 自动探测 | `~/.omp/agent` 或 `~/.pi/agent` |
-| `SAPPER_HOME` | `~/sapper-lab` | 项目与入口目录 |
+| `NUWA_MAX_TURNS` | `200` | 最大续跑轮数 |
+| `NUWA_MAX_MINUTES` | `480` | 总时长 |
+| `NUWA_MAX_TOKENS` | `4000000` | 上下文 tokens 上限 |
+| `NUWA_MAX_STALL` | `12` | 连续无推进上限 |
+| `NUWA_MAX_IDLE` | `4` | 连续空转上限 |
+| `NUWA_MAX_BATCH` | `4` | 单批派单上限 |
+| `NUWA_CLAIM_TTL` | `900` | claim 过期秒数 |
+| `NUWA_KB_DB` | `/data/nuwa-kb/kb.db` | 知识库 |
+| `NUWA_SCANNER_GUARD` | `1` | `0` 关闭 N-001 |
+| `NUWA_REQUIRE_FUJIANG` | `1` | `0` 关闭 N-004 |
 
-运行时命令：`/nuwa-loop`、`/nuwa-loop off|on|reset`、`/nuwa-loop log [n]`、`/nuwa-loop why`、`/nuwa-loop budget [tokens]`。
+## 从 v1 迁移
 
-## 工具面策略
-
-扩展对三类工具做统一拦截（`NUWA_POLICY_ENFORCE=0` 关闭；Python 侧同名函数在 `nuwa/policy.py`）：
-
-| 规则 | 触发 | 拦截对象 |
-|---|---|---|
-| P-001..P-004 | `rm -rf /`、`mkfs.`、`dd of=/dev/sd*`、`curl --noproxy` 直连元数据 | bash |
-| P-005 | 写 `.sapper/facts/` 或 `.sapper/intents/` | write / edit / multi_edit / apply_patch |
-| P-006 | 直接 `sapper done` / `sapper dispatch i<N>` / 裸 `sapper complete`（带 `--from` 的完成走 `nuwa complete`） | bash 与 task 文案 |
-| P-007 | 写 `.nuwa/journal.jsonl`、`checkpoint.*`、`CURRENT`、`global*.jsonl` | 写类工具 |
-| P-009 | 直接改 `.sapper/project.json` | 写类工具 |
-
-fact 只能经 `nuwa dispatch` / `nuwa commit` 产生；`nuwa commit --key auto` 用 `sha256(project|intent|attempt)` 规范键做幂等。
-flag 属于证据采集，允许 `sapper flag` / `nuwa flag` 直接入账；P-006 只约束 done / dispatch / complete。
-
-## 退出码
-
-| 码 | 含义 |
-|---|---|
-| 0 | 正常完成或预算用尽 |
-| 2 | 参数 / URL 错误 |
-| 3 | 依赖缺失（sapper / python3 / curl） |
-| 4 | 项目目录冲突 |
-| 5 | 另一个 nuwa 正在操作同一张图 |
-
-## 停机条件
-
-`project.status=completed` 且带证据，或 `turns > NUWA_MAX_TURNS`，或 `stall >= NUWA_MAX_STALL`，或 `idle >= NUWA_IDLE_LIMIT`，或 `spentTokens > NUWA_MAX_TOKENS`，或上膛超过 `NUWA_GUARD_HOURS`。停机后 `armed=false`，正常收工。
-
-**完成证据闸门**：`status=completed` 但没有任何 `flag` / `vuln` / `loot` 事实时，完成会被打回 `active` 并写 hint，最多打回 3 次。这是为了防止模型在 reason 阶段脑补"已拿到 flag"。
-
-## 排查
-
-```bash
-/nuwa-loop              # armed/turns/stall/idle/tokens + 图计数
-/nuwa-loop log 20       # 最近 20 行 JSONL 事件
-/nuwa-loop why          # 上一轮注入的完整指令
+```text
+nuwa_init(migrate=true)
 ```
 
-若 `armed=true` 但 turn 结束就停：确认 `.sapper/project.json` 存在、`status` 不是 `completed`、扩展确实被加载。
-若从未上膛：会话里出现过触发动词，或调用过带 `sapper` 的 bash / 带 `fujiang` 的 task。
-若出现 `另一个 nuwa 正在操作同一张图`：检查 `.nuwa.lock` 里的 pid 是否还活着。
-
-细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、[`docs/SANDBOX.md`](docs/SANDBOX.md)、[`CHANGELOG.md`](CHANGELOG.md)。
+读取同目录 `.sapper/`，事实/意图重新编号并保留引用，`host`→`asset`，`done/complete`→`done`。
+迁移事实没有原始命令回显，建议对关键节点重新取证。
 
 ## 测试
 
-五套测试全部可离线、零模型成本重复执行：
-
 ```bash
-./tests/run.sh          # 单元 30 + 协议 14 + 混沌 8 + 并发 5 + 端到端 4 + R1/R2-R7
+bun test tests/omp_nuwa.test.ts tests/omp_extension.test.ts
+# 39 pass / 0 fail / 120 expect()
 ```
 
-| 套件 | 依赖 | 说明 |
-|---|---|---|
-| `tests/unit.test.ts` | bun | 纯函数、工具策略与配置解析（30 例） |
-| `tests/test_nuwa_shell.py` | python3 | CLI 契约，对应每个缺陷编号 |
-| `tests/test_chaos.py` | flock | 坏图 / 陈旧锁 / SIGKILL / 只读目录 / 大图 |
-| `tests/test_concurrency.py` | flock | 单赢家、跨项目、锁清理、无重复派发 |
-| `tests/test_e2e_deterministic.py` | python3 | `fake-claude` 跑完整链路 |
-| `tests/test_r1_core.py` | python3 + fake-sapper | journal 代际/GC、账本、幂等提交 |
-| `tests/test_r2_r7.py` | python3 | 公平、证据、指标、策略、插件、夜跑校验 |
+覆盖：目标规范化、playbook 播种与去重、frontier 排序、claim/重领、证据拒绝、幂等、阶段推进、
+flag 闸门、完成闸门、directive、N-001..N-005、扩展注册、完整生命周期、session_stop 续跑、停机。
 
-两个替身：`tests/fake-sapper`（sapper 协议仿真）、`tests/fake-claude`（确定性模型）。
+## 旧代码
 
-多类型同时压测：`python3 sandbox/bin/matrix.py --replicas 2 --minutes 1`（部署后位于 `/srv/nuwa-sandbox/bin/matrix.py`），编排矩阵（8 类目标同时起）
-与 HTTP 矩阵（8 类响应面并发打）各一组断言。
+`bin/nuwa`、`nuwa/*.py`、`extensions/nuwa-loop` 保留在仓库里作为 v1 参考与回滚路径，但不再安装。
+`./install.sh` 会把已安装的 `nuwa-loop` 移到 `nuwa-loop.retired-*`，避免与新运行时抢 `session_stop`。
 
-靶场、小长测与判定口径见 [`docs/TESTING.md`](docs/TESTING.md)，最近一次读数见
-[`docs/TEST-RESULTS.md`](docs/TEST-RESULTS.md)。
-
-## 许可
-
-MIT。仅用于自己拥有或已获授权的目标。
+细节见 [`docs/OMP-NATIVE.md`](docs/OMP-NATIVE.md)。
