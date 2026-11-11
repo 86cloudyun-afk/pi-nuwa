@@ -27,7 +27,7 @@ case "${1:-}" in
     ;;
 esac
 
-NUWA_VERSION="1.2.1"
+NUWA_VERSION="1.2.2"
 
 ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
 # shellcheck disable=SC1090

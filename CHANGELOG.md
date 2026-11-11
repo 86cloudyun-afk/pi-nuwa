@@ -1,3 +1,10 @@
+## 1.2.2 — 2026-11-11
+
+- 修复 P-006：`hasUnresolvedStore` 不再把 `/root/sapper-lab/bin/nuwa` 等路径误判为 `sapper` 命令；仅匹配真正的 `sapper` 子命令加变量展开。
+- `session_stop` 增加 `stop_no_root` / `stop_no_graph` 诊断事件，避免“找不到图”时静默停机。
+- 补充两条 TS 策略回归：`sapper-lab` 路径放行、`sapper` 命令带变量仍拦截。
+- 全量 170 例 + 16 runs，45 TS 单测，EXIT=0。
+
 # Changelog
 
 ## 1.2.1 — 2026-11-08

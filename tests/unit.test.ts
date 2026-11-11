@@ -302,6 +302,20 @@ describe("checkTool", () => {
 		expect(mod.checkTool("bash", { command: "sapper done i001 --fact x" }).rule).toBe("P-006");
 		expect(mod.checkTool("bash", { command: "sapper claim i001 --worker w" }).allowed).toBe(true);
 	});
+
+	test("sapper-lab 路径不被 P-006 误杀", () => {
+		const v = mod.checkTool("bash", {
+			command: 'PATH="/root/.local/bin:$PATH" /root/sapper-lab/bin/nuwa "http://x" p1 --no-run',
+		});
+		expect(v.allowed).toBe(true);
+	});
+
+	test("sapper 命令里带变量仍拦 P-006", () => {
+		const v = mod.checkTool("bash", {
+			command: 'S="sapper --store /p/.sapper"; $S fact x',
+		});
+		expect(v.rule).toBe("P-006");
+	});
 	test("只读工具放行", () => {
 		expect(mod.checkTool("read", { path: "/p/.sapper/facts/f001.json" }).allowed).toBe(true);
 	});

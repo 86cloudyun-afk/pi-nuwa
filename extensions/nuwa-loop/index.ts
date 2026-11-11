@@ -106,7 +106,7 @@ const COMMIT_RE =
 /** store 值里出现变量展开/命令替换时，静态剥离不可靠：直接 fail-closed。 */
 function hasUnresolvedStore(cmd: string): boolean {
 	// 只要 sapper 段内出现变量展开/命令替换，就无法静态确定 store 与子命令边界，直接拒绝。
-	return /\bsapper\b[^\n]*?[$`]/.test(cmd);
+	return /\bsapper\s+[^\n]*?[$`]/.test(cmd);
 }
 
 /** 命令中所有可能的 cwd：原目录与每个 cd 之后的目录。检查时取并集，避免时序漏检。 */
@@ -852,9 +852,15 @@ export default function nuwaLoop(pi: ExtensionAPI) {
 		if (!st.armed || Date.now() - st.armedAt > cfg.guardMs) return;
 
 		const root = findRoot(ctx?.cwd ?? process.cwd(), sid);
-		if (!root) return;
+		if (!root) {
+			logEvent(sid, { event: "stop_no_root", cwd: ctx?.cwd ?? process.cwd() });
+			return;
+		}
 		const g = readGraph(root);
-		if (!g) return;
+		if (!g) {
+			logEvent(sid, { event: "stop_no_graph", root });
+			return;
+		}
 
 		// 目标完成 → 先验证证据，再决定是否收工
 		if (g.status === "completed") {
