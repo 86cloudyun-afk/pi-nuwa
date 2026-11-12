@@ -32,7 +32,7 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 
-export const VERSION = "2.1.2";
+export const VERSION = "2.1.3";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -454,7 +454,7 @@ function rootForSession(dir: string, sessionId: string): "use" | "skip" | "rejec
 	return isSharedCwd(dir) ? "skip" : "use";
 }
 
-/** cwd 向上找 .nuwa/state.json → NUWA_PROJECT → 当前会话指针；共享根不向下继承，目标不同即拒绝。 */
+/** cwd 向上找 .nuwa/state.json → NUWA_PROJECT → 当前会话指针；别的会话占着共享根时，落到本会话指针。 */
 export function findRoot(cwd: string, sessionId = "", target = ""): string | null {
 	const start = resolve(cwd || process.cwd());
 	const want = target ? normalizeTarget(target).url : "";
@@ -462,8 +462,11 @@ export function findRoot(cwd: string, sessionId = "", target = ""): string | nul
 	for (;;) {
 		if (d !== start && isSharedCwd(d)) break;
 		const verdict = rootForSession(d, sessionId);
-		if (verdict === "use") return sameTarget(d, want) ? d : null;
-		if (verdict === "reject") return null;
+		if (verdict === "use") {
+			if (sameTarget(d, want)) return d;
+			break; // 同目录目标不同：交给新根分配，不借旧图
+		}
+		if (verdict === "reject") break; // 别的会话的项目：继续找本会话指针，别被它挡住
 		const up = dirname(d);
 		if (up === d) break;
 		d = up;

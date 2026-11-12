@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.3 — 2026-11-12
+
+修复共享根被旧项目占用时 `/nuwa` 第 1 轮报「未找到女娲项目」：
+
+- `findRoot` 在共享根命中别的会话 owner 时不再直接返回空，继续落到本会话指针；目标不同同样走新根。
+- 场景：`/tmp` 留有旧项目（owner 为已结束会话），新会话 `/nuwa <新目标>` 已建好 `cache/nuwa-projects/...` 并写指针，但 `nuwa_frontier` 从 `/tmp` 解析时被旧 owner 挡住。
+- 新增 1 例：共享根被 sess-other 占用，sess-A 仍能解析到自己的指针项目；无指针会话返回空。
+- 测试：v2 62 例全绿（omp_extension 5 + omp_nuwa 34 + nuwa_command 11 + nuwa_isolation 12）。
+
 ## 2.1.2 — 2026-11-12
 
 补完多任务隔离的「同根换目标」缺口：

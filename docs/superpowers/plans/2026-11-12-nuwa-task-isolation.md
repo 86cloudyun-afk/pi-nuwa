@@ -28,6 +28,11 @@
    - `nuwa_init`、`/nuwa` 共用根选择；`VERSION=2.1.2`；装机后 `sha256(index.ts) == sha256(omp/nuwa.ts)`。
    - 验收：v2 61 例全绿、`bash -n install.sh`、装机哈希一致、双会话指针目录各写各的。
 
+6. **T6 共享根被占用的指针回落（2.1.3）**
+   - RED：`/tmp` 有旧 owner 项目时，`findRoot("/tmp", 新会话)` 被 reject 直接置空，`nuwa_frontier` 报「未找到女娲项目」。
+   - GREEN：reject / 目标不符只终止向上扫描，继续落到本会话指针。
+   - 验收：isolation 第 12 例 + 实盘 `nuwa_frontier` 返回 6 条 recon。
+
 ## 回滚点
 
 每个任务一个本地 commit；失败回到上一个绿测。安装前备份已安装扩展。

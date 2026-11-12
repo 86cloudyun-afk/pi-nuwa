@@ -190,6 +190,17 @@ describe("v2 会话/项目隔离", () => {
 		expect(mod.findRoot(SHARED, "sess-A")).toBe(SHARED);
 	});
 
+	test("共享根被别的会话占用时，落到本会话指针", () => {
+		makeState(SHARED, "sess-other", "http://10.0.0.66:8080");
+		mod.writePointer(SHARED, "sess-other");
+		const own = base();
+		makeState(own, "sess-A", "http://10.0.0.9:8080");
+		mod.writePointer(own, "sess-A");
+		expect(mod.findRoot(SHARED, "sess-A")).toBe(own);
+		expect(mod.findRoot(SHARED, "sess-other")).toBe(SHARED);
+		expect(mod.findRoot(SHARED, "sess-none")).toBeNull();
+	});
+
 	test("共享根同会话换目标：开新根，旧 state 不动", () => {
 		makeState(SHARED, "sess-A", "http://10.0.0.9:8080");
 		const before = readFileSync(join(SHARED, ".nuwa", "state.json"), "utf8");
