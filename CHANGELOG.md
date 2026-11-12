@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.1.0 — 2026-11-12
+
+`/nuwa <任务>` 一键开工：自然语言进，自动抽 target/mode，init 完立即起跑。
+
+- 命令 `/nuwa <任务>`：抽目标（URL → IPv4[:port] → 主机名[:port] → `NUWA_TARGET`/`TARGET`），
+  按语义选模式（审计/渗透/ctf）；无项目则 `newState` + `seedPhase(recon)`，有项目则把任务并入
+  `priority=95` 的 custom intent；随后 `sendUserMessage(kickPrompt)` 触发第 1 轮，之后交给
+  `session_stop` 续跑。
+- `/nuwa stop [原因]`、`/nuwa resume` 落成命令；`/nuwa`、`/nuwa log [n]`、`/nuwa why` 保留。
+- 新增 `findLocalRoot`：任务模式只认 cwd 树里的 `.nuwa`，不接管指针指向的其它项目（避免串台）。
+- 新增 `tests/nuwa_command.test.ts` 11 例：extractTarget（URL/IP/域名/文件名排除/环境变量）、
+  pickMode、一句话开工、任务并入、stop/resume/看板、无目标提示、流式回退。
+- 测试 50 pass（39 旧 + 11 新）。
+
 ## 2.0.0 — 2026-11-12
 
 纯 omp 运行时重构：移除 CLI、Python、sapper 依赖，状态机与续跑循环收进扩展进程。

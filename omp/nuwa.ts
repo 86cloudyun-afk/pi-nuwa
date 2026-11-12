@@ -7,6 +7,7 @@
  *   3. 执行只在 fujiang 子代理里发生；主线程只做派单、验收、记账。
  *   4. 一切写盘原子化，journal 保存完整快照，崩溃可回放。
  *
+ * 命令面：/nuwa <任务> 自然语言开工（自动抽 target/mode、init/resume、立即起跑）
  * 工具面：nuwa_init / nuwa_plan / nuwa_frontier / nuwa_claim / nuwa_commit /
  *         nuwa_flag / nuwa_complete / nuwa_status / nuwa_report / nuwa_stop / nuwa_kb
  * 事件面：session_stop 续跑、tool_call 纪律拦截、tool_execution_end 计数。
@@ -31,7 +32,7 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 
-export const VERSION = "2.0.0";
+export const VERSION = "2.1.0";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -383,6 +384,17 @@ export function findRoot(cwd: string, sessionId = ""): string | null {
 		if (!ptr.sessionId || !sessionId || ptr.sessionId === sessionId) return resolve(ptr.root);
 	}
 	return null;
+}
+
+/** 只向上找 cwd 树里的 .nuwa，不接管指针：新建任务不串到别的项目。 */
+export function findLocalRoot(cwd: string): string | null {
+	let d = resolve(cwd || process.cwd());
+	for (;;) {
+		if (existsSync(statePath(d))) return d;
+		const up = dirname(d);
+		if (up === d) return null;
+		d = up;
+	}
 }
 
 /** 从旧 .sapper 图迁移：事实与意图全部转成 v2 状态，id 重新编号并保持引用关系。 */
@@ -1656,6 +1668,56 @@ function toolError(err: unknown, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text: `ERROR: ${msg}` }], details: { error: true, ...details } };
 }
 
+// ---------------------------------------------------------------- /nuwa <任务> 解析
+
+const TASK_URL_RE = /https?:\/\/[^\s"'`）)，。；;、]+/i;
+const TASK_IP_RE = /\b((?:\d{1,3}\.){3}\d{1,3})(?::(\d{1,5}))?\b/;
+const TASK_HOST_RE = /\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,24})(?::(\d{1,5}))?\b/i;
+/** 文件名后缀不是主机名：state.json / app.ts 这类不该被当成 target。 */
+const FILE_EXT = new Set(
+	"json md ts tsx js jsx py go rs java php rb sh yml yaml toml ini log txt db sqlite html css xml zip tar gz tgz jar war bin exe dll so".split(" "),
+);
+
+/** 从自然语言任务里抽目标：URL → IPv4[:port] → 主机名[:port] → NUWA_TARGET/TARGET 环境变量。 */
+export function extractTarget(text: string): string | null {
+	const url = text.match(TASK_URL_RE);
+	if (url) return url[0].replace(/[.,;:!?]+$/, "");
+	const ip = text.match(TASK_IP_RE);
+	if (ip) return `http://${ip[1]}:${ip[2] ?? 80}`;
+	const host = text.match(TASK_HOST_RE);
+	if (host && !FILE_EXT.has(host[1].split(".").pop()!.toLowerCase())) {
+		return `http://${host[1]}:${host[2] ?? 80}`;
+	}
+	const env = (process.env.NUWA_TARGET ?? process.env.TARGET ?? "").trim();
+	return env || null;
+}
+
+/** 任务语义 → 模式：审计 / 渗透 / ctf。 */
+export function pickMode(text: string): Mode {
+	if (/(代码审计|审计|白盒|静态分析|源码|audit|review|source\s*review)/i.test(text)) return "audit";
+	if (/(渗透|打点|提权|横向|内网|域控|红队|拿权限|getshell|pentest|exploit|c2)/i.test(text)) return "pentest";
+	return "ctf";
+}
+
+/** 起跑 directive：作为用户消息打回主线程，触发第 1 轮。 */
+export function kickPrompt(st: NuwaState): string {
+	const p = st.project;
+	const open = Object.values(st.intents).filter((i) => i.status === "open").length;
+	const flags = Object.values(st.facts).filter((f) => f.kind === "flag").length;
+	return [
+		`[女娲 v${VERSION} · 开工] ${p.id} · ${p.url} · mode=${p.mode} · phase=${p.phase} · open=${open} · flags=${flags}`,
+		`目标: ${p.goal}`,
+		"",
+		"现在开始第 1 轮，按顺序直接做，不要复述任务、不要问我：",
+		"1) nuwa_frontier 取 eligible 意图（最多 6 条并行）",
+		"2) 每条 nuwa_claim(id) 拿 packet",
+		'3) task({tasks:[{agent:"fujiang", task:"<packet>"}]}) 并行派发',
+		"4) 回包后 nuwa_commit(id, kind, title, command, output) 记账；拿到 flag 用 nuwa_flag",
+		"5) 阶段清空自动 nuwa_plan(下一阶段)；flag 到手 nuwa_complete；卡死用 nuwa_commit(blocked=true, note=原因)",
+		"纪律：主线程不扫端口、不走 CLI、不写 .nuwa/state.json；扫描与利用全部在 fujiang 子代理里执行。",
+	].join("\n");
+}
+
 export default function nuwaOmp(pi: ExtensionAPI) {
 	const cfg = readCfg();
 	const z = pi.zod;
@@ -2089,34 +2151,138 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand?.("nuwa", {
-		description: "女娲状态：/nuwa | /nuwa log [n] | /nuwa why",
+		description: "女娲：/nuwa <任务> 开工并自动续跑 | /nuwa 看板 | log [n] | why | stop | resume",
+		getArgumentCompletions: (prefix: string) =>
+			["status", "log", "why", "stop", "resume"].filter((v) => v.startsWith(prefix)).map((v) => ({ value: v, label: v })),
 		handler: async (args, ctx) => {
-			const root = findRoot(ctx.cwd, sidOf(ctx));
-			if (!root) {
-				ctx.ui.notify("当前目录没有女娲项目；用 nuwa_init 创建", "info");
-				return;
-			}
-			const st = loadState(root);
-			if (!st) {
-				ctx.ui.notify("state 读取失败", "error");
-				return;
-			}
+			const notify = (t: string, level: "info" | "error" = "info") => {
+				try {
+					ctx.ui.notify(t, level);
+				} catch {
+					/* 非 TUI 模式无通知通道 */
+				}
+			};
+			// 命令本身不产生模型轮次：init 完再把 directive 作为用户消息打进去，立刻起跑。
+			const kick = (text: string): boolean => {
+				try {
+					pi.sendUserMessage(text);
+					return true;
+				} catch {
+					/* 流式中回退到自定义消息 */
+				}
+				try {
+					pi.sendMessage({ customType: "nuwa-kick", content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+					return true;
+				} catch {
+					return false;
+				}
+			};
 			const arg = (args ?? "").trim();
+			const found = findRoot(ctx.cwd, sidOf(ctx));
+
 			if (arg.startsWith("log")) {
+				if (!found) return notify("当前目录没有女娲项目", "error");
 				const n = Math.max(1, Math.min(100, Number(arg.split(/\s+/)[1]) || 10));
 				try {
-					const lines = readFileSync(journalPath(root), "utf8").trim().split("\n").slice(-n);
-					ctx.ui.notify(lines.join("\n"), "info");
+					notify(readFileSync(journalPath(found), "utf8").trim().split("\n").slice(-n).join("\n"));
 				} catch {
-					ctx.ui.notify("(空日志)", "info");
+					notify("(空日志)");
 				}
 				return;
 			}
 			if (arg === "why") {
-				ctx.ui.notify(st.runtime.lastDirective || "(还没注入过指令)", "info");
+				const st = found ? loadState(found) : null;
+				return notify(st?.runtime.lastDirective || "(还没注入过指令)");
+			}
+			if (arg === "stop" || arg.startsWith("stop ")) {
+				if (!found) return notify("当前目录没有女娲项目", "error");
+				const reason = arg.slice(4).trim() || "user stopped";
+				const st = withLock(found, () => {
+					const s = loadState(found);
+					if (!s) return null;
+					s.project.status = "stopped";
+					s.project.stopReason = reason;
+					saveState(found, s);
+					return s;
+				});
+				if (!st) return notify("state 读取失败", "error");
+				logEvent(found, { type: "stop", reason, via: "command" });
+				return notify(`已停止 ${st.project.id} · ${reason}｜/nuwa resume 继续`);
+			}
+			if (arg === "resume") {
+				if (!found) return notify("当前目录没有女娲项目", "error");
+				const st = withLock(found, () => {
+					const s = loadState(found);
+					if (!s) return null;
+					s.project.status = "active";
+					s.project.stopReason = undefined;
+					s.runtime.startedAt = Date.now();
+					s.runtime.turns = 0;
+					s.runtime.stall = 0;
+					s.runtime.idle = 0;
+					s.runtime.tokens = 0;
+					s.runtime.completionRejects = 0;
+					s.runtime.lastSig = "";
+					saveState(found, s);
+					return s;
+				});
+				if (!st) return notify("state 读取失败", "error");
+				writePointer(found, sidOf(ctx));
+				notify(`已恢复 ${st.project.id} · phase=${st.project.phase}`);
+				if (!kick(kickPrompt(st))) notify("已恢复；发任意一句话即继续");
 				return;
 			}
-			ctx.ui.notify(statusBoard(st), "info");
+			if (!arg || arg === "status" || arg === "board") {
+				if (!found) return notify("用法: /nuwa 打 http://10.0.0.5:8080 拿 flag｜/nuwa 看板");
+				const st = loadState(found);
+				return notify(st ? statusBoard(st) : "state 读取失败", st ? "info" : "error");
+			}
+
+			// ---- 任务模式：/nuwa <自然语言任务> ----
+			const root = findLocalRoot(ctx.cwd) ?? (process.env.NUWA_PROJECT ? resolve(process.env.NUWA_PROJECT) : resolve(ctx.cwd));
+			const mode = pickMode(arg);
+			const target = extractTarget(arg);
+			const prev = loadState(root);
+
+			if (prev) {
+				const it = withLock(root, () => {
+					const s = loadState(root);
+					if (!s) return null;
+					s.project.status = "active";
+					s.project.stopReason = undefined;
+					if (mode !== s.project.mode) s.project.mode = mode;
+					const intent = addIntent(s, { title: arg, detail: arg, phase: s.project.phase, priority: 95 });
+					saveState(root, s);
+					return intent;
+				});
+				if (!it) return notify("state 读取失败", "error");
+				writePointer(root, sidOf(ctx));
+				logEvent(root, { type: "task", intent: it.id, text: arg, via: "command" });
+				const st = loadState(root)!;
+				notify(`已并入 ${st.project.id}：${it.id} ${it.title}（phase=${it.phase} priority=95）\n${statusBoard(st)}`);
+				if (!kick(kickPrompt(st))) notify("已记账；发任意一句话即开始执行");
+				return;
+			}
+
+			if (!target) {
+				return notify("没识别到目标。用法: /nuwa 打 http://10.0.0.5:8080 拿 flag\n也可先 export NUWA_TARGET=http://host:port 再 /nuwa <任务>", "error");
+			}
+			let st: NuwaState;
+			try {
+				st = withLock(root, () => {
+					const s = newState(target, arg, mode, readCfg());
+					seedPhase(s, "recon");
+					saveState(root, s);
+					return s;
+				});
+			} catch (e) {
+				return notify(`上膛失败: ${e instanceof Error ? e.message : String(e)}`, "error");
+			}
+			mkdirSync(`/tmp/nuwa/${st.project.id}`, { recursive: true });
+			writePointer(root, sidOf(ctx));
+			logEvent(root, { type: "init", id: st.project.id, url: st.project.url, mode: st.project.mode, via: "command" });
+			notify(`女娲已上膛: ${st.project.id} · ${st.project.url} · mode=${st.project.mode}\n${statusBoard(st)}`);
+			if (!kick(kickPrompt(st))) notify("已上膛；发任意一句话即开始执行");
 		},
 	});
 

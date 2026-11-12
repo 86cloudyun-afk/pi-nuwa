@@ -135,6 +135,33 @@ v2 把所有边界收进 omp 进程：
 - `intents[*].status`：`open | claimed | done | blocked`。`claimed` 超过 `NUWA_CLAIM_TTL`（默认 900s）可被重新认领，`attempts+1`。
 - `runtime.lastSig`：`status|phase|open|claimed|done|blocked|facts|flags|lastFact`，用于 stall。
 
+## 3.5 `/nuwa` 命令（v2.1）
+
+```
+/nuwa <自然语言任务>      # 开工：抽 target/mode → init/resume → 注入第 1 轮
+/nuwa                    # 看板
+/nuwa log [n]            # journal 末 n 行
+/nuwa why                # 上一条续跑 directive
+/nuwa stop [原因]         # 停机（保留 facts/intents）
+/nuwa resume             # 复活并立即起跑
+```
+
+任务模式的解析规则：
+
+| 输入片断 | 结果 |
+|---|---|
+| `http://h:8080/path` | 原样作为 target |
+| `10.0.0.5:8080` / `10.0.0.5` | `http://10.0.0.5:8080` / `:80` |
+| `demo.target.test` | `http://demo.target.test:80`；`state.json`、`app.ts` 等文件后缀不算目标 |
+| 都没有 | 读 `NUWA_TARGET` / `TARGET`；仍为空则只回用法，不落状态 |
+
+模式：`审计|白盒|audit|review` → `audit`；`渗透|打点|提权|横向|内网|red|getshell` → `pentest`；
+其余 → `ctf`。
+
+建项目时 `seedPhase(recon)` 播 6 条；已有项目则 `addIntent(priority=95)` 把任务并入当前阶段。
+落地后命令自己调 `pi.sendUserMessage(kickPrompt)` 触发一次真实轮次——命令处理器本身不产生模型
+轮次，这一步是"输入 /nuwa 就开跑"的关键；流式中回退到 `sendMessage({triggerTurn:true})`。
+
 ## 4. 工具参考
 
 ### nuwa_init
