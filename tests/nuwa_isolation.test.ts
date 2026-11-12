@@ -5,7 +5,9 @@ import { join, resolve } from "node:path";
 
 // 模块顶层会读 PI_AGENT_HOME，必须先固定测试 agent home，再动态导入。
 const AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-isolation-agent-"));
+const SHARED = mkdtempSync("/var/tmp/nuwa-shared-root-");
 process.env.PI_AGENT_HOME = AGENT_HOME;
+process.env.NUWA_SHARED_CWDS = SHARED;
 delete process.env.NUWA_PROJECT;
 const mod = await import("../omp/nuwa");
 
@@ -13,6 +15,7 @@ const dirs: string[] = [];
 afterAll(() => {
 	for (const d of dirs) rmSync(d, { recursive: true, force: true });
 	rmSync(AGENT_HOME, { recursive: true, force: true });
+	rmSync(SHARED, { recursive: true, force: true });
 });
 
 function base(): string {
@@ -21,18 +24,54 @@ function base(): string {
 	return d;
 }
 
-function makeState(root: string, owner?: string): void {
+function makeState(root: string, owner?: string, url?: string): void {
 	mkdirSync(join(root, ".nuwa"), { recursive: true });
 	writeFileSync(join(root, ".nuwa", "state.json"), JSON.stringify({
 		schema: 1,
-		project: { ownerSessionId: owner },
+		project: { id: "p", url, target: url, ownerSessionId: owner, phase: "recon" },
 	}));
+}
+
+type RegisteredTool = {
+	name: string;
+	execute: (...args: unknown[]) => Promise<{ details?: Record<string, unknown> }>;
+};
+
+function captureTools(): Map<string, RegisteredTool> {
+	const chain = (): unknown => {
+		const f = (..._args: unknown[]) => chain();
+		return new Proxy(f, { get: () => (..._args: unknown[]) => chain() });
+	};
+	const z = new Proxy({}, { get: () => (..._args: unknown[]) => chain() });
+	const tools = new Map<string, RegisteredTool>();
+	const pi = {
+		zod: z,
+		logger: { debug() {}, info() {}, warn() {}, error() {} },
+		registerTool: (t: RegisteredTool) => tools.set(t.name, t),
+		registerCommand: () => {},
+		on: () => {},
+	};
+	// 测试只依赖工具注册面，这里按注册表形状做一次性断言。
+	mod.default(pi as unknown as Parameters<typeof mod.default>[0]);
+	return tools;
+}
+
+function makeCtx(cwd: string, sid: string): Record<string, unknown> {
+	return {
+		cwd,
+		agent: { kind: "main" },
+		sessionManager: { getSessionId: () => sid },
+		getContextUsage: () => ({ tokens: 0, usedTokens: 0 }),
+		ui: { notify() {}, setStatus() {} },
+	};
 }
 
 beforeEach(() => {
 	rmSync(join(AGENT_HOME, "cache", "nuwa-current.d"), { recursive: true, force: true });
 	rmSync(join(AGENT_HOME, "cache", "nuwa-current.json"), { force: true });
 	rmSync(join(AGENT_HOME, "cache", "nuwa-projects"), { recursive: true, force: true });
+	rmSync(SHARED, { recursive: true, force: true });
+	mkdirSync(SHARED, { recursive: true });
 });
 
 describe("v2 会话/项目隔离", () => {
@@ -140,5 +179,55 @@ describe("v2 会话/项目隔离", () => {
 		expect(resolve(root2)).not.toBe(resolve(root));
 		const st2 = JSON.parse(readFileSync(join(root2, ".nuwa", "state.json"), "utf8"));
 		expect(st2.project.url).toBe("http://10.0.0.10:8080");
+	});
+
+	test("共享根的项目不向子目录继承", () => {
+		makeState(SHARED, "sess-A", "http://10.0.0.9:8080");
+		mod.writePointer(SHARED, "sess-A");
+		const sub = join(SHARED, "sub");
+		mkdirSync(sub, { recursive: true });
+		expect(mod.findRoot(sub, "sess-A")).toBeNull();
+		expect(mod.findRoot(SHARED, "sess-A")).toBe(SHARED);
+	});
+
+	test("共享根同会话换目标：开新根，旧 state 不动", () => {
+		makeState(SHARED, "sess-A", "http://10.0.0.9:8080");
+		const before = readFileSync(join(SHARED, ".nuwa", "state.json"), "utf8");
+		const next = mod.defaultProjectRoot(SHARED, "10.0.0.10:8080", "sess-A");
+		expect(resolve(next)).not.toBe(resolve(SHARED));
+		expect(resolve(next).startsWith(resolve(AGENT_HOME, "cache", "nuwa-projects"))).toBe(true);
+		expect(readFileSync(join(SHARED, ".nuwa", "state.json"), "utf8")).toBe(before);
+	});
+
+	test("共享根同会话同目标：复用原根", () => {
+		makeState(SHARED, "sess-A", "http://10.0.0.9:8080");
+		expect(mod.defaultProjectRoot(SHARED, "http://10.0.0.9:8080", "sess-A")).toBe(SHARED);
+	});
+
+	test("非共享 cwd 第二目标落 .nuwa-tasks", () => {
+		const dir = base();
+		makeState(dir, "sess-A", "http://10.0.0.9:8080");
+		const next = mod.defaultProjectRoot(dir, "10.0.0.10:8080", "sess-A");
+		expect(resolve(next)).not.toBe(resolve(dir));
+		expect(resolve(next).startsWith(join(resolve(dir), ".nuwa-tasks"))).toBe(true);
+		expect(mod.defaultProjectRoot(dir, "10.0.0.9:8080", "sess-A")).toBe(dir);
+	});
+
+	test("nuwa_init 在共享根换目标不覆盖旧项目", async () => {
+		makeState(SHARED, "sess-A", "http://10.0.0.9:8080");
+		const before = readFileSync(join(SHARED, ".nuwa", "state.json"), "utf8");
+		const tools = captureTools();
+		const res = await tools.get("nuwa_init")!.execute(
+			"call-x",
+			{ target: "10.0.0.11:8080", mode: "ctf" },
+			undefined,
+			undefined,
+			makeCtx(SHARED, "sess-A"),
+		);
+		const root = String(res.details?.root ?? "");
+		expect(resolve(root)).not.toBe(resolve(SHARED));
+		expect(readFileSync(join(SHARED, ".nuwa", "state.json"), "utf8")).toBe(before);
+		const st = JSON.parse(readFileSync(join(root, ".nuwa", "state.json"), "utf8"));
+		expect(st.project.url).toBe("http://10.0.0.11:8080");
 	});
 });

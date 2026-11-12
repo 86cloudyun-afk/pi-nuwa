@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.2 — 2026-11-12
+
+补完多任务隔离的「同根换目标」缺口：
+
+- `findRoot` / `findLocalRoot` 增加 target 过滤：同目录已是 A 目标时，B 目标不再并入 A 的图；共享根（`/tmp`、home、`/`、`/data/workspace`、`NUWA_SHARED_CWDS`）的项目不向子目录继承。
+- `/nuwa <任务>` 有目标时按目标选根：同目标复用，不同目标新建 `cache/nuwa-projects/<target>-<sessionHash>`；非共享 cwd 的第二个目标落到 `<cwd>/.nuwa-tasks/<target>-<sessionHash>`。
+- `nuwa_init` 走同一套根选择；显式 `root` 与目标不一致时要求 `force=true`，避免静默覆盖。
+- 会话指针只对非共享项目根跨 cwd 生效；共享根只服务恰好位于该目录的会话。
+- 新增 5 例：共享根不向子目录继承、同会话换目标开新根、同目标复用、非共享第二目标落 `.nuwa-tasks`、`nuwa_init` 不覆盖旧项目。
+- 测试：v2 61 例全绿（omp_extension 5 + omp_nuwa 34 + nuwa_command 11 + nuwa_isolation 11）。
+
 ## 2.1.1 — 2026-11-12
 
 修复多女娲任务互相污染：

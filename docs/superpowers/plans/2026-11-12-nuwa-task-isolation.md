@@ -18,6 +18,16 @@
    - GREEN：`project.ownerSessionId`；`rootForSession` 直接 reject；`/nuwa` 非共享 cwd 优先 cwd。
    - 验收：v2 55+ 例全绿；全量 known-red 只保留 1.x 遗留项。
 
+4. **T4 同根换目标隔离（2.1.2）**
+   - 文件：`omp/nuwa.ts`、`tests/nuwa_isolation.test.ts`
+   - RED：共享根已有 A 项目时，同一会话 `/nuwa B` 把 B 并进 A；`findRoot` 从子目录继承共享根的 A。
+   - GREEN：`findRoot`/`findLocalRoot` 按 target 过滤；共享根不向下继承；`defaultProjectRoot` 为同根第二目标开隔离根（共享 cwd → `cache/nuwa-projects`，非共享 cwd → `.nuwa-tasks`）。
+   - 验收：isolation 第 7–11 例。
+
+5. **T5 入口一致与装机**
+   - `nuwa_init`、`/nuwa` 共用根选择；`VERSION=2.1.2`；装机后 `sha256(index.ts) == sha256(omp/nuwa.ts)`。
+   - 验收：v2 61 例全绿、`bash -n install.sh`、装机哈希一致、双会话指针目录各写各的。
+
 ## 回滚点
 
 每个任务一个本地 commit；失败回到上一个绿测。安装前备份已安装扩展。

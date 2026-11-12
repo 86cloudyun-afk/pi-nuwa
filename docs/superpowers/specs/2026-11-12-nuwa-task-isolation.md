@@ -12,6 +12,8 @@
 2. **共享 cwd 项目根隔离**：`/tmp`、home、`/data/workspace` 等共享目录下，新建项目默认落到 `AGENT_HOME/cache/nuwa-projects/<target>-<sessionHash>`，不复用共享 `.nuwa/state.json`。
 3. **state 归属**：新建/恢复项目写入 `project.ownerSessionId`；`findRoot`/`findLocalRoot` 遇到其他会话的 owner 直接拒绝，不向父目录借用图。
 4. **任务模式 cwd 优先**：`/nuwa <task>` 在非共享 cwd 优先当前目录项目；只有共享 cwd 才用本会话指针兜底。
+5. **同根换目标**：同一目录/共享根已有 A 目标时，B 目标必须开隔离根（共享 cwd → `AGENT_HOME/cache/nuwa-projects`，非共享 cwd → `<cwd>/.nuwa-tasks`），不得并入 A 的 facts/intents。
+6. **共享根不向下继承**：`/tmp` 等项目根只服务恰好位于该目录的会话，其子目录不再解析到该根。
 
 ## Non-goals
 

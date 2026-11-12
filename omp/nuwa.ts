@@ -32,7 +32,7 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 
-export const VERSION = "2.1.1";
+export const VERSION = "2.1.2";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -183,7 +183,20 @@ export function sha(input: string, len = 12): string {
 /** 共享 cwd 不能直接放 .nuwa，否则同机多个任务会写同一份 state。 */
 export function isSharedCwd(cwd: string): boolean {
 	const r = resolve(cwd || process.cwd());
-	return r === resolve(tmpdir()) || r === resolve(homedir()) || r === "/" || r === "/data/workspace";
+	const extra = (process.env.NUWA_SHARED_CWDS ?? "")
+		.split(":")
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.map((s) => resolve(s));
+	return [resolve(tmpdir()), resolve(homedir()), resolve("/"), resolve("/data/workspace"), ...extra].includes(r);
+}
+
+/** 共享根只服务“恰好在该目录”的会话；普通项目根允许会话指针跨 cwd 指向。 */
+function usableRoot(cwd: string, root: string): boolean {
+	const c = resolve(cwd);
+	const r = resolve(root);
+	if (c === r) return true;
+	return !isSharedCwd(r);
 }
 
 function sessionPointerPath(sessionId: string): string {
@@ -195,6 +208,18 @@ function stateOwner(dir: string): string | undefined {
 	return raw?.project?.ownerSessionId;
 }
 
+function stateUrl(dir: string): string | undefined {
+	const raw = readJson<{ project?: { url?: string } }>(statePath(dir));
+	return raw?.project?.url;
+}
+
+/** target 为空表示“不按目标过滤”；有 target 时只认同一个规范化 URL。 */
+function sameTarget(dir: string, targetUrl: string): boolean {
+	if (!targetUrl) return true;
+	const url = stateUrl(dir);
+	return !url || url === normalizeTarget(targetUrl).url;
+}
+
 function readSessionPointer(sessionId: string): { root?: string; sessionId?: string } | null {
 	const ptr = readJson<{ root?: string; sessionId?: string }>(sessionPointerPath(sessionId));
 	if (!ptr?.root || !existsSync(statePath(ptr.root))) return null;
@@ -202,13 +227,21 @@ function readSessionPointer(sessionId: string): { root?: string; sessionId?: str
 	return ptr;
 }
 
-/** 默认项目根：现有本地项目 > NUWA_PROJECT > 共享 cwd 的会话隔离目录。 */
+/** 默认项目根：同目标现有项目 > NUWA_PROJECT > 非共享 cwd 的任务子目录 > 共享 cwd 的会话隔离目录。 */
 export function defaultProjectRoot(cwd: string, target: string, sessionId: string): string {
-	const local = findLocalRoot(cwd, sessionId);
+	const want = target ? normalizeTarget(target).url : "";
+	const local = findLocalRoot(cwd, sessionId, want);
 	if (local) return local;
 	const env = process.env.NUWA_PROJECT;
-	if (env && existsSync(statePath(resolve(env)))) return resolve(env);
-	if (!isSharedCwd(cwd)) return resolve(cwd);
+	if (env && existsSync(statePath(resolve(env))) && sameTarget(resolve(env), want)) return resolve(env);
+	if (!isSharedCwd(cwd)) {
+		const base = resolve(cwd);
+		if (existsSync(statePath(base)) && !sameTarget(base, want)) {
+			const t = normalizeTarget(target);
+			return join(base, ".nuwa-tasks", `${slug(t.host)}-${t.port}-${sha(sessionId || "default", 8)}`);
+		}
+		return base;
+	}
 	const t = normalizeTarget(target);
 	return join(PROJECTS_DIR, `${slug(t.host)}-${t.port}-${sha(sessionId || "default", 10)}`);
 }
@@ -421,34 +454,46 @@ function rootForSession(dir: string, sessionId: string): "use" | "skip" | "rejec
 	return isSharedCwd(dir) ? "skip" : "use";
 }
 
-/** cwd 向上找 .nuwa/state.json → NUWA_PROJECT → 当前会话指针；legacy 指针只给无会话调用。 */
-export function findRoot(cwd: string, sessionId = ""): string | null {
-	let d = resolve(cwd || process.cwd());
+/** cwd 向上找 .nuwa/state.json → NUWA_PROJECT → 当前会话指针；共享根不向下继承，目标不同即拒绝。 */
+export function findRoot(cwd: string, sessionId = "", target = ""): string | null {
+	const start = resolve(cwd || process.cwd());
+	const want = target ? normalizeTarget(target).url : "";
+	let d = start;
 	for (;;) {
+		if (d !== start && isSharedCwd(d)) break;
 		const verdict = rootForSession(d, sessionId);
-		if (verdict === "use") return d;
+		if (verdict === "use") return sameTarget(d, want) ? d : null;
 		if (verdict === "reject") return null;
 		const up = dirname(d);
 		if (up === d) break;
 		d = up;
 	}
 	const env = process.env.NUWA_PROJECT;
-	if (env && existsSync(statePath(resolve(env)))) return resolve(env);
+	if (env && existsSync(statePath(resolve(env))) && sameTarget(resolve(env), want)) return resolve(env);
 	if (sessionId) {
 		const ptr = readSessionPointer(sessionId);
-		return ptr?.root ? resolve(ptr.root) : null;
+		if (!ptr?.root) return null;
+		const root = resolve(ptr.root);
+		if (!usableRoot(cwd, root)) return null;
+		return sameTarget(root, want) ? root : null;
 	}
 	const legacy = readJson<{ root?: string; sessionId?: string }>(POINTER);
-	if (legacy?.root && existsSync(statePath(legacy.root))) return resolve(legacy.root);
+	if (legacy?.root && existsSync(statePath(legacy.root))) {
+		const root = resolve(legacy.root);
+		if (usableRoot(cwd, root) && sameTarget(root, want)) return root;
+	}
 	return null;
 }
 
-/** 只向上找 cwd 树里的 .nuwa，不接管指针：新建任务不串到别的项目。 */
-export function findLocalRoot(cwd: string, sessionId = ""): string | null {
-	let d = resolve(cwd || process.cwd());
+/** 只向上找 cwd 树里的 .nuwa，不接管指针；共享根不向下继承，目标不同即拒绝。 */
+export function findLocalRoot(cwd: string, sessionId = "", target = ""): string | null {
+	const start = resolve(cwd || process.cwd());
+	const want = target ? normalizeTarget(target).url : "";
+	let d = start;
 	for (;;) {
+		if (d !== start && isSharedCwd(d)) break;
 		const verdict = rootForSession(d, sessionId);
-		if (verdict === "use") return d;
+		if (verdict === "use") return sameTarget(d, want) ? d : null;
 		if (verdict === "reject") return null;
 		const up = dirname(d);
 		if (up === d) break;
@@ -1808,19 +1853,19 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const sid = sidOf(ctx);
+				const want = p.target ? normalizeTarget(p.target).url : "";
 				let root: string;
 				if (p.root) {
 					root = resolve(ctx.cwd, p.root);
+				} else if (p.target) {
+					root = defaultProjectRoot(ctx.cwd, p.target, sid);
 				} else {
 					const local = findLocalRoot(ctx.cwd, sid);
 					if (local) {
 						root = local;
 					} else if (isSharedCwd(ctx.cwd)) {
 						const ptr = readSessionPointer(sid);
-						const want = p.target ? normalizeTarget(p.target) : null;
-						const prev = ptr?.root ? loadState(ptr.root) : null;
-						if (ptr?.root && (!want || prev?.project.url === want.url)) root = resolve(ptr.root);
-						else if (p.target) root = defaultProjectRoot(ctx.cwd, p.target, sid);
+						if (ptr?.root) root = resolve(ptr.root);
 						else throw new Error("共享 cwd 下新建/恢复项目需要 target 或 root");
 					} else {
 						root = resolve(ctx.cwd);
@@ -1829,6 +1874,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const existing = loadState(root);
 				if (existing?.project.ownerSessionId && existing.project.ownerSessionId !== sid && !p.force) {
 					throw new Error("该项目属于其他 omp 会话；用 force=true 明确接管，避免跨任务污染");
+				}
+				if (existing && want && existing.project.url !== want && !p.force) {
+					throw new Error(`该目录已是 ${existing.project.url} 的项目；新目标请换 root，或 force=true 明确接管`);
 				}
 				if (p.migrate) {
 					if (existing && !p.force) throw new Error("已有 .nuwa 状态；加 force=true 覆盖后再迁移");
@@ -2325,20 +2373,18 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const sid = sidOf(ctx);
 			const mode = pickMode(arg);
 			const target = extractTarget(arg);
-			const local = findLocalRoot(ctx.cwd, sid);
-			const want = target ? normalizeTarget(target) : null;
-			let root: string | null = local;
-			if (!root && isSharedCwd(ctx.cwd) && found) {
-				const fs = loadState(found);
-				if (!want || fs?.project.url === want.url) root = found;
-			}
-			if (!root && !isSharedCwd(ctx.cwd)) root = resolve(ctx.cwd);
-			if (!root && process.env.NUWA_PROJECT) root = resolve(process.env.NUWA_PROJECT);
-			if (!root && target) root = defaultProjectRoot(ctx.cwd, target, sid);
-			if (!root) return notify("共享 cwd 下请给 target 或显式 NUWA_PROJECT/root", "error");
+			const want = target ? normalizeTarget(target).url : "";
+			// 有目标：同目标复用、不同目标必开新根，绝不再并进旧图。
+			const root: string | null = target
+				? defaultProjectRoot(ctx.cwd, target, sid)
+				: (findLocalRoot(ctx.cwd, sid) ?? (isSharedCwd(ctx.cwd) ? findRoot(ctx.cwd, sid) : null));
+			if (!root) return notify("用法: /nuwa 打 http://10.0.0.5:8080 拿 flag；或先在该目录 nuwa_init / 设 NUWA_PROJECT", "error");
 			const prev = loadState(root);
 			if (prev?.project.ownerSessionId && prev.project.ownerSessionId !== sid) {
 				return notify("该项目属于其他 omp 会话；用 NUWA_PROJECT 明确接管", "error");
+			}
+			if (prev && want && prev.project.url !== want) {
+				return notify(`根目录属于 ${prev.project.url}，与本次目标不同；请换目录`, "error");
 			}
 
 			if (prev) {
