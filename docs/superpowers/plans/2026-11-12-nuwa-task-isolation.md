@@ -1,0 +1,23 @@
+# 女娲任务隔离 G2 计划
+
+1. **T1 会话语义指针**
+   - 文件：`omp/nuwa.ts`、`tests/nuwa_isolation.test.ts`
+   - RED：legacy 空 sessionId 指针被具名会话接管；两个 session 指针互相覆盖。
+   - GREEN：`writePointer` 写 `nuwa-current.d/<sha(sessionId)>.json`；`findRoot` 具名会话只读本会话指针；无 sessionId 才读 legacy。
+   - 验收：隔离测试前 3 例。
+
+2. **T2 共享 cwd 根隔离**
+   - 文件：`omp/nuwa.ts`、`tests/nuwa_isolation.test.ts`
+   - RED：`nuwa_init` 在 `/tmp` 写 `/tmp/.nuwa/state.json`；两个 session 同 target 共用。
+   - GREEN：`isSharedCwd` + `defaultProjectRoot`；`nuwa_init`/`/nuwa` 在共享 cwd 用 `nuwa-projects`。
+   - 验收：隔离测试后 2 例，包含真实 `nuwa_init` 不写 `/tmp/.nuwa`。
+
+3. **T3 owner 与命令根选择**
+   - 文件：`omp/nuwa.ts`、`tests/nuwa_command.test.ts`、`tests/nuwa_isolation.test.ts`
+   - RED：其他 session 的 state 被向父目录借用；`/nuwa` 在非共享新 cwd 并入旧项目。
+   - GREEN：`project.ownerSessionId`；`rootForSession` 直接 reject；`/nuwa` 非共享 cwd 优先 cwd。
+   - 验收：v2 55+ 例全绿；全量 known-red 只保留 1.x 遗留项。
+
+## 回滚点
+
+每个任务一个本地 commit；失败回到上一个绿测。安装前备份已安装扩展。

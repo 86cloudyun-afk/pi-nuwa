@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.1.1 — 2026-11-12
+
+修复多女娲任务互相污染：
+
+- 指针按 `sessionId` 分文件写入 `cache/nuwa-current.d/`；具名会话不再读写全局 legacy 指针，最后写入者不再覆盖别人的项目。
+- `findRoot` 只接管 `ownerSessionId` 匹配的 state；其他会话的项目直接拒绝，不向父目录借用图。
+- 共享 cwd（`/tmp`、home、`/data/workspace`）默认项目根落到 `cache/nuwa-projects/<target>-<sessionHash>`，不再共用 `/tmp/.nuwa/state.json`。
+- `/nuwa <task>` 在非共享 cwd 优先当前目录项目；只有共享 cwd 才用本会话指针兜底，避免把新任务并进旧项目。
+- 新增 `tests/nuwa_isolation.test.ts` 6 例：指针隔离、legacy 拒绝、owner 冲突、共享 cwd 根分离、真实 init 不写 `/tmp/.nuwa`。
+
 ## 2.1.0 — 2026-11-12
 
 `/nuwa <任务>` 一键开工：自然语言进，自动抽 target/mode，init 完立即起跑。

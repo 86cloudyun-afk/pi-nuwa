@@ -27,12 +27,12 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 
-export const VERSION = "2.1.0";
+export const VERSION = "2.1.1";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -40,6 +40,8 @@ const AGENT_HOME =
 	process.env.PI_AGENT_HOME ??
 	(existsSync(join(homedir(), ".omp/agent")) ? join(homedir(), ".omp/agent") : join(homedir(), ".pi/agent"));
 const POINTER = join(AGENT_HOME, "cache/nuwa-current.json");
+const POINTER_DIR = join(AGENT_HOME, "cache/nuwa-current.d");
+const PROJECTS_DIR = join(AGENT_HOME, "cache/nuwa-projects");
 
 export type Mode = "ctf" | "pentest" | "audit";
 export type FactKind =
@@ -102,6 +104,8 @@ export interface Project {
 	completedAt?: string;
 	completedFrom?: string[];
 	stopReason?: string;
+	/** 首次创建/接管的 omp 会话；共享 cwd 下用它拒绝跨会话接管。 */
+	ownerSessionId?: string;
 }
 
 export interface Runtime {
@@ -174,6 +178,39 @@ export function nowIso(): string {
 
 export function sha(input: string, len = 12): string {
 	return createHash("sha1").update(input).digest("hex").slice(0, len);
+}
+
+/** 共享 cwd 不能直接放 .nuwa，否则同机多个任务会写同一份 state。 */
+export function isSharedCwd(cwd: string): boolean {
+	const r = resolve(cwd || process.cwd());
+	return r === resolve(tmpdir()) || r === resolve(homedir()) || r === "/" || r === "/data/workspace";
+}
+
+function sessionPointerPath(sessionId: string): string {
+	return join(POINTER_DIR, `${sha(sessionId || "default", 16)}.json`);
+}
+
+function stateOwner(dir: string): string | undefined {
+	const raw = readJson<{ project?: { ownerSessionId?: string } }>(statePath(dir));
+	return raw?.project?.ownerSessionId;
+}
+
+function readSessionPointer(sessionId: string): { root?: string; sessionId?: string } | null {
+	const ptr = readJson<{ root?: string; sessionId?: string }>(sessionPointerPath(sessionId));
+	if (!ptr?.root || !existsSync(statePath(ptr.root))) return null;
+	if (ptr.sessionId && ptr.sessionId !== sessionId) return null;
+	return ptr;
+}
+
+/** 默认项目根：现有本地项目 > NUWA_PROJECT > 共享 cwd 的会话隔离目录。 */
+export function defaultProjectRoot(cwd: string, target: string, sessionId: string): string {
+	const local = findLocalRoot(cwd, sessionId);
+	if (local) return local;
+	const env = process.env.NUWA_PROJECT;
+	if (env && existsSync(statePath(resolve(env)))) return resolve(env);
+	if (!isSharedCwd(cwd)) return resolve(cwd);
+	const t = normalizeTarget(target);
+	return join(PROJECTS_DIR, `${slug(t.host)}-${t.port}-${sha(sessionId || "default", 10)}`);
 }
 
 export function normOneLine(s: string, max = 160): string {
@@ -360,43 +397,65 @@ export function saveState(root: string, state: NuwaState): void {
 }
 
 export function writePointer(root: string, sessionId: string): void {
+	const sid = (sessionId || "").trim();
+	const rec = { root: resolve(root), sessionId: sid, ts: Date.now() };
 	try {
-		mkdirSync(dirname(POINTER), { recursive: true });
-		atomicWrite(POINTER, JSON.stringify({ root: resolve(root), sessionId, ts: Date.now() }, null, 2));
+		mkdirSync(POINTER_DIR, { recursive: true });
+		atomicWrite(sessionPointerPath(sid), JSON.stringify(rec, null, 2));
+		// 无会话的旧调用只写 legacy；有会话时绝不覆盖全局指针，避免最后写入者串台。
+		if (!sid) {
+			mkdirSync(dirname(POINTER), { recursive: true });
+			atomicWrite(POINTER, JSON.stringify(rec, null, 2));
+		}
 	} catch {
 		/* 指针写失败不影响会话内 cwd 查找 */
 	}
 }
 
-/** cwd 向上找 .nuwa/state.json → NUWA_PROJECT → 指针（session 不匹配则拒绝接管）。 */
+/** 具名会话只接管自己 owner 的 state；共享 cwd 的无 owner 旧 state 一律跳过。 */
+function rootForSession(dir: string, sessionId: string): "use" | "skip" | "reject" {
+	if (!existsSync(statePath(dir))) return "skip";
+	if (!sessionId) return "use";
+	const owner = stateOwner(dir);
+	if (owner) return owner === sessionId ? "use" : "reject";
+	return isSharedCwd(dir) ? "skip" : "use";
+}
+
+/** cwd 向上找 .nuwa/state.json → NUWA_PROJECT → 当前会话指针；legacy 指针只给无会话调用。 */
 export function findRoot(cwd: string, sessionId = ""): string | null {
 	let d = resolve(cwd || process.cwd());
 	for (;;) {
-		if (existsSync(statePath(d))) return d;
+		const verdict = rootForSession(d, sessionId);
+		if (verdict === "use") return d;
+		if (verdict === "reject") return null;
 		const up = dirname(d);
 		if (up === d) break;
 		d = up;
 	}
 	const env = process.env.NUWA_PROJECT;
 	if (env && existsSync(statePath(resolve(env)))) return resolve(env);
-	const ptr = readJson<{ root?: string; sessionId?: string; ts?: number }>(POINTER);
-	if (ptr?.root && existsSync(statePath(ptr.root))) {
-		if (!ptr.sessionId || !sessionId || ptr.sessionId === sessionId) return resolve(ptr.root);
+	if (sessionId) {
+		const ptr = readSessionPointer(sessionId);
+		return ptr?.root ? resolve(ptr.root) : null;
 	}
+	const legacy = readJson<{ root?: string; sessionId?: string }>(POINTER);
+	if (legacy?.root && existsSync(statePath(legacy.root))) return resolve(legacy.root);
 	return null;
 }
 
 /** 只向上找 cwd 树里的 .nuwa，不接管指针：新建任务不串到别的项目。 */
-export function findLocalRoot(cwd: string): string | null {
+export function findLocalRoot(cwd: string, sessionId = ""): string | null {
 	let d = resolve(cwd || process.cwd());
 	for (;;) {
-		if (existsSync(statePath(d))) return d;
+		const verdict = rootForSession(d, sessionId);
+		if (verdict === "use") return d;
+		if (verdict === "reject") return null;
 		const up = dirname(d);
-		if (up === d) return null;
+		if (up === d) break;
 		d = up;
 	}
+	return null;
 }
-
 /** 从旧 .sapper 图迁移：事实与意图全部转成 v2 状态，id 重新编号并保持引用关系。 */
 export function migrateSapper(root: string): NuwaState {
 	const projPath = join(root, ".sapper", "project.json");
@@ -486,6 +545,7 @@ export function newState(
 	goal: string,
 	mode: Mode,
 	cfg: Cfg,
+	ownerSessionId = "",
 ): NuwaState {
 	const t = normalizeTarget(target);
 	const id = `${slug(t.host)}-${t.port}`;
@@ -506,6 +566,7 @@ export function newState(
 			phase: "recon",
 			createdAt: ts,
 			updatedAt: ts,
+			ownerSessionId: ownerSessionId || undefined,
 		},
 		facts: {},
 		intents: {},
@@ -1746,18 +1807,39 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		}),
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
-				// init 只看 cwd（或显式 root），不接管指针指向的旧项目，避免跨项目串台。
-				const root = resolve(ctx.cwd, p.root ?? ".");
+				const sid = sidOf(ctx);
+				let root: string;
+				if (p.root) {
+					root = resolve(ctx.cwd, p.root);
+				} else {
+					const local = findLocalRoot(ctx.cwd, sid);
+					if (local) {
+						root = local;
+					} else if (isSharedCwd(ctx.cwd)) {
+						const ptr = readSessionPointer(sid);
+						const want = p.target ? normalizeTarget(p.target) : null;
+						const prev = ptr?.root ? loadState(ptr.root) : null;
+						if (ptr?.root && (!want || prev?.project.url === want.url)) root = resolve(ptr.root);
+						else if (p.target) root = defaultProjectRoot(ctx.cwd, p.target, sid);
+						else throw new Error("共享 cwd 下新建/恢复项目需要 target 或 root");
+					} else {
+						root = resolve(ctx.cwd);
+					}
+				}
 				const existing = loadState(root);
+				if (existing?.project.ownerSessionId && existing.project.ownerSessionId !== sid && !p.force) {
+					throw new Error("该项目属于其他 omp 会话；用 force=true 明确接管，避免跨任务污染");
+				}
 				if (p.migrate) {
 					if (existing && !p.force) throw new Error("已有 .nuwa 状态；加 force=true 覆盖后再迁移");
 					if (existing && p.force) renameSync(statePath(root), `${statePath(root)}.bak-${Date.now()}`);
 					const migrated = withLock(root, () => {
 						const st = migrateSapper(root);
+						st.project.ownerSessionId = sid;
 						saveState(root, st);
 						return st;
 					});
-					writePointer(root, sidOf(ctx));
+					writePointer(root, sid);
 					return toolText(`已从 .sapper 迁移: ${migrated.project.id}\n\n${statusBoard(migrated)}`, {
 						root,
 						migrated: true,
@@ -1766,6 +1848,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				if (existing && p.resume) {
 					existing.project.status = "active";
 					existing.project.stopReason = undefined;
+					existing.project.ownerSessionId = sid;
 					existing.runtime.startedAt = Date.now();
 					existing.runtime.turns = 0;
 					existing.runtime.stall = 0;
@@ -1774,7 +1857,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					existing.runtime.completionRejects = 0;
 					existing.runtime.lastSig = "";
 					saveState(root, existing);
-					writePointer(root, sidOf(ctx));
+					writePointer(root, sid);
 					return toolText(`已恢复 ${existing.project.id}\n\n${statusBoard(existing)}`, { root });
 				}
 				if (existing && !p.force) {
@@ -1788,13 +1871,13 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				if (existing && p.force) {
 					renameSync(statePath(root), `${statePath(root)}.bak-${Date.now()}`);
 				}
-				const st = newState(p.target, p.goal ?? "", p.mode, cfg);
+				const st = newState(p.target, p.goal ?? "", p.mode, cfg, sid);
 				withLock(root, () => {
 					seedPhase(st, "recon");
 					saveState(root, st);
 				});
 				mkdirSync(`/tmp/nuwa/${st.project.id}`, { recursive: true });
-				writePointer(root, sidOf(ctx));
+				writePointer(root, sid);
 				logEvent(root, { type: "init", id: st.project.id, url: st.project.url, mode: st.project.mode });
 				return toolText(`女娲已上膛: ${st.project.id}\n\n${statusBoard(st)}`, { root, project: st.project.id });
 			} catch (e) {
@@ -2239,10 +2322,24 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			}
 
 			// ---- 任务模式：/nuwa <自然语言任务> ----
-			const root = findLocalRoot(ctx.cwd) ?? (process.env.NUWA_PROJECT ? resolve(process.env.NUWA_PROJECT) : resolve(ctx.cwd));
+			const sid = sidOf(ctx);
 			const mode = pickMode(arg);
 			const target = extractTarget(arg);
+			const local = findLocalRoot(ctx.cwd, sid);
+			const want = target ? normalizeTarget(target) : null;
+			let root: string | null = local;
+			if (!root && isSharedCwd(ctx.cwd) && found) {
+				const fs = loadState(found);
+				if (!want || fs?.project.url === want.url) root = found;
+			}
+			if (!root && !isSharedCwd(ctx.cwd)) root = resolve(ctx.cwd);
+			if (!root && process.env.NUWA_PROJECT) root = resolve(process.env.NUWA_PROJECT);
+			if (!root && target) root = defaultProjectRoot(ctx.cwd, target, sid);
+			if (!root) return notify("共享 cwd 下请给 target 或显式 NUWA_PROJECT/root", "error");
 			const prev = loadState(root);
+			if (prev?.project.ownerSessionId && prev.project.ownerSessionId !== sid) {
+				return notify("该项目属于其他 omp 会话；用 NUWA_PROJECT 明确接管", "error");
+			}
 
 			if (prev) {
 				const it = withLock(root, () => {
@@ -2250,13 +2347,14 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					if (!s) return null;
 					s.project.status = "active";
 					s.project.stopReason = undefined;
+					s.project.ownerSessionId = sid;
 					if (mode !== s.project.mode) s.project.mode = mode;
 					const intent = addIntent(s, { title: arg, detail: arg, phase: s.project.phase, priority: 95 });
 					saveState(root, s);
 					return intent;
 				});
 				if (!it) return notify("state 读取失败", "error");
-				writePointer(root, sidOf(ctx));
+				writePointer(root, sid);
 				logEvent(root, { type: "task", intent: it.id, text: arg, via: "command" });
 				const st = loadState(root)!;
 				notify(`已并入 ${st.project.id}：${it.id} ${it.title}（phase=${it.phase} priority=95）\n${statusBoard(st)}`);
@@ -2270,7 +2368,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			let st: NuwaState;
 			try {
 				st = withLock(root, () => {
-					const s = newState(target, arg, mode, readCfg());
+					const s = newState(target, arg, mode, readCfg(), sid);
 					seedPhase(s, "recon");
 					saveState(root, s);
 					return s;
@@ -2279,7 +2377,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				return notify(`上膛失败: ${e instanceof Error ? e.message : String(e)}`, "error");
 			}
 			mkdirSync(`/tmp/nuwa/${st.project.id}`, { recursive: true });
-			writePointer(root, sidOf(ctx));
+			writePointer(root, sid);
 			logEvent(root, { type: "init", id: st.project.id, url: st.project.url, mode: st.project.mode, via: "command" });
 			notify(`女娲已上膛: ${st.project.id} · ${st.project.url} · mode=${st.project.mode}\n${statusBoard(st)}`);
 			if (!kick(kickPrompt(st))) notify("已上膛；发任意一句话即开始执行");
@@ -2340,7 +2438,8 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			if (!cfg.loop) return;
 			if (!isMain(ctx)) return;
 			const sid = String(event.session_id ?? sidOf(ctx));
-			const root = findRoot(ctx.cwd, sid);
+			const local = findLocalRoot(ctx.cwd, sid);
+			const root = local ?? ((isSharedCwd(ctx.cwd) || process.env.NUWA_PROJECT) ? findRoot(ctx.cwd, sid) : null);
 			if (!root) return;
 			const st = loadState(root);
 			if (!st || st.project.status !== "active") return;
