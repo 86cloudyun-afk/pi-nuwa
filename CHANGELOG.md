@@ -8,6 +8,7 @@
 - `/nuwa <任务>` 有目标时按目标选根：同目标复用，不同目标新建 `cache/nuwa-projects/<target>-<sessionHash>`；非共享 cwd 的第二个目标落到 `<cwd>/.nuwa-tasks/<target>-<sessionHash>`。
 - `nuwa_init` 走同一套根选择；显式 `root` 与目标不一致时要求 `force=true`，避免静默覆盖。
 - 会话指针只对非共享项目根跨 cwd 生效；共享根只服务恰好位于该目录的会话。
+- 崩溃接管：`nuwa_init(root="<旧根>", resume=true, force=true)` 显式改 owner 并保留 facts（15 事实项目实测 owner 变更、facts 15→15）；`force` 不带 `resume` 仍是重建。
 - 新增 5 例：共享根不向子目录继承、同会话换目标开新根、同目标复用、非共享第二目标落 `.nuwa-tasks`、`nuwa_init` 不覆盖旧项目。
 - 测试：v2 61 例全绿（omp_extension 5 + omp_nuwa 34 + nuwa_command 11 + nuwa_isolation 11）。
 

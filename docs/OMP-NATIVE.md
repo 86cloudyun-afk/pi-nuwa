@@ -309,6 +309,8 @@ directive 包含：本轮计数、本批 intent、`claim → task(agent=fujiang)
 - journal 超过 8MB 轮转为 `journal.1.jsonl`（只保留一代）。
 - 所有写操作走 `withLock`：`open(O_EXCL)` 写 pid+ts；检测到活 pid 且 <30s 抛 `state locked`，死进程或陈旧锁直接回收。
 - 工具层拒绝并发写同一状态；读操作不加锁。
+- 多任务隔离（2.1.1/2.1.2）：会话指针按 `sessionId` 分文件；`project.ownerSessionId` 拒绝跨会话接管；`/tmp`、home、`/`、`/data/workspace`（可加 `NUWA_SHARED_CWDS`）不向子目录继承；同根换目标时共享 cwd 落 `cache/nuwa-projects/<target>-<sessionHash>`，非共享 cwd 落 `<cwd>/.nuwa-tasks/<target>-<sessionHash>`。
+- 崩溃接管：omp 重启后 `sessionId` 变化，旧项目默认被 owner 检查拒绝。确认旧会话已死时，用 `nuwa_init(root="<旧根>", resume=true, force=true)` 显式改 owner 并保留 facts；`force` 不带 `resume` 会重建项目（旧 state 自动备份）。
 
 ## 10. 从 v1 迁移
 
