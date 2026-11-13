@@ -10,7 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import graph, txn, policy
+from . import graph, txn, policy, kb
 from .journal import Journal
 from .ledger import Ledger
 from .locks import FileLock, is_locked
@@ -127,6 +127,8 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
     journal = Journal(root)
     ledger = Ledger()
     project = root.name
+    kb_tokens = kb.budget() if kb.enabled() else 0
+    tokens += kb_tokens
     intent = graph.get_intent(root, intent_id)
     if not intent:
         raise DispatchError(f"intent 不存在: {intent_id}")
@@ -232,6 +234,10 @@ def dispatch(root: str | Path, intent_id: str, model: str = "deepseek-flash",
                        tokens=0, status="blocked")
         journal.append("ack", txn=txn_id, intent=intent_id, status="blocked")
         raise DispatchError(f"策略拦截: {rule}")
+    if kb_tokens:
+        block = kb.enrich(prompt, root=root, budget_tokens=kb_tokens)
+        if block:
+            prompt = prompt + "\n\n" + block
     _crash("after_prepare")
     eng = engine or os.environ.get("NUWA_ENGINE", "omp-claude")
     worker_cmd = [sys.executable, str(WORKER),

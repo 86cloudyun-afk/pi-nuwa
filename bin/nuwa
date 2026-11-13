@@ -17,7 +17,7 @@ export PATH="$LAB_DIR/bin:$PATH"
 
 # R1 子命令走 Python CLI；其余参数保持旧 URL 语义
 case "${1:-}" in
-  ls|status|attach|budget|flag|complete|commit|recover|adopt|dispatch|run|metrics|report|verify|policy|fairness|plugin|soak|soak-night|soak-verify|migrate)
+  ls|status|attach|budget|flag|complete|commit|recover|adopt|dispatch|run|metrics|report|verify|policy|fairness|plugin|soak|soak-night|soak-verify|migrate|kb)
     if [[ -f "$_PKG_DIR/nuwa/cli.py" ]]; then
       # shellcheck disable=SC1090
       [[ -f "${NUWA_ENV:-$LAB_DIR/env.sh}" ]] && source "${NUWA_ENV:-$LAB_DIR/env.sh}"
@@ -32,6 +32,7 @@ NUWA_VERSION="1.2.2"
 ENV_FILE="${NUWA_ENV:-$LAB_DIR/env.sh}"
 # shellcheck disable=SC1090
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
+export NUWA_KB="${NUWA_KB:-1}"
 # env.sh 可能重置 PATH；再压一次，确保 guard 在真实 sapper 之前。
 export PATH="$LAB_DIR/bin:$PATH"
 

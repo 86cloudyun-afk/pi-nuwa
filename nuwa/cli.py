@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -227,6 +228,14 @@ def cmd_plugin(args) -> int:
     return 0
 
 
+def cmd_kb(args) -> int:
+    cli = os.environ.get("NUWA_KB_CLI", "/data/nuwa-kb/build/kb.py")
+    if not Path(cli).exists():
+        print(f"nuwa: 知识库 CLI 不存在: {cli}", file=sys.stderr)
+        return 2
+    return subprocess.call([sys.executable, cli] + list(args.rest))
+
+
 def cmd_soak(args) -> int:
     roots = args.project or [i["root"] for i in registry.load()]
     if not roots:
@@ -442,6 +451,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("plugin")
     s.add_argument("--dir", default="nuwa_plugins")
     s.set_defaults(func=cmd_plugin)
+
+    s = sub.add_parser("kb")
+    s.add_argument("rest", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_kb)
 
     s = sub.add_parser("soak")
     s.add_argument("--minutes", type=float, default=1)
