@@ -182,12 +182,25 @@ describe("extension wiring", () => {
 		expect(String((status as any).details?.status ?? "active")).toBe("active");
 	});
 
+
+	test("永动模式下模型无 confirm 停机被拒", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nuwa-omp-"));
+		dirs.push(dir);
+		const { call, hooks, ctx } = setup(dir);
+		await call("nuwa_init", { target: "10.0.0.5:8080", mode: "ctf" });
+		const res = await call("nuwa_stop", { reason: "模型想收工" });
+		expect(JSON.stringify(res)).toContain("停机被拒");
+		const stop = hooks.get("session_stop")![0];
+		const after = await stop({ session_id: "sess-test", stop_hook_active: true } as any, ctx);
+		expect(after?.decision).toBe("block");
+	});
+
 	test("stop 后不再续跑", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "nuwa-omp-"));
 		dirs.push(dir);
 		const { call, hooks, ctx } = setup(dir);
 		await call("nuwa_init", { target: "10.0.0.5:8080", mode: "ctf" });
-		await call("nuwa_stop", { reason: "测试停机" });
+		await call("nuwa_stop", { reason: "测试停机", confirm: "STOP" });
 		const stop = hooks.get("session_stop")![0];
 		const res = await stop({ session_id: "sess-test", stop_hook_active: false } as any, ctx);
 		expect(res).toBeUndefined();

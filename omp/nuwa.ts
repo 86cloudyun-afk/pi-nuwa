@@ -2356,7 +2356,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				const items = frontierList(st, p.limit, cfg.claimTtl);
@@ -2389,7 +2389,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				let packet = "";
@@ -2430,7 +2430,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				let text = "";
@@ -2486,7 +2486,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				let fact = "";
@@ -2519,7 +2519,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				let res: { ok: boolean; reason?: string; from: string[] } = { ok: false, from: [] };
@@ -2555,7 +2555,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				return toolText(statusBoard(st), { root, status: st.project.status });
@@ -2577,7 +2577,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				const md = reportMarkdown(st);
@@ -2605,7 +2605,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				let text = "";
 				let st: NuwaState | null = null;
 				st = withLock(root, () => {
@@ -2633,20 +2633,32 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "nuwa_stop",
 		label: "女娲停机",
-		description: "主动停止项目并解除续跑。reason 必须写清卡点，供下次 resume 参考。",
+		description:
+			"人工停机（需要 confirm=\"STOP\"）。永动模式下模型不得自行停机：没有 confirm 会被拒绝并提示扩张；目标未完成时请用 nuwa_expand 换面。",
 		loadMode: "essential",
 		parameters: z.object({
 			reason: z.string(),
+			confirm: z.string().optional().describe('人工停机必须显式传 "STOP"'),
 			root: z.string().optional(),
 		}),
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRoot(ctx, p.root);
-				if (!root) throw new Error("未找到女娲项目");
+				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				const reason = (p.reason ?? "").trim();
 				if (reason.length < 4) throw new Error("reason 至少 4 字");
+				if (cfg.infinite && (p.confirm ?? "").trim() !== "STOP") {
+					logEvent(root, { type: "stop_rejected", reason });
+					return toolText(
+						`停机被拒：永动模式下只有目标完成才会停。\n` +
+							`- 想换攻击面 → nuwa_expand()\n` +
+							`- 卡死 → nuwa_commit(id, blocked=true, note="...")\n` +
+							`- 人工停机 → nuwa_stop(reason="...", confirm="STOP")\n\n${statusBoard(st)}`,
+						{ root, stopped: false },
+					);
+				}
 				st.project.status = "stopped";
 				st.project.stopReason = reason;
 				saveState(root, st);
@@ -2889,7 +2901,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const input = ((event as { input?: Record<string, unknown> }).input ?? {}) as Record<string, unknown>;
 
 			// 只有主线程能改账本；子代理只执行与取证。
-			if (active && !main && /^nuwa_(init|plan|claim|commit|flag|complete|stop)$/.test(name)) {
+			if (active && !main && /^nuwa_(init|plan|claim|commit|flag|complete|expand|stop)$/.test(name)) {
 				return { block: true, reason: `nuwa N-005: ${name} 只能由主线程调用；子代理把结果回给主线程` };
 			}
 			if (name === "bash") {

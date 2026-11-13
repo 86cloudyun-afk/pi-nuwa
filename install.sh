@@ -23,19 +23,20 @@ EXT_DIR="$AGENT_HOME/extensions/nuwa-omp"
 
 # ---------------------------------------------------------------- 回滚
 if [[ "${1:-}" == "--rollback" ]]; then
+  BAK_ROOT="$AGENT_HOME/backups/nuwa-omp"
   BAK=""
   while IFS= read -r -d '' cand; do BAK="$cand"; break; done \
-    < <(find -L "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-omp.bak-*' -print0 2>/dev/null | sort -zr)
+    < <(find -L "$BAK_ROOT" -maxdepth 1 -name 'nuwa-omp.bak-*' -print0 2>/dev/null | sort -zr)
   [[ -n "$BAK" ]] || die "没有 nuwa-omp 备份可回滚" 3
   rm -rf "$EXT_DIR"
   cp -R "$BAK" "$EXT_DIR"
   # 恢复被退役的 v1 扩展（最近一份）
   RET=""
   while IFS= read -r -d '' cand; do RET="$cand"; break; done \
-    < <(find -L "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-loop.retired-*' -print0 2>/dev/null | sort -zr)
+    < <(find -L "$AGENT_HOME/backups" -maxdepth 1 -name 'nuwa-loop.retired-*' -print0 2>/dev/null | sort -zr)
   if [[ -n "$RET" ]]; then
     rm -rf "$AGENT_HOME/extensions/nuwa-loop"
-    mv "$RET" "$AGENT_HOME/extensions/nuwa-loop"
+    cp -R "$RET" "$AGENT_HOME/extensions/nuwa-loop"
     say "已恢复 $(basename "$RET") -> nuwa-loop"
   fi
   say "已回滚 nuwa-omp 到 $(basename "$BAK")"
@@ -73,11 +74,24 @@ command -v sqlite3 >/dev/null 2>&1 || say "提示: 未找到 sqlite3，nuwa_kb �
 say "[1/4] agent home = $AGENT_HOME"
 mkdir -p "$AGENT_HOME/extensions" "$AGENT_HOME/cache"
 
+# 关键：omp 会把 extensions/ 下每个含 index.ts 的目录都当扩展加载。
+# 备份与退役目录必须放到 extensions 之外，否则新旧两个 session_stop 同时抢跑，
+# 旧版仍按 continue 放行，omp 的 continuation cap（8）耗尽后就会「停下来」。
+BAK_ROOT="$AGENT_HOME/backups/nuwa-omp"
+mkdir -p "$BAK_ROOT"
+shopt -s nullglob
+for stale in "$AGENT_HOME/extensions"/nuwa-omp.bak-* "$AGENT_HOME/extensions"/nuwa-loop.*; do
+  [[ -e "$stale" ]] || continue
+  mv "$stale" "$BAK_ROOT/" 2>/dev/null || true
+  say "  已移出加载目录: $(basename "$stale")"
+done
+shopt -u nullglob
+
 if [[ -d "$EXT_DIR" ]]; then
-  BAK="$EXT_DIR.bak-$(date +%Y%m%dT%H%M%S)"
+  BAK="$BAK_ROOT/nuwa-omp.bak-$(date +%Y%m%dT%H%M%S)"
   cp -R "$EXT_DIR" "$BAK"
-  say "  已备份到 $(basename "$BAK")"
-  find -L "$AGENT_HOME/extensions" -maxdepth 1 -name 'nuwa-omp.bak-*' -print0 \
+  say "  已备份到 $BAK"
+  find "$BAK_ROOT" -maxdepth 1 -name 'nuwa-omp.bak-*' -print0 \
     | sort -z -r | tail -z -n +6 | xargs -0 -r rm -rf --
 fi
 rm -rf "$EXT_DIR"
@@ -87,9 +101,10 @@ say "  已安装 nuwa-omp（12 个 nuwa_* 工具，永动模式默认开启）"
 
 # v1 的 nuwa-loop 会与新运行时抢 session_stop/tool_call；默认退役，避免双跑。
 if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
-  RET="$AGENT_HOME/extensions/nuwa-loop.retired-$(date +%Y%m%dT%H%M%S)"
+  mkdir -p "$AGENT_HOME/backups"
+  RET="$AGENT_HOME/backups/nuwa-loop.retired-$(date +%Y%m%dT%H%M%S)"
   mv "$AGENT_HOME/extensions/nuwa-loop" "$RET"
-  say "  已退役 nuwa-loop -> $(basename "$RET")"
+  say "  已退役 nuwa-loop -> $RET"
 fi
 
 # ---------------------------------------------------------------- 2. skill
@@ -119,7 +134,10 @@ for t in nuwa_init nuwa_plan nuwa_frontier nuwa_claim nuwa_commit nuwa_flag nuwa
   grep -q "name: \"$t\"" "$EXT_DIR/index.ts" || { say "  缺少工具: $t"; missing=1; }
 done
 [[ "$missing" -eq 0 ]] || die "扩展自检失败" 1
-say "  工具面完整"
+# 双扩展自检：extensions/ 下除 nuwa-omp 外不允许再有 nuwa-* 目录（含 .bak/.retired）
+extra="$(find -L "$AGENT_HOME/extensions" -maxdepth 1 -type d -name 'nuwa-*' ! -name 'nuwa-omp' -print 2>/dev/null | wc -l | tr -d ' ')"
+[[ "$extra" -eq 0 ]] || die "extensions/ 下仍有 $extra 个旧 nuwa 扩展，会与 nuwa-omp 抢 session_stop；先移出再装" 1
+say "  工具面完整 · 单一扩展（无旧版共存）"
 
 cat <<EOF
 

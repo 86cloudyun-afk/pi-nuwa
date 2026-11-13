@@ -28,13 +28,18 @@
   - `autoPlan`：live → 补播当前阶段 → 事实派生 → 逐阶段推进 → 新 episode → 兜底，一步保证 frontier 非空。
 - report 全终态后自动 `episode+1` 回到 recon；`NUWA_MAX_EPISODES=0` 默认无限。
 - `compactIntents`：blocked 超过 120 条回收最旧，state 不会无限膨胀。
-- 新增 `nuwa_expand` 工具（第 12 个）；`nuwa_status` 增加 `pressure / ep / expand` 读数。
+- 新增 `nuwa_expand` 工具（第 12 个）；`nuwa_stop` 在永动模式下必须 `confirm="STOP"`，模型自行停机一律拒绝；
+  `nuwa_status` 增加 `pressure / ep / expand` 读数。
 - 看门狗：`session_start` 启动心跳（`NUWA_TICK_MS`，默认 60s），stop hook 被压缩/异常跳过时
   用 `sendUserMessage` 兜底续跑。
 - `normalizeState`：旧 state 缺 runtime/facts/intents 时补齐，不再因半截 state 抛错。
+- 根因补充（现场实测）：`extensions/` 下同时存在 `nuwa-omp.bak-*` 与退役的 `nuwa-loop.*` 时，
+  omp 会把每个含 `index.ts` 的目录都当扩展加载；旧版 `session_stop` 仍按 `continue` 放行，与新扩展抢跑。
+  `install.sh` 现在把备份/退役目录移到 `$AGENT_HOME/backups/`，安装末尾自检 `extensions/` 下除
+  `nuwa-omp` 外无其它 `nuwa-*` 目录；`--rollback` 同步从新位置取备份。
 - install.sh 工具自检补 `nuwa_expand`；退役的 sapper 安装断言同步到 v2 契约。
 
-测试（全绿）：omp_extension 6、omp_nuwa 34、nuwa_forever 20、nuwa_command 11、nuwa_isolation 12、
+测试（全绿）：omp_extension 7、omp_nuwa 34、nuwa_forever 20、nuwa_command 11、nuwa_isolation 12、
 shell 14、kb 5。新增关键用例：连续 30 轮 `stop_hook_active` 仍全部 `decision:block`；
 连续 60 轮零事实产出 frontier 仍非空；report 后自动进 E2；预算全超限 `stopReason=null`。
 

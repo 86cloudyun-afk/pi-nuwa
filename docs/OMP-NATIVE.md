@@ -234,11 +234,13 @@ v2 把所有边界收进 omp 进程：
 `from[]` 省略时使用全部证据事实。ctf 需 `flag`，pentest 需 `vuln/loot/flag`，audit 需 `vuln/loot`。
 不满足 → `ok=false`，`runtime.completionRejects++`，项目保持 active。
 
-### nuwa_status / nuwa_report / nuwa_stop / nuwa_kb
+### nuwa_status / nuwa_report / nuwa_expand / nuwa_stop / nuwa_kb
 
 - `nuwa_status`：ASCII 看板（阶段进度、事实统计、预算、frontier）。
 - `nuwa_report(write=true)`：Markdown 报告，写 `.nuwa/REPORT.md`。
-- `nuwa_stop(reason)`：`status=stopped`，停止续跑；`nuwa_init(resume=true)` 恢复。
+- `nuwa_expand()`：强制扩张（live → 补播 → 事实派生 → 阶段推进 → 新 episode → 兜底），返回新增意图。
+- `nuwa_stop(reason, confirm="STOP")`：人工停机。永动模式下不带 `confirm="STOP"` 会被拒绝并提示 `nuwa_expand`；
+  `nuwa_init(resume=true)` 可恢复。
 - `nuwa_kb(query, kind, limit)`：sqlite3 只读查询 `/data/nuwa-kb/kb.db`（产品卡/CVE/PoC/ATT&CK）。
 
 ## 5. 续跑算法
@@ -388,3 +390,6 @@ nuwa_report(write=false)
 - 不再有 sapper 的 `view/validate`：状态一致性由 `saveState` 的原子写 + journal 回放保证。
 - 知识库仍依赖外部 `kb.db`；缺失时 `nuwa_kb` 返回明确错误，其余工具不受影响。
 - 迁移事实没有原始命令回显；对证据强度要求高的项目，迁移后应重新取证。
+- `extensions/` 必须是单一 nuwa 扩展：omp 会加载该目录下每个含 `index.ts` 的子目录（包括 `.bak-*`）。
+  新旧两个 `session_stop` 同时注册时，旧版的 `continue` 放行会先耗尽 omp 的 continuation cap（8 次）；
+  `install.sh` 把备份/退役目录写到 `$AGENT_HOME/backups/`，安装末尾自检 `extensions/` 下无其它 `nuwa-*`。

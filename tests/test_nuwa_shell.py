@@ -179,6 +179,12 @@ class P0_InstallGuard(Base):
         self.assertIn("NUWA_MIN_OMP", text)
         self.assertIn("extensions/nuwa-omp", text)
 
+    def test_backups_live_outside_extension_dir(self):
+        text = INSTALL.read_text(encoding="utf-8")
+        self.assertIn("backups/nuwa-omp", text)
+        self.assertNotIn('BAK="$EXT_DIR.bak-', text)
+        self.assertIn("单一扩展（无旧版共存）", text)
+
 
 class P0_EngineWrapper(Base):
     """2.2 安装产物是 omp 扩展入口，不再生成 CLI 包装器。"""

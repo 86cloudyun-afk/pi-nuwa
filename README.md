@@ -31,6 +31,9 @@ cd pi-nuwa
 ./install.sh --rollback      # 回滚扩展与 nuwa-loop
 ```
 
+备份与退役目录写到 `~/.omp/agent/backups/`，**绝不放在 `extensions/` 下**：omp 会把每个含 `index.ts`
+的目录都当扩展加载，新旧两个 `session_stop` 同时抢跑会让续跑被旧版 `continue` 逻辑拖停。
+
 依赖：omp ≥ 18.16.0。`nuwa_kb` 额外需要 `sqlite3` 与 `/data/nuwa-kb/kb.db`，缺失不影响其余工具。
 
 ## 使用
