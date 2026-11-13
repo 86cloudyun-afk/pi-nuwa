@@ -21,7 +21,7 @@ run() {
 
 run contract python3 contract_check.py
 run unit bun test unit.test.ts
-run omp bun test omp_nuwa.test.ts omp_extension.test.ts nuwa_forever.test.ts ui.test.ts
+run omp bun test omp_nuwa.test.ts omp_extension.test.ts nuwa_forever.test.ts ui.test.ts ui_native.test.ts
 run isolation bun test nuwa_isolation.test.ts
 run shell python3 test_nuwa_shell.py
 run chaos python3 test_chaos.py

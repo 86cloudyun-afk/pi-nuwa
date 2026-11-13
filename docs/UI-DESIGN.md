@@ -19,13 +19,26 @@ omp 用 `TERM_PROGRAM=tern` 识别 Tern，并启用 TSP 原生渲染。
 | `custom(factory, {overlay:true})` | 浮层 | 全屏页 / native sheet |
 | `setFooter` / `setHeader` | 替换底/顶栏 | 可能被 Tern chrome 覆盖 |
 
-本版选择：**全部用字符串/ANSI，不 import `@oh-my-pi/pi-tui`**。
+2.3.0 选择：**全部用字符串/ANSI，不 import `@oh-my-pi/pi-tui`**。
 
-理由：
+2.4.0 演进：**手写 TSP 节点**，仍然不 import 包。实测 `import("@oh-my-pi/pi-tui")` 在扩展目录失败——
+包入口是 `src/index.ts`，依赖 `@oh-my-pi/pi-natives` 原生模块，bun 解析不到 omp 内置 bundle。
+`describe()` 返回的就是普通 JSON，于是直接构造节点，零依赖拿到原生渲染。
 
-1. 零依赖。扩展运行在 `~/.omp/agent/extensions`，包解析失败会让整个扩展加载失败。
-2. Tern 对 `ansi` / `rows` 节点有原生回退，颜色和 Unicode 进度条都能画。
-3. 原生组件（card/table/tree）留到 2.4.0，用动态 import + `supports()` 探测接入。
+节点映射（`omp/ui-native.ts`）：
+
+| 女娲元素 | TSP 节点 | 降级 |
+|---|---|---|
+| 看板外框 | `card`（title/tone） | — |
+| 阶段徽标 | `badge` | `text` |
+| 阶段进度 | `progress`（0–1 + label） | `text` |
+| 预算压力 | `meter`（thresholds warn/bad） | `text` |
+| 批次/计数 | `kv`（inline） | — |
+| 阶段表 | `table`（cols/rows） | `text` |
+| 攻击链 | `tree`（nodes） | `list` |
+| frontier / 事件流 | `list` + `item` | — |
+
+`describe(cx)` 里用 `cx.supports(kind)` 逐项判断；`describe` 缓存同一节点引用，`render()` 保留字符串回退。
 
 ## 2. 数据层
 
@@ -117,5 +130,6 @@ interface UiStyle {
 
 ## 8. 分阶段
 
-- 2.3.0（本版）：L1 + L2 + L3 文本版。
-- 2.4.0：动态 import `@oh-my-pi/pi-tui`，widget 换 `Box + ProgressBar + MetricRow`，board 换 `Table + TreeView`，用 `cx.supports()` 探测。
+- 2.3.0：L1 + L2 + L3 文本版（已完成）。
+- 2.4.0：手写 TSP 节点，widget/board 原生渲染，`supports()` 降级（已完成）。
+- 2.5.0（可选）：board 内选中 intent 后直接 `claim` / `blocked`（`NativeUiEvent` + `actions`）。

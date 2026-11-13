@@ -231,9 +231,23 @@ describe("可视化接线", () => {
 		expect(status).toContain("recon");
 		expect(status).toContain("E1");
 		const widget = widgets.get("nuwa");
-		expect(Array.isArray(widget)).toBe(true);
-		expect((widget as string[]).length).toBe(3);
-		expect((widget as string[])[0]).toContain("recon");
+		const lines = typeof widget === "function" ? (widget as () => any)().render(80) : (widget as string[]);
+		expect(Array.isArray(lines)).toBe(true);
+		expect(lines.length).toBe(3);
+		expect(lines[0]).toContain("recon");
+	});
+
+	test("NUWA_UI_NATIVE=0 回退字符串数组", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nuwa-ui-"));
+		dirs.push(dir);
+		const { call, widgets } = setup(dir);
+		process.env.NUWA_UI_NATIVE = "0";
+		try {
+			await call("nuwa_init", { target: "10.0.0.5:8080", mode: "ctf" });
+			expect(Array.isArray(widgets.get("nuwa"))).toBe(true);
+		} finally {
+			delete process.env.NUWA_UI_NATIVE;
+		}
 	});
 
 	test("shutdown 清理状态栏与 widget", async () => {

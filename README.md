@@ -80,9 +80,11 @@ nuwa_report(write=true)
 
 - `/nuwa board`：覆盖层只读面板（阶段表 + frontier + 攻击链 + 事件流），`q`/Esc 关闭。
 - 状态栏 ≤ 48 列；mini 看板默认 3 行，`NUWA_UI_LINES=5` 追加 commit 趋势与扩张读数。
-- 开关：`NUWA_UI=0` 全关，`NUWA_UI_WIDGET=0` 只留状态栏，`NUWA_UI_BOARD_MAX` 控制 board 行数。
+- 开关：`NUWA_UI=0` 全关，`NUWA_UI_WIDGET=0` 只留状态栏，`NUWA_UI_BOARD_MAX` 控制 board 行数，
+  `NUWA_UI_NATIVE=0` 关闭 Tern 原生节点、只用字符串。
 - 刷新：init/commit/flag/complete/expand/stop/status 与每轮 session_stop；250ms 节流 + sig 缓存。
-- 设计与非目标：`docs/UI-DESIGN.md`。2.4.0 计划接 `@oh-my-pi/pi-tui` 原生 card/table/tree。
+- Tern：`describe()` 手写 TSP 节点（card/progress/meter/table/tree/list），按 `cx.supports()` 逐项降级；
+  不依赖 `@oh-my-pi/pi-tui`。设计与降级矩阵：`docs/UI-DESIGN.md`。
 
 ## 工具
 

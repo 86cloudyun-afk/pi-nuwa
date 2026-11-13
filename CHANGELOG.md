@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.4.0 — 2026-11-13
+
+Tern 原生渲染：手写 TSP 节点，不引入 `@oh-my-pi/pi-tui` 依赖。
+
+- 实测 `import("@oh-my-pi/pi-tui")` 在扩展目录失败：包入口 `src/index.ts` 依赖
+  `@oh-my-pi/pi-natives` 原生模块，bun 解析到源码而非 omp 内置 bundle。改为直接构造 TSP 节点
+  （纯 JSON），组件只暴露 `render()` / `describe()`。
+- 新增 `omp/ui-native.ts`：
+  - `buildWidgetNode`：`card` > `row`（badge / progress / episode）+ `kv`（批/claim/facts/blocked/rate）
+    + `row`（meter / turns）；缺 `progress`/`meter` 时降级 `text`。
+  - `buildBoardNode`：`card` > `kv` + `section`（`table` 阶段表）+ frontier `list`
+    + 攻击链 `tree` + 事件 `list`；缺 `table`/`tree` 时降级 `text`/`list`。
+  - `createWidgetComponent` / `createBoardComponent`：`describe()` 缓存同一节点引用，
+    `render()` 走字符串回退，board 保留 `q`/Esc 关闭。
+- `refreshUi` 优先组件工厂；`NUWA_UI_NATIVE=0` 回退字符串数组；`setWidget` 的工厂返回同一实例，
+    避免每帧重建。
+- `install.sh` 部署 `ui.ts` + `ui-native.ts` 并自检；`tests/ui_native.test.ts` 7 例
+    （节点结构、supports 降级、describe 缓存、q 关闭），`omp_extension` 增 1 例回退。
+- 测试 120 例全绿（TS 109 + shell 15 + kb 5，shell/kb 见下）。
+
 ## 2.3.0 — 2026-11-13
 
 可视化：状态栏 + mini 看板 + `/nuwa board` 覆盖层。

@@ -257,8 +257,9 @@ v2 把所有边界收进 omp 进程：
 - 数据层：`omp/ui.ts` 的 `buildSnapshot(st, cfg, pressure, journalTail)` 纯函数；UI 不遍历 state。
 - 渲染：`renderStatusLine` / `renderWidgetLines` / `renderBoardLines`，`clipAnsi` 按可见宽度截断
   （`Bun.stringWidth`，ANSI 感知）。
-- Tern：`setWidget(string[])` 走 `ansi`/`rows` 节点，颜色保留；自有组件只有 `render()` 时同样回退。
-  原生 card/table/tree 需要 `describe()`，留 2.4.0（见 `docs/UI-DESIGN.md`）。
+- Tern：组件实现 `describe(cx)`，按 `cx.supports()` 返回手写 TSP 节点（2.4.0）：
+  widget = `card > row(badge/progress/meter) + kv`；board = `card > kv + section(table) + tree + list`。
+  宿主不支持某节点时降级 `text`/`list`。`NUWA_UI_NATIVE=0` 强制字符串路径。
 - 开关：`NUWA_UI`、`NUWA_UI_WIDGET`、`NUWA_UI_LINES`、`NUWA_UI_BOARD_MAX`。
 - 清理：`session_shutdown` 调 `setWidget(..., undefined)` 与 `setStatus(..., undefined)`。
 

@@ -43,8 +43,9 @@ import {
 	type UiSnapshot,
 	type UiStyle,
 } from "./ui";
+import { createBoardComponent, createWidgetComponent } from "./ui-native";
 
-export const VERSION = "2.3.0";
+export const VERSION = "2.4.0";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -2171,24 +2172,6 @@ function readJournalTail(root: string, limit = 200): JournalEntry[] {
 	}
 }
 
-/** `/nuwa board` 覆盖层：只读，q/Esc 关闭；Tern 下按 rows 回退渲染。 */
-class BoardView {
-	constructor(
-		private readonly snap: UiSnapshot,
-		private readonly style: UiStyle,
-		private readonly done: () => void,
-	) {}
-	render(width: number): readonly string[] {
-		return renderBoardLines(this.snap, this.style, {
-			width: Math.min(Math.max(40, width), 100),
-			maxIntents: 30,
-		});
-	}
-	handleInput(data: string): void {
-		if (data === "q" || data === "\x1b") this.done();
-	}
-	invalidate(): void {}
-}
 
 // ---------------------------------------------------------------- /nuwa <任务> 解析
 
@@ -2281,7 +2264,14 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const snap = buildSnapshot(st, cfg, budgetPressure(st, cfg), readJournalTail(root));
 			ui.setStatus("nuwa", renderStatusLine(snap, style));
 			if (u.widget) {
-				ui.setWidget("nuwa", renderWidgetLines(snap, style, { width: 96, lines: u.lines }), { placement: "aboveEditor" });
+				const lines = renderWidgetLines(snap, style, { width: 96, lines: u.lines });
+				const nativeOn = (process.env.NUWA_UI_NATIVE ?? "1").trim() !== "0";
+				if (nativeOn) {
+					const comp = createWidgetComponent(snap, style, { lines: u.lines });
+					ui.setWidget("nuwa", () => comp, { placement: "aboveEditor" });
+				} else {
+					ui.setWidget("nuwa", lines, { placement: "aboveEditor" });
+				}
 			}
 			ui.setTitle?.(`女娲 ${st.project.host}:${st.project.port} · ${st.project.phase} · E${st.project.episode ?? 1}`);
 		} catch {
@@ -2867,7 +2857,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 							const th = themeStyle(
 								theme as unknown as { fg(color: string, text: string): string; bold(text: string): string },
 							);
-							return new BoardView(snap, th, () => done(undefined));
+							return createBoardComponent(snap, th, () => done(undefined));
 						},
 						{ overlay: true, overlayOptions: { width: "92%", maxHeight: "85%", anchor: "center" } },
 					);
