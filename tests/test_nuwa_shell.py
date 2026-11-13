@@ -171,24 +171,23 @@ class P0_DependencyCheck(Base):
 
 
 class P0_InstallGuard(Base):
-    """0.5 install.sh 在缺 sapper 时必须硬失败。"""
+    """2.2 install.sh 只装 omp 扩展，不再依赖 sapper。"""
 
-    def test_install_hard_fails_without_sapper(self):
+    def test_install_does_not_require_sapper(self):
         text = INSTALL.read_text(encoding="utf-8")
-        tail = text[text.find('command -v sapper'):]
-        self.assertTrue(re.search(r"command -v sapper[\s\S]{0,200}?exit\s+1", tail),
-                        "install.sh 检测到 sapper 缺失后应 exit 1，而不是只 echo")
+        self.assertNotIn("command -v sapper", text)
+        self.assertIn("NUWA_MIN_OMP", text)
+        self.assertIn("extensions/nuwa-omp", text)
 
 
 class P0_EngineWrapper(Base):
-    """0.6 install.sh 必须生成 SAPPER_BIN 指向的执行引擎。"""
+    """2.2 安装产物是 omp 扩展入口，不再生成 CLI 包装器。"""
 
-    def test_install_creates_engine(self):
+    def test_install_wires_omp_extension(self):
         text = INSTALL.read_text(encoding="utf-8")
-        self.assertTrue(re.search(r"omp-claude", text),
-                        "install.sh 应创建 $SAPPER_HOME/bin/omp-claude")
-        self.assertTrue(re.search(r"chmod\s+\+?0?755|install\s+-m", text),
-                        "生成的引擎应可执行")
+        self.assertIn("$REPO_DIR/omp/nuwa.ts", text)
+        self.assertIn("index.ts", text)
+        self.assertNotIn("omp-claude", text)
 
 
 # ---------------------------------------------------------------- P1

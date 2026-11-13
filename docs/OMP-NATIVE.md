@@ -43,19 +43,21 @@ v2 把所有边界收进 omp 进程：
 │  nuwa_commit / nuwa_flag ──► fact fNNN，intent done/blocked                │
 │      │                                                                     │
 │      ▼                                                                     │
-│  session_stop ──► frontier? ──yes──► directive (decision:"block")          │
+│  session_stop ──► autoPlan：live → 补播 → 派生 → 推进 → 新 episode → 兜底   │
 │      │                │                                                    │
-│      │                no                                                   │
-│      ▼                ▼                                                    │
-│  completed/stopped   nuwa_plan(next phase) / nuwa_stop                     │
+│      │                ▼                                                    │
+│      │         directive (decision:"block")  ← 永不 continue，永不计 cap   │
+│      ▼                                                                     │
+│  completed/stopped（唯一出口）                                              │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-扩展注册 11 个工具、1 个命令、3 类事件：
+扩展注册 12 个工具、1 个命令、4 类事件：
 
 - `tool_execution_end`：累计工具调用数，用于 idle 判定。
 - `tool_call`：执行纪律拦截（N-001..N-005）。
-- `session_stop`：预算、stall/idle、证据闸门、注入 directive。
+- `session_stop`：计数、`autoPlan` 扩张、证据闸门、注入 directive；永远返回 `decision:"block"`。
+- `session_start`：启动看门狗心跳（`NUWA_TICK_MS`），stop hook 被压缩/异常跳过时兜底 `sendUserMessage`。
 
 ## 3. 状态模型
 
@@ -251,11 +253,15 @@ v2 把所有边界收进 omp 进程：
 6. 更新 `toolCalls`（来自 `tool_execution_end` 计数）。
 7. 计算 sig；相同 → `stall++`，否则 `stall=0` 并更新 sig。
 8. 工具调用数未增长 → `idle++`，否则 `idle=0`。
-9. 预算闸门：`turns > maxTurns` / `minutes > maxMinutes` / `tokens > maxTokens` / `stall >= maxStall` / `idle >= maxIdle`
-   → `status=stopped`，写 `stopReason`，放行。
-10. 生成 directive，`blockStreak++`，写 state + journal。
-11. 若 `event.stop_hook_active` 且 `blockStreak > NUWA_BLOCK_STREAK` → 返回一次 `continue + additionalContext`，避免与其它 stop handler 抢占。
-12. 否则返回 `{ decision: "block", reason: directive }`。
+9. 预算：`budgetPressure = max(turns/maxTurns, minutes/maxMinutes, tokens/maxTokens, stall/maxStall, idle/maxIdle)`。
+   `NUWA_INFINITE=1`（默认）时**不产生停机**，仅用于降档（pressure ≥ 0.9 → 并行降到 2）；
+   `NUWA_INFINITE=0` 时才走旧硬闸（status=stopped）。
+10. `autoPlan`：live 意图 → 补播当前阶段 → 事实派生 → 逐阶段推进 → 新 episode（report 全终态后 episode+1 回 recon）→ 兜底深挖。
+   这一步保证 frontier 永不为空；`NUWA_MAX_EPISODES=0` 表示轮次无限。
+11. 生成 directive，`blockStreak++`，写 state + journal。
+12. 永远返回 `{ decision: "block", reason: directive }`。
+    omp 只对 `continue:true` 计 continuation cap（8 次），`decision:"block"` 不计数，因此续跑无上限；
+    `blockStreak` 只用于升级文案，不再放行。
 
 directive 包含：本轮计数、本批 intent、`claim → task(agent=fujiang) → commit` 的逐步协议、
 纪律（禁止主线程扫描、禁止 CLI、禁止写 state）、stall/idle 换路提示、完成证据统计。
@@ -356,14 +362,18 @@ nuwa_report(write=false)
 | 变量 | 默认 | 含义 |
 |---|---|---|
 | `NUWA_LOOP` | `1` | `0` 关闭 session_stop 续跑 |
-| `NUWA_MAX_TURNS` | `200` | 单会话最大自动续跑轮数 |
-| `NUWA_MAX_MINUTES` | `480` | 总时长上限 |
-| `NUWA_MAX_TOKENS` | `4000000` | 上下文 tokens 上限（取峰值） |
-| `NUWA_MAX_STALL` | `12` | 连续无有效推进上限 |
-| `NUWA_MAX_IDLE` | `4` | 连续空转上限 |
-| `NUWA_MAX_BATCH` | `4` | 单批派单上限 |
+| `NUWA_INFINITE` | `1` | `1` 永动：预算只降档不停机；`0` 回到旧预算闸 |
+| `NUWA_MAX_TURNS` | `0` | 轮数上限；`0`=无限（仅 `NUWA_INFINITE=0` 时生效） |
+| `NUWA_MAX_MINUTES` | `0` | 总时长上限；`0`=无限 |
+| `NUWA_MAX_TOKENS` | `0` | 上下文 tokens 上限；`0`=无限 |
+| `NUWA_MAX_STALL` | `12` | stall 压力阈值（不再停机） |
+| `NUWA_MAX_IDLE` | `4` | idle 压力阈值（不再停机） |
+| `NUWA_MAX_BATCH` | `4` | 单批派单上限；pressure ≥ 0.9 时降到 2 |
 | `NUWA_CLAIM_TTL` | `900` | claim 过期秒数 |
-| `NUWA_BLOCK_STREAK` | `4` | block 链长度，超过切 continue |
+| `NUWA_TICK_MS` | `60000` | 看门狗心跳，兜底续跑 |
+| `NUWA_EXPAND_DEPTH` | `24` | 单轮派生的最大意图数 |
+| `NUWA_MAX_EPISODES` | `0` | 扩张轮次上限；`0`=无限 |
+| `NUWA_BLOCK_STREAK` | `4` | 仅用于升级文案，不再放行 |
 | `NUWA_KB_DB` | `/data/nuwa-kb/kb.db` | 知识库路径 |
 | `NUWA_SCANNER_GUARD` | `1` | `0` 关闭 N-001 |
 | `NUWA_REQUIRE_FUJIANG` | `1` | `0` 关闭 N-004 |

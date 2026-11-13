@@ -55,11 +55,11 @@ function setup(cwd: string) {
 }
 
 describe("extension wiring", () => {
-	test("注册 11 个工具与 3 类事件", () => {
+	test("注册 12 个工具与 4 类事件", () => {
 		const dir = mkdtempSync(join(tmpdir(), "nuwa-omp-"));
 		dirs.push(dir);
 		const { tools, hooks } = setup(dir);
-		expect(tools.size).toBe(11);
+		expect(tools.size).toBe(12);
 		for (const n of [
 			"nuwa_init",
 			"nuwa_plan",
@@ -70,6 +70,7 @@ describe("extension wiring", () => {
 			"nuwa_complete",
 			"nuwa_status",
 			"nuwa_report",
+			"nuwa_expand",
 			"nuwa_stop",
 			"nuwa_kb",
 		]) {
@@ -78,6 +79,7 @@ describe("extension wiring", () => {
 		expect(hooks.get("session_stop")?.length).toBe(1);
 		expect(hooks.get("tool_call")?.length).toBe(1);
 		expect(hooks.get("tool_execution_end")?.length).toBe(1);
+		expect(hooks.get("session_start")?.length).toBe(1);
 	});
 
 	test("完整生命周期：init → claim → commit → flag → complete → report", async () => {
@@ -161,6 +163,23 @@ describe("extension wiring", () => {
 		expect(res?.decision).toBe("block");
 		expect(res?.reason).toContain("nuwa_claim");
 		expect(res?.reason).toContain("fujiang");
+	});
+
+
+	test("连续 30 轮 stop_hook_active 仍全部 decision:block", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nuwa-omp-"));
+		dirs.push(dir);
+		const { call, hooks, ctx } = setup(dir);
+		await call("nuwa_init", { target: "10.0.0.5:8080", mode: "ctf" });
+		const stop = hooks.get("session_stop")![0];
+		for (let i = 0; i < 30; i++) {
+			const res = await stop({ session_id: "sess-test", stop_hook_active: true } as any, ctx);
+			expect(res?.decision).toBe("block");
+			expect(typeof res?.reason).toBe("string");
+			expect((res?.reason ?? "").length).toBeGreaterThan(80);
+		}
+		const status = await call("nuwa_status", {});
+		expect(String((status as any).details?.status ?? "active")).toBe("active");
 	});
 
 	test("stop 后不再续跑", async () => {

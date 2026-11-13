@@ -30,9 +30,10 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { setInterval as setNodeInterval } from "node:timers";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 
-export const VERSION = "2.1.3";
+export const VERSION = "2.2.0";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -104,6 +105,8 @@ export interface Project {
 	completedAt?: string;
 	completedFrom?: string[];
 	stopReason?: string;
+	/** 扩张轮次：report 全终态后 +1 并回到 recon；目标未达就永不封顶。 */
+	episode?: number;
 	/** 首次创建/接管的 omp 会话；共享 cwd 下用它拒绝跨会话接管。 */
 	ownerSessionId?: string;
 }
@@ -121,6 +124,13 @@ export interface Runtime {
 	lastDirective: string;
 	completionRejects: number;
 	emptyRounds: number;
+	/** 最近一次 settle/续跑时间；看门狗据此判断是否断线。 */
+	lastSettleAt?: number;
+	/** 累计自动扩张次数与最近一次时间。 */
+	expansions?: number;
+	lastExpandAt?: number;
+	/** 预算压力 0..1，只用于降档，不用于停机。 */
+	pressure?: number;
 }
 
 export interface NuwaState {
@@ -135,6 +145,8 @@ export interface NuwaState {
 
 export interface Cfg {
 	loop: boolean;
+	/** 无限推进：预算只降档不停机；唯一停机条件是目标完成或人工 stop。 */
+	infinite: boolean;
 	maxTurns: number;
 	maxStall: number;
 	maxIdle: number;
@@ -147,21 +159,29 @@ export interface Cfg {
 	kbDb: string;
 	scannerGuard: boolean;
 	requireFujiang: boolean;
+	/** 看门狗心跳间隔（毫秒）；stop hook 失效时用它兜底续跑。 */
+	tickMs: number;
+	/** 单次扩张最多派生多少条意图。 */
+	expandDepth: number;
+	/** 扩张轮次上限；0 = 无限。 */
+	maxEpisodes: number;
 }
 
-function num(name: string, dflt: number, min: number): number {
+function num(name: string, dflt: number, min: number, zeroOk = false): number {
 	const raw = Number(process.env[name] ?? dflt);
+	if (zeroOk && raw === 0) return 0;
 	return Number.isFinite(raw) && raw >= min ? raw : dflt;
 }
 
 export function readCfg(): Cfg {
 	return {
 		loop: (process.env.NUWA_LOOP ?? "1").trim() !== "0",
-		maxTurns: num("NUWA_MAX_TURNS", 200, 1),
+		infinite: (process.env.NUWA_INFINITE ?? "1").trim() !== "0",
+		maxTurns: num("NUWA_MAX_TURNS", 0, 0, true),
 		maxStall: num("NUWA_MAX_STALL", 12, 1),
 		maxIdle: num("NUWA_MAX_IDLE", 4, 1),
-		maxTokens: num("NUWA_MAX_TOKENS", 4_000_000, 1000),
-		maxMinutes: num("NUWA_MAX_MINUTES", 480, 1),
+		maxTokens: num("NUWA_MAX_TOKENS", 0, 0, true),
+		maxMinutes: num("NUWA_MAX_MINUTES", 0, 0, true),
 		maxBatch: num("NUWA_MAX_BATCH", 4, 1),
 		claimTtl: num("NUWA_CLAIM_TTL", 900, 30),
 		blockStreak: num("NUWA_BLOCK_STREAK", 4, 1),
@@ -169,6 +189,9 @@ export function readCfg(): Cfg {
 		kbDb: process.env.NUWA_KB_DB ?? "/data/nuwa-kb/kb.db",
 		scannerGuard: (process.env.NUWA_SCANNER_GUARD ?? "1").trim() !== "0",
 		requireFujiang: (process.env.NUWA_REQUIRE_FUJIANG ?? "1").trim() !== "0",
+		tickMs: num("NUWA_TICK_MS", 60_000, 5_000),
+		expandDepth: num("NUWA_EXPAND_DEPTH", 24, 1),
+		maxEpisodes: num("NUWA_MAX_EPISODES", 0, 0, true),
 	};
 }
 
@@ -408,18 +431,48 @@ function recoverFromJournal(root: string): NuwaState | null {
 	return null;
 }
 
+/** 2.2.0 新增字段：老 state 读入时就地补齐，避免 undefined 参与算术。 */
+export function normalizeState(st: NuwaState): NuwaState {
+	if (!st.project) throw new Error("state 缺少 project");
+	st.project.episode = Number.isFinite(st.project.episode) && (st.project.episode as number) > 0 ? st.project.episode : 1;
+	const cur: Partial<Runtime> = st.runtime ?? {};
+	const rt: Runtime = {
+		startedAt: Number.isFinite(cur.startedAt) ? (cur.startedAt as number) : Date.now(),
+		turns: Number.isFinite(cur.turns) ? (cur.turns as number) : 0,
+		stall: Number.isFinite(cur.stall) ? (cur.stall as number) : 0,
+		idle: Number.isFinite(cur.idle) ? (cur.idle as number) : 0,
+		blockStreak: Number.isFinite(cur.blockStreak) ? (cur.blockStreak as number) : 0,
+		toolCalls: Number.isFinite(cur.toolCalls) ? (cur.toolCalls as number) : 0,
+		lastToolCalls: Number.isFinite(cur.lastToolCalls) ? (cur.lastToolCalls as number) : 0,
+		tokens: Number.isFinite(cur.tokens) ? (cur.tokens as number) : 0,
+		lastSig: typeof cur.lastSig === "string" ? cur.lastSig : "",
+		lastDirective: typeof cur.lastDirective === "string" ? cur.lastDirective : "",
+		completionRejects: Number.isFinite(cur.completionRejects) ? (cur.completionRejects as number) : 0,
+		emptyRounds: Number.isFinite(cur.emptyRounds) ? (cur.emptyRounds as number) : 0,
+		lastSettleAt: Number.isFinite(cur.lastSettleAt) ? (cur.lastSettleAt as number) : 0,
+		expansions: Number.isFinite(cur.expansions) ? (cur.expansions as number) : 0,
+		lastExpandAt: Number.isFinite(cur.lastExpandAt) ? (cur.lastExpandAt as number) : 0,
+		pressure: Number.isFinite(cur.pressure) ? (cur.pressure as number) : 0,
+	};
+	st.runtime = rt;
+	if (!st.facts || typeof st.facts !== "object") st.facts = {};
+	if (!st.intents || typeof st.intents !== "object") st.intents = {};
+	if (!st.seq) st.seq = { fact: 0, intent: 0 };
+	return st;
+}
+
 export function loadState(root: string): NuwaState | null {
 	const direct = readJson<NuwaState>(statePath(root));
-	if (direct && direct.schema === SCHEMA && direct.project) return direct;
+	if (direct && direct.schema === SCHEMA && direct.project) return normalizeState(direct);
 	const recovered = recoverFromJournal(root);
 	if (recovered) {
 		try {
-			atomicWrite(statePath(root), JSON.stringify(recovered, null, 2));
+			atomicWrite(statePath(root), JSON.stringify(normalizeState(recovered), null, 2));
 		} catch {
 			/* 恢复成功即可 */
 		}
 	}
-	return recovered;
+	return recovered ? normalizeState(recovered) : null;
 }
 
 export function saveState(root: string, state: NuwaState): void {
@@ -612,6 +665,7 @@ export function newState(
 			mode,
 			status: "active",
 			phase: "recon",
+			episode: 1,
 			createdAt: ts,
 			updatedAt: ts,
 			ownerSessionId: ownerSessionId || undefined,
@@ -632,6 +686,10 @@ export function newState(
 			lastDirective: "",
 			completionRejects: 0,
 			emptyRounds: 0,
+			lastSettleAt: 0,
+			expansions: 0,
+			lastExpandAt: 0,
+			pressure: 0,
 		},
 	};
 }
@@ -1192,6 +1250,265 @@ export function maybeAdvance(st: NuwaState): { advanced: boolean; phase: Phase; 
 	return { advanced: true, phase: next, added };
 }
 
+// ============================================================================
+// 扩张引擎（2.2.0）：frontier 永不空，只有目标完成才停
+// ============================================================================
+
+const INTENT_SOFT_CAP = 800;
+const BLOCKED_KEEP = 120;
+
+/** 回收过量 blocked 意图，防止无限推进把 state 撑爆；done 与 facts 一律保留。 */
+export function compactIntents(st: NuwaState, keep = BLOCKED_KEEP): number {
+	const blocked = Object.values(st.intents)
+		.filter((i) => i.status === "blocked")
+		.sort((a, b) => (a.doneAt ?? a.createdAt).localeCompare(b.doneAt ?? b.createdAt));
+	let removed = 0;
+	for (const it of blocked.slice(0, Math.max(0, blocked.length - keep))) {
+		delete st.intents[it.id];
+		removed += 1;
+	}
+	return removed;
+}
+
+export interface ExpansionResult {
+	added: string[];
+	rules: string[];
+}
+
+/**
+ * 从已有事实派生下一层意图：服务→服务深挖，端点→端点审计，漏洞→利用/横向，
+ * 凭据→复用，资产→枚举，战利品→复盘。key 按 fact id 去重，反复调用幂等。
+ */
+export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): ExpansionResult {
+	const existing = new Set(Object.values(st.intents).map((i) => i.key));
+	const added: string[] = [];
+	const rules: string[] = [];
+	const push = (key: string, phase: Phase, title: string, detail: string, priority: number, from: string[]) => {
+		if (existing.has(key)) return;
+		if (Object.keys(st.intents).length >= cap) return;
+		existing.add(key);
+		const id = nextIntentId(st);
+		st.intents[id] = {
+			id,
+			phase,
+			key,
+			title: normOneLine(title, 120),
+			detail,
+			from,
+			status: "open",
+			priority,
+			attempts: 0,
+			createdAt: nowIso(),
+		};
+		added.push(id);
+		rules.push(key);
+	};
+
+	const facts = Object.values(st.facts).sort((a, b) => a.id.localeCompare(b.id));
+	for (const f of facts) {
+		switch (f.kind) {
+			case "service": {
+				const text = `${f.title} ${f.detail ?? ""}`;
+				const ports = [...new Set([...text.matchAll(/\b(\d{1,5})\/(?:tcp|udp)\b/gi)].map((m) => m[1]))].slice(0, 8);
+				for (const port of ports) {
+					push(
+						`svc:${f.id}:${port}`,
+						"surface",
+						`服务深挖 ${st.project.host}:${port}`,
+						`目标: 对 ${st.project.host}:${port} 做服务级枚举与版本核对。\n命令:\n  nmap -sV -Pn -p ${port} --version-all ${st.project.host}\n  curl -k -sS -D - --max-time 10 http://${st.project.host}:${port}/ | head -30\n  printf '' | openssl s_client -connect ${st.project.host}:${port} -servername ${st.project.host} 2>/dev/null | head -20\n证据: kind=service；detail 写 service/version/banner。\n换路: 非 HTTP → nc/openssl 探 banner；全滤 → 记录 blocked 并换端口。`,
+						70,
+						[f.id],
+					);
+				}
+				break;
+			}
+			case "endpoint": {
+				const path = (f.title.match(/\/[^\s"']{1,80}/) ?? [])[0] ?? "/";
+				push(
+					`ep:${f.id}`,
+					"vuln",
+					`端点审计 ${path}`,
+					`目标: 对 ${st.project.url}${path} 做参数、方法、认证、越权四类检查。\n命令:\n  curl -k -sS -i --max-time 10 '${st.project.url}${path}'\n  curl -k -sS -i -X OPTIONS --max-time 10 '${st.project.url}${path}'\n  curl -k -sS -i -X POST -H 'Content-Type: application/json' -d '{}' --max-time 10 '${st.project.url}${path}'\n证据: kind=vuln 或 endpoint；无问题则 commit(kind=note) 写清已测面。\n换路: 403 → 加 X-Forwarded-For / 换方法 / 路径规范化。`,
+					68,
+					[f.id],
+				);
+				break;
+			}
+			case "vuln": {
+				push(
+					`exp:${f.id}`,
+					"exploit",
+					`利用验证 ${normOneLine(f.title, 60)}`,
+					`目标: 把已确认漏洞 ${f.id} 推到可复现的利用结果（读敏感数据 / 命令执行 / 越权访问）。\n已知证据:\n  命令: ${normOneLine(f.command, 200)}\n  回显: ${normOneLine(f.output, 300)}\n要求: 给出可重复的最小利用命令与回显；拿到 flag 立即 nuwa_flag。\n换路: 被 WAF 拦 → 编码/分块/换 payload；仍失败 → commit(blocked) 写清拦截特征。`,
+					92,
+					[f.id],
+				);
+				push(
+					`pivot:${f.id}`,
+					"post",
+					`横向面 ${normOneLine(f.title, 50)}`,
+					`目标: 评估 ${f.id} 能否作为横向跳板。\n命令:\n  id; hostname; ip a; cat /etc/hosts 2>/dev/null\n  ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null\n证据: kind=loot 或 asset；detail 写内网网段、可达主机、可用凭据。\n换路: 无命令执行 → commit(blocked, note="仅数据面漏洞")。`,
+					55,
+					[f.id],
+				);
+				break;
+			}
+			case "cred": {
+				push(
+					`reuse:${f.id}`,
+					"post",
+					`凭据复用 ${normOneLine(f.title, 50)}`,
+					`目标: 用凭据 ${f.id} 撞已发现的服务（SSH/MySQL/Redis/管理面/后台）。\n命令:\n  hydra -L users.txt -P pass.txt -f ${st.project.host} ssh\n  curl -k -sS -i -u '<user>:<pass>' ${st.project.url}/admin\n证据: kind=loot 或 cred；成功必须给登录后页面/命令回显。\n换路: 锁定风险 → 每服务最多 3 次，换下一服务。`,
+					78,
+					[f.id],
+				);
+				break;
+			}
+			case "asset": {
+				push(
+					`enum:${f.id}`,
+					"recon",
+					`资产枚举 ${normOneLine(f.title, 50)}`,
+					`目标: 对新资产 ${f.id} 做端口与服务枚举。\n命令:\n  nmap -sT -sV -Pn -T4 --top-ports 1000 ${normOneLine(f.detail, 120) || st.project.host}\n证据: kind=service，每端口一条。`,
+					72,
+					[f.id],
+				);
+				break;
+			}
+			case "loot": {
+				push(
+					`loot:${f.id}`,
+					"report",
+					`战利品复盘 ${normOneLine(f.title, 50)}`,
+					`目标: 复盘 ${f.id} 的利用价值与可复用性（凭据/密钥/配置/源码）。\n输出: 报告攻击链段落 + 是否需要横向；有价值则派生新意图。`,
+					45,
+					[f.id],
+				);
+				break;
+			}
+			default:
+				break;
+		}
+	}
+	return { added, rules };
+}
+
+/** 第 N 轮扩张：完整重播六阶段种子，key 带轮次前缀，优先级随轮次衰减。 */
+export function seedEpisode(st: NuwaState, episode: number): string[] {
+	const added: string[] = [];
+	const existing = new Set(Object.values(st.intents).map((i) => i.key));
+	const decay = Math.min(25, Math.max(0, (episode - 1) * 2));
+	for (const phase of PHASE_ORDER) {
+		for (const s of SEEDS[phase] ?? []) {
+			const key = `e${episode}:${phase}:${s.key}`;
+			if (existing.has(key)) continue;
+			const id = nextIntentId(st);
+			st.intents[id] = {
+				id,
+				phase,
+				key,
+				title: `[E${episode}] ${s.title}`,
+				detail: `第 ${episode} 轮扩张（目标 ${st.project.url}）：同一攻击面必须换字典/换方法/换参数，优先验证上一轮未闭环的线索。\n\n${s.detail}`,
+				from: [],
+				status: "open",
+				priority: Math.max(20, (s.priority ?? 50) - decay),
+				attempts: 0,
+				createdAt: nowIso(),
+			};
+			added.push(id);
+		}
+	}
+	return added;
+}
+
+/** frontier 彻底空时的兜底：生成一条强制深挖意图，保证队列永不为空。 */
+export function addFallbackIntent(st: NuwaState): string | null {
+	if (Object.keys(st.intents).length >= INTENT_SOFT_CAP + 200) return null;
+	const ep = st.project.episode ?? 1;
+	const n = Object.values(st.intents).filter((i) => i.key.startsWith("fallback:")).length + 1;
+	const key = `fallback:e${ep}:${n}`;
+	if (Object.values(st.intents).some((i) => i.key === key)) return null;
+	const recent = Object.values(st.facts)
+		.slice(-8)
+		.map((f) => `${f.id}[${f.kind}] ${normOneLine(f.title, 50)}`);
+	const id = nextIntentId(st);
+	st.intents[id] = {
+		id,
+		phase: st.project.phase,
+		key,
+		title: `强制深挖 ${st.project.phase} #${n}`,
+		detail: [
+			`frontier 已空，自动扩张触发。目标: ${st.project.url}（第 ${ep} 轮）`,
+			`已知事实: ${recent.join("；") || "(无)"}`,
+			`从下面四项里选一项执行，必须产出新 fact 或 blocked note：`,
+			`1) 已知服务换探测深度：nmap -sV --version-all -p <port> + 服务专属脚本（http-* / smb-* / mysql-*）`,
+			`2) 已知端点换变体：路径大小写/编码/后缀（.bak .old .zip ~）/参数污染/HTTP 方法覆盖`,
+			`3) 已知凭据换复用面：管理后台、数据库、SSH、Redis、API token`,
+			`4) 已知漏洞换利用链：读文件→配置→凭据→横向；或从报错里拿版本→匹配 CVE`,
+			`纪律: 命令必须实际执行，回显原样入账。`,
+		].join("\n"),
+		from: [],
+		status: "open",
+		priority: 35,
+		attempts: 0,
+		createdAt: nowIso(),
+	};
+	st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
+	st.runtime.lastExpandAt = Date.now();
+	return id;
+}
+
+export interface AutoPlanResult {
+	added: string[];
+	reason: string;
+	phase?: Phase;
+	episode?: number;
+}
+
+/**
+ * 自动规划：保证 frontier 非空。
+ * 顺序：现有 live → 补播当前阶段 → 事实派生 → 逐阶段推进 → 新 episode → 兜底深挖。
+ * 返回空数组只在极端情况（软上限打满且兜底也被拒）发生，调用方仍应继续续跑。
+ */
+export function autoPlan(st: NuwaState, cfg: Cfg): AutoPlanResult {
+	compactIntents(st);
+	const live = Object.values(st.intents).filter((i) => i.status === "open" || i.status === "claimed");
+	if (live.length) return { added: [], reason: "frontier-live" };
+
+	const seeded = seedPhase(st, st.project.phase);
+	if (seeded.length) return { added: seeded, reason: "seed-current", phase: st.project.phase };
+
+	const derived = deriveFromFacts(st);
+	if (derived.added.length) {
+		st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
+		st.runtime.lastExpandAt = Date.now();
+		return { added: derived.added, reason: "derive", phase: st.project.phase };
+	}
+
+	for (let guard = 0; guard < PHASE_ORDER.length; guard++) {
+		const adv = maybeAdvance(st);
+		if (!adv.advanced) break;
+		if (adv.added.length) return { added: adv.added, reason: "advance", phase: adv.phase };
+	}
+
+	const curIdx = phaseIndex(st.project.phase);
+	const curIntents = Object.values(st.intents).filter((i) => i.phase === st.project.phase);
+	if (curIdx >= PHASE_ORDER.length - 1 || curIntents.length === 0) {
+		const ep = (st.project.episode ?? 1) + 1;
+		if (cfg.maxEpisodes === 0 || ep <= cfg.maxEpisodes) {
+			st.project.episode = ep;
+			st.project.phase = "recon";
+			const added = seedEpisode(st, ep);
+			st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
+			st.runtime.lastExpandAt = Date.now();
+			return { added, reason: "episode", phase: "recon", episode: ep };
+		}
+	}
+
+	const fb = addFallbackIntent(st);
+	return { added: fb ? [fb] : [], reason: fb ? "fallback" : "exhausted", phase: st.project.phase };
+}
+
 export function claimIntent(
 	st: NuwaState,
 	id: string,
@@ -1397,12 +1714,34 @@ export function sigOf(st: NuwaState): string {
 	return `${st.project.status}|${st.project.phase}|${open}|${claimed}|${done}|${blocked}|${facts}|${flags}|${last}`;
 }
 
-export function stopReason(st: NuwaState, cfg: Cfg): string | null {
+/** 预算压力 0..1.5：只用于降档与提示，不产生停机。 */
+export function budgetPressure(st: NuwaState, cfg: Cfg): number {
 	const rt = st.runtime;
 	const mins = (Date.now() - rt.startedAt) / 60000;
-	if (rt.turns > cfg.maxTurns) return `max_turns(${rt.turns}/${cfg.maxTurns})`;
-	if (mins > cfg.maxMinutes) return `max_minutes(${Math.round(mins)}/${cfg.maxMinutes})`;
-	if (rt.tokens > cfg.maxTokens) return `max_tokens(${rt.tokens}/${cfg.maxTokens})`;
+	const parts: number[] = [];
+	if (cfg.maxTurns > 0) parts.push(rt.turns / cfg.maxTurns);
+	if (cfg.maxMinutes > 0) parts.push(mins / cfg.maxMinutes);
+	if (cfg.maxTokens > 0) parts.push(rt.tokens / cfg.maxTokens);
+	if (cfg.maxStall > 0) parts.push(rt.stall / cfg.maxStall);
+	if (cfg.maxIdle > 0) parts.push(rt.idle / cfg.maxIdle);
+	const p = parts.length ? Math.max(...parts) : 0;
+	return Math.min(1.5, Math.max(0, p));
+}
+
+/**
+ * 停机判定。
+ * 2.2.0 起唯一停机条件：目标完成（completed）或人工 stop。
+ * infinite 模式下预算永不产生停机；NUWA_INFINITE=0 时保留旧预算闸做兼容。
+ */
+export function stopReason(st: NuwaState, cfg: Cfg): string | null {
+	if (st.project.status === "completed") return "completed";
+	if (st.project.status === "stopped") return st.project.stopReason ?? "stopped";
+	if (cfg.infinite) return null;
+	const rt = st.runtime;
+	const mins = (Date.now() - rt.startedAt) / 60000;
+	if (cfg.maxTurns > 0 && rt.turns > cfg.maxTurns) return `max_turns(${rt.turns}/${cfg.maxTurns})`;
+	if (cfg.maxMinutes > 0 && mins > cfg.maxMinutes) return `max_minutes(${Math.round(mins)}/${cfg.maxMinutes})`;
+	if (cfg.maxTokens > 0 && rt.tokens > cfg.maxTokens) return `max_tokens(${rt.tokens}/${cfg.maxTokens})`;
 	if (rt.stall >= cfg.maxStall) return `max_stall(${rt.stall}/${cfg.maxStall})`;
 	if (rt.idle >= cfg.maxIdle) return `max_idle(${rt.idle}/${cfg.maxIdle})`;
 	return null;
@@ -1450,10 +1789,14 @@ export function statusBoard(st: NuwaState): string {
 		.sort((a, b) => b[1] - a[1])
 		.map(([k, v]) => `${k}=${v}`)
 		.join(" ");
+	const pressure = budgetPressure(st, cfg);
+	const budgetLine = cfg.infinite
+		? `budget: ∞ 永动 · turns=${rt.turns} · ${mins}min · tokens=${rt.tokens} · stall=${rt.stall} idle=${rt.idle} · pressure=${Math.round(pressure * 100)}% · ep=${p.episode ?? 1} expand=${rt.expansions ?? 0}`
+		: `budget: 预算受限 · turns=${rt.turns}/${cfg.maxTurns} · ${mins}/${cfg.maxMinutes}min · tokens=${rt.tokens}/${cfg.maxTokens} · stall=${rt.stall}/${cfg.maxStall} idle=${rt.idle}/${cfg.maxIdle}`;
 	return [
 		`女娲 v${VERSION} · ${p.url} · ${p.mode} · ${p.status}`,
 		`phase=${p.phase} · facts=${Object.keys(st.facts).length} (${kindLine || "无"})`,
-		`budget: turns=${rt.turns}/${cfg.maxTurns} · ${mins}/${cfg.maxMinutes}min · tokens=${rt.tokens}/${cfg.maxTokens} · stall=${rt.stall} idle=${rt.idle}`,
+		budgetLine,
 		`rejects=${rt.completionRejects} · 目标: ${p.goal}`,
 		table,
 		`frontier: ${frontier}`,
@@ -1517,7 +1860,10 @@ export function reportMarkdown(st: NuwaState): string {
 export function buildDirective(st: NuwaState, cfg: Cfg): string {
 	const p = st.project;
 	const rt = st.runtime;
-	const items = frontierList(st, cfg.maxBatch, cfg.claimTtl);
+	const pressure = budgetPressure(st, cfg);
+	// 压力高时降档：并行降到 2，减少上下文与调度开销；轮次不减少、推进不停。
+	const batchSize = pressure >= 0.9 ? Math.max(1, Math.min(2, cfg.maxBatch)) : cfg.maxBatch;
+	const items = frontierList(st, batchSize, cfg.claimTtl);
 	const counts = Object.values(st.intents).reduce(
 		(acc, i) => {
 			acc[i.status] += 1;
@@ -1527,13 +1873,20 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 	);
 	const mins = Math.floor((Date.now() - rt.startedAt) / 60000);
 	const flags = Object.values(st.facts).filter((f) => f.kind === "flag").length;
-	const head = `[女娲 v${VERSION} · 自动续跑 第 ${rt.turns} 轮] status=${p.status} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked} facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}/${cfg.maxMinutes}min stall=${rt.stall} idle=${rt.idle}`;
+	const ep = p.episode ?? 1;
+	const head = `[女娲 v${VERSION} · 永动续跑 第 ${rt.turns} 轮 · E${ep}] status=${p.status} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked} facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}min stall=${rt.stall} idle=${rt.idle} pressure=${Math.round(pressure * 100)}% expand=${rt.expansions ?? 0}`;
 	const goal = `目标: ${p.url} (${p.mode}) — ${p.goal}`;
+	const hard = [
+		`本轮硬性动作（必须发生，禁止只输出说明文字）:`,
+		`- 至少 1 次 task 批量派单，或至少 1 次 nuwa_commit；`,
+		`- 目标未完成前，禁止输出“收工/已完成/本轮结束/等待指示”；`,
+		`- 只有 nuwa_complete 返回 ok=true 才会解除续跑；其他任何理由都不停。`,
+	].join("\n");
 
 	const fresh = claimedFresh(st, cfg.claimTtl);
 	const batch = items.length
 		? [
-				`本批派单（并行 ${Math.min(items.length, cfg.maxBatch)}）:`,
+				`本批派单（并行 ${Math.min(items.length, batchSize)}）:`,
 				...items.map(
 					(it) =>
 						`- ${it.intent.id} [${it.intent.phase}] ${it.intent.title}${it.stale ? " (stale 重新认领)" : ""} attempts=${it.intent.attempts}`,
@@ -1555,19 +1908,18 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 					`- 超过 ${cfg.claimTtl}s 未提交会自动回到 frontier，可重新认领。`,
 				].join("\n")
 			: [
-				`frontier 为空。`,
-				`- 若当前阶段还有 open/claimed：先 nuwa_status 查明依赖缺失。`,
-				`- 若当前阶段已全部终态：调 nuwa_plan(phase="<下一阶段>") 生成下一批意图；阶段顺序 recon→surface→vuln→exploit→post→report。`,
-				`- 若已有 flag/vuln/loot：调 nuwa_complete(from=[...]) 收口。`,
-				`- 确实无路可走：调 nuwa_stop(reason="...")，写清卡点。`,
-			].join("\n");
+					`frontier 为空：先调 nuwa_expand() 做强制扩张。`,
+					`扩张优先级: 未利用服务 > 未审计端点 > 未验证漏洞 > 未复用凭据 > 新攻击面（子域/API/备份/云元数据/横向）。`,
+					`扩张后仍为空：nuwa_plan(phase="<下一阶段>")；阶段 recon→surface→vuln→exploit→post→report，report 收尾后自动开下一轮 E${ep + 1}。`,
+					`禁止 nuwa_stop；收口只认 nuwa_complete(ok=true)。`,
+				].join("\n");
 
 	const discipline = [
 		`纪律:`,
 		`- 主线程禁止自己跑 nmap/ffuf/nuclei/sqlmap 等扫描命令（工具层已拦）；扫描只发生在 fujiang 子代理。`,
 		`- 禁止调用 bin/nuwa / nuwa/cli.py / sapper（均已退役）；一切记账走 nuwa_* 工具。`,
 		`- 禁止直接写 .nuwa/state.json 或 journal（工具层已拦）。`,
-		`- 一条 intent 超过 600s 无证据 → nuwa_commit(id, blocked=true, note="...") 换路，不要空转到预算烧完。`,
+		`- 一条 intent 超过 600s 无证据 → nuwa_commit(id, blocked=true, note="...") 换路；blocked 不是停止，系统会自动派生下一批意图。`,
 		`- 收工唯一条件: nuwa_complete 返回 ok=true。当前证据: flag=${flags} vuln=${Object.values(st.facts).filter((f) => f.kind === "vuln").length} loot=${Object.values(st.facts).filter((f) => f.kind === "loot").length}；不满足会被拒。`,
 	].join("\n");
 
@@ -1575,11 +1927,12 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 		rt.stall >= 3 ? `⚠ 连续 ${rt.stall} 轮无有效推进：换目标面，不要重复同一条命令；对卡住的 intent 写 blocked 并给 note。` : "",
 		rt.idle >= 2 ? `⚠ 连续 ${rt.idle} 轮没调工具：立刻 task 派单或 nuwa_status，不要再输出说明文字。` : "",
 		rt.completionRejects > 0 ? `⚠ 完成已被拒 ${rt.completionRejects} 次：没有 flag/vuln/loot 就不要调 nuwa_complete。` : "",
+		pressure >= 0.9 ? `⚠ 预算压力 ${Math.round(pressure * 100)}%：并行降档到 ${batchSize}，推进不减速；禁止以预算为由收工。` : "",
 	]
 		.filter(Boolean)
 		.join("\n");
 
-	return [head, goal, "", batch, "", discipline, escalate].filter(Boolean).join("\n");
+	return [head, goal, "", hard, "", batch, "", discipline, escalate].filter(Boolean).join("\n");
 }
 
 // ============================================================================
@@ -1822,7 +2175,8 @@ export function kickPrompt(st: NuwaState): string {
 		"2) 每条 nuwa_claim(id) 拿 packet",
 		'3) task({tasks:[{agent:"fujiang", task:"<packet>"}]}) 并行派发',
 		"4) 回包后 nuwa_commit(id, kind, title, command, output) 记账；拿到 flag 用 nuwa_flag",
-		"5) 阶段清空自动 nuwa_plan(下一阶段)；flag 到手 nuwa_complete；卡死用 nuwa_commit(blocked=true, note=原因)",
+		"5) 阶段清空先 nuwa_expand() 自动扩张；frontier 空会自动开下一轮 episode；卡住用 nuwa_commit(blocked=true, note=原因) 换路",
+		"6) 只有 nuwa_complete 返回 ok=true 才收工；在此之前系统每轮自动续跑，禁止输出“收工/等待指示”",
 		"纪律：主线程不扫端口、不走 CLI、不写 .nuwa/state.json；扫描与利用全部在 fujiang 子代理里执行。",
 	].join("\n");
 }
@@ -1907,6 +2261,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					existing.runtime.tokens = 0;
 					existing.runtime.completionRejects = 0;
 					existing.runtime.lastSig = "";
+					existing.runtime.lastSettleAt = 0;
+					existing.runtime.blockStreak = 0;
+					existing.runtime.pressure = 0;
 					saveState(root, existing);
 					writePointer(root, sid);
 					return toolText(`已恢复 ${existing.project.id}\n\n${statusBoard(existing)}`, { root });
@@ -2237,6 +2594,43 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "nuwa_expand",
+		label: "女娲扩张",
+		description:
+			"强制扩张攻击面：回收 blocked、从事实派生新意图、逐阶段推进；frontier 空则开下一轮 episode。目标未完成前永不停机。",
+		loadMode: "essential",
+		parameters: z.object({
+			root: z.string().optional(),
+		}),
+		async execute(_id, p, _sig, _up, ctx) {
+			try {
+				const root = resolveRoot(ctx, p.root);
+				if (!root) throw new Error("未找到女娲项目");
+				let text = "";
+				let st: NuwaState | null = null;
+				st = withLock(root, () => {
+					const s = loadState(root);
+					if (!s) throw new Error("state 不存在；先 nuwa_init");
+					const r = autoPlan(s, cfg);
+					saveState(root, s);
+					logEvent(root, {
+						type: "expand_manual",
+						reason: r.reason,
+						added: r.added,
+						phase: r.phase,
+						episode: r.episode,
+					});
+					text = `扩张: ${r.reason} · phase=${r.phase ?? s.project.phase} · ep=${s.project.episode ?? 1} · 新增 ${r.added.length} 条${r.added.length ? `: ${r.added.join(" ")}` : ""}`;
+					return s;
+				});
+				return toolText(`${text}\n\n${st ? statusBoard(st) : ""}`, { root });
+			} catch (e) {
+				return toolError(e);
+			}
+		},
+	});
+
+	pi.registerTool({
 		name: "nuwa_stop",
 		label: "女娲停机",
 		description: "主动停止项目并解除续跑。reason 必须写清卡点，供下次 resume 参考。",
@@ -2357,6 +2751,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					s.runtime.tokens = 0;
 					s.runtime.completionRejects = 0;
 					s.runtime.lastSig = "";
+					s.runtime.lastSettleAt = 0;
+					s.runtime.blockStreak = 0;
+					s.runtime.pressure = 0;
 					saveState(found, s);
 					return s;
 				});
@@ -2434,6 +2831,47 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	});
 
 	// ---------------------------------------------------------------- 事件
+	// 看门狗：stop hook 在压缩/异常路径被跳过时，靠心跳把项目重新拉起来。
+	let pumpCtx: ExtensionContext | null = null;
+	interface IntervalHandle {
+		unref: () => void;
+	}
+	let pump: IntervalHandle | null = null;
+	const armPump = (ctx: ExtensionContext): void => {
+		pumpCtx = ctx;
+		if (pump) return;
+		pump = setNodeInterval(() => {
+			try {
+				if (!cfg.loop) return;
+				const c = pumpCtx;
+				if (!c || !c.isIdle?.() || c.hasPendingMessages?.()) return;
+				const sid = sidOf(c);
+				const root = findLocalRoot(c.cwd, sid) ?? findRoot(c.cwd, sid);
+				if (!root) return;
+				const probe = loadState(root);
+				if (!probe || probe.project.status !== "active") return;
+				if (Date.now() - (probe.runtime.lastSettleAt ?? 0) < cfg.tickMs) return;
+				let directive = "";
+				withLock(root, () => {
+					const s = loadState(root);
+					if (!s || s.project.status !== "active") return;
+					autoPlan(s, cfg);
+					s.runtime.turns += 1;
+					s.runtime.lastSettleAt = Date.now();
+					directive = buildDirective(s, cfg);
+					s.runtime.lastDirective = directive;
+					saveState(root, s);
+					logEvent(root, { type: "pump", turn: s.runtime.turns, phase: s.project.phase });
+				});
+				if (directive) pi.sendUserMessage(directive);
+			} catch {
+				/* 看门狗失败不影响主流程 */
+			}
+		}, Math.max(5_000, cfg.tickMs));
+		pump.unref();
+	};
+	pi.on("session_start", (_event, ctx) => armPump(ctx as ExtensionContext));
+
 	pi.on("tool_execution_end", (_event, ctx) => {
 		const sid = sidOf(ctx);
 		liveCalls.set(sid, (liveCalls.get(sid) ?? 0) + 1);
@@ -2490,66 +2928,104 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const local = findLocalRoot(ctx.cwd, sid);
 			const root = local ?? ((isSharedCwd(ctx.cwd) || process.env.NUWA_PROJECT) ? findRoot(ctx.cwd, sid) : null);
 			if (!root) return;
-			const st = loadState(root);
-			if (!st || st.project.status !== "active") return;
+			const cur = loadState(root);
+			if (!cur || cur.project.status !== "active") return;
 
 			// 单写者：外部 CLI 若还活着，让 CLI 主导
 			const lock = readJson<{ pid?: number }>(lockPath(root));
 			if (lock?.pid && lock.pid !== process.pid && pidAlive(lock.pid)) return;
 
-			st.runtime.turns += 1;
-			const usage = ctx.getContextUsage?.() as { tokens?: number; usedTokens?: number } | undefined;
-			const tokens = Number(usage?.tokens ?? usage?.usedTokens ?? 0);
-			if (Number.isFinite(tokens) && tokens > st.runtime.tokens) st.runtime.tokens = tokens;
+			let directive = "";
+			let turn = 0;
+			let stoppedWhy = "";
+			let plan = "";
+			let added = 0;
+			let episode = 1;
+			let phase: Phase = cur.project.phase;
+			let facts = 0;
+			let stall = 0;
+			let st2: NuwaState | null = cur;
 
-			const live = liveCalls.get(sid) ?? 0;
-			if (live > st.runtime.toolCalls) st.runtime.toolCalls = live;
+			// 计数、扩张、指令生成一次落盘；扩张保证 frontier 永不为空。
+			st2 = withLock(root, () => {
+				const s = loadState(root);
+				if (!s || s.project.status !== "active") return s;
+				s.runtime.turns += 1;
+				s.runtime.lastSettleAt = Date.now();
+				const usage = ctx.getContextUsage?.() as { tokens?: number; usedTokens?: number } | undefined;
+				const tokens = Number(usage?.tokens ?? usage?.usedTokens ?? 0);
+				if (Number.isFinite(tokens) && tokens > s.runtime.tokens) s.runtime.tokens = tokens;
 
-			const sig = sigOf(st);
-			if (sig === st.runtime.lastSig) {
-				st.runtime.stall += 1;
-			} else {
-				st.runtime.stall = 0;
-				st.runtime.lastSig = sig;
-			}
-			if (st.runtime.toolCalls === st.runtime.lastToolCalls) st.runtime.idle += 1;
-			else st.runtime.idle = 0;
-			st.runtime.lastToolCalls = st.runtime.toolCalls;
+				const live = liveCalls.get(sid) ?? 0;
+				if (live > s.runtime.toolCalls) s.runtime.toolCalls = live;
 
-			const why = stopReason(st, cfg);
-			if (why) {
-				st.project.status = "stopped";
-				st.project.stopReason = why;
-				saveState(root, st);
-				logEvent(root, { type: "stop_budget", why });
-				ctx.ui?.setStatus?.("nuwa", `停机 (${why})`);
+				const sig = sigOf(s);
+				if (sig === s.runtime.lastSig) {
+					s.runtime.stall += 1;
+				} else {
+					s.runtime.stall = 0;
+					s.runtime.lastSig = sig;
+				}
+				if (s.runtime.toolCalls === s.runtime.lastToolCalls) s.runtime.idle += 1;
+				else s.runtime.idle = 0;
+				s.runtime.lastToolCalls = s.runtime.toolCalls;
+				s.runtime.pressure = budgetPressure(s, cfg);
+
+				const why = stopReason(s, cfg);
+				if (why) {
+					s.project.status = "stopped";
+					s.project.stopReason = why;
+					stoppedWhy = why;
+					saveState(root, s);
+					logEvent(root, { type: "stop_budget", why });
+					return s;
+				}
+
+				const planned = autoPlan(s, cfg);
+				plan = planned.reason;
+				added = planned.added.length;
+				if (planned.added.length) {
+					logEvent(root, { type: "expand", reason: planned.reason, added: planned.added, phase: planned.phase, episode: planned.episode });
+				}
+				if (planned.episode) logEvent(root, { type: "episode", episode: planned.episode });
+
+				directive = buildDirective(s, cfg);
+				s.runtime.lastDirective = directive;
+				s.runtime.blockStreak += 1;
+				turn = s.runtime.turns;
+				episode = s.project.episode ?? 1;
+				phase = s.project.phase;
+				facts = Object.keys(s.facts).length;
+				stall = s.runtime.stall;
+				saveState(root, s);
+				logEvent(root, {
+					type: "block",
+					turn,
+					sig,
+					stall,
+					idle: s.runtime.idle,
+					phase,
+					episode,
+					plan,
+					added,
+					pressure: s.runtime.pressure,
+				});
+				return s;
+			});
+
+			if (stoppedWhy) {
+				ctx.ui?.setStatus?.("nuwa", `停机 (${stoppedWhy})`);
 				return;
 			}
+			if (!directive || !st2) return;
+			ctx.ui?.setStatus?.("nuwa", `续跑 #${turn} · E${episode} · ${phase} · facts=${facts} stall=${stall}`);
 
-			const directive = buildDirective(st, cfg);
-			st.runtime.lastDirective = directive;
-			st.runtime.blockStreak += 1;
-			saveState(root, st);
-			logEvent(root, {
-				type: "block",
-				turn: st.runtime.turns,
-				sig,
-				stall: st.runtime.stall,
-				idle: st.runtime.idle,
-				phase: st.project.phase,
-			});
-			ctx.ui?.setStatus?.(
-				"nuwa",
-				`续跑 #${st.runtime.turns} · ${st.project.phase} · facts=${Object.keys(st.facts).length} stall=${st.runtime.stall}`,
-			);
-			if (event.stop_hook_active && st.runtime.blockStreak > cfg.blockStreak) {
-				st.runtime.blockStreak = 0;
-				saveState(root, st);
-				return { continue: true as const, additionalContext: directive };
-			}
+			// 2.2.0：永远 decision:"block"。omp 只对 continue:true 计 continuation cap（8 次），
+			// decision:block 不计数，因此可以无限续跑；blockStreak 降级为升级文案，不再放行。
 			return { decision: "block" as const, reason: directive };
 		} catch {
 			return;
 		}
 	});
+
 }

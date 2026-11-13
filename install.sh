@@ -83,7 +83,7 @@ fi
 rm -rf "$EXT_DIR"
 mkdir -p "$EXT_DIR"
 cp "$REPO_DIR/omp/nuwa.ts" "$EXT_DIR/index.ts" || die "扩展复制失败" 1
-say "  已安装 nuwa-omp（11 个 nuwa_* 工具）"
+say "  已安装 nuwa-omp（12 个 nuwa_* 工具，永动模式默认开启）"
 
 # v1 的 nuwa-loop 会与新运行时抢 session_stop/tool_call；默认退役，避免双跑。
 if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
@@ -115,7 +115,7 @@ fi
 # ---------------------------------------------------------------- 4. 验收
 say "[4/4] 验收"
 missing=0
-for t in nuwa_init nuwa_plan nuwa_frontier nuwa_claim nuwa_commit nuwa_flag nuwa_complete nuwa_status nuwa_report nuwa_stop nuwa_kb; do
+for t in nuwa_init nuwa_plan nuwa_frontier nuwa_claim nuwa_commit nuwa_flag nuwa_complete nuwa_status nuwa_report nuwa_expand nuwa_stop nuwa_kb; do
   grep -q "name: \"$t\"" "$EXT_DIR/index.ts" || { say "  缺少工具: $t"; missing=1; }
 done
 [[ "$missing" -eq 0 ]] || die "扩展自检失败" 1
@@ -130,8 +130,10 @@ cat <<EOF
   3. 之后由 session_stop 自动续跑；用 nuwa_status 看板，nuwa_report 出报告
 
 配置（可选）：
-  NUWA_MAX_TURNS=200 NUWA_MAX_MINUTES=480 NUWA_MAX_TOKENS=4000000
-  NUWA_CLAIM_TTL=900 NUWA_MAX_BATCH=4 NUWA_KB_DB=/data/nuwa-kb/kb.db
+  NUWA_INFINITE=1（默认永动；=0 回到旧预算闸）
+  NUWA_TICK_MS=60000（看门狗心跳，兜底续跑）
+  NUWA_MAX_EPISODES=0（0=无限轮扩张）NUWA_EXPAND_DEPTH=24
+  NUWA_MAX_BATCH=4 NUWA_CLAIM_TTL=900 NUWA_KB_DB=/data/nuwa-kb/kb.db
   NUWA_SCANNER_GUARD=1 NUWA_REQUIRE_FUJIANG=1 NUWA_LOOP=0（关续跑）
 
 回滚：$0 --rollback

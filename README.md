@@ -2,7 +2,7 @@
 
 把「长任务不会停」做成 omp 会话内的运行时，而不是外部 CLI 循环。
 
-**女娲模式 = 一套渗透纪律（SKILL.md）+ 一个运行时状态机（nuwa-omp 扩展）+ 11 个 `nuwa_*` 工具。**
+**女娲模式 = 一套渗透纪律（SKILL.md）+ 一个永动运行时状态机（nuwa-omp 扩展）+ 12 个 `nuwa_*` 工具。**
 没有 `bin/nuwa`，没有 Python，没有 sapper，没有 tmux/watchdog。
 
 ## 为什么 v1 要退役
@@ -52,12 +52,16 @@ nuwa_commit(id="i001", kind="service", title="HTTP 200 nginx",
             command="curl -k -sS -D - http://TARGET/",
             output="HTTP/1.1 200 OK\nServer: nginx")
 nuwa_flag(value="flag{...}", command="...", output="...")
+nuwa_expand()                   # 强制扩张（frontier 空时自动执行）
 nuwa_complete(from=["f012"])
 nuwa_report(write=true)
 ```
 
-每轮结束 `session_stop` 会检查 frontier、预算与证据，返回 `decision:"block"` 注入下一批派单。
-不需要手动「继续」，也不允许一轮就收工。
+每轮结束 `session_stop` 会先 `autoPlan` 扩张（live → 补播 → 事实派生 → 阶段推进 → 新 episode → 兜底深挖），
+再返回 `decision:"block"` 注入下一批派单。`decision:block` 不计入 omp 的 continuation cap，
+因此续跑没有次数上限；预算只降并行度，不停机。**唯一出口是 `nuwa_complete` 返回 `ok=true`。**
+
+`NUWA_INFINITE=0` 可回到旧的预算闸；`NUWA_TICK_MS` 控制看门狗心跳（默认 60s）。
 
 ## 工具
 

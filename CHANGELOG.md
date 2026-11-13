@@ -1,5 +1,43 @@
 # Changelog
 
+## 2.2.0 — 2026-11-13
+
+永动模式：目标未完成前不停机，攻击面自动扩张到下一轮、下一层、下一个面。
+
+根因（2.1.3 为什么总会停）：
+
+- `session_stop` 在 `blockStreak > NUWA_BLOCK_STREAK` 时返回 `{continue:true}`。omp 只对非 `decision:block`
+  的续跑计数，`continue` 上限 8（`dist/cli.js` 中 `_as=8`，日志 `session_stop continuation cap reached`）；
+  第 9 次放行后会话真正 settle，表现为「跑几轮就停」。
+- `stopReason` 有 5 个硬闸：turns 200 / minutes 480 / tokens 4M / stall 12 / idle 4，任一触发即
+  `status=stopped`，之后 hook 直接 return。
+- frontier 为空时指令引导 agent 调 `nuwa_stop`；阶段链走到 report 即终止，没有扩张层。
+- 压缩/异常路径下 stop hook 被跳过时没有兜底驱动。
+
+修复：
+
+- 续跑只返回 `decision:"block"`（omp 不计数），删除 `continue:true` 分支与所有放行路径；
+  `blockStreak` 降级为升级文案。frontier 空也照常续跑。
+- `NUWA_INFINITE=1`（默认）：`stopReason` 只在 completed/stopped 返回；预算降级为 `budgetPressure`，
+  压力 ≥90% 时并行降到 2，推进不减速。`NUWA_INFINITE=0` 保留旧硬闸。
+- 新增扩张引擎：
+  - `deriveFromFacts`：service→按端口深挖、endpoint→参数/方法/认证审计、vuln→利用+横向、
+    cred→复用、asset→枚举、loot→复盘；按 fact id 去重，幂等。
+  - `seedEpisode`：六阶段 32 条种子按 `e<N>:` 前缀重播，优先级随轮次衰减。
+  - `addFallbackIntent`：无面可扩时生成强制深挖意图，保证队列非空。
+  - `autoPlan`：live → 补播当前阶段 → 事实派生 → 逐阶段推进 → 新 episode → 兜底，一步保证 frontier 非空。
+- report 全终态后自动 `episode+1` 回到 recon；`NUWA_MAX_EPISODES=0` 默认无限。
+- `compactIntents`：blocked 超过 120 条回收最旧，state 不会无限膨胀。
+- 新增 `nuwa_expand` 工具（第 12 个）；`nuwa_status` 增加 `pressure / ep / expand` 读数。
+- 看门狗：`session_start` 启动心跳（`NUWA_TICK_MS`，默认 60s），stop hook 被压缩/异常跳过时
+  用 `sendUserMessage` 兜底续跑。
+- `normalizeState`：旧 state 缺 runtime/facts/intents 时补齐，不再因半截 state 抛错。
+- install.sh 工具自检补 `nuwa_expand`；退役的 sapper 安装断言同步到 v2 契约。
+
+测试（全绿）：omp_extension 6、omp_nuwa 34、nuwa_forever 20、nuwa_command 11、nuwa_isolation 12、
+shell 14、kb 5。新增关键用例：连续 30 轮 `stop_hook_active` 仍全部 `decision:block`；
+连续 60 轮零事实产出 frontier 仍非空；report 后自动进 E2；预算全超限 `stopReason=null`。
+
 ## 2.1.3 — 2026-11-12
 
 修复共享根被旧项目占用时 `/nuwa` 第 1 轮报「未找到女娲项目」：
