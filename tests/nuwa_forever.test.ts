@@ -15,6 +15,7 @@ import {
 	newState,
 	normalizeState,
 	readCfg,
+	releaseStaleClaims,
 	seedEpisode,
 	seedPhase,
 	stopReason,
@@ -217,6 +218,40 @@ describe("autoPlan：frontier 永不空", () => {
 		const removed = compactIntents(st, 120);
 		expect(removed).toBe(80);
 		expect(Object.values(st.intents).filter((i) => i.status === "blocked").length).toBe(120);
+	});
+});
+
+
+describe("stale claim 释放", () => {
+	test("超过 TTL 的 claimed 释放回 open，新鲜的保留", () => {
+		const st = fresh();
+		const ids = Object.keys(st.intents);
+		const a = st.intents[ids[0]];
+		const b = st.intents[ids[1]];
+		a.status = "claimed";
+		a.claimedAt = new Date(Date.now() - 3_600_000).toISOString();
+		a.worker = "fujiang";
+		b.status = "claimed";
+		b.claimedAt = new Date().toISOString();
+		b.worker = "fujiang";
+		const released = releaseStaleClaims(st, 900);
+		expect(released).toContain(a.id);
+		expect(released).not.toContain(b.id);
+		expect(st.intents[a.id].status).toBe("open");
+		expect(st.intents[a.id].claimedAt).toBeUndefined();
+		expect(st.intents[b.id].status).toBe("claimed");
+	});
+
+	test("autoPlan 先释放 stale，再判断 frontier", () => {
+		const st = fresh();
+		for (const i of Object.values(st.intents)) {
+			i.status = "claimed";
+			i.claimedAt = new Date(Date.now() - 7_200_000).toISOString();
+			i.worker = "fujiang";
+		}
+		const r = autoPlan(st, cfg);
+		expect(r.reason).toBe("frontier-live");
+		expect(Object.values(st.intents).every((i) => i.status === "open")).toBe(true);
 	});
 });
 

@@ -32,8 +32,19 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { setInterval as setNodeInterval } from "node:timers";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
+import {
+	buildSnapshot,
+	parseJournalTail,
+	renderBoardLines,
+	renderStatusLine,
+	renderWidgetLines,
+	themeStyle,
+	type JournalEntry,
+	type UiSnapshot,
+	type UiStyle,
+} from "./ui";
 
-export const VERSION = "2.2.0";
+export const VERSION = "2.3.0";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -1470,8 +1481,26 @@ export interface AutoPlanResult {
  * 顺序：现有 live → 补播当前阶段 → 事实派生 → 逐阶段推进 → 新 episode → 兜底深挖。
  * 返回空数组只在极端情况（软上限打满且兜底也被拒）发生，调用方仍应继续续跑。
  */
+/** 超过 claim TTL 仍挂着的意图释放回 open；否则它们会永久占住 live 位，阻塞扩张。 */
+export function releaseStaleClaims(st: NuwaState, claimTtl: number): string[] {
+	const now = Date.now();
+	const out: string[] = [];
+	for (const i of Object.values(st.intents)) {
+		if (i.status !== "claimed") continue;
+		const at = i.claimedAt ? Date.parse(i.claimedAt) : 0;
+		if (!at || now - at > claimTtl * 1000) {
+			i.status = "open";
+			i.worker = undefined;
+			i.claimedAt = undefined;
+			out.push(i.id);
+		}
+	}
+	return out;
+}
+
 export function autoPlan(st: NuwaState, cfg: Cfg): AutoPlanResult {
 	compactIntents(st);
+	releaseStaleClaims(st, cfg.claimTtl);
 	const live = Object.values(st.intents).filter((i) => i.status === "open" || i.status === "claimed");
 	if (live.length) return { added: [], reason: "frontier-live" };
 
@@ -2130,6 +2159,37 @@ function toolError(err: unknown, details: Record<string, unknown> = {}) {
 	return { content: [{ type: "text" as const, text: `ERROR: ${msg}` }], details: { error: true, ...details } };
 }
 
+// ---------------------------------------------------------------- 可视化
+
+/** 读 journal 尾部；超过 2MB 只取末尾，避免长跑项目每次刷新全量解析。 */
+function readJournalTail(root: string, limit = 200): JournalEntry[] {
+	try {
+		const raw = readFileSync(journalPath(root), "utf8");
+		return parseJournalTail(raw.length > 2_000_000 ? raw.slice(-2_000_000) : raw, limit);
+	} catch {
+		return [];
+	}
+}
+
+/** `/nuwa board` 覆盖层：只读，q/Esc 关闭；Tern 下按 rows 回退渲染。 */
+class BoardView {
+	constructor(
+		private readonly snap: UiSnapshot,
+		private readonly style: UiStyle,
+		private readonly done: () => void,
+	) {}
+	render(width: number): readonly string[] {
+		return renderBoardLines(this.snap, this.style, {
+			width: Math.min(Math.max(40, width), 100),
+			maxIntents: 30,
+		});
+	}
+	handleInput(data: string): void {
+		if (data === "q" || data === "\x1b") this.done();
+	}
+	invalidate(): void {}
+}
+
 // ---------------------------------------------------------------- /nuwa <任务> 解析
 
 const TASK_URL_RE = /https?:\/\/[^\s"'`）)，。；;、]+/i;
@@ -2185,6 +2245,60 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	const cfg = readCfg();
 	const z = pi.zod;
 	const liveCalls = new Map<string, number>();
+
+	// ---------------------------------------------------------------- 可视化
+	interface UiCfg {
+		enabled: boolean;
+		widget: boolean;
+		lines: 3 | 5;
+		boardMax: number;
+	}
+	const readUiCfg = (): UiCfg => {
+		const e = (k: string, d: string): string => (process.env[k] ?? d).trim();
+		return {
+			enabled: e("NUWA_UI", "1") !== "0",
+			widget: e("NUWA_UI_WIDGET", "1") !== "0",
+			lines: e("NUWA_UI_LINES", "3") === "5" ? 5 : 3,
+			boardMax: Math.max(5, Number(e("NUWA_UI_BOARD_MAX", "30")) || 30),
+		};
+	};
+	let uiSig = "";
+	let uiAt = 0;
+
+	/** 刷新状态栏 / mini 看板 / 终端标题；非 TUI 模式静默失败。 */
+	const refreshUi = (ctx: ExtensionContext, root: string, st: NuwaState, force = false): void => {
+		const u = readUiCfg();
+		if (!u.enabled) return;
+		const sig = `${sigOf(st)}|${st.runtime.turns}|${st.runtime.expansions ?? 0}|${st.project.phase}|${st.project.status}`;
+		const now = Date.now();
+		if (!force && sig === uiSig && now - uiAt < 5000) return;
+		if (!force && now - uiAt < 250) return;
+		uiSig = sig;
+		uiAt = now;
+		try {
+			const ui = ctx.ui;
+			const style = themeStyle(ui.theme as unknown as { fg(color: string, text: string): string; bold(text: string): string });
+			const snap = buildSnapshot(st, cfg, budgetPressure(st, cfg), readJournalTail(root));
+			ui.setStatus("nuwa", renderStatusLine(snap, style));
+			if (u.widget) {
+				ui.setWidget("nuwa", renderWidgetLines(snap, style, { width: 96, lines: u.lines }), { placement: "aboveEditor" });
+			}
+			ui.setTitle?.(`女娲 ${st.project.host}:${st.project.port} · ${st.project.phase} · E${st.project.episode ?? 1}`);
+		} catch {
+			/* print/RPC 或宿主无 UI 通道 */
+		}
+	};
+
+	const clearUi = (ctx: ExtensionContext): void => {
+		try {
+			ctx.ui.setWidget("nuwa", undefined);
+			ctx.ui.setStatus("nuwa", undefined);
+		} catch {
+			/* 无 UI 通道 */
+		}
+		uiSig = "";
+		uiAt = 0;
+	};
 
 	const activeAt = (root: string): boolean => {
 		const st = loadState(root);
@@ -2245,6 +2359,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						return st;
 					});
 					writePointer(root, sid);
+					refreshUi(ctx, root, migrated, true);
 					return toolText(`已从 .sapper 迁移: ${migrated.project.id}\n\n${statusBoard(migrated)}`, {
 						root,
 						migrated: true,
@@ -2266,6 +2381,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					existing.runtime.pressure = 0;
 					saveState(root, existing);
 					writePointer(root, sid);
+					refreshUi(ctx, root, existing, true);
 					return toolText(`已恢复 ${existing.project.id}\n\n${statusBoard(existing)}`, { root });
 				}
 				if (existing && !p.force) {
@@ -2287,6 +2403,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				mkdirSync(`/tmp/nuwa/${st.project.id}`, { recursive: true });
 				writePointer(root, sid);
 				logEvent(root, { type: "init", id: st.project.id, url: st.project.url, mode: st.project.mode });
+				refreshUi(ctx, root, st, true);
 				return toolText(`女娲已上膛: ${st.project.id}\n\n${statusBoard(st)}`, { root, project: st.project.id });
 			} catch (e) {
 				return toolError(e);
@@ -2464,6 +2581,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						text += `\n阶段推进: ${r.advanced.phase}（新增 ${r.advanced.added.length} 条: ${r.advanced.added.join(" ")}）`;
 					}
 				});
+				refreshUi(ctx, root, st);
 				return toolText(`${text}\n\n${statusBoard(st)}`, { root, id: p.id });
 			} catch (e) {
 				return toolError(e);
@@ -2498,6 +2616,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					saveState(root, st);
 					logEvent(root, { type: "flag", fact, value: p.value.slice(0, 32), duplicate: dup });
 				});
+				refreshUi(ctx, root, st, true);
 				return toolText(`${dup ? "幂等命中" : "flag 已入账"}: ${fact} = ${p.value}`, { root, fact });
 			} catch (e) {
 				return toolError(e);
@@ -2528,6 +2647,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					saveState(root, st);
 					logEvent(root, { type: "complete", ok: res.ok, from: res.from, reason: res.reason });
 				});
+				refreshUi(ctx, root, st, true);
 				if (!res.ok) {
 					return toolText(
 						`完成被拒: ${res.reason}\nrejects=${st.runtime.completionRejects}\n\n${statusBoard(st)}`,
@@ -2558,6 +2678,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+				refreshUi(ctx, root, st);
 				return toolText(statusBoard(st), { root, status: st.project.status });
 			} catch (e) {
 				return toolError(e);
@@ -2623,6 +2744,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					text = `扩张: ${r.reason} · phase=${r.phase ?? s.project.phase} · ep=${s.project.episode ?? 1} · 新增 ${r.added.length} 条${r.added.length ? `: ${r.added.join(" ")}` : ""}`;
 					return s;
 				});
+				if (st) refreshUi(ctx, root, st, true);
 				return toolText(`${text}\n\n${st ? statusBoard(st) : ""}`, { root });
 			} catch (e) {
 				return toolError(e);
@@ -2663,6 +2785,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				st.project.stopReason = reason;
 				saveState(root, st);
 				logEvent(root, { type: "stop_manual", reason });
+				refreshUi(ctx, root, st, true);
 				return toolText(`已停机: ${reason}`, { root });
 			} catch (e) {
 				return toolError(e);
@@ -2730,6 +2853,29 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				}
 				return;
 			}
+			if (arg === "board") {
+				if (!found) return notify("当前目录没有女娲项目", "error");
+				const st = loadState(found);
+				if (!st) return notify("state 读取失败", "error");
+				const style = themeStyle(
+					ctx.ui.theme as unknown as { fg(color: string, text: string): string; bold(text: string): string },
+				);
+				const snap = buildSnapshot(st, cfg, budgetPressure(st, cfg), readJournalTail(found, 400));
+				try {
+					await ctx.ui.custom(
+						(_tui, theme, _kb, done) => {
+							const th = themeStyle(
+								theme as unknown as { fg(color: string, text: string): string; bold(text: string): string },
+							);
+							return new BoardView(snap, th, () => done(undefined));
+						},
+						{ overlay: true, overlayOptions: { width: "92%", maxHeight: "85%", anchor: "center" } },
+					);
+				} catch {
+					notify(renderBoardLines(snap, style, { width: 88 }).join("\n"));
+				}
+				return;
+			}
 			if (arg === "why") {
 				const st = found ? loadState(found) : null;
 				return notify(st?.runtime.lastDirective || "(还没注入过指令)");
@@ -2747,6 +2893,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				});
 				if (!st) return notify("state 读取失败", "error");
 				logEvent(found, { type: "stop", reason, via: "command" });
+				refreshUi(ctx as ExtensionContext, found, st, true);
 				return notify(`已停止 ${st.project.id} · ${reason}｜/nuwa resume 继续`);
 			}
 			if (arg === "resume") {
@@ -2771,11 +2918,12 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				});
 				if (!st) return notify("state 读取失败", "error");
 				writePointer(found, sidOf(ctx));
+				refreshUi(ctx as ExtensionContext, found, st, true);
 				notify(`已恢复 ${st.project.id} · phase=${st.project.phase}`);
 				if (!kick(kickPrompt(st))) notify("已恢复；发任意一句话即继续");
 				return;
 			}
-			if (!arg || arg === "status" || arg === "board") {
+			if (!arg || arg === "status") {
 				if (!found) return notify("用法: /nuwa 打 http://10.0.0.5:8080 拿 flag｜/nuwa 看板");
 				const st = loadState(found);
 				return notify(st ? statusBoard(st) : "state 读取失败", st ? "info" : "error");
@@ -2815,6 +2963,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				writePointer(root, sid);
 				logEvent(root, { type: "task", intent: it.id, text: arg, via: "command" });
 				const st = loadState(root)!;
+				refreshUi(ctx as ExtensionContext, root, st, true);
 				notify(`已并入 ${st.project.id}：${it.id} ${it.title}（phase=${it.phase} priority=95）\n${statusBoard(st)}`);
 				if (!kick(kickPrompt(st))) notify("已记账；发任意一句话即开始执行");
 				return;
@@ -2837,6 +2986,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			mkdirSync(`/tmp/nuwa/${st.project.id}`, { recursive: true });
 			writePointer(root, sid);
 			logEvent(root, { type: "init", id: st.project.id, url: st.project.url, mode: st.project.mode, via: "command" });
+			refreshUi(ctx as ExtensionContext, root, st, true);
 			notify(`女娲已上膛: ${st.project.id} · ${st.project.url} · mode=${st.project.mode}\n${statusBoard(st)}`);
 			if (!kick(kickPrompt(st))) notify("已上膛；发任意一句话即开始执行");
 		},
@@ -2882,7 +3032,20 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		}, Math.max(5_000, cfg.tickMs));
 		pump.unref();
 	};
-	pi.on("session_start", (_event, ctx) => armPump(ctx as ExtensionContext));
+	pi.on("session_start", (_event, ctx) => {
+		armPump(ctx as ExtensionContext);
+		try {
+			const sid = sidOf(ctx as ExtensionContext);
+			const root = findLocalRoot((ctx as ExtensionContext).cwd, sid) ?? findRoot((ctx as ExtensionContext).cwd, sid);
+			if (!root) return;
+			const st = loadState(root);
+			if (st && st.project.status === "active") refreshUi(ctx as ExtensionContext, root, st, true);
+		} catch {
+			/* 无项目或无 UI 通道 */
+		}
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => clearUi(ctx as ExtensionContext));
 
 	pi.on("tool_execution_end", (_event, ctx) => {
 		const sid = sidOf(ctx);
@@ -3026,10 +3189,12 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			});
 
 			if (stoppedWhy) {
+				if (st2) refreshUi(ctx, root, st2, true);
 				ctx.ui?.setStatus?.("nuwa", `停机 (${stoppedWhy})`);
 				return;
 			}
 			if (!directive || !st2) return;
+			refreshUi(ctx, root, st2, true);
 			ctx.ui?.setStatus?.("nuwa", `续跑 #${turn} · E${episode} · ${phase} · facts=${facts} stall=${stall}`);
 
 			// 2.2.0：永远 decision:"block"。omp 只对 continue:true 计 continuation cap（8 次），

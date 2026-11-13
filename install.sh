@@ -66,6 +66,7 @@ fi
 say "omp: ${OMP_VER:-unknown}"
 
 [[ -f "$REPO_DIR/omp/nuwa.ts" ]] || die "仓库缺少 omp/nuwa.ts" 1
+[[ -f "$REPO_DIR/omp/ui.ts" ]] || die "仓库缺少 omp/ui.ts" 1
 [[ -f "$REPO_DIR/skills/nuwa-pentest/SKILL.md" ]] || die "仓库缺少 skills/nuwa-pentest/SKILL.md" 1
 
 command -v sqlite3 >/dev/null 2>&1 || say "提示: 未找到 sqlite3，nuwa_kb 将不可用（其余功能正常）"
@@ -97,6 +98,7 @@ fi
 rm -rf "$EXT_DIR"
 mkdir -p "$EXT_DIR"
 cp "$REPO_DIR/omp/nuwa.ts" "$EXT_DIR/index.ts" || die "扩展复制失败" 1
+cp "$REPO_DIR/omp/ui.ts" "$EXT_DIR/ui.ts" || die "ui.ts 复制失败" 1
 say "  已安装 nuwa-omp（12 个 nuwa_* 工具，永动模式默认开启）"
 
 # v1 的 nuwa-loop 会与新运行时抢 session_stop/tool_call；默认退役，避免双跑。
@@ -134,6 +136,7 @@ for t in nuwa_init nuwa_plan nuwa_frontier nuwa_claim nuwa_commit nuwa_flag nuwa
   grep -q "name: \"$t\"" "$EXT_DIR/index.ts" || { say "  缺少工具: $t"; missing=1; }
 done
 [[ "$missing" -eq 0 ]] || die "扩展自检失败" 1
+[[ -f "$EXT_DIR/ui.ts" ]] || die "扩展缺少 ui.ts（状态栏/看板会失效）" 1
 # 双扩展自检：extensions/ 下除 nuwa-omp 外不允许再有 nuwa-* 目录（含 .bak/.retired）
 extra="$(find -L "$AGENT_HOME/extensions" -maxdepth 1 -type d -name 'nuwa-*' ! -name 'nuwa-omp' -print 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$extra" -eq 0 ]] || die "extensions/ 下仍有 $extra 个旧 nuwa 扩展，会与 nuwa-omp 抢 session_stop；先移出再装" 1

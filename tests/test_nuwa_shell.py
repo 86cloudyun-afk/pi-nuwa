@@ -178,6 +178,7 @@ class P0_InstallGuard(Base):
         self.assertNotIn("command -v sapper", text)
         self.assertIn("NUWA_MIN_OMP", text)
         self.assertIn("extensions/nuwa-omp", text)
+        self.assertIn("omp/ui.ts", text)
 
     def test_backups_live_outside_extension_dir(self):
         text = INSTALL.read_text(encoding="utf-8")

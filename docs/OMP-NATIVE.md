@@ -243,6 +243,25 @@ v2 把所有边界收进 omp 进程：
   `nuwa_init(resume=true)` 可恢复。
 - `nuwa_kb(query, kind, limit)`：sqlite3 只读查询 `/data/nuwa-kb/kb.db`（产品卡/CVE/PoC/ATT&CK）。
 
+## 4.5 可视化面（2.3.0）
+
+三层，全部 ANSI 文本，零外部依赖（不 import `@oh-my-pi/pi-tui`）：
+
+| 层 | API | 刷新点 |
+|---|---|---|
+| 状态栏 | `ctx.ui.setStatus("nuwa", …)` | init/commit/flag/complete/expand/stop/session_stop |
+| mini 看板 | `ctx.ui.setWidget("nuwa", string[], {placement:"aboveEditor"})` | 同上（250ms 节流 + sig 缓存） |
+| 全屏 board | `ctx.ui.custom(..., {overlay:true})`，`/nuwa board` | 打开时取快照，`q`/Esc 关闭 |
+| 终端标题 | `ctx.ui.setTitle(...)` | 同上 |
+
+- 数据层：`omp/ui.ts` 的 `buildSnapshot(st, cfg, pressure, journalTail)` 纯函数；UI 不遍历 state。
+- 渲染：`renderStatusLine` / `renderWidgetLines` / `renderBoardLines`，`clipAnsi` 按可见宽度截断
+  （`Bun.stringWidth`，ANSI 感知）。
+- Tern：`setWidget(string[])` 走 `ansi`/`rows` 节点，颜色保留；自有组件只有 `render()` 时同样回退。
+  原生 card/table/tree 需要 `describe()`，留 2.4.0（见 `docs/UI-DESIGN.md`）。
+- 开关：`NUWA_UI`、`NUWA_UI_WIDGET`、`NUWA_UI_LINES`、`NUWA_UI_BOARD_MAX`。
+- 清理：`session_shutdown` 调 `setWidget(..., undefined)` 与 `setStatus(..., undefined)`。
+
 ## 5. 续跑算法
 
 `session_stop` 每次触发：

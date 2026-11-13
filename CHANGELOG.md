@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.3.0 — 2026-11-13
+
+可视化：状态栏 + mini 看板 + `/nuwa board` 覆盖层。
+
+- 新增 `omp/ui.ts`：`buildSnapshot` 纯函数、`renderStatusLine` / `renderWidgetLines` /
+  `renderBoardLines`、`clipAnsi`（ANSI/CJK 感知截断）、`sparkline`、`commitRate`、`parseJournalTail`。
+- 状态栏：`女娲 ● vuln 12/32 · 派单 2 · E1 · ∞`，≤ 48 列。
+- mini 看板：编辑器上方 3 行（`NUWA_UI_LINES=5` 追加 commit 趋势与扩张/停滞读数），宽度按终端截断。
+- `/nuwa board`：覆盖层只读面板（阶段表 + frontier + 攻击链 + 事件流），`q`/Esc 关闭；
+  宿主无 UI 通道时回退 `notify` 文本。
+- 刷新点：`nuwa_init` / `commit` / `flag` / `complete` / `expand` / `stop` / `status`、
+  `session_start`、`session_stop`；250ms 节流 + sig 缓存；`session_shutdown` 清理
+  `setWidget`/`setStatus`。
+- 开关：`NUWA_UI=0` 全关，`NUWA_UI_WIDGET=0` 只留状态栏，`NUWA_UI_LINES=3|5`，
+  `NUWA_UI_BOARD_MAX` 控制 board 意图行数。
+- 设计取舍：不 import `@oh-my-pi/pi-tui`，全部字符串/ANSI——扩展目录没有 node_modules，
+  包解析失败会拖垮整个扩展；Tern 下走 `ansi`/`rows` 回退，颜色保留。
+  原生组件（card/table/tree/progress）留 2.4.0，见 `docs/UI-DESIGN.md`。
+- `install.sh` 复制 `ui.ts` 并自检；新增 `tests/ui.test.ts` 13 例，`omp_extension` 增 2 例
+  （init 后状态栏/widget 写入、shutdown 清理）。
+
 ## 2.2.0 — 2026-11-13
 
 永动模式：目标未完成前不停机，攻击面自动扩张到下一轮、下一层、下一个面。

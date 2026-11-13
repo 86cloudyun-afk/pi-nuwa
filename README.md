@@ -66,6 +66,24 @@ nuwa_report(write=true)
 
 `NUWA_INFINITE=0` 可回到旧的预算闸；`NUWA_TICK_MS` 控制看门狗心跳（默认 60s）。
 
+## 可视化
+
+三层常驻可视面，全部 ANSI 文本：Tern 下按 `ansi`/`rows` 节点渲染，颜色保留；普通终端逐行输出。
+
+```text
+状态栏   女娲 ● vuln 12/32 · 派单 2 · E1 · ∞
+
+看板     女娲 ● vuln ██████░░░░ 12/32 E1 ∞
+         批 i026 i034 · claim 2 · blocked 0 · facts 43 · 4.2/min
+         pressure 42% · turns 12 · 1861min
+```
+
+- `/nuwa board`：覆盖层只读面板（阶段表 + frontier + 攻击链 + 事件流），`q`/Esc 关闭。
+- 状态栏 ≤ 48 列；mini 看板默认 3 行，`NUWA_UI_LINES=5` 追加 commit 趋势与扩张读数。
+- 开关：`NUWA_UI=0` 全关，`NUWA_UI_WIDGET=0` 只留状态栏，`NUWA_UI_BOARD_MAX` 控制 board 行数。
+- 刷新：init/commit/flag/complete/expand/stop/status 与每轮 session_stop；250ms 节流 + sig 缓存。
+- 设计与非目标：`docs/UI-DESIGN.md`。2.4.0 计划接 `@oh-my-pi/pi-tui` 原生 card/table/tree。
+
 ## 工具
 
 | 工具 | 作用 |
@@ -79,7 +97,8 @@ nuwa_report(write=true)
 | `nuwa_complete` | 完成验收；ctf 需 flag，pentest 需 vuln/loot/flag |
 | `nuwa_status` | ASCII 看板 |
 | `nuwa_report` | Markdown 报告，可写 `.nuwa/REPORT.md` |
-| `nuwa_stop` | 主动停机 |
+| `nuwa_expand` | 强制扩张攻击面（frontier 空时自动执行） |
+| `nuwa_stop` | 人工停机；永动模式需 `confirm="STOP"` |
 | `nuwa_kb` | 本地知识库（产品卡/CVE/PoC/ATT&CK） |
 
 ## 证据闸门

@@ -43,15 +43,30 @@ function setup(cwd: string) {
 		},
 	};
 	nuwaOmp(pi);
+	const statuses = new Map<string, string>();
+	const widgets = new Map<string, unknown>();
 	const ctx: any = {
 		cwd,
 		agent: { kind: "main", id: "Main", name: "main", depth: 0 },
 		sessionManager: { getSessionId: () => "sess-test" },
 		getContextUsage: () => ({ tokens: 1234, usedTokens: 1234 }),
-		ui: { setStatus() {}, notify() {} },
+		ui: {
+			setStatus(key: string, value: string | undefined) {
+				if (value === undefined) statuses.delete(key);
+				else statuses.set(key, value);
+			},
+			setWidget(key: string, value: unknown) {
+				if (value === undefined) widgets.delete(key);
+				else widgets.set(key, value);
+			},
+			setTitle() {},
+			notify() {},
+			theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text },
+			custom: async () => undefined,
+		},
 	};
 	const call = (name: string, args: any) => tools.get(name).execute("call-1", args, undefined, undefined, ctx);
-	return { tools, hooks, ctx, call };
+	return { tools, hooks, ctx, call, statuses, widgets };
 }
 
 describe("extension wiring", () => {
@@ -205,4 +220,33 @@ describe("extension wiring", () => {
 		const res = await stop({ session_id: "sess-test", stop_hook_active: false } as any, ctx);
 		expect(res).toBeUndefined();
 	});
+describe("可视化接线", () => {
+	test("init 后写入状态栏与 3 行 widget", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nuwa-ui-"));
+		dirs.push(dir);
+		const { call, statuses, widgets } = setup(dir);
+		await call("nuwa_init", { target: "10.0.0.5:8080", mode: "ctf" });
+		const status = statuses.get("nuwa") ?? "";
+		expect(status).toContain("女娲");
+		expect(status).toContain("recon");
+		expect(status).toContain("E1");
+		const widget = widgets.get("nuwa");
+		expect(Array.isArray(widget)).toBe(true);
+		expect((widget as string[]).length).toBe(3);
+		expect((widget as string[])[0]).toContain("recon");
+	});
+
+	test("shutdown 清理状态栏与 widget", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nuwa-ui-"));
+		dirs.push(dir);
+		const { call, hooks, ctx, statuses, widgets } = setup(dir);
+		await call("nuwa_init", { target: "10.0.0.5:8080", mode: "ctf" });
+		expect(statuses.has("nuwa")).toBe(true);
+		const shutdown = hooks.get("session_shutdown")![0];
+		await shutdown({}, ctx);
+		expect(statuses.has("nuwa")).toBe(false);
+		expect(widgets.has("nuwa")).toBe(false);
+	});
+});
+
 });
