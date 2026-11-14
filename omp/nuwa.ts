@@ -17,6 +17,7 @@ import {
 	appendFileSync,
 	closeSync,
 	existsSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -347,11 +348,29 @@ function readJson<T>(path: string): T | null {
 	}
 }
 
+let atomicSeq = 0;
+
 function atomicWrite(path: string, body: string): void {
 	mkdirSync(dirname(path), { recursive: true });
-	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-	writeFileSync(tmp, body, "utf8");
+	const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${atomicSeq++}`;
+	const fd = openSync(tmp, "w");
+	try {
+		writeSync(fd, body);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
 	renameSync(tmp, path);
+	try {
+		const dfd = openSync(dirname(path), "r");
+		try {
+			fsyncSync(dfd);
+		} finally {
+			closeSync(dfd);
+		}
+	} catch {
+		/* 目录 fsync 在部分文件系统上不支持，忽略 */
+	}
 }
 
 function pidAlive(pid: number): boolean {
@@ -364,15 +383,22 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
-/** 单写者锁：创建失败时探活；死进程或超时锁直接回收。 */
-export function withLock<T>(root: string, fn: () => T): T {
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** 单写者锁：活进程持锁时只等不抢；空壳或死进程的锁立即回收。 */
+export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: number }): T {
 	mkdirSync(stateDir(root), { recursive: true });
 	const p = lockPath(root);
-	for (let attempt = 0; attempt < 3; attempt++) {
+	const deadline = Date.now() + (opts?.timeoutMs ?? 10_000);
+	let backoff = 4;
+	for (;;) {
 		let fd = -1;
 		try {
 			fd = openSync(p, "wx");
 			writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+			fsyncSync(fd);
 			closeSync(fd);
 			fd = -1;
 			try {
@@ -395,18 +421,56 @@ export function withLock<T>(root: string, fn: () => T): T {
 			const code = (err as NodeJS.ErrnoException)?.code;
 			if (code !== "EEXIST") throw err;
 			const held = readJson<{ pid?: number; ts?: number }>(p);
-			const fresh = held?.ts ? Date.now() - held.ts < 30_000 : false;
-			if (held?.pid && pidAlive(held.pid) && fresh) {
-				throw new Error(`state locked by pid ${held.pid}`);
+			if (held?.pid && pidAlive(held.pid)) {
+				if (Date.now() >= deadline) {
+					throw new Error(`state locked by pid ${held.pid} (>${Date.now() - (held.ts ?? Date.now())}ms)`);
+				}
+				sleepSync(backoff);
+				backoff = Math.min(backoff * 2, 120);
+				continue;
 			}
 			try {
 				unlinkSync(p);
 			} catch {
-				/* 下一次重试 */
+				/* 被别的进程先回收，下一轮重试 */
 			}
 		}
 	}
-	throw new Error("state lock busy");
+}
+
+const JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
+const JOURNAL_KEEP = 5;
+
+function journalArchivePath(root: string): string {
+	const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 17);
+	return join(stateDir(root), `journal.${stamp}-${process.pid}.jsonl`);
+}
+
+function pruneJournalArchives(root: string): void {
+	try {
+		const dir = stateDir(root);
+		const arcs = readdirSync(dir)
+			.filter((f) => /^journal\..+\.jsonl$/.test(f))
+			.sort();
+		for (const f of arcs.slice(0, Math.max(0, arcs.length - JOURNAL_KEEP))) {
+			try {
+				unlinkSync(join(dir, f));
+			} catch {
+				/* 已被别的进程清理 */
+			}
+		}
+	} catch {
+		/* 目录读失败不影响主流程 */
+	}
+}
+
+function rotateJournal(root: string): void {
+	try {
+		renameSync(journalPath(root), journalArchivePath(root));
+	} catch {
+		return;
+	}
+	pruneJournalArchives(root);
 }
 
 function journalAppend(root: string, rec: Record<string, unknown>): void {
@@ -414,8 +478,7 @@ function journalAppend(root: string, rec: Record<string, unknown>): void {
 		const p = journalPath(root);
 		mkdirSync(dirname(p), { recursive: true });
 		appendFileSync(p, JSON.stringify({ ts: nowIso(), ...rec }) + "\n", "utf8");
-		const size = statSync(p).size;
-		if (size > 8 * 1024 * 1024) renameSync(p, join(stateDir(root), "journal.1.jsonl"));
+		if (statSync(p).size > JOURNAL_MAX_BYTES) rotateJournal(root);
 	} catch {
 		/* 日志失败不阻塞主流程 */
 	}
@@ -425,10 +488,9 @@ export function logEvent(root: string, rec: Record<string, unknown>): void {
 	journalAppend(root, { type: "event", ...rec });
 }
 
-/** 从 journal 最后一条快照恢复，避免 state.json 半写损坏导致整图丢失。 */
-function recoverFromJournal(root: string): NuwaState | null {
+function snapshotFrom(file: string): NuwaState | null {
 	try {
-		const raw = readFileSync(journalPath(root), "utf8").trim().split("\n");
+		const raw = readFileSync(file, "utf8").trim().split("\n");
 		for (let i = raw.length - 1; i >= 0; i--) {
 			try {
 				const rec = JSON.parse(raw[i]) as { type?: string; state?: NuwaState };
@@ -438,7 +500,28 @@ function recoverFromJournal(root: string): NuwaState | null {
 			}
 		}
 	} catch {
-		/* 无 journal */
+		/* 文件缺失 */
+	}
+	return null;
+}
+
+/** 从 journal 当前文件与轮转归档里找最后一份快照，避免 state.json 半写损坏导致整图丢失。 */
+function recoverFromJournal(root: string): NuwaState | null {
+	const direct = snapshotFrom(journalPath(root));
+	if (direct) return direct;
+	let arcs: string[] = [];
+	try {
+		const dir = stateDir(root);
+		arcs = readdirSync(dir)
+			.filter((f) => /^journal\..+\.jsonl$/.test(f))
+			.sort()
+			.reverse();
+	} catch {
+		return null;
+	}
+	for (const f of arcs) {
+		const st = snapshotFrom(join(stateDir(root), f));
+		if (st) return st;
 	}
 	return null;
 }
@@ -2081,6 +2164,15 @@ export function checkTaskPolicy(input: Record<string, unknown>, active: boolean,
 	if (!active || !isMain) return null;
 	if ((process.env.NUWA_REQUIRE_FUJIANG ?? "1").trim() === "0") return null;
 	const raw = Array.isArray(input.tasks) ? (input.tasks as Array<Record<string, unknown>>) : [input];
+	for (const item of [input, ...raw]) {
+		if (item && Object.prototype.hasOwnProperty.call(item, "tools")) {
+			return {
+				block: true,
+				reason:
+					'nuwa N-006: task 的 tools 只接受 eval 内核里 @tool 定义的名字；填 bash/read/write 这类内建名会让子代理工具表变空，子任务以 "Unknown eval tool(s) ... Available: none" 秒失败。删掉 tools 字段，子代理自动继承全部内建工具',
+			};
+		}
+	}
 	for (const item of raw) {
 		const agent = typeof item?.agent === "string" ? item.agent : "";
 		if (agent !== "fujiang") {
