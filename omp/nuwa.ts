@@ -530,6 +530,33 @@ function pruneSnapshots(root: string): void {
 	}
 }
 
+/** 项目目录被整块删除时的兜底镜像：同一份 gz 再写一份到 agent 缓存，保留 3 份。 */
+function writeSnapshotMirror(state: NuwaState, body: Buffer, name: string): void {
+	try {
+		const id = (state.project?.id || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
+		const dir = join(AGENT_HOME, "cache", "nuwa-backup", id);
+		mkdirSync(dir, { recursive: true });
+		const fd = openSync(join(dir, name), "w");
+		try {
+			writeSync(fd, body);
+		} finally {
+			closeSync(fd);
+		}
+		const files = readdirSync(dir)
+			.filter((f) => f.endsWith(".json.gz"))
+			.sort();
+		for (const f of files.slice(0, Math.max(0, files.length - 3))) {
+			try {
+				unlinkSync(join(dir, f));
+			} catch {
+				/* 已被别的进程清理 */
+			}
+		}
+	} catch {
+		/* 镜像失败不影响记账 */
+	}
+}
+
 /** 快照写独立 gz 文件：journal 只留一行引用，避免每次记账把整图塞进日志。 */
 function writeSnapshotFile(root: string, state: NuwaState): { file: string; bytes: number } | null {
 	try {
@@ -546,6 +573,7 @@ function writeSnapshotFile(root: string, state: NuwaState): { file: string; byte
 			closeSync(fd);
 		}
 		pruneSnapshots(root);
+		writeSnapshotMirror(state, body, name);
 		return { file: `${SNAP_DIR}/${name}`, bytes: body.length };
 	} catch {
 		return null;
