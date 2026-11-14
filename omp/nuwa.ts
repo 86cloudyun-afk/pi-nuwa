@@ -46,8 +46,9 @@ import {
 	type UiStyle,
 } from "./ui";
 import { createBoardComponent, createWidgetComponent } from "./ui-native";
+import { pickAuto, ruleFor, runAutoIntent } from "./autoexec";
 
-export const VERSION = "2.4.0";
+export const VERSION = "2.6.0";
 const SCHEMA = 1;
 const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
@@ -145,6 +146,8 @@ export interface Runtime {
 	lastExpandAt?: number;
 	/** 预算压力 0..1，只用于降档，不用于停机。 */
 	pressure?: number;
+	/** 上一轮 facts 数，空转闸用它判断是否有新事实。 */
+	lastFacts?: number;
 }
 
 export interface NuwaState {
@@ -179,6 +182,14 @@ export interface Cfg {
 	expandDepth: number;
 	/** 扩张轮次上限；0 = 无限。 */
 	maxEpisodes: number;
+	/** 确定性侦察自动执行（omp 驱动）。 */
+	auto: boolean;
+	/** 每轮自动批上限。 */
+	autoMax: number;
+	/** 连续 N 轮无新事实触发空转硬闸。 */
+	emptyLimit: number;
+	/** 单条意图尝试上限，超过自动 blocked。 */
+	maxAttempts: number;
 }
 
 function num(name: string, dflt: number, min: number, zeroOk = false): number {
@@ -206,6 +217,10 @@ export function readCfg(): Cfg {
 		tickMs: num("NUWA_TICK_MS", 60_000, 5_000),
 		expandDepth: num("NUWA_EXPAND_DEPTH", 24, 1),
 		maxEpisodes: num("NUWA_MAX_EPISODES", 0, 0, true),
+		auto: (process.env.NUWA_AUTO ?? "1").trim() !== "0",
+		autoMax: num("NUWA_AUTO_MAX", 3, 1),
+		emptyLimit: num("NUWA_EMPTY_LIMIT", 3, 1),
+		maxAttempts: num("NUWA_MAX_ATTEMPTS", 3, 1),
 	};
 }
 
@@ -675,6 +690,7 @@ export function normalizeState(st: NuwaState): NuwaState {
 		expansions: Number.isFinite(cur.expansions) ? (cur.expansions as number) : 0,
 		lastExpandAt: Number.isFinite(cur.lastExpandAt) ? (cur.lastExpandAt as number) : 0,
 		pressure: Number.isFinite(cur.pressure) ? (cur.pressure as number) : 0,
+		lastFacts: Number.isFinite(cur.lastFacts) ? (cur.lastFacts as number) : -1,
 	};
 	st.runtime = rt;
 	if (!st.facts || typeof st.facts !== "object") st.facts = {};
@@ -912,6 +928,7 @@ export function newState(
 			expansions: 0,
 			lastExpandAt: 0,
 			pressure: 0,
+			lastFacts: -1,
 		},
 	};
 }
@@ -1709,9 +1726,55 @@ export function releaseStaleClaims(st: NuwaState, claimTtl: number): string[] {
 	return out;
 }
 
+/**
+ * 空转硬闸：facts 连续 emptyLimit 轮不涨 → 把所有非 auto 的 claimed 收口，返回被收口的 id。
+ * 调用方随后跑 autoPlan 换面。纯函数，便于测试。
+ */
+export function applyEmptyGuard(st: NuwaState, cfg: Cfg): string[] {
+	const factsNow = Object.keys(st.facts).length;
+	if (factsNow === (st.runtime.lastFacts ?? -1)) {
+		st.runtime.emptyRounds = (st.runtime.emptyRounds ?? 0) + 1;
+	} else {
+		st.runtime.emptyRounds = 0;
+		st.runtime.lastFacts = factsNow;
+	}
+	if ((st.runtime.emptyRounds ?? 0) < cfg.emptyLimit) return [];
+	const stalled = Object.values(st.intents).filter((i) => i.status === "claimed" && i.worker !== "auto");
+	for (const it of stalled) {
+		it.status = "blocked";
+		it.note = `空转: 连续 ${cfg.emptyLimit} 轮无新事实`;
+		it.doneAt = nowIso();
+	}
+	st.runtime.emptyRounds = 0;
+	return stalled.map((i) => i.id);
+}
+
+/** 领自动批：白名单 key、open、依赖满足、尝试未超限；标 claimed(worker=auto) 并返回 id。 */
+export function claimAutoBatch(st: NuwaState, cfg: Cfg): string[] {
+	if (!cfg.auto) return [];
+	const ids = pickAuto(st, cfg, cfg.autoMax);
+	for (const id of ids) {
+		const it = st.intents[id];
+		if (!it) continue;
+		it.status = "claimed";
+		it.worker = "auto";
+		it.claimedAt = nowIso();
+		it.attempts += 1;
+	}
+	return ids;
+}
+
 export function autoPlan(st: NuwaState, cfg: Cfg): AutoPlanResult {
 	compactIntents(st);
 	releaseStaleClaims(st, cfg.claimTtl);
+	// 尝试上限：同一条意图烧到上限仍无产出，转停驻态，别让它占着 live 位。
+	for (const it of Object.values(st.intents)) {
+		if ((it.status === "open" || it.status === "claimed") && it.attempts >= cfg.maxAttempts) {
+			it.status = "blocked";
+			it.note = `尝试上限 ${cfg.maxAttempts}: 未产出，换路`;
+			it.doneAt = nowIso();
+		}
+	}
 	const live = Object.values(st.intents).filter((i) => i.status === "open" || i.status === "claimed");
 	if (live.length) return { added: [], reason: "frontier-live" };
 
@@ -2025,6 +2088,10 @@ export function statusBoard(st: NuwaState): string {
 		head,
 	].join("\n");
 	const frontier = frontierList(st, 8, cfg.claimTtl).map((f) => f.intent.id).join(" ") || "(空)";
+	const autoBatch = Object.values(st.intents)
+		.filter((i) => i.status === "claimed" && i.worker === "auto")
+		.map((i) => i.id)
+		.join(" ");
 	const kindLine = Object.entries(kinds)
 		.sort((a, b) => b[1] - a[1])
 		.map(([k, v]) => `${k}=${v}`)
@@ -2039,7 +2106,7 @@ export function statusBoard(st: NuwaState): string {
 		budgetLine,
 		`rejects=${rt.completionRejects} · 目标: ${p.goal}`,
 		table,
-		`frontier: ${frontier}`,
+		`frontier: ${frontier}${autoBatch ? ` · auto: ${autoBatch}` : ""}`,
 	].join("\n");
 }
 
@@ -2123,7 +2190,9 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 		`- 只有 nuwa_complete 返回 ok=true 才会解除续跑；其他任何理由都不停。`,
 	].join("\n");
 
-	const fresh = claimedFresh(st, cfg.claimTtl);
+	const freshAll = claimedFresh(st, cfg.claimTtl);
+	const fresh = freshAll.filter((i) => i.worker !== "auto");
+	const autoRunning = freshAll.filter((i) => i.worker === "auto");
 	const batch = items.length
 		? [
 				`本批派单（并行 ${Math.min(items.length, batchSize)}）:`,
@@ -2155,6 +2224,7 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 				].join("\n");
 
 	const discipline = [
+		autoRunning.length ? `自动批在跑（引擎执行，不要 claim/commit）: ${autoRunning.map((i) => i.id).join(" ")}` : "",
 		`纪律:`,
 		`- 主线程禁止自己跑 nmap/ffuf/nuclei/sqlmap 等扫描命令（工具层已拦）；扫描只发生在 fujiang 子代理。`,
 		`- 禁止调用 bin/nuwa / nuwa/cli.py / sapper（均已退役）；一切记账走 nuwa_* 工具。`,
@@ -2495,6 +2565,54 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			ui.setTitle?.(`女娲 ${st.project.host}:${st.project.port} · ${st.project.phase} · E${st.project.episode ?? 1}`);
 		} catch {
 			/* print/RPC 或宿主无 UI 通道 */
+		}
+	};
+
+	/** 自动批：引擎直接跑确定性侦察并入账；模型不参与。 */
+	const runAutoBatch = async (ctx: ExtensionContext, root: string, ids: string[]): Promise<void> => {
+		for (const id of ids) {
+			try {
+				const st = loadState(root);
+				if (!st) return;
+				const it = st.intents[id];
+				if (!it || it.status !== "claimed" || it.worker !== "auto") continue;
+				const rule = ruleFor(it.key);
+				if (!rule) {
+					withLock(root, () => {
+						const s = loadState(root);
+						const cur = s?.intents[id];
+						if (s && cur && cur.status === "claimed") {
+							commitIntent(s, { id, blocked: true, note: "auto: 无匹配规则" });
+							saveState(root, s);
+						}
+					});
+					continue;
+				}
+				const res = await runAutoIntent(rule, st, (c, a, o) => pi.exec(c, a, o), root);
+				withLock(root, () => {
+					const s = loadState(root);
+					const cur = s?.intents[id];
+					if (!s || !cur || cur.status !== "claimed") return;
+					if (res.ok && res.fact) {
+						commitIntent(s, {
+							id,
+							kind: res.fact.kind,
+							title: res.fact.title,
+							detail: res.fact.detail,
+							command: res.fact.command,
+							output: res.fact.output,
+						});
+						logEvent(root, { type: "auto", id, ok: true, kind: res.fact.kind });
+					} else {
+						commitIntent(s, { id, blocked: true, note: `auto: ${res.error ?? "无产出"}` });
+						logEvent(root, { type: "auto", id, ok: false, error: res.error });
+					}
+					saveState(root, s);
+					refreshUi(ctx, root, s, true);
+				});
+			} catch {
+				/* 单条失败不影响整批 */
+			}
 		}
 	};
 
@@ -3329,6 +3447,8 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			let facts = 0;
 			let stall = 0;
 			let st2: NuwaState | null = cur;
+			let autoIds: string[] = [];
+			let emptyGuard: string[] = [];
 
 			// 计数、扩张、指令生成一次落盘；扩张保证 frontier 永不为空。
 			st2 = withLock(root, () => {
@@ -3365,6 +3485,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					return s;
 				}
 
+				// 空转硬闸：连续 N 轮 facts 不涨，把模型批全部收口，逼 autoPlan 换面。
+				emptyGuard = applyEmptyGuard(s, cfg);
+
 				const planned = autoPlan(s, cfg);
 				plan = planned.reason;
 				added = planned.added.length;
@@ -3372,6 +3495,10 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					logEvent(root, { type: "expand", reason: planned.reason, added: planned.added, phase: planned.phase, episode: planned.episode });
 				}
 				if (planned.episode) logEvent(root, { type: "episode", episode: planned.episode });
+				if (emptyGuard.length) logEvent(root, { type: "empty_guard", blocked: emptyGuard, plan: planned.reason });
+
+				// 自动批：claim 白名单意图；锁外执行，下一轮结算。
+				autoIds = claimAutoBatch(s, cfg);
 
 				directive = buildDirective(s, cfg);
 				s.runtime.lastDirective = directive;
@@ -3403,6 +3530,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				return;
 			}
 			if (!directive || !st2) return;
+			if (autoIds.length) void runAutoBatch(ctx, root, autoIds);
 			refreshUi(ctx, root, st2, true);
 			ctx.ui?.setStatus?.("nuwa", `续跑 #${turn} · E${episode} · ${phase} · facts=${facts} stall=${stall}`);
 

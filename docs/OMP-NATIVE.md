@@ -263,6 +263,23 @@ v2 把所有边界收进 omp 进程：
 - 开关：`NUWA_UI`、`NUWA_UI_WIDGET`、`NUWA_UI_LINES`、`NUWA_UI_BOARD_MAX`。
 - 清理：`session_shutdown` 调 `setWidget(..., undefined)` 与 `setStatus(..., undefined)`。
 
+## 4.6 自渗透执行器（2.6.0）
+
+`omp/autoexec.ts` 把确定性侦察从模型手里拿走：
+
+```text
+session_stop
+  ├─ applyEmptyGuard：连续 N 轮 facts 不涨 → 模型批 blocked
+  ├─ autoPlan：补播 / 派生 / 推进 / 新 episode
+  ├─ claimAutoBatch：白名单意图标 claimed(worker=auto)
+  ├─ buildDirective：只给模型判断类任务 + "自动批在跑"提示
+  └─ runAutoBatch（异步）：pi.exec → parse → commitIntent
+```
+
+规则：`recon:http|ports|dirs|tlsjs`、`surface:sensitive|api`。每条 8–50s 超时，脚本用
+`bash -lc`，解析器是纯函数。自动批不参与空转闸；`attempts >= NUWA_MAX_ATTEMPTS` 在
+`autoPlan` 里转 blocked。
+
 ## 5. 续跑算法
 
 `session_stop` 每次触发：

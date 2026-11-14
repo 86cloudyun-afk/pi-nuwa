@@ -86,6 +86,23 @@ nuwa_report(write=true)
 - Tern：`describe()` 手写 TSP 节点（card/progress/meter/table/tree/list），按 `cx.supports()` 逐项降级；
   不依赖 `@oh-my-pi/pi-tui`。设计与降级矩阵：`docs/UI-DESIGN.md`。
 
+## 自渗透（omp 驱动）
+
+确定性侦察不再等模型动手：每轮 `session_stop` 时扩展先领一批白名单意图，自己 `bash -lc` 跑命令、
+解析、入账；模型只看剩下的判断类意图。
+
+```text
+自动批   recon:http / recon:ports / recon:dirs / recon:tlsjs
+         surface:sensitive / surface:api
+执行     pi.exec → 解析 → commitIntent（worker="auto"）
+防线     连续 3 轮无新事实 → 模型批全部 blocked + autoPlan 换面
+         attempts ≥ 3 → 自动 blocked
+开关     NUWA_AUTO=1 · NUWA_AUTO_MAX=3 · NUWA_EMPTY_LIMIT=3 · NUWA_MAX_ATTEMPTS=3
+```
+
+不覆盖：nmap 全端口、ffuf 大字典、exploit 链、写操作——这些仍由 fujiang 子代理/模型完成。
+详见 `docs/AUTOPILOT.md`。
+
 ## 工具
 
 | 工具 | 作用 |

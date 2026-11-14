@@ -1,5 +1,39 @@
 # Changelog
 
+## 2.6.0 — 2026-11-15
+
+omp 驱动的自渗透：确定性侦察由扩展直接执行，模型只做判断类意图。
+
+从 ARTEX 抄的三条：
+
+- **调度与执行分离**：ARTEX 的 scheduler 决定批次、worker 执行；女娲此前把两者都交给模型，
+  模型"只思考不动手"就空转。现在扩展自己 claim 自动批、自己跑命令、自己入账。
+- **空转硬闸**：ARTEX 对"只有思考、无正文无工具"的回合注入续跑并设上限（每意图 2 次）；
+  女娲改为按 facts 增长判定，连续 `NUWA_EMPTY_LIMIT` 轮无新事实就把模型批全部收口、强制换面。
+- **意图尝试上限**：ARTEX 的限额不随重启/换版本重置；女娲 `attempts >= NUWA_MAX_ATTEMPTS`
+  的意图在 `autoPlan` 里自动转 blocked，不再占 live 位。
+
+新增 `omp/autoexec.ts`：
+
+- 6 条确定性规则：`recon:http`（状态/Server/标题）、`recon:ports`（29 端口 TCP 连通）、
+  `recon:dirs`（23 条常见路径）、`recon:tlsjs`（证书/SAN）、`surface:sensitive`
+  （robots/.git/.env/backup）、`surface:api`（openapi/swagger/graphql）。
+  `bash -lc` 执行，8–50s 超时，解析器纯函数。
+- `pickAuto` / `claimAutoBatch`：白名单 key、依赖满足、attempts 未超限；标 `worker="auto"`。
+- `runAutoBatch`：锁外执行、锁内 `commitIntent`；成功记 `auto` 事件，失败写 `blocked(note="auto: …")`。
+- 模型 directive 会单独列出"自动批在跑，不要 claim/commit"。
+
+配置：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `NUWA_AUTO` | `1` | `0` 关闭自动批 |
+| `NUWA_AUTO_MAX` | `3` | 每轮自动批上限 |
+| `NUWA_EMPTY_LIMIT` | `3` | 连续无新事实轮数触发空转闸 |
+| `NUWA_MAX_ATTEMPTS` | `3` | 单意图尝试上限 |
+
+`install.sh` 部署 `autoexec.ts` 并自检；新增 `tests/autoexec.test.ts` 18 例。
+
 ## 2.4.0 — 2026-11-13
 
 Tern 原生渲染：手写 TSP 节点，不引入 `@oh-my-pi/pi-tui` 依赖。
