@@ -30,6 +30,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { spawnSync } from "node:child_process";
 import { setInterval as setNodeInterval } from "node:timers";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
@@ -383,6 +384,19 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
+/** /proc/<pid>/stat 第 22 字段（starttime），用于识别 PID 复用。 */
+function procStartTime(pid: number): string | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return null;
+		const fields = stat.slice(close + 2).split(" ");
+		return fields[19] ?? null;
+	} catch {
+		return null;
+	}
+}
+
 function sleepSync(ms: number): void {
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -397,7 +411,7 @@ export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: numb
 		let fd = -1;
 		try {
 			fd = openSync(p, "wx");
-			writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+			writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now(), start: procStartTime(process.pid) }));
 			fsyncSync(fd);
 			closeSync(fd);
 			fd = -1;
@@ -420,10 +434,13 @@ export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: numb
 			}
 			const code = (err as NodeJS.ErrnoException)?.code;
 			if (code !== "EEXIST") throw err;
-			const held = readJson<{ pid?: number; ts?: number }>(p);
-			if (held?.pid && pidAlive(held.pid)) {
+			const held = readJson<{ pid?: number; ts?: number; start?: string }>(p);
+			const heldPid = typeof held?.pid === "number" ? held.pid : 0;
+			const heldStart = typeof held?.start === "string" ? held.start : null;
+			const sameProcess = heldPid > 0 && pidAlive(heldPid) && (!heldStart || heldStart === procStartTime(heldPid));
+			if (sameProcess) {
 				if (Date.now() >= deadline) {
-					throw new Error(`state locked by pid ${held.pid} (>${Date.now() - (held.ts ?? Date.now())}ms)`);
+					throw new Error(`state locked by pid ${heldPid} (>${Date.now() - (held?.ts ?? Date.now())}ms)`);
 				}
 				sleepSync(backoff);
 				backoff = Math.min(backoff * 2, 120);
@@ -488,13 +505,79 @@ export function logEvent(root: string, rec: Record<string, unknown>): void {
 	journalAppend(root, { type: "event", ...rec });
 }
 
-function snapshotFrom(file: string): NuwaState | null {
+const SNAP_DIR = "snap";
+const SNAP_KEEP = 5;
+
+function snapshotDir(root: string): string {
+	return join(stateDir(root), SNAP_DIR);
+}
+
+function pruneSnapshots(root: string): void {
+	try {
+		const dir = snapshotDir(root);
+		const files = readdirSync(dir)
+			.filter((f) => f.endsWith(".json.gz"))
+			.sort();
+		for (const f of files.slice(0, Math.max(0, files.length - SNAP_KEEP))) {
+			try {
+				unlinkSync(join(dir, f));
+			} catch {
+				/* 已被别的进程清理 */
+			}
+		}
+	} catch {
+		/* 目录缺失 */
+	}
+}
+
+/** 快照写独立 gz 文件：journal 只留一行引用，避免每次记账把整图塞进日志。 */
+function writeSnapshotFile(root: string, state: NuwaState): { file: string; bytes: number } | null {
+	try {
+		const dir = snapshotDir(root);
+		mkdirSync(dir, { recursive: true });
+		const name = `${Date.now()}-${process.pid}-${atomicSeq++}.json.gz`;
+		const body = gzipSync(Buffer.from(JSON.stringify(state)));
+		const full = join(dir, name);
+		const fd = openSync(full, "w");
+		try {
+			writeSync(fd, body);
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		pruneSnapshots(root);
+		return { file: `${SNAP_DIR}/${name}`, bytes: body.length };
+	} catch {
+		return null;
+	}
+}
+
+function readSnapshotFile(root: string, rel: string): NuwaState | null {
+	try {
+		const buf = readFileSync(join(stateDir(root), rel));
+		const text = rel.endsWith(".gz") ? gunzipSync(buf).toString("utf8") : buf.toString("utf8");
+		const st = JSON.parse(text) as NuwaState;
+		return st?.schema === SCHEMA ? st : null;
+	} catch {
+		return null;
+	}
+}
+
+function stateFromSnapshotRecord(root: string, rec: { type?: string; state?: NuwaState; file?: string }): NuwaState | null {
+	if (rec?.type !== "snapshot") return null;
+	if (rec.state?.schema === SCHEMA) return rec.state;
+	if (typeof rec.file === "string") return readSnapshotFile(root, rec.file);
+	return null;
+}
+
+function snapshotFrom(root: string, file: string): NuwaState | null {
 	try {
 		const raw = readFileSync(file, "utf8").trim().split("\n");
 		for (let i = raw.length - 1; i >= 0; i--) {
 			try {
-				const rec = JSON.parse(raw[i]) as { type?: string; state?: NuwaState };
-				if (rec?.type === "snapshot" && rec.state?.schema === SCHEMA) return rec.state;
+				const rec = JSON.parse(raw[i]) as { type?: string; state?: NuwaState; file?: string };
+				const st = stateFromSnapshotRecord(root, rec);
+				if (st) return st;
 			} catch {
 				/* 跳过坏行 */
 			}
@@ -505,9 +588,25 @@ function snapshotFrom(file: string): NuwaState | null {
 	return null;
 }
 
-/** 从 journal 当前文件与轮转归档里找最后一份快照，避免 state.json 半写损坏导致整图丢失。 */
+function latestSnapshotFile(root: string): NuwaState | null {
+	try {
+		const files = readdirSync(snapshotDir(root))
+			.filter((f) => f.endsWith(".json.gz"))
+			.sort()
+			.reverse();
+		for (const f of files) {
+			const st = readSnapshotFile(root, `${SNAP_DIR}/${f}`);
+			if (st) return st;
+		}
+	} catch {
+		/* 目录缺失 */
+	}
+	return null;
+}
+
+/** 从 journal 当前文件、轮转归档、快照目录三处依次找最后一份快照，避免 state.json 半写损坏导致整图丢失。 */
 function recoverFromJournal(root: string): NuwaState | null {
-	const direct = snapshotFrom(journalPath(root));
+	const direct = snapshotFrom(root, journalPath(root));
 	if (direct) return direct;
 	let arcs: string[] = [];
 	try {
@@ -517,13 +616,13 @@ function recoverFromJournal(root: string): NuwaState | null {
 			.sort()
 			.reverse();
 	} catch {
-		return null;
+		arcs = [];
 	}
 	for (const f of arcs) {
-		const st = snapshotFrom(join(stateDir(root), f));
+		const st = snapshotFrom(root, join(stateDir(root), f));
 		if (st) return st;
 	}
-	return null;
+	return latestSnapshotFile(root);
 }
 
 /** 2.2.0 新增字段：老 state 读入时就地补齐，避免 undefined 参与算术。 */
@@ -572,8 +671,8 @@ export function loadState(root: string): NuwaState | null {
 
 export function saveState(root: string, state: NuwaState): void {
 	state.project.updatedAt = nowIso();
-	const body = JSON.stringify(state);
-	journalAppend(root, { type: "snapshot", state });
+	const snap = writeSnapshotFile(root, state);
+	journalAppend(root, snap ? { type: "snapshot", file: snap.file, bytes: snap.bytes } : { type: "snapshot", state });
 	atomicWrite(statePath(root), JSON.stringify(state, null, 2));
 }
 
