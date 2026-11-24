@@ -30,7 +30,6 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -131,19 +130,21 @@ const POINTER = join(AGENT_HOME, "cache/nuwa-current.json");
 const POINTER_DIR = join(AGENT_HOME, "cache/nuwa-current.d");
 const PROJECTS_DIR = join(AGENT_HOME, "cache/nuwa-projects");
 
-// ---------------------------------------------------------------- 邻近 v3 模块按需桥接（兼容单分支隔离测试与全仓合并部署）
+// ---------------------------------------------------------------- 邻近 v3 模块桥接
+// 扩展以 ESM 加载，createRequire 不能 require 异步/ESM 的 .ts 兄弟模块
+// （bun: "require() async module ... is unsupported"）。这里在模块顶层用
+// await import() 预加载，loadSibling 退化为同步查表。
 const MOD_DIR = dirname(fileURLToPath(import.meta.url));
-const siblingRequire = createRequire(import.meta.url);
-const siblingCache = new Map<string, unknown>();
+const siblingModules: Record<string, unknown> = {
+	scope: await import("./scope.ts").catch(() => null),
+	evidence: await import("./evidence.ts").catch(() => null),
+	profiles: await import("./profiles.ts").catch(() => null),
+	autoexec: await import("./autoexec.ts").catch(() => null),
+};
 
 function loadSibling<T>(name: string): T | null {
-	if (siblingCache.has(name)) return siblingCache.get(name) as T;
-	const hasTs = existsSync(join(MOD_DIR, `${name}.ts`));
-	const hasJs = !hasTs && existsSync(join(MOD_DIR, `${name}.js`));
-	if (!hasTs && !hasJs) return null;
-	const mod = siblingRequire(`./${name}`) as T;
-	siblingCache.set(name, mod);
-	return mod;
+	const mod = siblingModules[name];
+	return (mod as T | null) ?? null;
 }
 
 interface ScopeMod {
