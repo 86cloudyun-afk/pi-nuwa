@@ -4,6 +4,7 @@
 # 后跑的用例会拿到别人的 agent home，出现 6 例假红。
 # --isolate 让每个测试文件用独立全局对象，实测 154/154 通过。
 set -u
+unset BUN_OPTIONS
 cd "$(dirname "$0")" || exit 1
 export NUWA_WORK="${NUWA_WORK:-$(pwd)}"
 exec bun test --isolate "$@"
