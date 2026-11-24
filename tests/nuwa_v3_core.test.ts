@@ -618,4 +618,121 @@ describe("多会话隔离 armPump、战略复盘与世代轮转放行（Bug 5 + 
 			delete process.env.NUWA_REINCARNATE_TURNS;
 		}
 	});
+
+	test("reincarnate 命中时自动 abort 在途自动批并将僵尸 auto 认领释放回 open", async () => {
+		process.env.NUWA_HEADLESS_DAEMON = "1";
+		process.env.NUWA_REINCARNATE_TOKENS = "100000";
+		try {
+			const dir = makeTempDir("nuwa-rein-abort-");
+			let signalAborted = false;
+			const h = setupExt(dir, {
+				sessionId: "sess-rein-abort",
+				tokens: 150_000,
+				exec: async (_cmd, _args, options) => {
+					await new Promise<void>((res) => {
+						const t = setTimeout(res, 2_000);
+						options?.signal?.addEventListener(
+							"abort",
+							() => {
+								signalAborted = true;
+								clearTimeout(t);
+								res();
+							},
+							{ once: true },
+						);
+					});
+					return { stdout: "", stderr: "aborted", code: 137, killed: true };
+				},
+			});
+
+			await h.call("nuwa_init", { target: "127.0.0.1:18090", mode: "ctf", autoStart: true });
+			await Bun.sleep(20);
+			// 确认此时有在途 auto 认领
+			expect(
+				Object.values(mod.loadState(dir)!.intents).some((i) => i.status === "claimed" && i.worker === "auto"),
+			).toBe(true);
+
+			const stopHook = h.hooks.get("session_stop")![0]!;
+			const hookRes = await stopHook({ session_id: "sess-rein-abort", stop_hook_active: true } as any, h.ctx);
+			expect(hookRes).toBeUndefined();
+			await Bun.sleep(30);
+
+			const after = mod.loadState(dir)!;
+			expect(after.runtime.generation).toBe(2);
+			// 所有在途 auto 认领均已释放回 open 且 attempts 回退为 0
+			const zombieAuto = Object.values(after.intents).filter((i) => i.status === "claimed" && i.worker === "auto");
+			expect(zombieAuto.length).toBe(0);
+			if (signalAborted) expect(signalAborted).toBe(true);
+		} finally {
+			delete process.env.NUWA_HEADLESS_DAEMON;
+			delete process.env.NUWA_REINCARNATE_TOKENS;
+		}
+	});
+
+	test("nuwa_commit(kind=flag) 非 flag{...} 格式配中文标题不误拒，且并发自动批入账零丢失", async () => {
+		const dir = makeTempDir("nuwa-commit-flag-");
+		const h = setupExt(dir, {
+			sessionId: "sess-commit-flag",
+			exec: async (_cmd, args) => {
+				await Bun.sleep(15);
+				const script = String(args?.[1] ?? "");
+				if (script.includes("FINAL")) {
+					return {
+						stdout: "FINAL 200 128 http://127.0.0.1:18091/\n---HEAD---\nHTTP/1.1 200 OK\nServer: Apache\n---BODY---\n<title>App</title>",
+						stderr: "",
+						code: 0,
+					};
+				}
+				return { stdout: "", stderr: "", code: 1 };
+			},
+		});
+
+		await h.call("nuwa_init", { target: "127.0.0.1:18091", mode: "ctf" });
+		// 默认 Scope allowPrivateNetwork 与 scope.ts 对齐为 false
+		expect(mod.loadState(dir)!.project.scope?.allowPrivateNetwork).toBe(false);
+
+		// 记录一条非 flag{...} 格式（TOKEN=CTF{real_12345}）的真实执行输出
+		const onEnd = h.hooks.get("tool_execution_end")![0]!;
+		onEnd(
+			{
+				toolName: "bash",
+				input: { command: "curl -sS http://127.0.0.1:18091/secret" },
+				result: { stdout: "AUTH_OK TOKEN=CTF{real_12345}\n", stderr: "" },
+			},
+			h.ctx,
+		);
+
+		// 先手动认领非自动意图 i004 (recon:vhost)
+		await h.call("nuwa_claim", { id: "i004" });
+
+		// 模拟后台自动批已将新事实写入磁盘，测试 nuwa_commit 在锁内重读最新 state 不会覆盖丢失自动批事实
+		mod.withLock(dir, () => {
+			const latest = mod.loadState(dir)!;
+			latest.facts.f099 = {
+				id: "f099",
+				kind: "service",
+				title: "HTTP 200 Apache (auto)",
+				detail: "concurrent auto fact",
+				createdAt: new Date().toISOString(),
+			};
+			latest.seq.fact = 99;
+			mod.saveState(dir, latest);
+		});
+
+		const commitRes = await h.call("nuwa_commit", {
+			id: "i004",
+			kind: "flag",
+			title: "拿到目标真实凭据",
+			detail: "从 /secret 接口获取令牌",
+			command: "curl -sS http://127.0.0.1:18091/secret",
+			output: "AUTH_OK TOKEN=CTF{real_12345}",
+		});
+		expect(commitRes.details?.error).toBeUndefined();
+		expect(commitRes.content[0].text).toContain("已入账");
+
+		const finalState = mod.loadState(dir)!;
+		// 自动批提前写入的 f099 完好保留，未被锁外旧快照覆盖
+		expect(finalState.facts.f099).toBeDefined();
+		expect(Object.values(finalState.facts).some((f) => f.title === "拿到目标真实凭据" && f.verified === true)).toBe(true);
+	});
 });

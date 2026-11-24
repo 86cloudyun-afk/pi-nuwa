@@ -174,34 +174,73 @@ interface ProfilesMod {
 	): { key: string; phase: Phase; title: string; detail: string; priority: number; from: string[] } | null;
 }
 
+type AutoErrorKind = "network" | "blocked_by_waf" | "empty";
+type BudgetSkipReason = "budget_exceeded" | "aborted";
+
+interface AutoFailureClassification {
+	kind: AutoErrorKind;
+	errorKind: AutoErrorKind;
+	retryAfterMs?: number;
+	waf?: string;
+	reason: string;
+}
+
+interface LoadedAutoRules {
+	rules: readonly { key: string }[];
+	source: "project" | "user" | "builtin";
+	path?: string;
+	error?: string;
+}
+
 interface AutoExecExtResult extends AutoRunResult {
-	errorKind?: "network" | "blocked_by_waf" | "empty";
+	errorKind?: AutoErrorKind;
 	retryAfterMs?: number;
 	waf?: string;
 	fact?: AutoFact & { meta?: AutoFactMeta };
 }
 
+interface AutoBatchItemResult {
+	id: string;
+	key: string;
+	canonicalKey: string;
+	result: AutoExecExtResult;
+	durationMs: number;
+}
+
+interface AutoBatchOptions {
+	budgetMs?: number;
+	concurrency?: number;
+	signal?: AbortSignal;
+	agentHome?: string;
+	getState?: () => NuwaState | null;
+	onResult?: (item: AutoBatchItemResult) => void | Promise<void>;
+	onBudgetSkip?: (remainingIds: string[], reason: BudgetSkipReason) => void | Promise<void>;
+}
+
+interface AutoBatchManagedResult {
+	results: Record<string, AutoExecExtResult>;
+	items: AutoBatchItemResult[];
+	skippedIds: string[];
+	skipReason?: BudgetSkipReason;
+	elapsedMs: number;
+	ruleSource: "project" | "user" | "builtin";
+	ruleError?: string;
+}
+
 interface AutoExecMod {
-	pickAuto: typeof pickAuto;
+	pickAuto: (st: NuwaState, cfg: Cfg, max: number, now?: number, root?: string) => string[];
 	ruleFor: typeof ruleFor;
 	runAutoIntent: typeof runAutoIntent;
 	canonicalAutoKey?: (key: string) => string;
-	loadAutoRules?: (root?: string, agentHome?: string) => unknown;
-	classifyAutoFailure?: (res: { stdout: string; stderr: string; code: number; killed?: boolean }) => string;
+	loadAutoRules?: (root?: string, agentHome?: string) => LoadedAutoRules;
+	classifyAutoFailure?: (res: { stdout: string; stderr: string; code: number; killed?: boolean }) => AutoFailureClassification;
 	runAutoBatchManaged?: (
 		ids: string[],
 		st: NuwaState,
 		exec: ExecLike,
 		root: string,
-		opts?: {
-			budgetMs?: number;
-			concurrency?: number;
-			signal?: AbortSignal;
-			agentHome?: string;
-			onBudgetSkip?: (remainingIds: string[], reason: string) => void;
-			onResult?: (id: string, res: AutoExecExtResult) => void;
-		},
-	) => Promise<unknown>;
+		opts?: AutoBatchOptions,
+	) => Promise<AutoBatchManagedResult>;
 }
 
 function fallbackDefaultScope(target: string, mode: string, overrides?: Partial<ScopePolicy>): ScopePolicy {
@@ -222,7 +261,7 @@ function fallbackDefaultScope(target: string, mode: string, overrides?: Partial<
 		allowCidrs: overrides?.allowCidrs ?? envCidrs,
 		denyHosts: overrides?.denyHosts ?? [],
 		allowSubdomains: overrides?.allowSubdomains ?? envSub,
-		allowPrivateNetwork: overrides?.allowPrivateNetwork ?? true,
+		allowPrivateNetwork: overrides?.allowPrivateNetwork ?? false,
 		allowDestructive: overrides?.allowDestructive ?? false,
 	};
 }
@@ -3470,19 +3509,18 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			if (!st0) return;
 			const autoMod = loadSibling<AutoExecMod>("autoexec");
 			if (autoMod?.runAutoBatchManaged) {
-				const managed = (await autoMod.runAutoBatchManaged(ids, st0, execFn, normRoot, {
+				const managed = await autoMod.runAutoBatchManaged(ids, st0, execFn, normRoot, {
 					budgetMs,
 					concurrency,
 					signal: ac.signal,
 					agentHome: AGENT_HOME,
 					getState: () => loadState(normRoot),
-					onResult: (item: unknown) => {
-						const itObj = item as { id: string; result: AutoExecExtResult };
-						if (itObj?.id && itObj?.result) {
-							commitSingleAutoResult(ctx, normRoot, itObj.id, itObj.result);
+					onResult: (item: AutoBatchItemResult) => {
+						if (item?.id && item?.result) {
+							commitSingleAutoResult(ctx, normRoot, item.id, item.result);
 						}
 					},
-					onBudgetSkip: (remainingIds: string[], skipReason: string) => {
+					onBudgetSkip: (remainingIds: string[], skipReason: BudgetSkipReason) => {
 						withLock(normRoot, () => {
 							const s = loadState(normRoot);
 							if (!s) return;
@@ -3497,7 +3535,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 							}
 						});
 					},
-				})) as { ruleSource?: string; ruleError?: string } | undefined;
+				});
 
 				if (managed?.ruleSource) {
 					withLock(normRoot, () => {
@@ -3660,41 +3698,44 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				}
 				if (existing && p.resume) {
 					const scopeHelper = resolveScopeHelper();
-					withLock(root, () => {
-						existing.project.status = "active";
-						existing.project.stopReason = undefined;
-						existing.project.ownerSessionId = sid;
+					const resumed = withLock(root, () => {
+						const s = loadState(root);
+						if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
+						s.project.status = "active";
+						s.project.stopReason = undefined;
+						s.project.ownerSessionId = sid;
 						if (p.scope) {
-							existing.project.scope = scopeHelper.defaultScopeForTarget(
-								existing.project.url || existing.project.target,
-								existing.project.mode,
-								{ ...existing.project.scope, ...p.scope },
+							s.project.scope = scopeHelper.defaultScopeForTarget(
+								s.project.url || s.project.target,
+								s.project.mode,
+								{ ...s.project.scope, ...p.scope },
 							);
-						} else if (!existing.project.scope) {
-							existing.project.scope = scopeHelper.defaultScopeForTarget(
-								existing.project.url || existing.project.target,
-								existing.project.mode,
+						} else if (!s.project.scope) {
+							s.project.scope = scopeHelper.defaultScopeForTarget(
+								s.project.url || s.project.target,
+								s.project.mode,
 							);
 						}
-						if (!existing.project.toolchain) {
-							existing.project.toolchain = resolveEvidenceHelper().probeToolchain();
+						if (!s.project.toolchain) {
+							s.project.toolchain = resolveEvidenceHelper().probeToolchain();
 						}
-						existing.runtime.startedAt = Date.now();
-						existing.runtime.turns = 0;
-						existing.runtime.genTurns = 0;
-						existing.runtime.stall = 0;
-						existing.runtime.idle = 0;
-						existing.runtime.tokens = 0;
-						existing.runtime.completionRejects = 0;
-						existing.runtime.lastSig = "";
-						existing.runtime.lastSettleAt = 0;
-						existing.runtime.blockStreak = 0;
-						existing.runtime.pressure = 0;
-						saveState(root, existing, { reason: "init" });
+						s.runtime.startedAt = Date.now();
+						s.runtime.turns = 0;
+						s.runtime.genTurns = 0;
+						s.runtime.stall = 0;
+						s.runtime.idle = 0;
+						s.runtime.tokens = 0;
+						s.runtime.completionRejects = 0;
+						s.runtime.lastSig = "";
+						s.runtime.lastSettleAt = 0;
+						s.runtime.blockStreak = 0;
+						s.runtime.pressure = 0;
+						saveState(root, s, { reason: "init" });
+						return s;
 					});
 					writePointer(root, sid);
-					refreshUi(ctx, root, existing, true);
-					return toolText(`已恢复 ${existing.project.id}\n\n${statusBoard(existing, root)}`, { root });
+					refreshUi(ctx, root, resumed, true);
+					return toolText(`已恢复 ${resumed.project.id}\n\n${statusBoard(resumed, root)}`, { root });
 				}
 				if (existing && !p.force) {
 					return toolText(
@@ -3757,22 +3798,23 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			try {
 				const root = resolveRoot(ctx, p.root);
 				if (!root) throw new Error("未找到女娲项目；先 nuwa_init");
-				const st = loadState(root);
-				if (!st) throw new Error("state 不存在；先 nuwa_init");
 				const added: string[] = [];
-				withLock(root, () => {
+				const updated = withLock(root, () => {
+					const s = loadState(root);
+					if (!s) throw new Error("state 不存在；先 nuwa_init");
 					if (p.phase) {
 						const idx = phaseIndex(p.phase);
-						if (idx > phaseIndex(st.project.phase)) st.project.phase = p.phase;
-						added.push(...seedPhase(st, p.phase));
+						if (idx > phaseIndex(s.project.phase)) s.project.phase = p.phase;
+						added.push(...seedPhase(s, p.phase));
 					}
 					for (const it of p.intents ?? []) {
-						added.push(addIntent(st, it).id);
+						added.push(addIntent(s, it).id);
 					}
-					saveState(root, st);
+					saveState(root, s);
+					return s;
 				});
 				return toolText(
-					`已追加 ${added.length} 条意图: ${added.join(" ") || "(无新增，均已存在)"}\nphase=${st.project.phase}\n\n${statusBoard(st, root)}`,
+					`已追加 ${added.length} 条意图: ${added.join(" ") || "(无新增，均已存在)"}\nphase=${updated.project.phase}\n\n${statusBoard(updated, root)}`,
 					{ root, added },
 				);
 			} catch (e) {
@@ -3829,15 +3871,15 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const curCfg = readCfg();
 				const root = resolveRoot(ctx, p.root);
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
-				const st = loadState(root);
-				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				let packet = "";
 				let stale = false;
 				withLock(root, () => {
-					const r = claimIntent(st, p.id, p.worker, curCfg.claimTtl);
+					const s = loadState(root);
+					if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+					const r = claimIntent(s, p.id, p.worker, curCfg.claimTtl);
 					packet = r.packet;
 					stale = r.stale;
-					saveState(root, st);
+					saveState(root, s);
 					logEvent(root, { type: "claim", id: p.id, worker: p.worker, stale });
 				});
 				return toolText(packet, { root, id: p.id, stale });
@@ -3870,18 +3912,18 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			try {
 				const root = resolveRoot(ctx, p.root);
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
-				const st = loadState(root);
-				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+				const pre = loadState(root);
+				if (!pre) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 
 				let verifiedFlag: boolean | undefined;
 				if (!p.blocked && (p.kind === "vuln" || p.kind === "cred" || p.kind === "flag")) {
 					const strict = (process.env.NUWA_STRICT_EVIDENCE ?? "").trim() === "1";
 					const extractedFlag =
 						p.kind === "flag"
-							? `${p.title ?? ""} ${p.detail ?? ""} ${p.output ?? ""}`.match(/flag\{[^}\s]{2,}\}/i)?.[0] ?? p.title
+							? (`${p.title ?? ""} ${p.detail ?? ""} ${p.output ?? ""}`.match(/flag\{[^}\s]{2,}\}/i)?.[0] ?? undefined)
 							: undefined;
 					const vr = resolveEvidenceHelper().verifyExecutionEvidence(root, {
-						projectId: st.project.id,
+						projectId: pre.project.id,
 						kind: p.kind,
 						command: p.command,
 						output: p.output,
@@ -3896,8 +3938,10 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				}
 
 				let text = "";
-				withLock(root, () => {
-					const r = commitIntent(st, {
+				const updated = withLock(root, () => {
+					const s = loadState(root);
+					if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+					const r = commitIntent(s, {
 						id: p.id,
 						kind: p.kind,
 						title: p.title,
@@ -3908,7 +3952,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						note: p.note,
 						verified: verifiedFlag,
 					});
-					saveState(root, st, p.kind === "flag" && !p.blocked ? { reason: "flag" } : undefined);
+					saveState(root, s, p.kind === "flag" && !p.blocked ? { reason: "flag" } : undefined);
 					logEvent(root, {
 						type: p.blocked ? "blocked" : "commit",
 						id: p.id,
@@ -3918,18 +3962,19 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						duplicate: r.duplicate ?? false,
 					});
 					if (p.blocked) {
-						text = `已收口 ${p.id}: blocked — ${p.note ?? ""}\nphase=${st.project.phase}`;
+						text = `已收口 ${p.id}: blocked — ${p.note ?? ""}\nphase=${s.project.phase}`;
 					} else if (r.duplicate) {
 						text = `幂等命中: ${p.id} → ${r.fact?.id}（未重复入账）`;
 					} else {
-						text = `已入账 ${r.fact?.id} [${r.fact?.kind}] ${r.fact?.title} ← ${p.id}\nphase=${st.project.phase}`;
+						text = `已入账 ${r.fact?.id} [${r.fact?.kind}] ${r.fact?.title} ← ${p.id}\nphase=${s.project.phase}`;
 					}
 					if (r.advanced) {
 						text += `\n阶段推进: ${r.advanced.phase}（新增 ${r.advanced.added.length} 条: ${r.advanced.added.join(" ")}）`;
 					}
+					return s;
 				});
-				refreshUi(ctx, root, st);
-				return toolText(`${text}\n\n${statusBoard(st, root)}`, { root, id: p.id });
+				refreshUi(ctx, root, updated);
+				return toolText(`${text}\n\n${statusBoard(updated, root)}`, { root, id: p.id });
 			} catch (e) {
 				return toolError(e);
 			}
@@ -3952,12 +3997,12 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			try {
 				const root = resolveRoot(ctx, p.root);
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
-				const st = loadState(root);
-				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+				const pre = loadState(root);
+				if (!pre) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 
 				const strict = (process.env.NUWA_STRICT_EVIDENCE ?? "").trim() === "1";
 				const vr = resolveEvidenceHelper().verifyExecutionEvidence(root, {
-					projectId: st.project.id,
+					projectId: pre.project.id,
 					kind: "flag",
 					command: p.command,
 					output: p.output,
@@ -3971,14 +4016,17 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 
 				let fact = "";
 				let dup = false;
-				withLock(root, () => {
-					const r = recordFlag(st, p.value, p.command, p.output, p.challenge, vr.verified);
+				const updated = withLock(root, () => {
+					const s = loadState(root);
+					if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+					const r = recordFlag(s, p.value, p.command, p.output, p.challenge, vr.verified);
 					fact = r.fact.id;
 					dup = r.duplicate ?? false;
-					saveState(root, st, { reason: "flag" });
+					saveState(root, s, { reason: "flag" });
 					logEvent(root, { type: "flag", fact, value: p.value.slice(0, 32), verified: vr.verified, duplicate: dup });
+					return s;
 				});
-				refreshUi(ctx, root, st, true);
+				refreshUi(ctx, root, updated, true);
 				return toolText(`${dup ? "幂等命中" : "flag 已入账"}: ${fact} = ${p.value}`, {
 					root,
 					fact,
@@ -4005,23 +4053,24 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			try {
 				const root = resolveRoot(ctx, p.root);
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
-				const st = loadState(root);
-				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 				let res: { ok: boolean; reason?: string; from: string[] } = { ok: false, from: [] };
-				withLock(root, () => {
-					res = completeProject(st, p.from, p.note);
-					saveState(root, st, res.ok ? { reason: "complete" } : undefined);
+				const updated = withLock(root, () => {
+					const s = loadState(root);
+					if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+					res = completeProject(s, p.from, p.note);
+					saveState(root, s, res.ok ? { reason: "complete" } : undefined);
 					logEvent(root, { type: "complete", ok: res.ok, from: res.from, reason: res.reason });
+					return s;
 				});
-				refreshUi(ctx, root, st, true);
+				refreshUi(ctx, root, updated, true);
 				if (!res.ok) {
 					return toolText(
-						`完成被拒: ${res.reason}\nrejects=${st.runtime.completionRejects}\n\n${statusBoard(st, root)}`,
+						`完成被拒: ${res.reason}\nrejects=${updated.runtime.completionRejects}\n\n${statusBoard(updated, root)}`,
 						{ root, ok: false },
 					);
 				}
 				return toolText(
-					`完成已验收: ${st.project.id}\n证据: ${res.from.join(",")}\n\n调 nuwa_report(write=true) 生成报告。`,
+					`完成已验收: ${updated.project.id}\n证据: ${res.from.join(",")}\n\n调 nuwa_report(write=true) 生成报告。`,
 					{ root, ok: true },
 				);
 			} catch (e) {
@@ -4481,18 +4530,24 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		}
 	};
 
-	const armPump = (ctx: ExtensionContext): void => {
-		const sid = sidOf(ctx);
-		pumpSessions.set(sid, ctx);
-		const wantPeriod = Math.max(50, readCfg().tickMs);
-		if (pump && pumpPeriodMs === wantPeriod) return;
-		if (pump && typeof (pump as unknown as { close?: () => void }).close === "function") {
+	const stopPump = (): void => {
+		if (pump) {
 			try {
 				clearInterval(pump as unknown as ReturnType<typeof setInterval>);
 			} catch {
 				/* ignore */
 			}
+			pump = null;
+			pumpPeriodMs = 0;
 		}
+	};
+
+	const armPump = (ctx: ExtensionContext): void => {
+		const sid = sidOf(ctx);
+		pumpSessions.set(sid, ctx);
+		const wantPeriod = Math.max(50, readCfg().tickMs);
+		if (pump && pumpPeriodMs === wantPeriod) return;
+		stopPump();
 		pumpPeriodMs = wantPeriod;
 		pump = setNodeInterval(tickAllPumpSessions, wantPeriod);
 		pump.unref();
@@ -4515,6 +4570,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		const c = ctx as ExtensionContext;
 		const sid = sidOf(c);
 		pumpSessions.delete(sid);
+		if (pumpSessions.size === 0) {
+			stopPump();
+		}
 		try {
 			const root = findLocalRoot(c.cwd, sid) ?? findRoot(c.cwd, sid);
 			if (root) abortAutoBatch(root, "session_shutdown");
@@ -4660,10 +4718,11 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					return s;
 				}
 
-				// 升级 1：无头守护世代轮转检查——命中则交接摘要并放行当前会话退出，由外层守护器拉起下一代。
+				// 升级 1：无头守护世代轮转检查——先释放在途 auto 认领，交接摘要并放行当前会话退出，由外层守护器拉起下一代。
 				const reinPolicy = readReincarnatePolicy();
 				const reinVerdict = shouldReincarnate(s, reinPolicy);
 				if (reinVerdict.needed) {
+					const releasedAuto = releaseAutoBatchRemaining(s);
 					const handoff = prepareNextGeneration(s, reinVerdict.reason);
 					reincarnated = { generation: handoff.generation, reason: reinVerdict.reason ?? "reincarnate" };
 					saveState(root, s, { reason: "reincarnate" });
@@ -4672,6 +4731,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						generation: handoff.generation,
 						reason: reinVerdict.reason,
 						summaryLen: handoff.summary.length,
+						...(releasedAuto.length ? { releasedAuto } : {}),
 					});
 					return s;
 				}
@@ -4731,8 +4791,10 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				return;
 			}
 			if (reincarnated) {
+				abortAutoBatch(root, "reincarnate");
 				const rInfo = reincarnated as { generation: number; reason: string };
-				if (st2) refreshUi(ctx, root, st2, true);
+				const latest = loadState(root) ?? st2;
+				if (latest) refreshUi(ctx, root, latest, true);
 				ctx.ui?.setStatus?.("nuwa", `世代交接 -> G${rInfo.generation} (${rInfo.reason})`);
 				return undefined;
 			}
