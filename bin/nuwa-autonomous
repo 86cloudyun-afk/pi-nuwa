@@ -1,0 +1,536 @@
+#!/usr/bin/env bun
+/**
+ * bin/nuwa-autonomous — 女娲 v3.0 外层轻量无头守护器。
+ *
+ * 职责：
+ * 1. 注入无头运行与世代轮转环境变量（NUWA_LOOP/NUWA_INFINITE/NUWA_HEADLESS_DAEMON 等）。
+ * 2. 以干净上下文循环拉起 omp 无头会话，读取磁盘 `.nuwa/state.json` 完成跨世代换血接力。
+ * 3. 在目标完成（status=completed）时打印报告路径与摘要并退出 0；
+ *    在非换代人工/硬闸停机（status=stopped）时打印停机原因并退出 2；
+ *    在子进程异常退出（如 API 429/5xx 断流或崩溃）时按指数退避重启并继续读取磁盘接力。
+ *
+ * 退出码：
+ *   0 — 任务完成或 --dry-run / --help 成功
+ *   1 — 子进程连续崩溃超限或超过世代/时长上限
+ *   2 — 参数错误或项目非换代停机（status=stopped）
+ *   130 / 143 — 收到 SIGINT / SIGTERM 优雅退出
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+
+const VALID_MODES = new Set(["ctf", "pentest", "audit", "coding", "ops"]);
+const REINCARNATE_STOP_RE = /(reincarnat|handoff|generation|换代)/i;
+
+const HELP_TEXT = `女娲 v3.0 外层无头守护器 (nuwa-autonomous)
+
+用法:
+  nuwa-autonomous --target <目标> [选项]
+  nuwa-autonomous --root <已有项目目录> [选项]
+
+选项:
+  --target <t>                 目标 URL、主机或本地目录/服务标识（新项目必填）
+  --mode <m>                   任务模式: ctf | pentest | audit | coding | ops（默认: ctf）
+  --goal <g>                   任务目标描述（可选，默认按模式与目标自动生成）
+  --root <dir>                 项目根目录（默认: 当前工作目录）
+  --max-generations <n>        最大会话世代数（默认: 20）
+  --max-hours <h>              最大连续运行时长（小时，默认: 12）
+  --reincarnate-tokens <n>     单代触发换血的上下文 token 阈值（默认: 140000）
+  --reincarnate-turns <n>      单代触发换血的轮次阈值（默认: 30）
+  --allow-subdomains           放行目标主域的子域名（NUWA_SCOPE_ALLOW_SUBDOMAINS=1）
+  --allow-cidr <cidr>          追加放行的 IPv4 CIDR 网段，可重复传入或逗号分隔
+  --model <m>                  透传给 omp 的模型名（可选）
+  --omp-bin <path>             指定 omp 可执行路径（默认: omp，测试可注入 stub）
+  --dry-run                    仅打印规划配置与首轮启动命令并退出 0
+  -h, --help                   显示本帮助信息
+
+环境变量:
+  NUWA_DAEMON_BACKOFF_MS       异常重试基础退避毫秒数（默认: 2000，测试可设小值）
+  NUWA_DAEMON_MAX_ERRORS       连续异常退出最大重试次数（默认: 5）
+`;
+
+function log(msg) {
+	console.log(`[nuwa-autonomous] ${msg}`);
+}
+
+function logErr(msg) {
+	console.error(`[nuwa-autonomous] ERROR: ${msg}`);
+}
+
+function parsePositiveNumber(name, raw, integerOnly = false) {
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n <= 0 || (integerOnly && !Number.isInteger(n))) {
+		throw new Error(`参数 ${name} 必须为正${integerOnly ? "整" : ""}数，实际收到: ${raw}`);
+	}
+	return n;
+}
+
+function parseArgs(argv) {
+	const opts = {
+		target: "",
+		mode: "ctf",
+		modeExplicit: false,
+		goal: "",
+		root: process.cwd(),
+		maxGenerations: 20,
+		maxHours: 12,
+		reincarnateTokens: 140000,
+		reincarnateTurns: 30,
+		allowSubdomains: false,
+		allowCidrs: [],
+		model: "",
+		ompBin: "omp",
+		dryRun: false,
+		help: false,
+	};
+
+	const needVal = (flag, i) => {
+		if (i + 1 >= argv.length) throw new Error(`参数 ${flag} 缺少取值`);
+		return argv[i + 1];
+	};
+
+	for (let i = 0; i < argv.length; i += 1) {
+		const raw = argv[i];
+		let flag = raw;
+		let inlineVal = null;
+		if (raw.startsWith("--") && raw.includes("=")) {
+			const idx = raw.indexOf("=");
+			flag = raw.slice(0, idx);
+			inlineVal = raw.slice(idx + 1);
+		}
+		const take = () => (inlineVal !== null ? inlineVal : needVal(flag, i++));
+
+		switch (flag) {
+			case "-h":
+			case "--help":
+				opts.help = true;
+				break;
+			case "--target":
+				opts.target = take().trim();
+				break;
+			case "--mode":
+				opts.mode = take().trim().toLowerCase();
+				opts.modeExplicit = true;
+				break;
+			case "--goal":
+				opts.goal = take().trim();
+				break;
+			case "--root":
+				opts.root = take().trim();
+				break;
+			case "--max-generations":
+				opts.maxGenerations = parsePositiveNumber(flag, take(), true);
+				break;
+			case "--max-hours":
+				opts.maxHours = parsePositiveNumber(flag, take(), false);
+				break;
+			case "--reincarnate-tokens":
+				opts.reincarnateTokens = parsePositiveNumber(flag, take(), true);
+				break;
+			case "--reincarnate-turns":
+				opts.reincarnateTurns = parsePositiveNumber(flag, take(), true);
+				break;
+			case "--allow-subdomains":
+				opts.allowSubdomains = true;
+				break;
+			case "--allow-cidr": {
+				const parts = take()
+					.split(",")
+					.map((s) => s.trim())
+					.filter(Boolean);
+				for (const c of parts) {
+					if (!opts.allowCidrs.includes(c)) opts.allowCidrs.push(c);
+				}
+				break;
+			}
+			case "--model":
+				opts.model = take().trim();
+				break;
+			case "--omp-bin":
+				opts.ompBin = take().trim() || "omp";
+				break;
+			case "--dry-run":
+				opts.dryRun = true;
+				break;
+			default:
+				throw new Error(`未知参数: ${raw}（使用 --help 查看用法）`);
+		}
+	}
+
+	if (!VALID_MODES.has(opts.mode)) {
+		throw new Error(`不支持的 --mode: ${opts.mode}（可选: ${[...VALID_MODES].join(", ")}）`);
+	}
+	opts.root = resolve(opts.root || process.cwd());
+	return opts;
+}
+
+function stateFilePath(root) {
+	return join(root, ".nuwa", "state.json");
+}
+
+function reportFilePath(root) {
+	return join(root, ".nuwa", "REPORT.md");
+}
+
+function readDiskState(root) {
+	const p = stateFilePath(root);
+	if (!existsSync(p)) return null;
+	try {
+		const parsed = JSON.parse(readFileSync(p, "utf8"));
+		if (parsed && typeof parsed === "object" && parsed.project) return parsed;
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+function isReincarnateStop(state) {
+	if (!state || state.project?.status !== "stopped") return false;
+	const stopReason = String(state.project?.stopReason ?? "");
+	if (REINCARNATE_STOP_RE.test(stopReason)) return true;
+	if (state.runtime?.reincarnatePending === true) return true;
+	return false;
+}
+
+function defaultGoalFor(mode, target) {
+	switch (mode) {
+		case "coding":
+			return `对 ${target} 完成自主代码分析、实现与全量测试验证`;
+		case "ops":
+			return `对 ${target} 完成服务巡检、故障定位与恢复验收`;
+		case "audit":
+			return `对 ${target} 完成安全审计并输出可复验风险证据`;
+		case "pentest":
+			return `对 ${target} 完成授权渗透评估并留存完整证据链`;
+		case "ctf":
+		default:
+			return `对 ${target} 完成完整评估并取得验证 flag`;
+	}
+}
+
+function buildChildEnv(opts, gen) {
+	const env = {
+		...process.env,
+		NUWA_LOOP: "1",
+		NUWA_INFINITE: "1",
+		NUWA_HEADLESS_DAEMON: "1",
+		NUWA_STRICT_EVIDENCE: "1",
+		NUWA_REINCARNATE_TOKENS: String(opts.reincarnateTokens),
+		NUWA_REINCARNATE_TURNS: String(opts.reincarnateTurns),
+		NUWA_PROJECT: opts.root,
+		NUWA_GENERATION: String(gen),
+	};
+	if (opts.target) {
+		env.NUWA_TARGET = opts.target;
+	}
+	if (opts.allowSubdomains) {
+		env.NUWA_SCOPE_ALLOW_SUBDOMAINS = "1";
+	}
+	if (opts.allowCidrs.length > 0) {
+		env.NUWA_SCOPE_ALLOW_CIDRS = opts.allowCidrs.join(",");
+	}
+	return env;
+}
+
+function buildPrompt(opts, state, gen) {
+	const target = state?.project?.url || state?.project?.target || opts.target;
+	const mode = state?.project?.mode || opts.mode;
+	const goal = state?.project?.goal || opts.goal || defaultGoalFor(mode, target);
+	const phase = state?.project?.phase || "recon";
+	const stateGen = Number(state?.runtime?.generation ?? 0);
+	const displayGen = Math.max(gen, stateGen || 1);
+	const handoff = typeof state?.runtime?.handoffSummary === "string" ? state.runtime.handoffSummary.trim() : "";
+
+	if (handoff) {
+		return [
+			`[女娲无头守护 · 第 ${displayGen} 代交接接力]`,
+			`目标: ${target} (mode=${mode})`,
+			`项目根目录: ${opts.root}`,
+			`当前阶段: ${phase} · 世代: G${displayGen}`,
+			``,
+			`上一代交接摘要:`,
+			handoff,
+			``,
+			`接力指令:`,
+			`1. 先调用 nuwa_init(root=${JSON.stringify(opts.root)}, resume=true, force=true) 接管当前无头会话所有权，再调 nuwa_status 确认最新盘面。`,
+			`2. 严格沿用交接摘要中的关键事实与避坑经验，继续通过 nuwa_frontier → nuwa_claim → task(agent="fujiang") → nuwa_commit 推进，避免重复已证伪路径。`,
+			`3. 目标达成后调用 nuwa_complete 验收并执行 nuwa_report(write=true) 生成最终报告；未验收前不得自行停机。`,
+		].join("\n");
+	}
+
+	if (state) {
+		const factCount = Object.keys(state.facts ?? {}).length;
+		const openCount = Object.values(state.intents ?? {}).filter((i) => i.status === "open" || i.status === "claimed").length;
+		return [
+			`[女娲无头守护 · 第 ${displayGen} 代恢复起跑]`,
+			`目标: ${target} (mode=${mode}) — ${goal}`,
+			`项目根目录: ${opts.root}`,
+			`当前磁盘状态: phase=${phase} facts=${factCount} open/claimed=${openCount}`,
+			``,
+			`恢复指令:`,
+			`1. 立即调用 nuwa_init(root=${JSON.stringify(opts.root)}, resume=true, force=true) 接管会话所有权并确认 nuwa_status。`,
+			`2. 继续推进未完成 frontier 意图，证据全部经真实命令回显入账。`,
+			`3. 达成验收条件后调用 nuwa_complete 与 nuwa_report(write=true) 收尾。`,
+		].join("\n");
+	}
+
+	return [
+		`[女娲无头守护 · 第 ${displayGen} 代首次起跑]`,
+		`目标: ${target} (mode=${mode}) — ${goal}`,
+		`项目根目录: ${opts.root}`,
+		``,
+		`起跑指令:`,
+		`1. 立即调用 nuwa_init(target=${JSON.stringify(target)}, mode=${JSON.stringify(mode)}, goal=${JSON.stringify(goal)}, root=${JSON.stringify(opts.root)}, autoStart=true) 初始化女娲项目（若目录已有同目标项目则使用 resume=true, force=true 接管）。`,
+		`2. 按女娲纪律持续推进（nuwa_frontier → nuwa_claim → task(agent="fujiang") → nuwa_commit / nuwa_flag），所有结论必须附带真实执行命令与关键回显。`,
+		`3. 目标完成后调用 nuwa_complete 验收并执行 nuwa_report(write=true) 输出报告；未完成前不得输出收工结论。`,
+	].join("\n");
+}
+
+function buildOmpArgs(opts, prompt) {
+	const args = ["-p", "--cwd", opts.root];
+	if (opts.model) {
+		args.push("--model", opts.model);
+	}
+	args.push("--", prompt);
+	return args;
+}
+
+function formatCompletionSummary(root, state, gen, startedAt) {
+	const facts = Object.values(state.facts ?? {});
+	const flags = facts.filter((f) => f.kind === "flag").length;
+	const vulns = facts.filter((f) => f.kind === "vuln").length;
+	const loots = facts.filter((f) => f.kind === "loot").length;
+	const elapsedSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+	const reportPath = reportFilePath(root);
+	const reportHint = existsSync(reportPath) ? `${reportPath}（已生成）` : `${reportPath}（未写入，可运行 nuwa_report 生成）`;
+	return [
+		`任务已完成 (status=completed)`,
+		`  项目: ${state.project?.id ?? "-"} (${state.project?.url ?? state.project?.target ?? "-"})`,
+		`  模式: ${state.project?.mode ?? "-"} · 阶段: ${state.project?.phase ?? "-"} · 守护世代: ${gen} (state.gen=${state.runtime?.generation ?? 1})`,
+		`  耗时: ${elapsedSec}s · 事实: ${facts.length} (flag=${flags}, vuln=${vulns}, loot=${loots})`,
+		`  报告: ${reportHint}`,
+	].join("\n");
+}
+
+function persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal) {
+	try {
+		const dir = join(opts.root, ".nuwa");
+		mkdirSync(dir, { recursive: true });
+		const cfgPath = join(dir, "daemon-config.json");
+		const payload = {
+			target: effectiveTarget,
+			mode: effectiveMode,
+			goal: effectiveGoal,
+			root: opts.root,
+			maxGenerations: opts.maxGenerations,
+			maxHours: opts.maxHours,
+			reincarnateTokens: opts.reincarnateTokens,
+			reincarnateTurns: opts.reincarnateTurns,
+			allowSubdomains: opts.allowSubdomains,
+			allowCidrs: opts.allowCidrs,
+			model: opts.model || undefined,
+			updatedAt: new Date().toISOString(),
+		};
+		writeFileSync(cfgPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+	} catch {
+		/* 记录辅助配置失败不阻断守护启动 */
+	}
+}
+
+function shellQuotePreview(arg) {
+	return `'${String(arg).replace(/'/g, `'\\''`)}'`;
+}
+
+async function main() {
+	let opts;
+	try {
+		opts = parseArgs(process.argv.slice(2));
+	} catch (err) {
+		logErr(err instanceof Error ? err.message : String(err));
+		process.exit(2);
+	}
+
+	if (opts.help) {
+		console.log(HELP_TEXT.trimEnd());
+		process.exit(0);
+	}
+
+	const initialState = readDiskState(opts.root);
+	if (!opts.target && !initialState) {
+		logErr(`未指定 --target 且 ${stateFilePath(opts.root)} 不存在（使用 --help 查看用法）`);
+		process.exit(2);
+	}
+
+	const effectiveTarget = opts.target || initialState?.project?.target || initialState?.project?.url || "";
+	const effectiveMode = opts.modeExplicit ? opts.mode : initialState?.project?.mode || opts.mode;
+	const effectiveGoal = opts.goal || initialState?.project?.goal || defaultGoalFor(effectiveMode, effectiveTarget);
+	opts.target = effectiveTarget;
+	opts.mode = effectiveMode;
+	opts.goal = effectiveGoal;
+
+	if (opts.dryRun) {
+		const envPreview = buildChildEnv(opts, 1);
+		const prompt = buildPrompt(opts, initialState, 1);
+		const ompArgs = buildOmpArgs(opts, prompt);
+		const plan = {
+			dryRun: true,
+			root: opts.root,
+			target: effectiveTarget,
+			mode: effectiveMode,
+			goal: effectiveGoal,
+			maxGenerations: opts.maxGenerations,
+			maxHours: opts.maxHours,
+			reincarnateTokens: opts.reincarnateTokens,
+			reincarnateTurns: opts.reincarnateTurns,
+			allowSubdomains: opts.allowSubdomains,
+			allowCidrs: opts.allowCidrs,
+			model: opts.model || null,
+			ompBin: opts.ompBin,
+			existingState: Boolean(initialState),
+			env: {
+				NUWA_LOOP: envPreview.NUWA_LOOP,
+				NUWA_INFINITE: envPreview.NUWA_INFINITE,
+				NUWA_HEADLESS_DAEMON: envPreview.NUWA_HEADLESS_DAEMON,
+				NUWA_STRICT_EVIDENCE: envPreview.NUWA_STRICT_EVIDENCE,
+				NUWA_REINCARNATE_TOKENS: envPreview.NUWA_REINCARNATE_TOKENS,
+				NUWA_REINCARNATE_TURNS: envPreview.NUWA_REINCARNATE_TURNS,
+				NUWA_PROJECT: envPreview.NUWA_PROJECT,
+				...(envPreview.NUWA_SCOPE_ALLOW_SUBDOMAINS
+					? { NUWA_SCOPE_ALLOW_SUBDOMAINS: envPreview.NUWA_SCOPE_ALLOW_SUBDOMAINS }
+					: {}),
+				...(envPreview.NUWA_SCOPE_ALLOW_CIDRS
+					? { NUWA_SCOPE_ALLOW_CIDRS: envPreview.NUWA_SCOPE_ALLOW_CIDRS }
+					: {}),
+			},
+			command: [opts.ompBin, ...ompArgs],
+		};
+		log("Dry-run 规划配置:");
+		console.log(JSON.stringify(plan, null, 2));
+		log(`首轮命令预览: ${[opts.ompBin, ...ompArgs.slice(0, -1), "<prompt>"].map(shellQuotePreview).join(" ")}`);
+		process.exit(0);
+	}
+
+	mkdirSync(opts.root, { recursive: true });
+	persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal);
+
+	const rawBackoff = Number(process.env.NUWA_DAEMON_BACKOFF_MS ?? 2000);
+	const baseBackoffMs = Number.isFinite(rawBackoff) && rawBackoff >= 0 ? rawBackoff : 2000;
+	const rawMaxErr = Number(process.env.NUWA_DAEMON_MAX_ERRORS ?? 5);
+	const maxConsecutiveErrors = Number.isFinite(rawMaxErr) && rawMaxErr >= 1 ? Math.floor(rawMaxErr) : 5;
+
+	const startedAt = Date.now();
+	const maxDurationMs = opts.maxHours * 3600_000;
+	let activeChild = null;
+	let shuttingDown = false;
+
+	const handleSignal = (sig, code) => {
+		if (shuttingDown) return;
+		shuttingDown = true;
+		log(`收到信号 ${sig}，正在停止子进程并退出...`);
+		try {
+			activeChild?.kill("SIGTERM");
+		} catch {
+			/* 子进程可能已结束 */
+		}
+		process.exit(code);
+	};
+	process.on("SIGINT", () => handleSignal("SIGINT", 130));
+	process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
+
+	let gen = 1;
+	let consecutiveErrors = 0;
+
+	while (gen <= opts.maxGenerations && Date.now() - startedAt < maxDurationMs) {
+		const preState = readDiskState(opts.root);
+		if (preState?.project?.status === "completed") {
+			log(formatCompletionSummary(opts.root, preState, gen, startedAt));
+			process.exit(0);
+		}
+		if (preState?.project?.status === "stopped" && !isReincarnateStop(preState)) {
+			log(`项目已停机 (status=stopped)，原因: ${preState.project?.stopReason ?? "未记录"}`);
+			process.exit(2);
+		}
+
+		const prompt = buildPrompt(opts, preState, gen);
+		const ompArgs = buildOmpArgs(opts, prompt);
+		const childEnv = buildChildEnv(opts, gen);
+		const hasHandoff = Boolean(preState?.runtime?.handoffSummary);
+		log(
+			`启动第 ${gen}/${opts.maxGenerations} 代会话 (${hasHandoff ? "换代交接" : preState ? "磁盘恢复" : "首次起跑"}) · root=${opts.root}`,
+		);
+
+		let exitCode = 1;
+		try {
+			activeChild = Bun.spawn([opts.ompBin, ...ompArgs], {
+				cwd: opts.root,
+				env: childEnv,
+				stdin: "ignore",
+				stdout: "inherit",
+				stderr: "inherit",
+			});
+			exitCode = await activeChild.exited;
+		} catch (err) {
+			logErr(`启动 ${opts.ompBin} 失败: ${err instanceof Error ? err.message : String(err)}`);
+			exitCode = 127;
+		} finally {
+			activeChild = null;
+		}
+
+		if (shuttingDown) return;
+
+		const postState = readDiskState(opts.root);
+		if (postState?.project?.status === "completed") {
+			log(formatCompletionSummary(opts.root, postState, gen, startedAt));
+			process.exit(0);
+		}
+		if (postState?.project?.status === "stopped" && !isReincarnateStop(postState)) {
+			log(`项目已停机 (status=stopped)，原因: ${postState.project?.stopReason ?? "未记录"}`);
+			process.exit(2);
+		}
+
+		if (exitCode !== 0) {
+			consecutiveErrors += 1;
+			if (consecutiveErrors > maxConsecutiveErrors) {
+				logErr(`子进程连续异常退出 ${consecutiveErrors} 次（上限 ${maxConsecutiveErrors}），停止守护。`);
+				process.exit(1);
+			}
+			const delayMs = Math.min(60_000, baseBackoffMs * 2 ** (consecutiveErrors - 1));
+			const remainMs = maxDurationMs - (Date.now() - startedAt);
+			if (remainMs <= 0) break;
+			const actualDelay = Math.min(delayMs, remainMs);
+			log(
+				`第 ${gen} 代子进程异常退出 (exit=${exitCode})，${actualDelay}ms 后按磁盘状态退避重试（连续错误 ${consecutiveErrors}/${maxConsecutiveErrors}）...`,
+			);
+			if (actualDelay > 0) {
+				await Bun.sleep(actualDelay);
+			}
+			continue;
+		}
+
+		consecutiveErrors = 0;
+		const nextGenHint = postState?.runtime?.handoffSummary ? "检测到交接摘要，准备拉起下一代" : "本代正常退出且任务仍活跃，准备拉起下一代";
+		log(`第 ${gen} 代会话结束 (exit=0)：${nextGenHint}`);
+		gen += 1;
+	}
+
+	// 循环结束前最后复核一次磁盘状态
+	const finalState = readDiskState(opts.root);
+	if (finalState?.project?.status === "completed") {
+		log(formatCompletionSummary(opts.root, finalState, gen, startedAt));
+		process.exit(0);
+	}
+	if (finalState?.project?.status === "stopped" && !isReincarnateStop(finalState)) {
+		log(`项目已停机 (status=stopped)，原因: ${finalState.project?.stopReason ?? "未记录"}`);
+		process.exit(2);
+	}
+
+	const elapsedMs = Date.now() - startedAt;
+	if (elapsedMs >= maxDurationMs) {
+		logErr(`已达到最大运行时长上限 (${opts.maxHours}h)，任务尚未完成。`);
+	} else {
+		logErr(`已达到最大世代上限 (${opts.maxGenerations})，任务尚未完成。`);
+	}
+	process.exit(1);
+}
+
+await main();

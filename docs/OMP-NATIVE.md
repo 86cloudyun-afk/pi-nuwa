@@ -1,432 +1,184 @@
-# 女娲 v2：纯 omp 运行时
+# 女娲 v3：omp 原生自治运行时架构
 
-## 1. 为什么要变
+## 1. 架构演进：从 v1 到 v3
 
-v1 的链路是 `bin/nuwa (bash) → nuwa/cli.py (Python) → sapper CLI → 子进程`。
-任何一环出问题，整个循环就停：bash 的 flock、Python 的 journal 代际、sapper 的图写入、
-`omp-claude` 的 stdout 解析，四个进程边界叠在一起，故障面大且难复现。
+- **v1**：`bin/nuwa (bash) → nuwa/cli.py (Python) → sapper CLI → 子进程`，四层进程边界易碎难复现。
+- **v2**：彻底移除 Python 与 `sapper`，把状态机（`.nuwa/state.json`）、续跑循环（`session_stop`）、确定性自动批与可视化收进 omp 扩展进程。
+- **v3.0**：保持单进程 12 工具面 100% 向后兼容，新增外层极薄无头守护器 `bin/nuwa-autonomous` 实现跨世代自动换血，并将运行时拆分为 9 个职责清晰的模块：
 
-v2 把所有边界收进 omp 进程：
-
-| v1 | v2 |
-|---|---|
-| `bin/nuwa` 建项目、循环、看板 | `nuwa_init` / `session_stop` 自动续跑 |
-| `nuwa/cli.py dispatch` 渲染提示、调引擎 | `nuwa_claim` 生成 packet，主线程用 `task` 派 fujiang |
-| `sapper` 事实-意图图 | `.nuwa/state.json` 单文件状态机 |
-| `.nuwa/journal.jsonl` + `txn.repair` | 每次写盘前追加完整快照，load 时回放 |
-| `.nuwa.lock` + `flock` | `state.lock` 单写者锁（pid + 30s 新鲜度） |
-| `NUWA_*` 环境变量散落 bash/Python | 统一 `readCfg()`，一份配置 |
-
-没有 CLI、没有 Python、没有外部守护进程。会话结束，循环就结束；下一个会话 `resume` 继续。
-
-## 2. 架构
-
-```
-┌──────────────────────────── omp session (main) ────────────────────────────┐
-│                                                                            │
-│  user: 女娲模式，打 http://TARGET                                          │
-│      │                                                                     │
-│      ▼                                                                     │
-│  nuwa_init ──► .nuwa/state.json  (project/facts/intents/runtime)           │
-│      │              ▲                                                      │
-│      │              │ atomic write + journal snapshot                      │
-│      ▼              │                                                      │
-│  nuwa_claim(iNNN) ──┘  packet: 目标/事实/命令/输出契约                     │
-│      │                                                                     │
-│      ▼                                                                     │
-│  task({ tasks:[{agent:"fujiang", task:packet}] })                          │
-│      │                                                                     │
-│      ▼                                                                     │
-│  subagent (fujiang): 执行命令，回 5 行结论                                 │
-│      │                                                                     │
-│      ▼                                                                     │
-│  nuwa_commit / nuwa_flag ──► fact fNNN，intent done/blocked                │
-│      │                                                                     │
-│      ▼                                                                     │
-│  session_stop ──► autoPlan：live → 补播 → 派生 → 推进 → 新 episode → 兜底   │
-│      │                │                                                    │
-│      │                ▼                                                    │
-│      │         directive (decision:"block")  ← 永不 continue，永不计 cap   │
-│      ▼                                                                     │
-│  completed/stopped（唯一出口）                                              │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-扩展注册 12 个工具、1 个命令、4 类事件：
-
-- `tool_execution_end`：累计工具调用数，用于 idle 判定。
-- `tool_call`：执行纪律拦截（N-001..N-005）。
-- `session_stop`：计数、`autoPlan` 扩张、证据闸门、注入 directive；永远返回 `decision:"block"`。
-- `session_start`：启动看门狗心跳（`NUWA_TICK_MS`），stop hook 被压缩/异常跳过时兜底 `sendUserMessage`。
-
-## 3. 状态模型
-
-`.nuwa/state.json`：
-
-```json
-{
-  "schema": 1,
-  "version": "2.0.0",
-  "project": {
-    "id": "10-0-0-5-8080",
-    "target": "10.0.0.5:8080",
-    "url": "http://10.0.0.5:8080",
-    "host": "10.0.0.5",
-    "port": 8080,
-    "scheme": "http",
-    "goal": "打穿并拿 flag",
-    "mode": "ctf",
-    "status": "active",
-    "phase": "recon",
-    "createdAt": "2026-11-12T00:00:00.000Z",
-    "updatedAt": "2026-11-12T00:01:00.000Z"
-  },
-  "facts": {
-    "f001": {
-      "id": "f001",
-      "kind": "service",
-      "title": "HTTP 200 nginx",
-      "detail": "Server: nginx",
-      "command": "curl -k -sS -D - http://10.0.0.5:8080/",
-      "output": "HTTP/1.1 200 OK\nServer: nginx",
-      "intent": "i001",
-      "key": "3f2a...",
-      "createdAt": "2026-11-12T00:00:30.000Z"
-    }
-  },
-  "intents": {
-    "i001": {
-      "id": "i001",
-      "phase": "recon",
-      "key": "recon:http",
-      "title": "HTTP 存活与响应指纹",
-      "detail": "...",
-      "from": [],
-      "to": "f001",
-      "status": "done",
-      "worker": "fujiang",
-      "priority": 90,
-      "attempts": 1,
-      "createdAt": "2026-11-12T00:00:00.000Z",
-      "claimedAt": "2026-11-12T00:00:05.000Z",
-      "doneAt": "2026-11-12T00:00:30.000Z"
-    }
-  },
-  "seq": { "fact": 1, "intent": 6 },
-  "runtime": {
-    "startedAt": 1794412800000,
-    "turns": 3,
-    "stall": 0,
-    "idle": 0,
-    "blockStreak": 1,
-    "toolCalls": 12,
-    "lastToolCalls": 10,
-    "tokens": 48210,
-    "lastSig": "active|recon|5|0|1|0|1|0|f001",
-    "lastDirective": "...",
-    "completionRejects": 0,
-    "emptyRounds": 0
-  }
-}
-```
-
-字段约束：
-
-- `facts[*].key`：幂等键。`commit` 用 `sha1(project.id|intent.id|attempts|kind|title)`；`flag` 用 `sha1(value)`。
-- `intents[*].from`：依赖的 fact id；为空表示根意图，播种即 eligible。
-- `intents[*].status`：`open | claimed | done | blocked`。`claimed` 超过 `NUWA_CLAIM_TTL`（默认 900s）可被重新认领，`attempts+1`。
-- `runtime.lastSig`：`status|phase|open|claimed|done|blocked|facts|flags|lastFact`，用于 stall。
-
-## 3.5 `/nuwa` 命令（v2.1）
-
-```
-/nuwa <自然语言任务>      # 开工：抽 target/mode → init/resume → 注入第 1 轮
-/nuwa                    # 看板
-/nuwa log [n]            # journal 末 n 行
-/nuwa why                # 上一条续跑 directive
-/nuwa stop [原因]         # 停机（保留 facts/intents）
-/nuwa resume             # 复活并立即起跑
-```
-
-任务模式的解析规则：
-
-| 输入片断 | 结果 |
-|---|---|
-| `http://h:8080/path` | 原样作为 target |
-| `10.0.0.5:8080` / `10.0.0.5` | `http://10.0.0.5:8080` / `:80` |
-| `demo.target.test` | `http://demo.target.test:80`；`state.json`、`app.ts` 等文件后缀不算目标 |
-| 都没有 | 读 `NUWA_TARGET` / `TARGET`；仍为空则只回用法，不落状态 |
-
-模式：`审计|白盒|audit|review` → `audit`；`渗透|打点|提权|横向|内网|red|getshell` → `pentest`；
-其余 → `ctf`。
-
-建项目时 `seedPhase(recon)` 播 6 条；已有项目则 `addIntent(priority=95)` 把任务并入当前阶段。
-落地后命令自己调 `pi.sendUserMessage(kickPrompt)` 触发一次真实轮次——命令处理器本身不产生模型
-轮次，这一步是"输入 /nuwa 就开跑"的关键；流式中回退到 `sendMessage({triggerTurn:true})`。
-
-## 4. 工具参考
-
-### nuwa_init
-
-建项目或恢复。默认在 cwd 建 `.nuwa/`，不接管指针里的旧项目。
-
-| 参数 | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| target | string | — | URL / host:port；新建时必填 |
-| goal | string | 自动 | 目标描述 |
-| mode | ctf/pentest/audit | ctf | 决定完成证据 |
-| root | string | cwd | 项目目录 |
-| resume | bool | false | 恢复 stopped 项目，保留 facts/intents，重置预算 |
-| force | bool | false | 覆盖现有 state（旧文件备份为 `.bak-<ts>`） |
-| migrate | bool | false | 从同目录 `.sapper` 迁移 |
-
-### nuwa_plan
-
-播种阶段或追加自定义意图。`phase` 会播种该阶段全部内置意图（按 key 去重，可重复调用）；
-`intents[]` 支持 `title/detail/phase/from/priority`。若 `phase` 晚于当前阶段，会把项目阶段推进到该阶段。
-
-### nuwa_frontier
-
-返回 eligible 意图：`status=open`，或 `claimed` 且超过 TTL；所有 `from` fact 存在。
-按 `priority DESC, id ASC` 排序。
-
-### nuwa_claim
-
-认领并返回 packet：
-
-```
-[女娲派单 i007] vuln · SQL 注入验证
-目标: http://10.0.0.5:8080
-已知事实:
-- f003 [service] nginx 1.18 ...
-执行内容:
-<该 intent 的 detail，{URL}/{HOST}/{PORT}/{OUT}/{ID} 已替换>
-输出契约（子代理只回 5 行）:
-结论 / 证据 / 命令 / 阻断 / 下一步
-```
-
-已认领且未过 TTL 会拒绝；过期则 `stale=true` 重领。
-
-### nuwa_commit
-
-| 参数 | 说明 |
-|---|---|
-| id | intent id |
-| kind | target/asset/service/endpoint/cred/vuln/flag/loot/note/blocked |
-| title/detail | 结论与细节 |
-| command/output | 实际命令与关键回显；非 note 必填 |
-| blocked/note | 收口卡住的 intent，不产 fact |
-
-校验：
-
-- `command` 非空、`output` ≥ 8 字符、不是占位符。
-- `echo`/`printf` 开头的命令不算证据。
-- `kind=flag` 时，若 title/detail 含 `flag{...}`，output 必须包含该值。
-- 幂等：同一 `intent/attempt/kind/title` 只入账一次。
-
-### nuwa_flag
-
-`value` + `command` + `output`。`output` 必须包含完整 flag 值；`command` ≥ 3 字符且不能是 echo/printf。
-按 `sha1(value)` 幂等。
-
-### nuwa_complete
-
-`from[]` 省略时使用全部证据事实。ctf 需 `flag`，pentest 需 `vuln/loot/flag`，audit 需 `vuln/loot`。
-不满足 → `ok=false`，`runtime.completionRejects++`，项目保持 active。
-
-### nuwa_status / nuwa_report / nuwa_expand / nuwa_stop / nuwa_kb
-
-- `nuwa_status`：ASCII 看板（阶段进度、事实统计、预算、frontier）。
-- `nuwa_report(write=true)`：Markdown 报告，写 `.nuwa/REPORT.md`。
-- `nuwa_expand()`：强制扩张（live → 补播 → 事实派生 → 阶段推进 → 新 episode → 兜底），返回新增意图。
-- `nuwa_stop(reason, confirm="STOP")`：人工停机。永动模式下不带 `confirm="STOP"` 会被拒绝并提示 `nuwa_expand`；
-  `nuwa_init(resume=true)` 可恢复。
-- `nuwa_kb(query, kind, limit)`：sqlite3 只读查询 `/data/nuwa-kb/kb.db`（产品卡/CVE/PoC/ATT&CK）。
-
-## 4.5 可视化面（2.3.0）
-
-三层，全部 ANSI 文本，零外部依赖（不 import `@oh-my-pi/pi-tui`）：
-
-| 层 | API | 刷新点 |
+| 模块 | 部署位置 | 核心职责 |
 |---|---|---|
-| 状态栏 | `ctx.ui.setStatus("nuwa", …)` | init/commit/flag/complete/expand/stop/session_stop |
-| mini 看板 | `ctx.ui.setWidget("nuwa", string[], {placement:"aboveEditor"})` | 同上（250ms 节流 + sig 缓存） |
-| 全屏 board | `ctx.ui.custom(..., {overlay:true})`，`/nuwa board` | 打开时取快照，`q`/Esc 关闭 |
-| 终端标题 | `ctx.ui.setTitle(...)` | 同上 |
+| `omp/nuwa.ts` | `$EXT_DIR/index.ts` | 主状态机、12 个 `nuwa_*` 工具、`/nuwa` 命令、事件钩子、增量快照与容量治理 |
+| `omp/types.ts` | `$EXT_DIR/types.ts` | 公共类型定义（由 `nuwa.ts` 全量 re-export，避免子模块循环依赖） |
+| `omp/autoexec.ts` | `$EXT_DIR/autoexec.ts` | 跨平台确定性自动批、E2+ key 归一化、外置 JSON 规则热更新、失败三分类、预算与取消 |
+| `omp/scope.ts` | `$EXT_DIR/scope.ts` | 靶标范围策略（`N-007`）、高危破坏命令拦截（`N-008`）、`.nuwa/` 权威状态防篡改（`N-003`） |
+| `omp/evidence.ts` | `$EXT_DIR/evidence.ts` | 真实执行账本（`.nuwa/exec-ledger.jsonl`）防幻觉复验、本地武器库探针与指令自适配 |
+| `omp/profiles.ts` | `$EXT_DIR/profiles.ts` | 5 种领域 Profile（`ctf`/`pentest`/`audit`/`coding`/`ops`）、技术栈提取与 KB 富化、战略复盘规划 |
+| `omp/reincarnate.ts` | `$EXT_DIR/reincarnate.ts` | 无头世代轮转判定与 ≤1500 字交接摘要生成 |
+| `omp/ui.ts` | `$EXT_DIR/ui.ts` | 纯函数状态快照与 ANSI 渲染（状态栏 / mini 看板 / board） |
+| `omp/ui-native.ts` | `$EXT_DIR/ui-native.ts` | Tern 原生 TSP 节点渲染与 `cx.supports()` 逐项降级 |
+| `bin/nuwa-autonomous` | `~/.local/bin/nuwa-autonomous` | 外层无头守护器：跨世代拉起全新 omp 会话、API 断流指数退避续跑 |
 
-- 数据层：`omp/ui.ts` 的 `buildSnapshot(st, cfg, pressure, journalTail)` 纯函数；UI 不遍历 state。
-- 渲染：`renderStatusLine` / `renderWidgetLines` / `renderBoardLines`，`clipAnsi` 按可见宽度截断
-  （`Bun.stringWidth`，ANSI 感知）。
-- Tern：组件实现 `describe(cx)`，按 `cx.supports()` 返回手写 TSP 节点（2.4.0）：
-  widget = `card > row(badge/progress/meter) + kv`；board = `card > kv + section(table) + tree + list`。
-  宿主不支持某节点时降级 `text`/`list`。`NUWA_UI_NATIVE=0` 强制字符串路径。
-- 开关：`NUWA_UI`、`NUWA_UI_WIDGET`、`NUWA_UI_LINES`、`NUWA_UI_BOARD_MAX`。
-- 清理：`session_shutdown` 调 `setWidget(..., undefined)` 与 `setStatus(..., undefined)`。
-
-## 4.6 自渗透执行器（2.6.0）
-
-`omp/autoexec.ts` 把确定性侦察从模型手里拿走：
+## 2. 运行架构
 
 ```text
-session_stop
-  ├─ applyEmptyGuard：连续 N 轮 facts 不涨 → 模型批 blocked
-  ├─ autoPlan：补播 / 派生 / 推进 / 新 episode
-  ├─ claimAutoBatch：白名单意图标 claimed(worker=auto)
-  ├─ buildDirective：只给模型判断类任务 + "自动批在跑"提示
-  └─ runAutoBatch（异步）：pi.exec → parse → commitIntent
+┌─────────────────── 外层无头守护器 bin/nuwa-autonomous（可选）───────────────────┐
+│  注入 NUWA_HEADLESS_DAEMON=1 / NUWA_REINCARNATE_* / NUWA_SCOPE_*                │
+│  读 .nuwa/state.json：completed→exit 0｜stopped→exit 2｜handoff→拉起第 G+1 代    │
+│  子进程崩溃/429/5xx → 指数退避重启并从磁盘续跑                                   │
+└───────────────────────────────────────┬─────────────────────────────────────────┘
+                                        ▼
+┌──────────────────────────── omp session (main) ─────────────────────────────────┐
+│  /nuwa <任务> 或 nuwa_init ──► probeToolchain + defaultScopeForTarget           │
+│      │                        ──► .nuwa/state.json (原子写 + 增量 .json.gz)     │
+│      ▼                                                                          │
+│  nuwa_claim(iNNN) ──► adaptPacketForToolchain ──► task(agent="fujiang")         │
+│      │                                                                          │
+│      ▼                                                                          │
+│  tool_call 纪律拦截 (N-001..N-008)  &  tool_execution_end ──► exec-ledger.jsonl │
+│      │                                                                          │
+│      ▼                                                                          │
+│  nuwa_commit / nuwa_flag ──► verifyExecutionEvidence ──► fact fNNN              │
+│      │                                                                          │
+│      ▼                                                                          │
+│  session_stop ──► shouldReincarnate? ──(是)──► prepareNextGeneration & 放行换代  │
+│      │                │(否)                                                     │
+│      │                ├─ applyEmptyGuard（二维空转闸：emptyRounds/suspectRounds） │
+│      │                ├─ autoPlan（reflect → 补播 → derive + KB富化 → 推进/E+1） │
+│      │                ├─ claimAutoBatch + runAutoBatchManaged（预算/取消/回灌）   │
+│      │                └─ 返回 decision:"block" 注入下一批 directive              │
+│      ▼                                                                          │
+│  nuwa_complete (按 Profile proofKinds 验收) → nuwa_report(write=true)           │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-规则：`recon:http|ports|dirs|tlsjs`、`surface:sensitive|api`。每条 8–50s 超时，脚本用
-`bash -lc`，解析器是纯函数。自动批不参与空转闸；`attempts >= NUWA_MAX_ATTEMPTS` 在
-`autoPlan` 里转 blocked。
+## 3. 状态模型与容量治理（Issue #8）
 
-## 5. 续跑算法
+`.nuwa/state.json` 在 v2 基础上向后兼容扩展了以下关键字段：
 
-`session_stop` 每次触发：
+- `project.scope`：`ScopePolicy`（`allowHosts`, `allowCidrs`, `denyHosts`, `allowSubdomains`, `allowPrivateNetwork`, `allowDestructive`）
+- `project.toolchain`：`ToolchainCaps`（本地 `available` / `missing` 工具列表与探测时间）
+- `facts[*].meta`：`AutoFactMeta`（结构化 `ports`/`paths`/`server`/`tech`/`status`/`san`/`waf`）与 `facts[*].verified`（执行账本核验标记）
+- `intents[*].nextRunAt`：自动批遇到 `network` 失败时的冷却截止时间戳（ms）
+- `runtime.generation` / `runtime.genTurns` / `runtime.handoffSummary`：世代轮转状态与交接摘要
+- `runtime.suspectRounds`：二维空转闸的有工具无产出计数
+- `runtime.netRetries` / `runtime.saveCount` / `runtime.stateBytes` / `runtime.rulesSource`：可观测运行指标
 
-1. `NUWA_LOOP=0` 或非主会话 → 放行。
-2. 找 root（cwd 向上 → `NUWA_PROJECT` → `~/.omp/agent/cache/nuwa-current.json`，session 不匹配则拒绝）。
-3. 无 state 或 `status != active` → 放行。
-4. `state.lock` 被其它活进程持有 → 放行（兼容手动 CLI）。
-5. `turns++`；更新 tokens（`ctx.getContextUsage()` 的 `tokens`/`usedTokens`）。
-6. 更新 `toolCalls`（来自 `tool_execution_end` 计数）。
-7. 计算 sig；相同 → `stall++`，否则 `stall=0` 并更新 sig。
-8. 工具调用数未增长 → `idle++`，否则 `idle=0`。
-9. 预算：`budgetPressure = max(turns/maxTurns, minutes/maxMinutes, tokens/maxTokens, stall/maxStall, idle/maxIdle)`。
-   `NUWA_INFINITE=1`（默认）时**不产生停机**，仅用于降档（pressure ≥ 0.9 → 并行降到 2）；
-   `NUWA_INFINITE=0` 时才走旧硬闸（status=stopped）。
-10. `autoPlan`：live 意图 → 补播当前阶段 → 事实派生 → 逐阶段推进 → 新 episode（report 全终态后 episode+1 回 recon）→ 兜底深挖。
-   这一步保证 frontier 永不为空；`NUWA_MAX_EPISODES=0` 表示轮次无限。
-11. 生成 directive，`blockStreak++`，写 state + journal。
-12. 永远返回 `{ decision: "block", reason: directive }`。
-    omp 只对 `continue:true` 计 continuation cap（8 次），`decision:"block"` 不计数，因此续跑无上限；
-    `blockStreak` 只用于升级文案，不再放行。
+容量治理机制：
+- `compactFacts(st)`：保留近期 200 条未被引用的 `note` 并按幂等键去重，高价值证据与被引用的事实永不裁剪；
+- `compactIntents(st)`：回收过量 `blocked` 意图（默认保留最近 120 条）；
+- **增量快照策略**：`saveState` 改为每 10 次写盘或关键节点（`init`/`flag`/`complete`/`stop`/`reincarnate`）才写全量 `.json.gz` 快照，普通写盘仅原子刷新 `state.json`；
+- **体积告警**：监测 `state.json` 超过 2MB 时写入日志告警，`nuwa_status` 看板实时展示 `state=xxKB`、`rules=<source>`、`net-retry=<n>`、`gen=<g>`。
 
-directive 包含：本轮计数、本批 intent、`claim → task(agent=fujiang) → commit` 的逐步协议、
-纪律（禁止主线程扫描、禁止 CLI、禁止写 state）、stall/idle 换路提示、完成证据统计。
+## 4. 多领域 Profile 引擎（升级 6）
 
-## 6. 证据与幂等
+`omp/profiles.ts` 将领域策略与核心状态机解耦，支持 5 种模式：
 
-证据闸门在入口，而不是完成时：
+| `mode` | 标签 | `requireHttpTarget` | 完成验收 `proofKinds` | 适用场景 |
+|---|---|---|---|---|
+| `ctf` | CTF 靶场取证 | `true` | `["flag"]` | CTF 靶机与 flag 验证 |
+| `pentest` | 渗透测试与安全评估 | `true` | `["vuln", "loot", "flag"]` | 授权渗透与证据链评估 |
+| `audit` | 代码与配置安全审计 | `true` | `["vuln", "loot"]` | 源码/配置安全审计 |
+| `coding` | 软件工程自治开发 | `false` | `["loot", "note"]` | 本地代码库重构、功能实现与测试验证 |
+| `ops` | 自动化运维与排障 | `false` | `["loot", "note"]` | 服务巡检、日志聚类、根因定位与恢复验收 |
 
-- 事实写入必须带 command + output（note 除外）。
-- flag 写入必须 output 包含完整值。
-- 完成只接受 `proofKinds(mode)` 内的事实，且引用必须存在。
+所有模式统一复用 6 阶段状态机（`recon` → `surface` → `vuln` → `exploit` → `post` → `report`），由各自 Profile 提供对应领域的内置种子清单。
 
-幂等两层：
-
-1. `commit` 的 key 含 `attempts`：同一 attempt 重复提交返回已有 fact，不重复计数。
-2. `flag` 的 key 是 value 哈希：同一 flag 只入账一次。
-
-这解决 v1 的两个老问题：模型重试导致事实膨胀、reason 阶段脑补 flag。
-
-## 7. 阶段 playbook
-
-内置 32 条意图，播种后并行执行（`from=[]`），按阶段推进：
-
-| 阶段 | 意图数 | 内容 |
-|---|---|---|
-| recon | 6 | HTTP 指纹、端口、目录、vhost、证书/SAN、技术栈→CVE |
-| surface | 6 | 爬取、参数、认证面、敏感文件、API/GraphQL、上传点 |
-| vuln | 10 | SQLi、XSS、SSTI、LFI、SSRF、命令注入、上传绕过、IDOR、认证绕过、组件 CVE |
-| exploit | 5 | 链验证、RCE、凭据、提权、横向 |
-| post | 3 | flag、loot、影响面 |
-| report | 2 | 攻击链、修复建议 |
-
-`maybeAdvance`：当前阶段所有意图 `done/blocked` 时，自动切下一阶段并播种；`nuwa_plan(phase=...)` 可手动提前。
-
-## 8. 纪律拦截
-
-| 规则 | 触发 | 拦截 |
-|---|---|---|
-| N-001 | 主会话 bash 出现 nmap/ffuf/nuclei/sqlmap 等 | 扫描必须在 fujiang 子代理 |
-| N-002 | bash 出现 `bin/nuwa`、`nuwa/cli.py`、`nuwa dispatch/commit/...` | CLI 已退役 |
-| N-003 | bash 重定向或 write/edit/apply_patch 目标命中 `.nuwa/state.json`、`journal*.jsonl`、`state.lock` | 状态只允许 nuwa_* 写 |
-| N-004 | task 的任一 item `agent != "fujiang"`；eval 里 `agent()` 未写 fujiang | 统一使用 fujiang |
-| N-005 | 子会话调用 nuwa_init/plan/claim/commit/flag/complete/stop | 只有主线程记账 |
-
-拦截只在该 root 有 state 且 `status=active` 时生效；只读工具（status/frontier/report/kb）子代理可用。
-
-## 9. 崩溃恢复与并发
-
-- 每次 `saveState` 先 `journalAppend({type:"snapshot", state})`，再 `writeFileSync(tmp) + rename`。
-- `loadState` 读不到合法 `state.json` 时，从 journal 末尾向前找最后一条合法 snapshot，回写 state。
-- journal 超过 8MB 轮转为 `journal.1.jsonl`（只保留一代）。
-- 所有写操作走 `withLock`：`open(O_EXCL)` 写 pid+ts；检测到活 pid 且 <30s 抛 `state locked`，死进程或陈旧锁直接回收。
-- 工具层拒绝并发写同一状态；读操作不加锁。
-- 多任务隔离（2.1.1/2.1.2）：会话指针按 `sessionId` 分文件；`project.ownerSessionId` 拒绝跨会话接管；`/tmp`、home、`/`、`/data/workspace`（可加 `NUWA_SHARED_CWDS`）不向子目录继承；同根换目标时共享 cwd 落 `cache/nuwa-projects/<target>-<sessionHash>`，非共享 cwd 落 `<cwd>/.nuwa-tasks/<target>-<sessionHash>`。
-- 崩溃接管：omp 重启后 `sessionId` 变化，旧项目默认被 owner 检查拒绝。确认旧会话已死时，用 `nuwa_init(root="<旧根>", resume=true, force=true)` 显式改 owner 并保留 facts；`force` 不带 `resume` 会重建项目（旧 state 自动备份）。
-
-## 10. 从 v1 迁移
+## 5. `/nuwa` 命令与 12 工具面
 
 ```text
-nuwa_init(migrate=true)
+/nuwa <自然语言任务>         # 抽目标与模式 → init/resume → 自动批 + 起跑
+/nuwa                        # ASCII 看板
+/nuwa board                  # 全屏覆盖层只读面板（q/Esc 关闭）
+/nuwa scope [动作]           # 查看或调整当前项目 Scope 范围策略
+/nuwa log [n]                # journal 末 n 行
+/nuwa why                    # 上一条续跑 directive
+/nuwa stop [原因]            # 停机并立即中止在途自动批
+/nuwa resume                 # 复活并立即起跑
 ```
 
-读取 `.sapper/project.json`、`facts/*.json`、`intents/*.json`：
+12 个工具严格保持名称与向后兼容（`tools.size === 12`）：
 
-- fact 重新编号为 `f001..`，保留 `[migrated:<oldid>]` 前缀与 `kind`（`host`→`asset`，未知→`note`）。
-- intent 重新编号为 `i001..`，`from`/`to` 按映射重写，`done/complete`→`done`。
-- 目标 URL 从 facts 的 JSON 文本里提取第一个 `http(s)://`；找不到用 `http://migrated.local:80`。
-- 迁移事实没有 command/output；`nuwa_complete` 只按 kind 校验，迁移后建议补证据。
+| 工具 | v3.0 增强说明 |
+|---|---|
+| `nuwa_init` | 新增 `mode` 支持 `coding`/`ops`、新增可选参数 `scope` 与 `autoStart`；初始化时调用 `probeToolchain` 与 `defaultScopeForTarget`（支持 `NUWA_SCOPE_ALLOW_SUBDOMAINS`/`NUWA_SCOPE_ALLOW_CIDRS`）；仅在 `/nuwa <任务>` 或显式 `autoStart: true` / `NUWA_AUTO_ON_INIT=1` 时立即跑自动批，避免抢跑破坏手动 `claim` |
+| `nuwa_plan` | 播种阶段或追加带 `from` 依赖链的自定义意图（复盘意图 `reflect:*` 的核心落盘入口） |
+| `nuwa_frontier` | 返回 eligible 意图（依赖满足、未有效认领且不在网络冷却期） |
+| `nuwa_claim` | 认领并返回 packet，通过 `adaptPacketForToolchain` 对缺失工具追加本地可用替代提示 |
+| `nuwa_commit` | 支持 `meta` / `verified`；对 `vuln`/`cred`/`flag` 调用 `verifyExecutionEvidence` 复验真实执行账本 |
+| `nuwa_flag` | 除要求 `output` 含完整 flag 外，同步调用 `verifyExecutionEvidence` 核验该值真实出现在近期执行流或 `/tmp/nuwa/<id>/` 产物中 |
+| `nuwa_complete` | 按 `getProfile(mode).proofKinds` 验收 |
+| `nuwa_status` | 展示阶段表、预算、frontier 及 `state=xxKB`、`rules=<source>`、`net-retry=<n>`、`gen=<g>` |
+| `nuwa_report` | 生成 Markdown 报告，可落盘 `.nuwa/REPORT.md` |
+| `nuwa_expand` | 强制扩张攻击面（集成复盘、事实派生与 KB 自动富化） |
+| `nuwa_stop` | 人工停机并立即 `abort()` 在途自动批；永动模式需 `confirm="STOP"` |
+| `nuwa_kb` | 只读查询本地 sqlite3 知识库（产品卡/CVE/PoC/ATT&CK） |
 
-## 11. 安装与验收
+## 6. 纪律拦截与靶标 Scope 护栏（N-001..N-008）
 
-```bash
-./install.sh                 # 装 nuwa-omp + skill，退役 nuwa-loop，旧 CLI 改名 nuwa.legacy
-./install.sh --keep-legacy   # 保留旧 CLI
-./install.sh --rollback      # 恢复上一版扩展与 nuwa-loop
-```
+| 规则 | 触发条件 | 拦截行为 |
+|---|---|---|
+| N-001 | 主会话 bash 跑扫描工具 | 要求改派 `fujiang` 子代理；动态读取 `NUWA_SCANNER_GUARD=0` 可放行 |
+| N-002 | 调用退役的 `bin/nuwa` / `nuwa/cli.py` / `nuwa dispatch...` | 要求改用 `nuwa_*` 工具 |
+| N-003 | 写工具、重定向或 bash 的 `rm`/`mv`/`cp`/`sed -i`/`truncate`/脚本篡改 `.nuwa/` 下 `state.json`、`journal`、`snap`、`state.lock` | 权威状态只允许 `nuwa_*` 写入 |
+| N-004 | `task` 或 `eval agent()` 未指定 `agent:"fujiang"` | 统一执行代理（`NUWA_REQUIRE_FUJIANG=0` 可关） |
+| N-005 | 子会话调用写类 `nuwa_*` 工具 | 仅主线程记账 |
+| N-006 | `task` 携带 `tools` 字段 | 防止清空子代理内建工具表 |
+| N-007 | bash 命令访问超出项目 `ScopePolicy` 的主机/域名/IP（`omp/scope.ts`） | 拦截越界目标；黑名单优先，支持精确主机、`*.domain`、IPv4 CIDR 掩码与回环策略 |
+| N-008 | 非 `allowDestructive` 模式下执行 `rm -rf`/`mkfs`/`dd if=`/`shutdown`/`reboot`/`DROP TABLE`/`TRUNCATE` 等破坏性命令 | 阻止高危不可逆破坏 |
 
-验收：
+## 7. 真实执行账本与工具链探针（升级 3 & 5）
 
-```bash
-bun test tests/omp_nuwa.test.ts tests/omp_extension.test.ts
-# 39 pass / 0 fail
-```
+- **执行账本（`omp/evidence.ts`）**：每次 `tool_execution_end` 将工具输出记录至内存环形缓冲并追加到 `<root>/.nuwa/exec-ledger.jsonl`（滚动保留最近 200 条摘要及 SHA1）。
+- **防幻觉复验**：`nuwa_flag` 与 `nuwa_commit(kind="vuln"|"cred"|"flag")` 调用 `verifyExecutionEvidence` 校验关键回显行或 flag 值是否真实出现在近期执行账本或 `/tmp/nuwa/<projectId>/` 产物中。若 `NUWA_STRICT_EVIDENCE=0` 直接放行；否则当开启严格模式或项目已有真实执行历史时，对凭空编造的 flag 直接拒绝入账。
+- **武器库探针**：`probeToolchain` 检测本地 `curl`/`openssl`/`nmap`/`ffuf`/`nuclei`/`sqlmap`/`whatweb`/`hydra`/`python3`/`nc`/`sqlite3` 可用性；`adaptPacketForToolchain` 在派单 packet 中对缺失工具自动附带本地可用替代方案。
 
-手工冒烟（omp 会话内）：
+## 8. KB 自动富化与战略复盘（升级 2）
 
-```text
-nuwa_init(target="http://127.0.0.1:8080", mode="ctf")
-nuwa_status
-nuwa_claim(id="i001")
-nuwa_commit(id="i001", kind="service", title="HTTP 200", command="curl -sS -D - http://127.0.0.1:8080/", output="HTTP/1.1 200 OK\nServer: nginx")
-nuwa_plan(phase="surface")
-nuwa_report(write=false)
-```
+- **KB 自动富化**：`extractTechKeywords` 从 `service`/`endpoint`/`vuln` 中识别主流组件（`nginx`/`apache`/`tomcat`/`php`/`spring`/`fastjson`/`thinkphp`/`shiro`/`redis`/`mysql`/`postgres`/`grafana`/`gitlab`/`jenkins`/`wordpress`/`graphql`/`swagger` 等）及 `CVE-YYYY-NNNN`；`deriveKbIntents` 在 `try/catch` 中查库（缺库静默返回空数组），对有效命中派生 `key=kb:<fid>:<slug>`（`phase="vuln"`, `priority=86`, `from=[fact.id]`），按 key 严格去重。
+- **战略复盘**：`autoPlan` 在阶段将尽或连续 `stall >= 3` 时调用 `buildReflectIntentSpec`，按 `reflect:e<ep>:<phase>:<bucket>` 去重生成战略复盘意图，要求模型综合已有事实与阻塞经验调用 `nuwa_plan(intents=[...])` 构建带 `from` 依赖链的新假设。
 
-## 12. 配置
+## 9. 无头守护与跨世代轮转（升级 1）
+
+长程任务容易因单会话上下文窗口膨胀导致推理退化或被 API 限流断流。v3.0 采用「内层优雅换代 + 外层极薄守护」解耦：
+
+1. 外层运行 `bin/nuwa-autonomous`，自动注入 `NUWA_HEADLESS_DAEMON=1`、`NUWA_REINCARNATE_TOKENS`（默认 140000）、`NUWA_REINCARNATE_TURNS`（默认 30）、`NUWA_STRICT_EVIDENCE=1`、`NUWA_LOOP=1`、`NUWA_INFINITE=1`、`NUWA_PROJECT=<root>` 以及 Scope 环境变量。
+2. 会话内 `session_stop` 调用 `shouldReincarnate(st, policy)`：当 `tokens >= maxTokens` 或本代轮次 `genTurns >= maxTurns` 时，立即中止并释放正在运行的自动批，调用 `prepareNextGeneration` 递增 `generation`、写入 ≤1500 字 `handoffSummary`、清零 `genTurns`/`tokens` 与 `lastSig`，记录 `reincarnate` 事件并**返回 `undefined` 放行会话退出**。
+3. 外层 `bin/nuwa-autonomous` 检测到进程退出后重读 `.nuwa/state.json`：
+   - `status === "completed"` → 打印完成摘要与报告路径，退出码 `0`；
+   - `status === "stopped"`（非换代标记）→ 打印停机原因，退出码 `2`；
+   - 存在 `runtime.handoffSummary` 或仍为 `active` → 携带交接摘要构造干净起跑 Prompt 拉起下一代 `omp -p --cwd <root> ... -- <prompt>`；
+   - 子进程非零退出（API 429/5xx 断流或崩溃）→ 按指数退避（测试可通过 `NUWA_DAEMON_BACKOFF_MS` 调小）重试并从磁盘接力。
+
+## 10. 多会话并发、看门狗与崩溃恢复
+
+- `armPump` 改用 `Map<string, ExtensionContext>` 按 `sessionId` 多会话隔离，`session_shutdown` 在无活跃会话时停止定时器清理资源；
+- 所有状态写操作严格在 `withLock` 内读取并回写最新磁盘快照，避免并发写丢失；
+- 崩溃恢复依次从 `.nuwa/state.json` → `journal*.jsonl` → `.nuwa/snap/*.json.gz` 回放恢复。
+
+## 11. 配置一览
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `NUWA_LOOP` | `1` | `0` 关闭 session_stop 续跑 |
-| `NUWA_INFINITE` | `1` | `1` 永动：预算只降档不停机；`0` 回到旧预算闸 |
-| `NUWA_MAX_TURNS` | `0` | 轮数上限；`0`=无限（仅 `NUWA_INFINITE=0` 时生效） |
-| `NUWA_MAX_MINUTES` | `0` | 总时长上限；`0`=无限 |
-| `NUWA_MAX_TOKENS` | `0` | 上下文 tokens 上限；`0`=无限 |
-| `NUWA_MAX_STALL` | `12` | stall 压力阈值（不再停机） |
-| `NUWA_MAX_IDLE` | `4` | idle 压力阈值（不再停机） |
-| `NUWA_MAX_BATCH` | `4` | 单批派单上限；pressure ≥ 0.9 时降到 2 |
-| `NUWA_CLAIM_TTL` | `900` | claim 过期秒数 |
-| `NUWA_TICK_MS` | `60000` | 看门狗心跳，兜底续跑 |
-| `NUWA_EXPAND_DEPTH` | `24` | 单轮派生的最大意图数 |
-| `NUWA_MAX_EPISODES` | `0` | 扩张轮次上限；`0`=无限 |
-| `NUWA_BLOCK_STREAK` | `4` | 仅用于升级文案，不再放行 |
-| `NUWA_KB_DB` | `/data/nuwa-kb/kb.db` | 知识库路径 |
-| `NUWA_SCANNER_GUARD` | `1` | `0` 关闭 N-001 |
-| `NUWA_REQUIRE_FUJIANG` | `1` | `0` 关闭 N-004 |
-| `NUWA_PROJECT` | — | 显式项目根 |
-| `PI_AGENT_HOME` | 自动 | agent home |
-
-## 13. 与 v1 的差异 / 边界
-
-- 不再有 `--detach` 后台模式：长跑由 omp 会话内的 `session_stop` 续跑承担；会话关闭即停。
-  需要跨会话继续时，`nuwa_init(resume=true)` 从 `.nuwa/state.json` 接着跑。
-- 不再有 Web 看板：`nuwa_status` 的 ASCII 表 + `nuwa_report` 的 Markdown 替代。
-- 不再有 sapper 的 `view/validate`：状态一致性由 `saveState` 的原子写 + journal 回放保证。
-- 知识库仍依赖外部 `kb.db`；缺失时 `nuwa_kb` 返回明确错误，其余工具不受影响。
-- 迁移事实没有原始命令回显；对证据强度要求高的项目，迁移后应重新取证。
-- `extensions/` 必须是单一 nuwa 扩展：omp 会加载该目录下每个含 `index.ts` 的子目录（包括 `.bak-*`）。
-  新旧两个 `session_stop` 同时注册时，旧版的 `continue` 放行会先耗尽 omp 的 continuation cap（8 次）；
-  `install.sh` 把备份/退役目录写到 `$AGENT_HOME/backups/`，安装末尾自检 `extensions/` 下无其它 `nuwa-*`。
+| `NUWA_LOOP` | `1` | `0` 关闭 `session_stop` 续跑 |
+| `NUWA_INFINITE` | `1` | `1` 永动模式（预算仅降档）；`0` 回到旧预算硬闸 |
+| `NUWA_HEADLESS_DAEMON` | `0` | `1` 启用跨世代轮转放行 |
+| `NUWA_REINCARNATE_TOKENS` | `140000` | 单代换血上下文 token 阈值 |
+| `NUWA_REINCARNATE_TURNS` | `30` | 单代换血轮次阈值 |
+| `NUWA_STRICT_EVIDENCE` | `1` | `1` 开启执行账本证据复验；`0` 关闭 |
+| `NUWA_SCOPE_ALLOW_SUBDOMAINS` | `0` | `1` 放行目标主域子域名 |
+| `NUWA_SCOPE_ALLOW_CIDRS` | — | 额外放行 IPv4 CIDR（逗号分隔） |
+| `NUWA_AUTO` / `NUWA_AUTO_MAX` | `1` / `3` | 自动批开关与单轮上限 |
+| `NUWA_AUTO_BUDGET_MS` | `90000` | 单批自动执行总预算（ms） |
+| `NUWA_AUTO_CONCURRENCY` | `1` | 自动批并发度（`recon:ports` 始终独占） |
+| `NUWA_AUTO_ON_INIT` | `0` | `1` 允许 `nuwa_init` 立即执行首轮自动批 |
+| `NUWA_EMPTY_LIMIT` / `NUWA_SUSPECT_LIMIT` | `3` / `5` | 二维空转硬闸阈值 |
+| `NUWA_MAX_ATTEMPTS` | `3` | 单意图尝试上限（网络失败不消耗） |
+| `NUWA_MAX_BATCH` / `NUWA_CLAIM_TTL` | `4` / `900` | 单批派单上限 / claim 过期秒数 |
+| `NUWA_TICK_MS` | `60000` | 看门狗心跳（ms） |
+| `NUWA_EXPAND_DEPTH` / `NUWA_MAX_EPISODES` | `24` / `0` | 单轮扩张上限 / 扩张轮次上限（0=无限） |
+| `NUWA_KB_DB` | `/data/nuwa-kb/kb.db` | 本地知识库路径 |
+| `NUWA_SCANNER_GUARD` / `NUWA_REQUIRE_FUJIANG` | `1` / `1` | N-001 / N-004 开关 |
+| `NUWA_UI` / `NUWA_UI_NATIVE` / `NUWA_UI_WIDGET` / `NUWA_UI_LINES` | `1`/`1`/`1`/`3` | 可视化开关与看板行数 |
+| `NUWA_PROJECT` / `PI_AGENT_HOME` / `NUWA_BIN_DIR` | 自动 | 显式项目根 / agent home / 守护器安装目录 |
+| `NUWA_DAEMON_BACKOFF_MS` / `NUWA_DAEMON_MAX_ERRORS` | `2000` / `5` | 守护器异常重试退避基数（ms）与连续错误上限 |

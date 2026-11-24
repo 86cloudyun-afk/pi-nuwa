@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-nuwa v2 安装器：只装 omp 扩展与 skill，不装 CLI、不依赖 sapper/python。
+# pi-nuwa v3 安装器：安装 omp 原生扩展（9 模块）、nuwa-pentest skill 与无头守护器 nuwa-autonomous。
 #
 # 退出码：0 成功 / 1 依赖缺失 / 2 参数错误 / 3 回滚失败
 set -euo pipefail
@@ -20,6 +20,18 @@ else
   AGENT_HOME="$HOME/.pi/agent"
 fi
 EXT_DIR="$AGENT_HOME/extensions/nuwa-omp"
+
+# 扩展子模块清单（主入口 omp/nuwa.ts 复制为 index.ts，其余保持原名）
+EXT_MODULES=(
+  "omp/types.ts"
+  "omp/ui.ts"
+  "omp/ui-native.ts"
+  "omp/autoexec.ts"
+  "omp/scope.ts"
+  "omp/evidence.ts"
+  "omp/profiles.ts"
+  "omp/reincarnate.ts"
+)
 
 # ---------------------------------------------------------------- 回滚
 if [[ "${1:-}" == "--rollback" ]]; then
@@ -49,6 +61,10 @@ case "${1:-}" in
 用法: ./install.sh [--keep-legacy] [--rollback]
   --keep-legacy  保留旧的 $SAPPER_HOME/bin/nuwa（默认改名为 nuwa.legacy）
   --rollback     恢复最近一次安装前的 nuwa-omp 扩展
+
+环境变量:
+  PI_AGENT_HOME  指定 omp/pi agent 目录（默认自动探测 ~/.omp/agent 或 ~/.pi/agent）
+  NUWA_BIN_DIR   指定 nuwa-autonomous 无头守护器安装目录（默认 ~/.local/bin）
 EOF
     exit 0
     ;;
@@ -66,15 +82,20 @@ fi
 say "omp: ${OMP_VER:-unknown}"
 
 [[ -f "$REPO_DIR/omp/nuwa.ts" ]] || die "仓库缺少 omp/nuwa.ts" 1
-[[ -f "$REPO_DIR/omp/ui.ts" ]] || die "仓库缺少 omp/ui.ts" 1
-[[ -f "$REPO_DIR/omp/ui-native.ts" ]] || die "仓库缺少 omp/ui-native.ts" 1
-[[ -f "$REPO_DIR/omp/autoexec.ts" ]] || die "仓库缺少 omp/autoexec.ts" 1
+for mod in "${EXT_MODULES[@]}"; do
+  [[ -f "$REPO_DIR/$mod" ]] || die "仓库缺少 $mod" 1
+done
 [[ -f "$REPO_DIR/skills/nuwa-pentest/SKILL.md" ]] || die "仓库缺少 skills/nuwa-pentest/SKILL.md" 1
+[[ -f "$REPO_DIR/bin/nuwa-autonomous" ]] || die "仓库缺少 bin/nuwa-autonomous" 1
+
+# 从 omp/nuwa.ts 动态提取 VERSION（Issue #9：与代码保持单一事实来源）
+INSTALLED_VER="$(sed -nE "s/^export[[:space:]]+const[[:space:]]+VERSION[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/p" "$REPO_DIR/omp/nuwa.ts" | head -n 1)"
+[[ -n "$INSTALLED_VER" ]] || die "无法从 omp/nuwa.ts 提取 VERSION" 1
 
 command -v sqlite3 >/dev/null 2>&1 || say "提示: 未找到 sqlite3，nuwa_kb 将不可用（其余功能正常）"
 
 # ---------------------------------------------------------------- 1. 扩展
-say "[1/4] agent home = $AGENT_HOME"
+say "[1/5] agent home = $AGENT_HOME"
 mkdir -p "$AGENT_HOME/extensions" "$AGENT_HOME/cache"
 
 # 关键：omp 会把 extensions/ 下每个含 index.ts 的目录都当扩展加载。
@@ -94,16 +115,24 @@ if [[ -d "$EXT_DIR" ]]; then
   BAK="$BAK_ROOT/nuwa-omp.bak-$(date +%Y%m%dT%H%M%S)"
   cp -R "$EXT_DIR" "$BAK"
   say "  已备份到 $BAK"
-  find "$BAK_ROOT" -maxdepth 1 -name 'nuwa-omp.bak-*' -print0 \
-    | sort -z -r | tail -z -n +6 | xargs -0 -r rm -rf --
+  # 保留最近 5 份备份（跨平台兼容 macOS BSD 与 GNU 工具链）
+  bak_idx=0
+  while IFS= read -r -d '' old_bak; do
+    bak_idx=$((bak_idx + 1))
+    if [[ "$bak_idx" -gt 5 ]]; then
+      rm -rf -- "$old_bak"
+    fi
+  done < <(find "$BAK_ROOT" -maxdepth 1 -name 'nuwa-omp.bak-*' -print0 2>/dev/null | sort -zr)
 fi
+
 rm -rf "$EXT_DIR"
 mkdir -p "$EXT_DIR"
-cp "$REPO_DIR/omp/nuwa.ts" "$EXT_DIR/index.ts" || die "扩展复制失败" 1
-cp "$REPO_DIR/omp/ui.ts" "$EXT_DIR/ui.ts" || die "ui.ts 复制失败" 1
-cp "$REPO_DIR/omp/ui-native.ts" "$EXT_DIR/ui-native.ts" || die "ui-native.ts 复制失败" 1
-cp "$REPO_DIR/omp/autoexec.ts" "$EXT_DIR/autoexec.ts" || die "autoexec.ts 复制失败" 1
-say "  已安装 nuwa-omp（12 个 nuwa_* 工具，永动模式默认开启）"
+cp "$REPO_DIR/omp/nuwa.ts" "$EXT_DIR/index.ts" || die "扩展主入口复制失败" 1
+for mod in "${EXT_MODULES[@]}"; do
+  base="$(basename "$mod")"
+  cp "$REPO_DIR/$mod" "$EXT_DIR/$base" || die "$base 复制失败" 1
+done
+say "  已安装 nuwa-omp v${INSTALLED_VER}（index.ts + ${#EXT_MODULES[@]} 个模块，12 个 nuwa_* 工具）"
 
 # v1 的 nuwa-loop 会与新运行时抢 session_stop/tool_call；默认退役，避免双跑。
 if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
@@ -114,18 +143,45 @@ if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
 fi
 
 # ---------------------------------------------------------------- 2. skill
-say "[2/4] 安装 nuwa-pentest skill"
-mkdir -p "$AGENT_HOME/skills" "$HOME/.claude/skills"
+say "[2/5] 安装 nuwa-pentest skill"
+mkdir -p "$AGENT_HOME/skills"
 rm -rf "$AGENT_HOME/skills/nuwa-pentest"
 cp -R "$REPO_DIR/skills/nuwa-pentest" "$AGENT_HOME/skills/nuwa-pentest"
-if [[ -e "$HOME/.claude/skills/nuwa-pentest" && ! -L "$HOME/.claude/skills/nuwa-pentest" ]]; then
-  mv "$HOME/.claude/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest.bak-$(date +%s)"
+# 非隔离安装时同步建立 ~/.claude/skills 软链，隔离 PI_AGENT_HOME 测试不污染宿主目录
+if [[ -z "${PI_AGENT_HOME:-}" ]]; then
+  if mkdir -p "$HOME/.claude/skills" 2>/dev/null && [[ -w "$HOME/.claude/skills" ]]; then
+    if [[ -e "$HOME/.claude/skills/nuwa-pentest" && ! -L "$HOME/.claude/skills/nuwa-pentest" ]]; then
+      mv "$HOME/.claude/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest.bak-$(date +%s)"
+    fi
+    ln -sfn "$AGENT_HOME/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest"
+  fi
 fi
-ln -sfn "$AGENT_HOME/skills/nuwa-pentest" "$HOME/.claude/skills/nuwa-pentest"
 say "  $AGENT_HOME/skills/nuwa-pentest"
 
-# ---------------------------------------------------------------- 3. 旧入口退场
-say "[3/4] 处理旧 CLI 入口"
+# ---------------------------------------------------------------- 3. 无头守护器 nuwa-autonomous
+say "[3/5] 安装外层无头守护器 nuwa-autonomous"
+BIN_DIR="${NUWA_BIN_DIR:-$HOME/.local/bin}"
+BIN_TARGET="$BIN_DIR/nuwa-autonomous"
+BIN_INSTALLED=0
+if [[ -n "${NUWA_BIN_DIR:-}" ]]; then
+  mkdir -p "$BIN_DIR" || die "无法创建 NUWA_BIN_DIR: $BIN_DIR" 1
+  cp "$REPO_DIR/bin/nuwa-autonomous" "$BIN_TARGET" || die "nuwa-autonomous 复制失败" 1
+  chmod +x "$BIN_TARGET"
+  BIN_INSTALLED=1
+  say "  $BIN_TARGET"
+else
+  if ( [[ -d "$BIN_DIR" && -w "$BIN_DIR" ]] ) || ( [[ ! -e "$BIN_DIR" ]] && mkdir -p "$BIN_DIR" 2>/dev/null && [[ -w "$BIN_DIR" ]] ); then
+    cp "$REPO_DIR/bin/nuwa-autonomous" "$BIN_TARGET" || die "nuwa-autonomous 复制失败" 1
+    chmod +x "$BIN_TARGET"
+    BIN_INSTALLED=1
+    say "  $BIN_TARGET"
+  else
+    say "  跳过安装 nuwa-autonomous（$BIN_DIR 不可写；可通过 NUWA_BIN_DIR 指定可写目录）"
+  fi
+fi
+
+# ---------------------------------------------------------------- 4. 旧入口退场
+say "[4/5] 处理旧 CLI 入口"
 if [[ -x "$SAPPER_HOME/bin/nuwa" && "$KEEP_LEGACY" -eq 0 ]]; then
   mv "$SAPPER_HOME/bin/nuwa" "$SAPPER_HOME/bin/nuwa.legacy"
   say "  已改名 $SAPPER_HOME/bin/nuwa -> nuwa.legacy（--keep-legacy 可保留）"
@@ -133,34 +189,42 @@ else
   say "  未发现旧入口或要求保留"
 fi
 
-# ---------------------------------------------------------------- 4. 验收
-say "[4/4] 验收"
+# ---------------------------------------------------------------- 5. 验收
+say "[5/5] 验收"
 missing=0
 for t in nuwa_init nuwa_plan nuwa_frontier nuwa_claim nuwa_commit nuwa_flag nuwa_complete nuwa_status nuwa_report nuwa_expand nuwa_stop nuwa_kb; do
   grep -q "name: \"$t\"" "$EXT_DIR/index.ts" || { say "  缺少工具: $t"; missing=1; }
 done
 [[ "$missing" -eq 0 ]] || die "扩展自检失败" 1
-[[ -f "$EXT_DIR/ui.ts" ]] || die "扩展缺少 ui.ts（状态栏/看板会失效）" 1
-[[ -f "$EXT_DIR/ui-native.ts" ]] || die "扩展缺少 ui-native.ts（Tern 原生渲染会回退）" 1
-[[ -f "$EXT_DIR/autoexec.ts" ]] || die "扩展缺少 autoexec.ts（自动批会关闭）" 1
+[[ -f "$EXT_DIR/index.ts" ]] || die "扩展缺少 index.ts" 1
+for mod in "${EXT_MODULES[@]}"; do
+  base="$(basename "$mod")"
+  [[ -f "$EXT_DIR/$base" ]] || die "扩展缺少 $base" 1
+done
+if [[ "$BIN_INSTALLED" -eq 1 ]]; then
+  [[ -x "$BIN_TARGET" ]] || die "守护器缺少可执行权限: $BIN_TARGET" 1
+fi
 # 双扩展自检：extensions/ 下除 nuwa-omp 外不允许再有 nuwa-* 目录（含 .bak/.retired）
 extra="$(find -L "$AGENT_HOME/extensions" -maxdepth 1 -type d -name 'nuwa-*' ! -name 'nuwa-omp' -print 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$extra" -eq 0 ]] || die "extensions/ 下仍有 $extra 个旧 nuwa 扩展，会与 nuwa-omp 抢 session_stop；先移出再装" 1
-say "  工具面完整 · 单一扩展（无旧版共存）"
+say "  工具面完整 · 模块齐备（9/9） · 单一扩展（无旧版共存）"
+say "installed version = ${INSTALLED_VER}"
 
 cat <<EOF
 
-下一步（必须在 omp 会话里）：
+下一步（omp 会话内或无头守护）：
   1. 重启 omp 或 /reload 扩展
-  2. 在项目目录里说：女娲模式，打 http://TARGET:PORT
-     或直接调用：nuwa_init(target="http://TARGET:PORT", mode="ctf")
-  3. 之后由 session_stop 自动续跑；用 nuwa_status 看板，nuwa_report 出报告
+  2. 交互式开工：在项目目录说「女娲模式，打 http://TARGET:PORT」或 /nuwa 打 http://TARGET:PORT
+     多领域支持：nuwa_init(target="...", mode="ctf|pentest|audit|coding|ops")
+  3. 长跑无头守护（跨世代自动换血）：
+     nuwa-autonomous --target http://TARGET:PORT --mode ctf --max-generations 20
 
-配置（可选）：
+常用配置（可选）：
   NUWA_INFINITE=1（默认永动；=0 回到旧预算闸）
-  NUWA_TICK_MS=60000（看门狗心跳，兜底续跑）
-  NUWA_MAX_EPISODES=0（0=无限轮扩张）NUWA_EXPAND_DEPTH=24
-  NUWA_MAX_BATCH=4 NUWA_CLAIM_TTL=900 NUWA_KB_DB=/data/nuwa-kb/kb.db
+  NUWA_HEADLESS_DAEMON=1 NUWA_REINCARNATE_TOKENS=140000 NUWA_REINCARNATE_TURNS=30
+  NUWA_STRICT_EVIDENCE=1（开启真实执行账本证据复验）
+  NUWA_SCOPE_ALLOW_SUBDOMAINS=1 NUWA_SCOPE_ALLOW_CIDRS=10.0.0.0/24
+  NUWA_AUTO=1 NUWA_AUTO_MAX=3 NUWA_EMPTY_LIMIT=3 NUWA_MAX_ATTEMPTS=3
   NUWA_SCANNER_GUARD=1 NUWA_REQUIRE_FUJIANG=1 NUWA_LOOP=0（关续跑）
 
 回滚：$0 --rollback
