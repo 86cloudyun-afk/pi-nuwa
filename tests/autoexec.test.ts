@@ -61,6 +61,20 @@ function execOf(stdout: string, code = 0): ExecLike {
 	return async () => ({ stdout, stderr: "", code, killed: false });
 }
 
+const realAsyncExec: ExecLike = async (cmd, args, opts) => {
+	const proc = Bun.spawn([cmd, ...args], {
+		cwd: opts?.cwd,
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, code] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { stdout, stderr, code };
+};
+
 describe("脚本与目标", () => {
 	test("shellQuote 处理单引号", () => {
 		expect(shellQuote("a'b")).toBe(`'a'\\''b'`);
@@ -194,7 +208,7 @@ describe("规则解析与结构化 AutoFactMeta", () => {
 		expect(fact.meta?.status).toBe(200);
 	});
 
-	test("api 文档暴露判定并带 meta.paths", () => {
+	test("api 文档暴露判定并带 meta.paths（含多行格式化 JSON 实测）", async () => {
 		const st = fresh();
 		const rule = ruleFor("surface:api")!;
 		const fact = rule.parse({ stdout: '/openapi.json 200 {"openapi":"3.0.0"}\n', stderr: "", code: 0 }, st)!;
@@ -202,6 +216,31 @@ describe("规则解析与结构化 AutoFactMeta", () => {
 		expect(fact.title).toContain("API 文档");
 		expect(fact.meta?.paths).toEqual(["/openapi.json"]);
 		expect(fact.meta?.status).toBe(200);
+
+		// 启动本地 127.0.0.1 HTTP 服务返回多行格式化 /openapi.json，验证 probePaths 脚本压平与解析
+		const httpSrv = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req) {
+				const u = new URL(req.url);
+				if (u.pathname === "/openapi.json") {
+					return new Response('{\n  "openapi": "3.1.0",\n  "info": {\n    "title": "Demo"\n  }\n}\n', {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					});
+				}
+				return new Response("not found", { status: 404 });
+			},
+		});
+		try {
+			const localSt = newState(`http://127.0.0.1:${httpSrv.port}`, "多行 OpenAPI 验证", "ctf", cfg);
+			const runRes = await runAutoIntent(rule, localSt, realAsyncExec, "/tmp");
+			expect(runRes.ok).toBe(true);
+			expect(runRes.fact?.title).toContain("API 文档暴露");
+			expect(runRes.fact?.meta?.paths).toEqual(["/openapi.json"]);
+		} finally {
+			httpSrv.stop(true);
+		}
 	});
 
 	test("tls 加固 shellQuote 且解析 subject/SAN 与 meta.san", () => {
@@ -357,10 +396,82 @@ describe("Issue #2 外置 autoexec.json 配置加载与热更新", () => {
 		expect(badJson.source).toBe("builtin");
 		expect(badJson.error).toBeDefined();
 		expect(badJson.rules.length).toBe(AUTO_KEYS.length);
+
+		// 6. replace: true 下 isAutoKey 与 ruleFor 严格一致（包括 PI_AGENT_HOME 全局覆盖）
+		const replaceHome = makeDir("nuwa-replace-home-");
+		writeFileSync(
+			join(replaceHome, "nuwa-autoexec.json"),
+			JSON.stringify({
+				replace: true,
+				rules: [{ key: "recon:only_one", phase: "recon", timeoutMs: 5000, parse: "http" }],
+			}),
+		);
+		const prevAgentHome = process.env.PI_AGENT_HOME;
+		process.env.PI_AGENT_HOME = replaceHome;
+		try {
+			expect(isAutoKey("recon:only_one")).toBe(true);
+			expect(isAutoKey("recon:http")).toBe(false);
+			expect(ruleFor("recon:http")).toBeUndefined();
+		} finally {
+			if (prevAgentHome === undefined) delete process.env.PI_AGENT_HOME;
+			else process.env.PI_AGENT_HOME = prevAgentHome;
+		}
 	});
 });
 
 describe("Issue #3 失败三分类 classifyAutoFailure", () => {
+	test("dirsRule 与 probePaths 在真实连接被拒 (curl 7) 和 429 限流时正确分类为 network / blocked_by_waf", async () => {
+		// 找一个已关闭的随机空闲本地端口，测试连接被拒（curl exit 7 -> network）
+		const tmpSrv = createServer();
+		await new Promise<void>((r) => tmpSrv.listen(0, "127.0.0.1", () => r()));
+		const closedPort = (tmpSrv.address() as { port: number }).port;
+		await new Promise<void>((r) => tmpSrv.close(() => r()));
+
+		const dir = makeDir("nuwa-net-cls-");
+		mkdirSync(join(dir, ".nuwa"), { recursive: true });
+		writeFileSync(
+			join(dir, ".nuwa", "autoexec.json"),
+			JSON.stringify({
+				rules: [
+					{ key: "recon:dirs", phase: "recon", timeoutMs: 8000, parse: "dirs", paths: ["/admin", "/api"] },
+					{ key: "surface:api", phase: "surface", timeoutMs: 8000, parse: "probe", paths: ["/openapi.json"] },
+				],
+			}),
+		);
+
+		const closedSt = newState(`http://127.0.0.1:${closedPort}`, "连接拒绝分类验证", "ctf", cfg);
+		const dirsNetRes = await runAutoIntent(ruleFor("recon:dirs", dir)!, closedSt, realAsyncExec, dir);
+		expect(dirsNetRes.ok).toBe(false);
+		expect(dirsNetRes.errorKind).toBe("network");
+		expect(dirsNetRes.retryAfterMs).toBe(60_000);
+
+		const probeNetRes = await runAutoIntent(ruleFor("surface:api", dir)!, closedSt, realAsyncExec, dir);
+		expect(probeNetRes.ok).toBe(false);
+		expect(probeNetRes.errorKind).toBe("network");
+		expect(probeNetRes.retryAfterMs).toBe(60_000);
+
+		// 启动返回全 429 的本地服务，验证 dirsRule 与 probePaths 分类为 blocked_by_waf
+		const wafSrv = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				return new Response("Too Many Requests", { status: 429, headers: { "server": "cloudflare" } });
+			},
+		});
+		try {
+			const wafSt = newState(`http://127.0.0.1:${wafSrv.port}`, "429 分类验证", "ctf", cfg);
+			const dirsWafRes = await runAutoIntent(ruleFor("recon:dirs", dir)!, wafSt, realAsyncExec, dir);
+			expect(dirsWafRes.ok).toBe(false);
+			expect(dirsWafRes.errorKind).toBe("blocked_by_waf");
+
+			const probeWafRes = await runAutoIntent(ruleFor("surface:api", dir)!, wafSt, realAsyncExec, dir);
+			expect(probeWafRes.ok).toBe(false);
+			expect(probeWafRes.errorKind).toBe("blocked_by_waf");
+			expect(probeWafRes.waf).toBe("cloudflare");
+		} finally {
+			wafSrv.stop(true);
+		}
+	});
 	test("精准区分 network、blocked_by_waf 与 empty", async () => {
 		// network: curl 28 超时 / curl 6 DNS / killed
 		const net1 = classifyAutoFailure({ stdout: "", stderr: "curl: (28) Operation timed out", code: 28 });

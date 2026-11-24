@@ -100,6 +100,16 @@ describe("omp/scope.ts — ScopePolicy 与目标提取", () => {
 		expect(extractCommandTargets("curl --connect-to ::out-of-scope.org:443 https://target.test/")).toContain(
 			"out-of-scope.org",
 		);
+
+		// 回归验证：脚本解释器内联代码正文中的属性/模块名与 curl/nmap 文件参数不得误判为外部域名
+		expect(extractCommandTargets(`python3 -c "import logging; f = logging.info"`)).toEqual([]);
+		expect(extractCommandTargets(`python3 -c "from myapp.app import main"`)).toEqual([]);
+		expect(extractCommandTargets(`python3 -c "print(obj.to)"`)).toEqual([]);
+		expect(extractCommandTargets(`python3 -c "import os" 'evil.com'`)).toEqual(["evil.com"]);
+		expect(extractCommandTargets("curl -sS http://127.0.0.1:8080/ -o out.test -D head.info -b a.app")).toEqual([
+			"127.0.0.1",
+		]);
+		expect(extractCommandTargets("nmap -sV -p 80 -oN scan.test -oX report.dev 127.0.0.1")).toEqual(["127.0.0.1"]);
 	});
 
 	test("isHostInScope：黑名单优先、精确匹配、*.domain、allowSubdomains、CIDR 掩码与回环处理", () => {
@@ -128,11 +138,13 @@ describe("omp/scope.ts — ScopePolicy 与目标提取", () => {
 		expect(isHostInScope("10.10.20.254", scope).ok).toBe(true);
 		expect(isHostInScope("10.10.21.1", scope).ok).toBe(false);
 
-		// 回环地址默认允许，被显式拉黑时拦截
+		// 回环地址默认允许，被显式拉黑时（含等价回环别名联动）全部拦截
 		expect(isHostInScope("127.0.0.1", scope).ok).toBe(true);
 		expect(isHostInScope("localhost", scope).ok).toBe(true);
 		expect(isHostInScope("::1", scope).ok).toBe(true);
 		expect(isHostInScope("127.0.0.1", { ...scope, denyHosts: ["127.0.0.1"] }).ok).toBe(false);
+		expect(isHostInScope("localhost", { ...scope, denyHosts: ["127.0.0.1"] }).ok).toBe(false);
+		expect(isHostInScope("::1", { ...scope, denyHosts: ["localhost"] }).ok).toBe(false);
 
 		// allowSubdomains 开关与 allowPrivateNetwork 开关
 		expect(isHostInScope("sub.target.test", { ...scope, allowSubdomains: true }).ok).toBe(true);

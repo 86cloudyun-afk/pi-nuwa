@@ -383,7 +383,18 @@ function parseTlsFact(res: ExecLikeResult, st: NuwaState): AutoFact | null {
 }
 
 function parseProbeFact(key: string, pathCount: number, res: ExecLikeResult, st: NuwaState): AutoFact | null {
-	const rows = res.stdout.split("\n").filter((l) => /^\/\S*\s+/.test(l.trim()));
+	const rows: string[] = [];
+	for (const rawLine of res.stdout.replace(/\r/g, "").split("\n")) {
+		const trimmed = rawLine.trim();
+		if (!trimmed) continue;
+		if (/^FINAL\s+\d{3}\b/.test(trimmed)) continue;
+		if (/^\/\S*\s+/.test(trimmed)) {
+			rows.push(trimmed);
+		} else if (rows.length > 0) {
+			// 兼容未压平的多行响应体续行（如多行 JSON / .env 内容）拼接回上一条命中记录
+			rows[rows.length - 1] = `${rows[rows.length - 1]} ${trimmed}`.slice(0, 400);
+		}
+	}
 	if (rows.length === 0) return null;
 
 	const paths: string[] = [];
@@ -470,11 +481,20 @@ function dirsRule(paths: readonly string[] = DIR_PATHS, timeoutMs = 45_000): Aut
 			const base = shellQuote(originOf(st));
 			return [
 				`BASE=${base}`,
+				`hits=0; net_rc=0; waf_429=0`,
 				`for p in ${paths.map(shellQuote).join(" ")}; do`,
 				`  out=$(curl -k -sS -o /dev/null --max-time 6 -w '%{http_code} %{size_download} %{redirect_url}' "$BASE$p" 2>/dev/null)`,
+				`  rc=$?`,
 				`  code=\${out%% *}`,
-				`  case "$code" in 200|204|301|302|307|401|403|405|500) echo "$p $out";; esac`,
+				`  case "$rc" in 6|7|28|35|52|56) net_rc=$rc ;; esac`,
+				`  [ "$code" = "429" ] && waf_429=1`,
+				`  case "$code" in 200|204|301|302|307|401|403|405|500) hits=$((hits + 1)); echo "$p $out";; esac`,
 				`done`,
+				`if [ "$hits" -eq 0 ]; then`,
+				`  if [ "$waf_429" -eq 1 ]; then echo "FINAL 429 0 $BASE"; exit 0; fi`,
+				`  if [ "$net_rc" -ne 0 ]; then exit "$net_rc"; fi`,
+				`fi`,
+				`exit 0`,
 			].join("\n");
 		},
 		parse(res, st) {
@@ -517,12 +537,28 @@ function probePaths(key: string, phase: Phase, paths: readonly string[], timeout
 			const base = shellQuote(originOf(st));
 			return [
 				`BASE=${base}`,
+				`hits=0; net_rc=0; waf_code=""; waf_hint=""`,
+				`h=$(mktemp); b=$(mktemp)`,
+				`trap 'rm -f "$h" "$b"' EXIT`,
 				`for p in ${paths.map(shellQuote).join(" ")}; do`,
-				`  body=$(curl -k -sS --max-time 6 -w '\\n%{http_code}' "$BASE$p" 2>/dev/null)`,
-				`  code=$(printf '%s' "$body" | tail -n1)`,
-				`  content=$(printf '%s' "$body" | sed '$d')`,
-				`  [ "$code" = "200" ] && echo "$p $content"`,
+				`  code=$(curl -k -sS -D "$h" -o "$b" --max-time 6 -w '%{http_code}' "$BASE$p" 2>/dev/null)`,
+				`  rc=$?`,
+				`  case "$rc" in 6|7|28|35|52|56) net_rc=$rc ;; esac`,
+				`  if [ "$code" = "200" ]; then`,
+				`    hits=$((hits + 1))`,
+				`    line=$(tr '\\r\\n' '  ' < "$b" | head -c 240)`,
+				`    echo "$p 200 $line"`,
+				`  elif [ "$code" = "429" ] || [ "$code" = "403" ] || [ "$code" = "406" ]; then`,
+				`    waf_code="$code"`,
+				`    waf_hint=$( (cat "$h"; head -c 240 "$b") | tr '\\r\\n' '  ' | head -c 300 )`,
+				`  fi`,
 				`done`,
+				`if [ "$hits" -eq 0 ]; then`,
+				`  if [ "$waf_code" = "429" ]; then echo "FINAL 429 0 $BASE"; echo "$waf_hint"; exit 0; fi`,
+				`  if [ -n "$waf_code" ] && [ -n "$waf_hint" ]; then echo "FINAL $waf_code 0 $BASE"; echo "$waf_hint"; exit 0; fi`,
+				`  if [ "$net_rc" -ne 0 ]; then exit "$net_rc"; fi`,
+				`fi`,
+				`exit 0`,
 			].join("\n");
 		},
 		parse(res, st) {
@@ -752,7 +788,6 @@ export function loadAutoRules(root?: string, agentHome?: string): LoadedAutoRule
 export function isAutoKey(key: string, root?: string, agentHome?: string): boolean {
 	const norm = canonicalAutoKey(key);
 	if (!norm) return false;
-	if (!root && !agentHome && AUTO_KEY_SET.has(norm)) return true;
 	const { rules } = loadAutoRules(root, agentHome);
 	return rules.some((r) => r.key === norm);
 }
@@ -760,10 +795,6 @@ export function isAutoKey(key: string, root?: string, agentHome?: string): boole
 export function ruleFor(key: string, root?: string, agentHome?: string): AutoRule | undefined {
 	const norm = canonicalAutoKey(key);
 	if (!norm) return undefined;
-	if (!root && !agentHome) {
-		const loaded = loadAutoRules();
-		return loaded.rules.find((r) => r.key === norm);
-	}
 	const { rules } = loadAutoRules(root, agentHome);
 	return rules.find((r) => r.key === norm);
 }

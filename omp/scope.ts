@@ -243,8 +243,332 @@ const CODE_IDENTIFIERS = new Set([
 	"console.error",
 ]);
 
-const NET_CMD_RE =
-	/\b(?:curl|wget|nmap|masscan|nc|ncat|netcat|socat|telnet|openssl|ping6?|dig|nslookup|host|traceroute|tracepath|mtr|whois|ssh|scp|sftp|ftp|ffuf|gobuster|feroxbuster|dirsearch|dirb|wfuzz|nuclei|nikto|wpscan|sqlmap|whatweb|httpx|katana|subfinder|amass|hydra|medusa|ncrack|redis-cli|mysql|psql|pg_isready|mongosh?|python3?|node|bun|ruby|perl|php)\b/i;
+const INTERPRETER_CMDS = new Set(["python", "python3", "node", "bun", "ruby", "perl", "php"]);
+
+const NET_CLIENT_CMDS = new Set([
+	"curl",
+	"wget",
+	"nmap",
+	"masscan",
+	"nc",
+	"ncat",
+	"netcat",
+	"socat",
+	"telnet",
+	"openssl",
+	"ping",
+	"ping6",
+	"dig",
+	"nslookup",
+	"host",
+	"traceroute",
+	"tracepath",
+	"mtr",
+	"whois",
+	"ssh",
+	"scp",
+	"sftp",
+	"ftp",
+	"ffuf",
+	"gobuster",
+	"feroxbuster",
+	"dirsearch",
+	"dirb",
+	"wfuzz",
+	"nuclei",
+	"nikto",
+	"wpscan",
+	"sqlmap",
+	"whatweb",
+	"httpx",
+	"katana",
+	"subfinder",
+	"amass",
+	"hydra",
+	"medusa",
+	"ncrack",
+	"redis-cli",
+	"mysql",
+	"psql",
+	"pg_isready",
+	"mongo",
+	"mongosh",
+]);
+
+/** 紧跟文件/头部/报文/配置值而非目标主机的 CLI 选项。 */
+const NON_HOST_VALUE_FLAGS = new Set([
+	"-o",
+	"--output",
+	"-D",
+	"--dump-header",
+	"-b",
+	"--cookie",
+	"-c",
+	"--cookie-jar",
+	"-d",
+	"--data",
+	"--data-raw",
+	"--data-binary",
+	"--data-urlencode",
+	"--data-ascii",
+	"-F",
+	"--form",
+	"-H",
+	"--header",
+	"-A",
+	"--user-agent",
+	"-e",
+	"--referer",
+	"-X",
+	"--request",
+	"-T",
+	"--upload-file",
+	"-K",
+	"--config",
+	"--cacert",
+	"--capath",
+	"-CAfile",
+	"-CApath",
+	"--cert",
+	"--key",
+	"-cert",
+	"-key",
+	"-in",
+	"-out",
+	"-w",
+	"--write-out",
+	"-m",
+	"--max-time",
+	"--connect-timeout",
+	"-oN",
+	"-oX",
+	"-oG",
+	"-oA",
+	"-oS",
+	"-iL",
+	"--excludefile",
+	"--datadir",
+	"--script",
+	"--script-args",
+	"--script-args-file",
+	"-p",
+	"--ports",
+	"-g",
+	"--source-port",
+	"--interface",
+	"-of",
+	"-od",
+	"-fc",
+	"-mc",
+	"-fs",
+	"-ms",
+	"-fw",
+	"-mw",
+	"-fl",
+	"-ml",
+	"-t",
+	"-rate",
+	"-i",
+	"-l",
+	"-L",
+	"-P",
+	"--output-document",
+	"--save-headers",
+	"--post-data",
+	"--post-file",
+]);
+
+interface ShellToken {
+	text: string;
+	afterRedirect: boolean;
+}
+
+/** 将命令行按引号感知切分为子命令 token 序列，并标记重定向目标文件。 */
+function splitShellCommands(src: string): ShellToken[][] {
+	const cmds: ShellToken[][] = [];
+	let curCmd: ShellToken[] = [];
+	let cur = "";
+	let hasTokenChar = false;
+	let inSingle = false;
+	let inDouble = false;
+	let afterRedirect = false;
+
+	const flushToken = () => {
+		if (hasTokenChar || cur.length > 0) {
+			curCmd.push({ text: cur, afterRedirect });
+			cur = "";
+			hasTokenChar = false;
+			afterRedirect = false;
+		}
+	};
+
+	const flushCmd = () => {
+		flushToken();
+		if (curCmd.length > 0) {
+			cmds.push(curCmd);
+			curCmd = [];
+		}
+		afterRedirect = false;
+	};
+
+	for (let i = 0; i < src.length; i++) {
+		const ch = src[i]!;
+		if (inSingle) {
+			if (ch === "'") inSingle = false;
+			else cur += ch;
+			continue;
+		}
+		if (inDouble) {
+			if (ch === '"') {
+				inDouble = false;
+			} else if (ch === "\\" && i + 1 < src.length) {
+				cur += src[++i]!;
+			} else {
+				cur += ch;
+			}
+			continue;
+		}
+
+		if (ch === "'") {
+			inSingle = true;
+			hasTokenChar = true;
+			continue;
+		}
+		if (ch === '"') {
+			inDouble = true;
+			hasTokenChar = true;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < src.length) {
+			cur += src[++i]!;
+			hasTokenChar = true;
+			continue;
+		}
+		if (ch === ";" || ch === "|" || ch === "&" || ch === "\n" || ch === "(" || ch === ")") {
+			if (ch === "&" && src[i + 1] === ">") {
+				flushToken();
+				i += 1;
+				if (src[i + 1] === ">") i += 1;
+				afterRedirect = true;
+				continue;
+			}
+			flushCmd();
+			continue;
+		}
+		if (ch === ">" || ch === "<") {
+			if (/^\d+$/.test(cur)) {
+				cur = "";
+				hasTokenChar = false;
+			} else {
+				flushToken();
+			}
+			while (i + 1 < src.length && (src[i + 1] === ">" || src[i + 1] === "<" || src[i + 1] === "&" || /\d/.test(src[i + 1]!))) {
+				i += 1;
+			}
+			afterRedirect = true;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			flushToken();
+			continue;
+		}
+		cur += ch;
+		hasTokenChar = true;
+	}
+	flushCmd();
+	return cmds;
+}
+
+const WRAPPER_CMDS = new Set(["sudo", "env", "nohup", "nice", "stdbuf", "command", "builtin", "exec", "time"]);
+
+function extractBareDomainsFromCommands(rest: string, onCandidate: (domain: string) => void): void {
+	const subcmds = splitShellCommands(rest);
+	for (const tokens of subcmds) {
+		let idx = 0;
+		while (idx < tokens.length) {
+			const t = tokens[idx]!.text;
+			if (!t || tokens[idx]!.afterRedirect) {
+				idx++;
+				continue;
+			}
+			if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+				idx++;
+				continue;
+			}
+			const base = (t.split("/").pop() ?? t).toLowerCase();
+			if (WRAPPER_CMDS.has(base)) {
+				idx++;
+				while (idx < tokens.length && tokens[idx]!.text.startsWith("-")) idx++;
+				continue;
+			}
+			if (base === "timeout") {
+				idx += 2;
+				continue;
+			}
+			break;
+		}
+		if (idx >= tokens.length) continue;
+
+		const cmdName = (tokens[idx]!.text.split("/").pop() ?? tokens[idx]!.text).toLowerCase();
+
+		if (INTERPRETER_CMDS.has(cmdName)) {
+			let sawInlineCode = false;
+			let skippedScriptFile = false;
+			for (let i = idx + 1; i < tokens.length; i++) {
+				const tok = tokens[i]!;
+				if (tok.afterRedirect) continue;
+				const val = tok.text;
+				if (!val) continue;
+				if (val === "-c" || val === "-e" || val === "-r" || val === "--eval" || val === "--print" || val === "-m") {
+					sawInlineCode = true;
+					i += 1; // 跳过内联代码字符串本身，避免将 Python/JS 属性如 logging.info / myapp.app 误判为域名
+					continue;
+				}
+				if (val.startsWith("-")) continue;
+				if (!sawInlineCode && !skippedScriptFile) {
+					skippedScriptFile = true; // 跳过首个本地脚本文件路径参数
+					continue;
+				}
+				if (/^(?:\.{0,2}\/|~\/|@)/.test(val)) continue;
+				const hostPart = val.split("/")[0]!.replace(/:\d{1,5}$/, "");
+				if (looksLikeDomain(hostPart)) {
+					onCandidate(hostPart);
+				}
+			}
+			continue;
+		}
+
+		if (NET_CLIENT_CMDS.has(cmdName)) {
+			for (let i = idx + 1; i < tokens.length; i++) {
+				const tok = tokens[i]!;
+				if (tok.afterRedirect) continue;
+				const val = tok.text;
+				if (!val) continue;
+				if (NON_HOST_VALUE_FLAGS.has(val) || (cmdName === "curl" && (val === "-u" || val === "--user"))) {
+					i += 1; // 跳过紧随其后的文件名/头部/配置值
+					continue;
+				}
+				if (val.startsWith("-")) {
+					const eq = val.indexOf("=");
+					if (eq > 0) {
+						const flagPart = val.slice(0, eq);
+						if (NON_HOST_VALUE_FLAGS.has(flagPart) || (cmdName === "curl" && flagPart === "--user")) {
+							continue;
+						}
+						const rhs = val.slice(eq + 1).split("/")[0]!.replace(/:\d{1,5}$/, "");
+						if (looksLikeDomain(rhs)) onCandidate(rhs);
+					}
+					continue;
+				}
+				if (/^(?:\.{0,2}\/|~\/|@)/.test(val) || val.includes("@")) continue;
+				const hostPart = val.split("/")[0]!.replace(/:\d{1,5}$/, "");
+				if (looksLikeDomain(hostPart)) {
+					onCandidate(hostPart);
+				}
+			}
+		}
+	}
+}
 
 /** 解析点分十进制 IPv4 为无符号 32 位整数；非法返回 null。 */
 function parseIpv4(ip: string): number | null {
@@ -446,19 +770,14 @@ export function isHostInScope(host: string, scope: ScopePolicy): { ok: boolean; 
 		return { ok: false, reason: "目标主机为空" };
 	}
 
-	// 1. 黑名单最高优先级
+	// 1. 黑名单最高优先级（含等价回环别名联动）
 	for (const deny of scope.denyHosts ?? []) {
 		if (matchesHostPattern(norm, deny)) {
 			return { ok: false, reason: `目标 ${norm} 命中黑名单 denyHosts (${deny})` };
 		}
-		// 若黑名单写了根域或 loopback 别名，也对等价 loopback 严格拦截
 		const denyNorm = normalizeHostToken(deny, false);
-		if (
-			isLoopbackHost(norm) &&
-			(denyNorm === "localhost" || denyNorm === "127.0.0.1" || denyNorm === "::1") &&
-			denyNorm === norm
-		) {
-			return { ok: false, reason: `回环目标 ${norm} 已被 denyHosts 显式禁止` };
+		if (!norm.includes("/") && !denyNorm.includes("/") && isLoopbackHost(norm) && isLoopbackHost(denyNorm)) {
+			return { ok: false, reason: `回环目标 ${norm} 已被 denyHosts (${deny}) 禁止` };
 		}
 	}
 
@@ -652,22 +971,8 @@ export function extractCommandTargets(cmd: string): string[] {
 		if (m[1] && m[1].includes(":")) addTarget(m[1]);
 	}
 
-	// 10. 网络相关命令中的裸域名参数（如 curl evil.com:8080/a、nmap scanme.nmap.org、python3 -c '...' 'evil.com'）
-	if (NET_CMD_RE.test(text)) {
-		const domainRe =
-			/(?<![a-zA-Z0-9/_.-])((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,24}|localhost)(?::\d{1,5})?(?=[/\s'"`);|&]|$)/g;
-		for (const m of rest.matchAll(domainRe)) {
-			const cand = m[1];
-			if (!cand) continue;
-			// 排除形如 ./foo.bar 或 ../foo.bar 或紧跟 @ 邮箱后缀（非 ssh）
-			const idx = m.index ?? 0;
-			const prev = idx > 0 ? rest[idx - 1] : "";
-			if (prev === "@" && !/\b(?:ssh|scp|sftp|rsync)\b/i.test(rest)) continue;
-			if (looksLikeDomain(cand)) {
-				addTarget(cand);
-			}
-		}
-	}
+	// 10. 网络相关命令与脚本外部参数中的裸域名（跳过 -c/-e 内联代码正文及 -o/-D/-oN 等非主机选项值）
+	extractBareDomainsFromCommands(rest, (cand) => addTarget(cand));
 
 	return found;
 }
