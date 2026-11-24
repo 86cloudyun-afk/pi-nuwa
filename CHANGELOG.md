@@ -1,5 +1,40 @@
 # Changelog
 
+## 3.0.0 — 2026-11-24
+
+女娲自治闭环与多领域引擎全面升级：外层无头世代轮转、知识库自动富化与战略复盘、真实执行账本防幻觉、靶标范围护栏、工具链探针自适配、多领域 Profile 解耦，以及 2.6.0 全部遗留 Issues（#1–#9）清零。
+
+### 六大核心升级
+
+- **升级 1 · 外层无头守护与跨世代自动换血**：
+  - 新增 `bin/nuwa-autonomous`（`#!/usr/bin/env bun`）：自动注入 `NUWA_LOOP=1`、`NUWA_INFINITE=1`、`NUWA_HEADLESS_DAEMON=1`、`NUWA_STRICT_EVIDENCE=1`、`NUWA_REINCARNATE_TOKENS`、`NUWA_REINCARNATE_TURNS`、`NUWA_PROJECT` 及范围环境变量，支持 `--target`/`--mode`/`--goal`/`--root`/`--max-generations`/`--max-hours`/`--allow-subdomains`/`--allow-cidr`/`--model`/`--omp-bin`/`--dry-run`；自动读取 `.nuwa/state.json` 接力拉起下一代会话，子进程非零退出（API 429/5xx 断流或崩溃）按指数退避重启并从磁盘接续。
+  - 新增 `omp/reincarnate.ts`：`readReincarnatePolicy` / `shouldReincarnate` / `buildHandoffSummary`（≤1500 字精炼交接摘要）/ `prepareNextGeneration`；`session_stop` 命中换代阈值时自动释放并中止在途自动批、写入 `handoffSummary` 并优雅放行，由外层守护器拉起全新上下文。
+- **升级 2 · 知识库自动富化与战略复盘规划**：
+  - 新增 `omp/profiles.ts` 中的 `extractTechKeywords` / `deriveKbIntents` / `buildReflectIntentSpec`：自动从 `service`/`endpoint`/`vuln` 提取技术栈（nginx/apache/tomcat/php/spring/fastjson/thinkphp/shiro/redis/mysql/postgres/grafana/gitlab/jenkins/wordpress/graphql/swagger 等）与 `CVE-YYYY-NNNN`，安全查库并派生 `key=kb:<fid>:<slug>`（`phase=vuln`, `priority=86`, `from=[fid]`）核验意图（缺 KB 库静默降级）。
+  - 阶段将尽或连续 `stall >= 3` 时自动生成 `reflect:e<ep>:<phase>:<bucket>` 战略复盘意图，要求模型综合已知事实与阻塞原因调用 `nuwa_plan(intents=[...])` 构建带 `from` 依赖链的新假设。
+- **升级 3 · 执行账本真实证据复验（防幻觉）**：
+  - 新增 `omp/evidence.ts`：`tool_execution_end` 自动记录执行输出至内存环形缓冲与 `.nuwa/exec-ledger.jsonl`（滚动保留最近 200 条摘要及 SHA1）；`nuwa_flag` 与 `nuwa_commit(kind="vuln"|"cred"|"flag")` 调用 `verifyExecutionEvidence` 核验关键行是否真实出现在近期执行流或 `/tmp/nuwa/<projectId>/` 产物中（`NUWA_STRICT_EVIDENCE=0` 可关闭）。
+- **升级 4 · 靶标范围护栏与 `.nuwa` 防篡改**：
+  - 新增 `omp/scope.ts`：`defaultScopeForTarget` / `extractCommandTargets` / `isHostInScope` / `checkNuwaDirTamper` / `checkScopeAndRisk`。
+  - 工具层新增 `N-007`（越界外链/非授权主机拦截，支持黑名单优先、精确主机、`*.domain`、IPv4 CIDR 掩码与回环地址策略）、`N-008`（默认拦截 `rm -rf`/`mkfs`/`dd if=`/`shutdown`/`reboot`/`DROP TABLE`/`TRUNCATE` 等破坏性命令），并强化 `N-003` 拦 `rm`/`mv`/`cp`/`sed -i`/`truncate` 与脚本写入 `.nuwa/` 权威状态。
+  - `/nuwa scope` 支持运行时查看与调整范围；`nuwa_init` 支持 `scope`、`autoStart` 参数；修复 `NUWA_SCANNER_GUARD=0` 在 `checkBashPolicy` 中动态生效。
+- **升级 5 · 本地武器库能力探针与指令自适配**：
+  - `omp/evidence.ts` 新增 `probeToolchain`（检测 `curl`/`openssl`/`nmap`/`ffuf`/`nuclei`/`sqlmap`/`whatweb`/`hydra`/`python3`/`nc`/`sqlite3`）与 `adaptPacketForToolchain`，`nuwa_init` 探测并记录工具链快照，`nuwa_claim` 对缺失工具自动附加本地可用工具的合规替代建议。
+- **升级 6 · 多领域 Profile 引擎解耦**：
+  - 新增 `omp/profiles.ts` 与 `omp/types.ts`：`ProfileMode` 扩展为 `ctf` / `pentest` / `audit` / `coding` / `ops`；`coding` 与 `ops` 支持本地目录/服务标识目标（`requireHttpTarget: false`），提供软件工程与自动化运维 6 阶段内置种子，验收证据支持 `loot`/`note`。
+
+### 自渗透引擎重构与 Issues #1–#9 修复
+
+- **Issue #1（自动批回灌派生 + 跨平台 + E2+ key）**：`omp/autoexec.ts` 新增 `canonicalAutoKey` 归一化 `e<N>:` 前缀；`portsRule` 彻底去除 GNU `timeout` 与 `/dev/tcp`，改用 `python3` 短超时并发 `socket.create_connection` 并全面 `shellQuote`（兼容 macOS/Linux）；`AutoFact` 增加结构化 `meta`（`ports/paths/server/tech/status/san/waf`），每次自动批提交后锁内立即回灌 `deriveFromFacts` + `deriveKbIntents`。
+- **Issue #2（规则表外置 JSON 热更新）**：`loadAutoRules` 按 `<root>/.nuwa/autoexec.json` > `<agentHome>/nuwa-autoexec.json` > 内置顺序加载，支持 `mtimeMs` 缓存热更新，仅允许绑定内置 `parse`（`http|ports|dirs|tls|probe`），非法 JSON 自动降级回内置。
+- **Issue #3（失败三分类与冷却重试）**：`classifyAutoFailure` 区分 `network`（不消耗 `attempts`，设置 `nextRunAt` 冷却重试并计入 `runtime.netRetries`）、`blocked_by_waf`（403/406/429 特征标注并换路）、`empty`。
+- **Issue #4（二维空转硬闸）**：`applyEmptyGuard` 区分无工具活动（`emptyRounds`）与有工具活动但无新事实（`suspectRounds`，默认阈值 5），避免长 turn 误杀。
+- **Issue #5（预算、并发与取消）**：`runAutoBatchManaged` 支持单批总预算 `NUWA_AUTO_BUDGET_MS`（默认 90s）、并发度控制（`recon:ports` 仍独占）与 `AbortSignal` 取消；`nuwa_stop` / `/nuwa stop` / `session_shutdown` 立即中止在途自动批并释放未完成意图回 `open`。
+- **Issue #6（Tern `describe()` 验证矩阵）**：`tests/ui_native.test.ts` 补齐 `table`/`tree`/`progress`+`meter`/`badge`+`kv`、16 组可选原语开关矩阵及 40 列窄宽度断言，完整记录于 `docs/UI-DESIGN.md`。
+- **Issue #7（v1/v2 契约与 CI 治理）**：`tests/contract_check.py` 与 `tests/run.sh` 新增 `--v2-only` 模式，缺真实 `sapper` 时优雅 `SKIP`；`.github/workflows/test.yml` 拆分为 `v2-fast` 与 `full-suite`，`soak.yml` 移除无人值守 `schedule`；修复 `NightTest` 时长校验与多会话 `armPump` 隔离。
+- **Issue #8（state 容量控制与增量快照）**：新增 `compactFacts` 保留近期 200 条未引用 `note`；`saveState` 改为每 10 次或关键节点（`init/flag/complete/stop/reincarnate`）才写全量 `.json.gz` 快照，超过 2MB 告警；`statusBoard` 展示 `state=xxKB`、`rules=<source>`、`net-retry=<n>`、`gen=<g>`。
+- **Issue #9（版本一致性门禁与安装器对齐）**：新增 `tests/version_check.py` 校验 `omp/nuwa.ts`、`CHANGELOG.md`、`install.sh` 一致；`install.sh` 部署全部 9 个 `omp/*.ts` 模块与 `bin/nuwa-autonomous`，动态提取 `VERSION` 并在结尾回显 `installed version = 3.0.0`。
+
 ## 2.6.0 — 2026-11-15
 
 omp 驱动的自渗透：确定性侦察由扩展直接执行，模型只做判断类意图。
@@ -33,6 +68,10 @@ omp 驱动的自渗透：确定性侦察由扩展直接执行，模型只做判�
 | `NUWA_MAX_ATTEMPTS` | `3` | 单意图尝试上限 |
 
 `install.sh` 部署 `autoexec.ts` 并自检；新增 `tests/autoexec.test.ts` 18 例。
+
+### 历史版本号说明：关于 2.5.0–2.5.2（Issue #9）
+
+2.4.0 发布后，原计划用于 2.5.0–2.5.2 的若干扩展稳定性与交互小修直接并入 2.6.0 一同发布，未单独切出 `2.5.0–2.5.2` 发布标签与变更条目，导致版本号由 `2.4.0` 直接跳升至 `2.6.0`。自 `3.0.0` 起已引入 `tests/version_check.py` 作为 CI 门禁，确保 `omp/nuwa.ts` 的 `VERSION`、`CHANGELOG.md` 顶部条目与 `install.sh` 的版本回显严格保持单一事实来源。
 
 ## 2.4.0 — 2026-11-13
 

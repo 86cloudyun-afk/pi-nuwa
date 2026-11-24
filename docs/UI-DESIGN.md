@@ -117,19 +117,37 @@ interface UiStyle {
 | widget 挤压 transcript | 默认 3 行，上限 5 行，可关 |
 | 刷新抖动 | sig 缓存 + 250ms 节流 |
 | CJK 对齐 | 不画右边框，统一 `Bun.stringWidth` 截断 |
-| Tern 版本差异 | 只用文本/ansi，不依赖原生节点 |
+| Tern 版本差异 | `describe(cx)` 通过 `safeSupports(cx, kind)` 逐项探测并降级，异常时回退纯文本节点；`NUWA_UI_NATIVE=0` 可强制走字符串路径 |
 | 多会话残留 | `session_shutdown` 清 `setWidget/setStatus` |
 | print/RPC 无 UI | 全 try/catch，回退到 notify |
 
-## 7. 验收
+## 7. Tern 降级与 `describe()` 验证矩阵（Issue #6）
+
+以下矩阵记录 `omp/ui-native.ts` 中 `buildWidgetNode`、`buildBoardNode`、`createWidgetComponent` 与 `createBoardComponent` 在不同 `cx.supports(kind)` 能力组合及极窄终端宽度下的实际行为，全部由 `tests/ui_native.test.ts` 自动化断言覆盖（13 例全绿）：
+
+| 验证场景 | `cx.supports()` 能力组合 | Widget 节点表现 | Board 节点表现 | 验证断言与说明 |
+|---|---|---|---|---|
+| 全能力支持 | 全部返回 `true` | `card > row(badge, progress, text) + kv + row(meter, text)` | `card > kv + section(table) + section(list) + section(tree) + section(list)` | 原生 TSP 节点齐全，JSON 序列化无异常 |
+| 仅 `table` 缺失 | `k !== "table"` | 保持 `progress` + `meter` | 阶段表降级为单行 `text`（如 `recon 1/6 · ...`），攻击链 `tree` 保留 | 验证按原语粒度独立降级，互不影响 |
+| 仅 `tree` 缺失 | `k !== "tree"` | 保持 `progress` + `meter` | 攻击链降级为多行 `text`（含已完成 intent id 与标题），阶段表 `table` 保留 | 保留完整攻击链可读文本 |
+| `progress` + `meter` 缺失 | `k !== "progress" && k !== "meter"` | 进度降级为 `text("done/total")`，压力降级为 `text("pressure XX%")`，保留 `expand/stall/idle` 提示 | 保持 `table` + `tree` | `dark: false` 与 `lines: 5` 均正常输出 |
+| `badge` + `kv` 缺失探针 | `k !== "badge" && k !== "kv"` | 基础布局骨架 `card` 与可选原语 `progress`/`meter` 保持合法节点树 | `card` 骨架与 `table`/`tree` 保持合法节点树 | 基础原语不抛错，整棵 TSP 树可稳定 `JSON.stringify` |
+| 最小集合（`minimal`） | 仅支持 `card/row/col/text/section/kv/list/item` | 不含 `progress`/`meter`，降级为 `text` | 不含 `table`/`tree`，降级为 `text` | 模拟早期 Tern 客户端最小能力集 |
+| 全能力关闭 / `supports()` 抛异常 | 全部 `false` 或 `supports()` 抛出 `Error` | `safeSupports` 兜底返回 `false`，不含 `progress`/`meter` | `safeSupports` 兜底返回 `false`，不含 `table`/`tree` | 宿主探针故障零崩溃 |
+| 16 组可选原语全组合矩阵 | `table × tree × progress × meter`（2⁴ = 16 种）+ `dark: true/false` 交替 | `progress`/`meter` 出现与 `supports()` 返回值严格一一对应 | `table`/`tree` 出现与 `supports()` 返回值严格一一对应 | 穷举 16 种掩码并验证 `JSON.stringify` 均不抛错 |
+| 极窄终端宽度（`cols: 40`） | `all` 与 `minimal`，`width: 40` | `describe()` 返回合法 `card`；`render(40)` 在 `lines=3`/`lines=5` 下每行可见宽度均 `≤ 40` | `describe()` 返回合法 `card`；`render(40)` 每行可见宽度均 `≤ 40` | 覆盖 ANSI 去除后的 `Bun.stringWidth` 宽度硬约束 |
+| 缓存与刷新机制 | 连续调用 `describe()` / 调用 `invalidate()` | 两次 `describe()` 返回同一对象引用（零重复构树） | `invalidate()` 后再次 `describe()` 重新按新 `cx.supports` 构树并返回新引用 | 同时验证 `q` / `Esc` 触发关闭回调、其它按键忽略 |
+
+## 8. 验收
 
 - `tests/ui.test.ts`：状态行/看板行/进度条/颜色/截断/空状态。
-- `tests/omp_extension.test.ts`：init 后 status 被设置；commit 后 widget 行数变化；shutdown 清理。
+- `tests/ui_native.test.ts`：TSP 节点结构、全量 16 组 `supports()` 降级矩阵、异常处理、40 列极窄宽度、`describe()` 缓存与 `invalidate()`、`q`/Esc 关闭。
+- `tests/omp_extension.test.ts`：init 后 status 被设置；commit 后 widget 行数变化；`NUWA_UI_NATIVE=0` 回退；shutdown 清理。
 - 本地 `omp -p` 冒烟：`setStatus/setWidget` 调用无异常。
-- Tern：文本节点可见，颜色保留；`/nuwa board` 覆盖层可 `q` 关闭。
 
-## 8. 分阶段
+## 9. 分阶段
 
 - 2.3.0：L1 + L2 + L3 文本版（已完成）。
 - 2.4.0：手写 TSP 节点，widget/board 原生渲染，`supports()` 降级（已完成）。
-- 2.5.0（可选）：board 内选中 intent 后直接 `claim` / `blocked`（`NativeUiEvent` + `actions`）。
+- 3.0.0：补齐 Tern `describe()` 全组合降级与 40 列窄宽度验证矩阵（Issue #6，已完成），`statusBoard` 补充 `state=xxKB`、`rules=<source>`、`net-retry=<n>`、`gen=<g>` 运行指标。
+- 后续可选：board 内选中 intent 后直接 `claim` / `blocked`（`NativeUiEvent` + `actions`）。
