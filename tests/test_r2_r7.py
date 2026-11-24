@@ -265,10 +265,11 @@ class NightTest(unittest.TestCase):
             "SAPPER_HOME": str(tmp / "lab"),
             "PI_AGENT_HOME": str(tmp / "agent"),
             "NUWA_ENGINE": "fake-claude",
-            "NUWA_MAX_ROUNDS": "1",
+            "FAKE_ENGINE_COUNTER": str(tmp / "engine.count"),
+            "NUWA_MAX_ROUNDS": "0",
         })
         try:
-            night.run(tmp / "base", minutes=0.02, projects=2, interval=0.01, model="fake")
+            night.run(tmp / "base", minutes=0.02, projects=2, interval=0.05, model="fake")
             self._pass_report(tmp / "base")
             v = night.verify(tmp / "base")
             self.assertTrue(v["ok"], v)
@@ -313,10 +314,11 @@ class NightTest(unittest.TestCase):
             "SAPPER_HOME": str(tmp / "lab"),
             "PI_AGENT_HOME": str(tmp / "agent"),
             "NUWA_ENGINE": "fake-claude",
-            "NUWA_MAX_ROUNDS": "1",
+            "FAKE_ENGINE_COUNTER": str(tmp / "engine.count"),
+            "NUWA_MAX_ROUNDS": "0",
         })
         try:
-            night.run(tmp / "base", minutes=0.02, projects=2, interval=0.01, model="fake")
+            night.run(tmp / "base", minutes=0.02, projects=2, interval=0.05, model="fake")
             self._pass_report(tmp / "base")
             self.assertTrue(night.verify(tmp / "base", expect_commit="deadbeef")["ok"] is False)
             real = (tmp / "base" / "COMMIT").read_text().strip()

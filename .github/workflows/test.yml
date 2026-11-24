@@ -6,11 +6,28 @@ on:
   pull_request:
 
 jobs:
-  suite:
+  v2-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: V2 fast suite (version + v2 contract + bun --isolate + shell + kb)
+        run: ./tests/run.sh --v2-only
+
+  full-suite:
     runs-on: ubuntu-latest
     env:
       SAPPER_REF: c91881dc1629409bbf278577dfdaa6b8f383b438
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -28,9 +45,10 @@ jobs:
           git -C /tmp/sapper-v2 checkout "$SAPPER_REF"
           bash /tmp/sapper-v2/install.sh --cli-only
 
-      - name: Full suite (contract + five suites + gates)
+      - name: Full suite (version + contract + all suites + gates)
         env:
           NUWA_REQUIRE_GATES: "1"
+          NUWA_REQUIRE_V1_SAPPER: "1"
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           ./tests/run.sh
