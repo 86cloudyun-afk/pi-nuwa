@@ -1,0 +1,1334 @@
+[
+  {
+    "cve_id": "CVE-2021-44228",
+    "product": "log4j",
+    "affected_versions": "2.0-beta9 <= version <= 2.14.1",
+    "severity": "CRITICAL",
+    "cvss": 10.0,
+    "cwe": "CWE-502",
+    "descr": "Apache Log4j2 log4j-core 日志消息查找功能边界缺陷（需核验传递依赖版本）。",
+    "verify_hint": "只读核对 pom.xml、依赖树及部署包中 log4j-core-*.jar 版本是否低于 2.15.0。",
+    "remediation": "升级至 Apache Log4j 2.17.1 或最新 2.2x 稳定版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-44228",
+      "https://logging.apache.org/log4j/2.x/security.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.975, "percentile": 0.999 },
+    "published": "2021-12-10"
+  },
+  {
+    "cve_id": "CVE-2021-45046",
+    "product": "log4j",
+    "affected_versions": "2.0-beta9 <= version <= 2.15.0",
+    "severity": "CRITICAL",
+    "cvss": 9.0,
+    "cwe": "CWE-502",
+    "descr": "Apache Log4j2 在特定非默认日志模式配置下查找功能修复不完整。",
+    "verify_hint": "只读核对 log4j-core 版本是否低于 2.16.0 及日志配置模板。",
+    "remediation": "升级至 Apache Log4j 2.17.1 及以上版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-45046",
+      "https://logging.apache.org/log4j/2.x/security.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.968, "percentile": 0.997 },
+    "published": "2021-12-14"
+  },
+  {
+    "cve_id": "CVE-2021-23017",
+    "product": "nginx",
+    "affected_versions": "0.6.18 <= version < 1.20.1",
+    "severity": "HIGH",
+    "cvss": 7.7,
+    "cwe": "CWE-193",
+    "descr": "Nginx DNS 解析器（resolver 配置）响应处理中的边界计算缺陷。",
+    "verify_hint": "只读检查 nginx -v 版本号与配置中是否启用 resolver 指令。",
+    "remediation": "升级至 Nginx 1.20.1 / 1.21.0 及以上维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-23017",
+      "https://nginx.org/en/security_advisories.html"
+    ],
+    "kev": false,
+    "epss": { "score": 0.72, "percentile": 0.98 },
+    "published": "2021-06-01"
+  },
+  {
+    "cve_id": "CVE-2022-41741",
+    "product": "nginx",
+    "affected_versions": "1.1.3 <= version < 1.22.1",
+    "severity": "HIGH",
+    "cvss": 7.8,
+    "cwe": "CWE-787",
+    "descr": "Nginx ngx_http_mp4_module 媒体模块解析 MP4 元数据时的内存边界缺陷。",
+    "verify_hint": "只读检查 nginx -V 是否编译 ngx_http_mp4_module 及版本号是否低于 1.22.1。",
+    "remediation": "升级至 Nginx 1.22.1 / 1.23.2 及以上版本，或移除未使用的 mp4 模块。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-41741",
+      "https://nginx.org/en/security_advisories.html"
+    ],
+    "kev": false,
+    "epss": { "score": 0.04, "percentile": 0.72 },
+    "published": "2022-10-19"
+  },
+  {
+    "cve_id": "CVE-2019-20372",
+    "product": "nginx",
+    "affected_versions": "version < 1.17.7",
+    "severity": "MEDIUM",
+    "cvss": 5.3,
+    "cwe": "CWE-444",
+    "descr": "Nginx 在特定 error_page 重定向配置下存在 HTTP 请求解析不一致风险。",
+    "verify_hint": "只读核对 nginx -v 版本与 error_page 指向远程上游的配置项。",
+    "remediation": "升级至 Nginx 1.17.7 及以上版本并规范 error_page 配置。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2019-20372",
+      "https://nginx.org/en/security_advisories.html"
+    ],
+    "kev": false,
+    "epss": { "score": 0.06, "percentile": 0.78 },
+    "published": "2020-01-09"
+  },
+  {
+    "cve_id": "CVE-2020-1938",
+    "product": "tomcat",
+    "affected_versions": "7.x < 7.0.100, 8.5.x < 8.5.51, 9.x < 9.0.31",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-285",
+    "descr": "Apache Tomcat AJP 连接器（默认 8009 端口）默认配置下的资源访问边界缺陷。",
+    "verify_hint": "只读核对 catalina.sh version 及 server.xml 中 AJP Connector 是否启用并暴露。",
+    "remediation": "升级至官方修补版本，非必要时注释 AJP Connector 或配置 secret 与仅本机监听。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2020-1938",
+      "https://tomcat.apache.org/security-9.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2020-02-24"
+  },
+  {
+    "cve_id": "CVE-2024-50379",
+    "product": "tomcat",
+    "affected_versions": "9.0.0.M1-9.0.97, 10.1.0-M1-10.1.33, 11.0.0-M1-11.0.1",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-367",
+    "descr": "Apache Tomcat 在大小写不敏感文件系统且启用默认 Servlet 写权限时的并发竞态缺陷。",
+    "verify_hint": "只读核对 Tomcat 版本号、操作系统文件系统特性及 DefaultServlet readonly 配置。",
+    "remediation": "升级至 Tomcat 9.0.98 / 10.1.34 / 11.0.2 及以上版本，并保持 readonly=true。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-50379",
+      "https://tomcat.apache.org/security-9.html"
+    ],
+    "kev": false,
+    "epss": { "score": 0.65, "percentile": 0.97 },
+    "published": "2024-12-17"
+  },
+  {
+    "cve_id": "CVE-2025-24813",
+    "product": "tomcat",
+    "affected_versions": "9.0.0.M1-9.0.98, 10.1.0-M1-10.1.34, 11.0.0-M1-11.0.2",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-502",
+    "descr": "Apache Tomcat 启用部分写入且使用基于文件的会话持久化时的路径与反序列化配置风险。",
+    "verify_hint": "只读核对 Tomcat 版本、DefaultServlet readonly 参数及 FileStore 会话持久化配置。",
+    "remediation": "升级至 Tomcat 9.0.99 / 10.1.35 / 11.0.3 及以上版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2025-24813",
+      "https://tomcat.apache.org/security-9.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.85, "percentile": 0.99 },
+    "published": "2025-03-10"
+  },
+  {
+    "cve_id": "CVE-2021-41773",
+    "product": "apache",
+    "affected_versions": "2.4.49",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-22",
+    "descr": "Apache HTTP Server 2.4.49 路径规范化映射边界缺陷。",
+    "verify_hint": "只读检查 httpd -v 是否恰好为 2.4.49 及目录访问控制规则。",
+    "remediation": "立即升级至 Apache HTTP Server 2.4.51 及以上受支持版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-41773",
+      "https://httpd.apache.org/security/vulnerabilities_24.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2021-10-05"
+  },
+  {
+    "cve_id": "CVE-2021-42013",
+    "product": "apache",
+    "affected_versions": "2.4.49, 2.4.50",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-22",
+    "descr": "Apache HTTP Server 2.4.49 与 2.4.50 中路径规范化修复不完整。",
+    "verify_hint": "只读检查 httpd -v 是否处于 2.4.49 或 2.4.50。",
+    "remediation": "升级至 Apache HTTP Server 2.4.51 及以上版本，确保默认拒绝目录规则生效。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-42013",
+      "https://httpd.apache.org/security/vulnerabilities_24.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2021-10-07"
+  },
+  {
+    "cve_id": "CVE-2024-38476",
+    "product": "apache",
+    "affected_versions": "version <= 2.4.59",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-829",
+    "descr": "Apache HTTP Server 后端应用响应头触发本地处理器映射时的信任边界缺陷。",
+    "verify_hint": "只读核对 httpd -v 是否 <= 2.4.59 以及代理后端响应头配置。",
+    "remediation": "升级至 Apache HTTP Server 2.4.60 及以上版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-38476",
+      "https://httpd.apache.org/security/vulnerabilities_24.html"
+    ],
+    "kev": false,
+    "epss": { "score": 0.12, "percentile": 0.85 },
+    "published": "2024-07-01"
+  },
+  {
+    "cve_id": "CVE-2024-4577",
+    "product": "php",
+    "affected_versions": "8.1.x < 8.1.29, 8.2.x < 8.2.20, 8.3.x < 8.3.8 (Windows CGI)",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-78",
+    "descr": "PHP Windows 环境下特定区域设置与 CGI 模式下的字符映射参数处理缺陷。",
+    "verify_hint": "只读检查部署平台是否为 Windows PHP-CGI 以及 php -v 版本区间。",
+    "remediation": "升级至 PHP 8.1.29 / 8.2.20 / 8.3.8 及以上版本，或改用 FastCGI / FPM 部署模式。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-4577",
+      "https://www.php.net/ChangeLog-8.php"
+    ],
+    "kev": true,
+    "epss": { "score": 0.95, "percentile": 0.995 },
+    "published": "2024-06-09"
+  },
+  {
+    "cve_id": "CVE-2019-11043",
+    "product": "php",
+    "affected_versions": "7.1.x < 7.1.33, 7.2.x < 7.2.24, 7.3.x < 7.3.11",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-787",
+    "descr": "PHP-FPM 搭配特定 fastcgi_split_path_info 代理配置时的环境变量指针边界缺陷。",
+    "verify_hint": "只读核对 php-fpm -v 版本号及 Nginx 中 fastcgi_split_path_info 配置。",
+    "remediation": "升级至受支持的 PHP 8.2/8.3+ 版本并在转发前校验目标脚本存在性。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2019-11043",
+      "https://bugs.php.net/bug.php?id=78599"
+    ],
+    "kev": true,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2019-10-28"
+  },
+  {
+    "cve_id": "CVE-2022-22965",
+    "product": "spring",
+    "affected_versions": "Spring Framework 5.3.0-5.3.17, 5.2.0-5.2.19 (JDK 9+ WAR on Tomcat)",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-94",
+    "descr": "Spring Framework 在 JDK 9+ 与特定 Servlet 容器部署模式下的参数数据绑定边界缺陷。",
+    "verify_hint": "只读检查 spring-beans/spring-webmvc 版本、JDK 主版本及部署形态。",
+    "remediation": "升级至 Spring Framework 5.3.18+ / 5.2.20+ 或 Spring 6.x，并配置 DataBinder 白名单。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-22965",
+      "https://spring.io/security/cve-2022-22965"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2022-04-01"
+  },
+  {
+    "cve_id": "CVE-2022-22963",
+    "product": "spring",
+    "affected_versions": "Spring Cloud Function 3.1.6, 3.2.2 及更早版本",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-917",
+    "descr": "Spring Cloud Function 路由功能处理请求头表达式时的边界校验缺陷。",
+    "verify_hint": "只读核查依赖清单中 spring-cloud-function-context 版本号。",
+    "remediation": "升级至 Spring Cloud Function 3.1.7 / 3.2.3 及以上版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-22963",
+      "https://spring.io/security/cve-2022-22963"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.997 },
+    "published": "2022-03-29"
+  },
+  {
+    "cve_id": "CVE-2024-38816",
+    "product": "spring",
+    "affected_versions": "Spring Framework 5.3.0-5.3.39, 6.0.0-6.0.23, 6.1.0-6.1.12",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-22",
+    "descr": "Spring WebMvc.fn / WebFlux.fn 静态资源路由处理中的路径边界缺陷。",
+    "verify_hint": "只读检查 spring-webmvc / spring-webflux 版本及 RouterFunctions 静态资源配置。",
+    "remediation": "升级至 Spring Framework 6.1.13 / 6.0.24 / 5.3.40 及以上版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-38816",
+      "https://spring.io/security/cve-2024-38816"
+    ],
+    "kev": false,
+    "epss": { "score": 0.42, "percentile": 0.94 },
+    "published": "2024-09-13"
+  },
+  {
+    "cve_id": "CVE-2022-25845",
+    "product": "fastjson",
+    "affected_versions": "version <= 1.2.80",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-502",
+    "descr": "Alibaba Fastjson 1.2.80 及更早版本在未开启 SafeMode 时的反序列化类型检查边界缺陷。",
+    "verify_hint": "只读核对 pom.xml/jar 中 fastjson 版本及是否配置 ParserConfig.setSafeMode(true)。",
+    "remediation": "升级至 Fastjson 1.2.83 并开启 SafeMode，或迁移至 Fastjson2。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-25845",
+      "https://github.com/alibaba/fastjson/wiki/security_update_20220523"
+    ],
+    "kev": false,
+    "epss": { "score": 0.89, "percentile": 0.99 },
+    "published": "2022-06-10"
+  },
+  {
+    "cve_id": "CVE-2017-18349",
+    "product": "fastjson",
+    "affected_versions": "version <= 1.2.24",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-502",
+    "descr": "Alibaba Fastjson 1.2.24 及更早版本默认启用自动类型解析导致的安全边界缺陷。",
+    "verify_hint": "只读核查依赖树中是否存在老旧 fastjson 1.2.24 及以下版本。",
+    "remediation": "升级至 Fastjson 1.2.83+（启用 SafeMode）或迁移至 Fastjson2。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2017-18349",
+      "https://github.com/alibaba/fastjson/wiki/security_update_20170315"
+    ],
+    "kev": false,
+    "epss": { "score": 0.95, "percentile": 0.995 },
+    "published": "2019-02-01"
+  },
+  {
+    "cve_id": "CVE-2018-20062",
+    "product": "thinkphp",
+    "affected_versions": "5.0.x < 5.0.24, 5.1.x < 5.1.31",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-94",
+    "descr": "ThinkPHP 5.x 路由控制器名称校验不严格导致的调用边界缺陷。",
+    "verify_hint": "只读检查 composer.lock 中 topthink/framework 版本号。",
+    "remediation": "升级至 ThinkPHP 5.0.24+ / 5.1.31+ 或最新 6.x/8.x 维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2018-20062",
+      "https://github.com/top-think/framework/releases"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2018-12-11"
+  },
+  {
+    "cve_id": "CVE-2022-47945",
+    "product": "thinkphp",
+    "affected_versions": "version < 6.0.14",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-22",
+    "descr": "ThinkPHP 开启多语言特性时语言参数文件路径校验不足的边界缺陷。",
+    "verify_hint": "只读核对 topthink/framework 版本是否低于 6.0.14 以及多语言中间件配置。",
+    "remediation": "升级至 ThinkPHP 6.0.14 及以上版本，按需关闭未使用的多语言扩展。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-47945",
+      "https://github.com/top-think/framework/releases"
+    ],
+    "kev": false,
+    "epss": { "score": 0.94, "percentile": 0.994 },
+    "published": "2022-12-23"
+  },
+  {
+    "cve_id": "CVE-2016-4437",
+    "product": "shiro",
+    "affected_versions": "version <= 1.2.4",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-502",
+    "descr": "Apache Shiro 1.2.4 及更早版本 RememberMe 功能使用硬编码默认密钥的配置风险。",
+    "verify_hint": "只读检查 shiro-core 版本及配置中是否显式注入高熵随机 cipherKey。",
+    "remediation": "升级至最新 Shiro 版本并替换自定义强随机加密密钥或禁用 RememberMe。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2016-4437",
+      "https://shiro.apache.org/security-reports.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2016-06-07"
+  },
+  {
+    "cve_id": "CVE-2020-1957",
+    "product": "shiro",
+    "affected_versions": "version < 1.5.2",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-287",
+    "descr": "Apache Shiro 与 Spring 组合使用时路径匹配归一化不一致导致的权限校验差异。",
+    "verify_hint": "只读核查 shiro-web/shiro-spring 版本是否低于 1.5.2 及鉴权过滤器路径规则。",
+    "remediation": "升级至 Apache Shiro 1.5.2 及以上（建议 1.13+/2.x）并统一路径归一化策略。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2020-1957",
+      "https://shiro.apache.org/security-reports.html"
+    ],
+    "kev": false,
+    "epss": { "score": 0.95, "percentile": 0.995 },
+    "published": "2020-03-23"
+  },
+  {
+    "cve_id": "CVE-2022-32532",
+    "product": "shiro",
+    "affected_versions": "version < 1.9.1",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-287",
+    "descr": "Apache Shiro 使用 RegExPatternMatcher 且正则表达式配置含点号匹配时的权限边界差异。",
+    "verify_hint": "只读检查 shiro-core 版本是否低于 1.9.1 及是否配置 RegExPatternMatcher。",
+    "remediation": "升级至 Apache Shiro 1.9.1 及以上版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-32532",
+      "https://shiro.apache.org/security-reports.html"
+    ],
+    "kev": false,
+    "epss": { "score": 0.88, "percentile": 0.99 },
+    "published": "2022-06-29"
+  },
+  {
+    "cve_id": "CVE-2022-0543",
+    "product": "redis",
+    "affected_versions": "Debian/Ubuntu 特定 Redis 打包版本",
+    "severity": "CRITICAL",
+    "cvss": 10.0,
+    "cwe": "CWE-862",
+    "descr": "部分 Debian/Ubuntu 发行版打包的 Redis 动态链接 Lua 库引入的沙盒隔离缺失。",
+    "verify_hint": "只读核对宿主机发行版 redis-server 软件包补丁版本号。",
+    "remediation": "应用 Debian/Ubuntu 官方安全更新并限制 Redis 仅受控内网加 ACL 访问。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-0543",
+      "https://www.debian.org/security/2022/dsa-5081"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2022-02-18"
+  },
+  {
+    "cve_id": "CVE-2024-31449",
+    "product": "redis",
+    "affected_versions": "version < 6.2.16, 7.0.x < 7.2.6, 7.4.0",
+    "severity": "HIGH",
+    "cvss": 7.0,
+    "cwe": "CWE-121",
+    "descr": "Redis Lua bit 库运算参数在特定边界条件下的栈内存处理缺陷。",
+    "verify_hint": "只读核对 redis-server --version 或受控 INFO server 中的版本号。",
+    "remediation": "升级至 Redis 6.2.16 / 7.2.6 / 7.4.1 及以上版本，并用 ACL 限制脚本执行权限。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-31449",
+      "https://github.com/redis/redis/security/advisories"
+    ],
+    "kev": false,
+    "epss": { "score": 0.14, "percentile": 0.87 },
+    "published": "2024-10-03"
+  },
+  {
+    "cve_id": "CVE-2012-2122",
+    "product": "mysql",
+    "affected_versions": "MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.24; MariaDB < 5.5.23",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-287",
+    "descr": "老旧版本 MySQL/MariaDB 在特定构建下口令比对返回值类型截断引发的认证边界缺陷。",
+    "verify_hint": "只读核查 mysqld --version 是否处于已停止维护的 5.1/5.5 历史分支。",
+    "remediation": "升级至受官方支持的 MySQL 8.0/8.4 LTS 或 MariaDB 最新维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2012-2122",
+      "https://dev.mysql.com/doc/relnotes/mysql/8.0/en/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.94, "percentile": 0.993 },
+    "published": "2012-06-11"
+  },
+  {
+    "cve_id": "CVE-2024-20960",
+    "product": "mysql",
+    "affected_versions": "MySQL Server <= 8.0.35, <= 8.2.0",
+    "severity": "MEDIUM",
+    "cvss": 4.9,
+    "cwe": "CWE-400",
+    "descr": "Oracle MySQL Server 服务端组件在特定权限上下文下的服务可用性缺陷。",
+    "verify_hint": "只读核对 mysqld --version 及 Oracle CPU 季度补丁安装级别。",
+    "remediation": "升级至 MySQL 8.0.36 / 8.3.0 及以上版本，并遵循最小权限管理数据库账号。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-20960",
+      "https://www.oracle.com/security-alerts/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.02, "percentile": 0.55 },
+    "published": "2024-01-16"
+  },
+  {
+    "cve_id": "CVE-2019-9193",
+    "product": "postgres",
+    "affected_versions": "PostgreSQL 9.3 - 11.x（高权限角色配置治理项）",
+    "severity": "HIGH",
+    "cvss": 7.2,
+    "cwe": "CWE-269",
+    "descr": "PostgreSQL 超级用户或被授予 pg_execute_server_program 角色的命令交互权限管理风险。",
+    "verify_hint": "只读审查 pg_roles 与应用连接角色清单，确认业务连接未使用超级用户或高危系统角色。",
+    "remediation": "严格回收业务账号超级用户与系统执行角色权限，实施 pg_hba.conf 最小化授权。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2019-9193",
+      "https://www.postgresql.org/about/news/cve-2019-9193-not-a-security-vulnerability-1935/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.94, "percentile": 0.994 },
+    "published": "2019-03-21"
+  },
+  {
+    "cve_id": "CVE-2024-10979",
+    "product": "postgres",
+    "affected_versions": "PostgreSQL < 17.1, < 16.5, < 15.9, < 14.14, < 13.17",
+    "severity": "HIGH",
+    "cvss": 8.8,
+    "cwe": "CWE-15",
+    "descr": "PostgreSQL PL/Perl 扩展环境变量控制不严引起的服务端配置边界缺陷。",
+    "verify_hint": "只读检查 postgres --version 与已安装的 PL/Perl 扩展清单。",
+    "remediation": "升级至 PostgreSQL 17.1 / 16.5 / 15.9 / 14.14 / 13.17 及以上版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-10979",
+      "https://www.postgresql.org/support/security/CVE-2024-10979/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.08, "percentile": 0.81 },
+    "published": "2024-11-14"
+  },
+  {
+    "cve_id": "CVE-2021-43798",
+    "product": "grafana",
+    "affected_versions": "8.0.0-beta1 <= version <= 8.3.0",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-22",
+    "descr": "Grafana 8.x 插件静态资源路由中的路径规范化缺陷。",
+    "verify_hint": "只读核对 grafana-server -v 或受控 /api/health 返回的版本是否落于 8.0.0-8.3.0。",
+    "remediation": "升级至 Grafana 8.3.1 及以上（推荐最新稳定版）并收敛公网暴露。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-43798",
+      "https://grafana.com/blog/2021/12/07/grafana-8.3.1-8.2.7-8.1.8-and-8.0.7-released-with-high-severity-security-fix/"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2021-12-07"
+  },
+  {
+    "cve_id": "CVE-2024-9264",
+    "product": "grafana",
+    "affected_versions": "11.0.x < 11.0.6, 11.1.x < 11.1.7, 11.2.x < 11.2.2",
+    "severity": "CRITICAL",
+    "cvss": 9.9,
+    "cwe": "CWE-78",
+    "descr": "Grafana 11.x 实验性 SQL Expressions 功能在特定系统依赖存在时的输入校验缺陷。",
+    "verify_hint": "只读核对 Grafana 版本号是否位于 11.0-11.2 受影响区间及环境是否安装 duckdb。",
+    "remediation": "升级至 Grafana 11.0.6 / 11.1.7 / 11.2.2 及以上安全版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-9264",
+      "https://grafana.com/security/security-advisories/cve-2024-9264/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.78, "percentile": 0.98 },
+    "published": "2024-10-17"
+  },
+  {
+    "cve_id": "CVE-2021-22205",
+    "product": "gitlab",
+    "affected_versions": "GitLab CE/EE 11.9 <= version < 13.10.3",
+    "severity": "CRITICAL",
+    "cvss": 10.0,
+    "cwe": "CWE-94",
+    "descr": "GitLab 图像元数据解析组件（ExifTool）输入校验缺失引发的服务端处理缺陷。",
+    "verify_hint": "只读核查 gitlab-rake gitlab:env:info 中的 GitLab 版本号。",
+    "remediation": "升级至 GitLab 最新维护安全版本并限制实例公网注册与暴露。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-22205",
+      "https://about.gitlab.com/releases/2021/04/14/security-release-gitlab-13-10-3-released/"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2021-04-23"
+  },
+  {
+    "cve_id": "CVE-2023-7028",
+    "product": "gitlab",
+    "affected_versions": "16.1-16.1.5, 16.2-16.2.8, 16.3-16.3.6, 16.4-16.4.4, 16.5-16.5.5, 16.6-16.6.3, 16.7.0-16.7.1",
+    "severity": "CRITICAL",
+    "cvss": 10.0,
+    "cwe": "CWE-640",
+    "descr": "GitLab 账号密码重置邮箱校验流程中的身份验证边界缺陷。",
+    "verify_hint": "只读检查 GitLab CE/EE 版本是否处于 16.1 至 16.7.1 受影响补丁区间。",
+    "remediation": "升级至 GitLab 16.7.2 / 16.6.4 / 16.5.6 及以上版本，并强制全员开启 2FA。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-7028",
+      "https://about.gitlab.com/releases/2024/01/11/critical-security-release-gitlab-16-7-2-released/"
+    ],
+    "kev": true,
+    "epss": { "score": 0.93, "percentile": 0.992 },
+    "published": "2024-01-12"
+  },
+  {
+    "cve_id": "CVE-2024-45409",
+    "product": "gitlab",
+    "affected_versions": "GitLab CE/EE < 17.3.3, < 17.2.7, < 17.1.8, < 17.0.8, < 16.11.10",
+    "severity": "CRITICAL",
+    "cvss": 10.0,
+    "cwe": "CWE-347",
+    "descr": "GitLab 依赖的 Ruby-SAML 组件断言签名校验边界缺陷。",
+    "verify_hint": "只读核对 GitLab 版本号及是否启用 SAML SSO 身份认证。",
+    "remediation": "升级至 GitLab 17.3.3 / 17.2.7 / 16.11.10 及以上安全修复版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-45409",
+      "https://about.gitlab.com/releases/2024/09/17/patch-release-gitlab-17-3-3-released/"
+    ],
+    "kev": true,
+    "epss": { "score": 0.79, "percentile": 0.98 },
+    "published": "2024-09-18"
+  },
+  {
+    "cve_id": "CVE-2024-23897",
+    "product": "jenkins",
+    "affected_versions": "Jenkins <= 2.441, LTS <= 2.426.2",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-22",
+    "descr": "Jenkins 内置 CLI 命令解析器（args4j）参数文件展开开关默认启用导致的文件读取边界缺陷。",
+    "verify_hint": "只读核查 Jenkins 版本号（X-Jenkins 响应头或 jenkins.war 清单）与匿名只读权限状态。",
+    "remediation": "升级至 Jenkins 2.442 / LTS 2.426.3 及以上版本，关闭匿名访问与非必要 CLI。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-23897",
+      "https://www.jenkins.io/security/advisory/2024-01-24/"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2024-01-24"
+  },
+  {
+    "cve_id": "CVE-2024-43044",
+    "product": "jenkins",
+    "affected_versions": "Jenkins <= 2.470, LTS <= 2.452.3",
+    "severity": "HIGH",
+    "cvss": 8.8,
+    "cwe": "CWE-22",
+    "descr": "Jenkins Remoting 代理通道类加载器文件请求路径校验不足引发的控制器边界缺陷。",
+    "verify_hint": "只读检查 Jenkins 主控版本及 Remoting 库版本是否低于修复基线。",
+    "remediation": "升级至 Jenkins 2.471 / LTS 2.452.4 及以上版本，严格隔离构建节点权限。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-43044",
+      "https://www.jenkins.io/security/advisory/2024-08-07/"
+    ],
+    "kev": true,
+    "epss": { "score": 0.61, "percentile": 0.96 },
+    "published": "2024-08-07"
+  },
+  {
+    "cve_id": "CVE-2023-2745",
+    "product": "wordpress",
+    "affected_versions": "WordPress < 6.2.1",
+    "severity": "MEDIUM",
+    "cvss": 5.4,
+    "cwe": "CWE-22",
+    "descr": "WordPress 核心语言参数目录路径校验不足引发的站点边界缺陷。",
+    "verify_hint": "只读核对 wp-includes/version.php 或 wp core version 中的 WordPress 核心版本。",
+    "remediation": "升级至 WordPress 6.2.1 及以上受官方支持的最新版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-2745",
+      "https://wordpress.org/news/2023/05/wordpress-6-2-1-maintenance-security-release/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.05, "percentile": 0.75 },
+    "published": "2023-05-24"
+  },
+  {
+    "cve_id": "CVE-2022-21661",
+    "product": "wordpress",
+    "affected_versions": "WordPress 3.7.37 - 5.8.2",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-89",
+    "descr": "WordPress 核心 WP_Query 组件处理特定分类查询参数时的查询构造校验缺陷。",
+    "verify_hint": "只读检查 WordPress 核心版本号是否低于 5.8.3 及已装主题/插件依赖情况。",
+    "remediation": "升级至 WordPress 5.8.3 及以上（建议最新 6.x 分支）。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-21661",
+      "https://wordpress.org/news/2022/01/wordpress-5-8-3-security-release/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.93, "percentile": 0.992 },
+    "published": "2022-01-06"
+  },
+  {
+    "cve_id": "CVE-2022-37734",
+    "product": "graphql",
+    "affected_versions": "graphql-java < 19.2, < 18.4, < 17.5",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-400",
+    "descr": "graphql-java 解析重复或深度嵌套指令时的资源消耗控制缺陷。",
+    "verify_hint": "只读核对依赖清单中 graphql-java 版本及查询复杂度/深度限流中间件状态。",
+    "remediation": "升级至 graphql-java 修复版本并配置查询深度与最大 Token 限制。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-37734",
+      "https://github.com/graphql-java/graphql-java/security/advisories"
+    ],
+    "kev": false,
+    "epss": { "score": 0.03, "percentile": 0.65 },
+    "published": "2022-09-21"
+  },
+  {
+    "cve_id": "CVE-2023-44487",
+    "product": "graphql",
+    "affected_versions": "受 HTTP/2 Rapid Reset 影响的未打补丁网关与 API 运行时",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-400",
+    "descr": "HTTP/2 协议快速流重置处理导致的网关及 GraphQL/API 服务端资源耗尽风险。",
+    "verify_hint": "只读核查入口代理、负载均衡与 API 运行时（Node/Go/Netty/Envoy/Nginx）补丁版本。",
+    "remediation": "将边缘代理与后端运行时升级至包含 HTTP/2 Rapid Reset 缓解措施的版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-44487",
+      "https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+    ],
+    "kev": true,
+    "epss": { "score": 0.94, "percentile": 0.994 },
+    "published": "2023-10-10"
+  },
+  {
+    "cve_id": "CVE-2019-17495",
+    "product": "swagger",
+    "affected_versions": "swagger-ui < 3.23.11",
+    "severity": "MEDIUM",
+    "cvss": 6.1,
+    "cwe": "CWE-79",
+    "descr": "Swagger UI 处理外部传入样式或规范 URL 参数时的前端渲染安全策略缺陷。",
+    "verify_hint": "只读核对前端包 swagger-ui 版本及线上环境是否公开暴露 Swagger UI。",
+    "remediation": "生产环境关闭或鉴权保护 Swagger UI，升级至最新 swagger-ui 维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2019-17495",
+      "https://github.com/swagger-api/swagger-ui/releases"
+    ],
+    "kev": false,
+    "epss": { "score": 0.04, "percentile": 0.72 },
+    "published": "2019-10-11"
+  },
+  {
+    "cve_id": "CVE-2018-25031",
+    "product": "swagger",
+    "affected_versions": "swagger-ui < 3.18.0",
+    "severity": "MEDIUM",
+    "cvss": 6.1,
+    "cwe": "CWE-20",
+    "descr": "旧版 Swagger UI 允许通过查询参数加载外部未受控规范文档导致的页面伪造与渲染风险。",
+    "verify_hint": "只读检查 swagger-ui 静态资源版本号及是否禁用 queryConfigEnabled。",
+    "remediation": "升级至 Swagger UI 4.x/5.x 最新版并禁用外部 URL 规范参数加载。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2018-25031",
+      "https://github.com/swagger-api/swagger-ui/releases"
+    ],
+    "kev": false,
+    "epss": { "score": 0.06, "percentile": 0.79 },
+    "published": "2022-02-20"
+  },
+  {
+    "cve_id": "CVE-2017-5638",
+    "product": "struts",
+    "affected_versions": "Apache Struts 2.3.5-2.3.31, 2.5-2.5.10",
+    "severity": "CRITICAL",
+    "cvss": 10.0,
+    "cwe": "CWE-20",
+    "descr": "Apache Struts2 Jakarta Multipart 解析器错误处理流程中的输入边界缺陷。",
+    "verify_hint": "只读检查依赖清单中 struts2-core 版本是否落于 2.3.x(<2.3.32) 或 2.5.x(<2.5.10.1)。",
+    "remediation": "升级至 Apache Struts 6.x 最新安全维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2017-5638",
+      "https://cwiki.apache.org/confluence/display/WW/S2-045"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.999 },
+    "published": "2017-03-11"
+  },
+  {
+    "cve_id": "CVE-2023-50164",
+    "product": "struts",
+    "affected_versions": "Apache Struts 2.0.0-2.3.37, 2.5.0-2.5.32, 6.0.0-6.3.0.1",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-22",
+    "descr": "Apache Struts2 文件上传参数大小写归一化不一致导致的路径边界缺陷。",
+    "verify_hint": "只读核对 struts2-core-*.jar 版本是否低于 2.5.33 / 6.3.0.2。",
+    "remediation": "升级至 Apache Struts 2.5.33 / 6.3.0.2 及以上安全版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-50164",
+      "https://cwiki.apache.org/confluence/display/WW/S2-066"
+    ],
+    "kev": true,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2023-12-07"
+  },
+  {
+    "cve_id": "CVE-2020-14882",
+    "product": "weblogic",
+    "affected_versions": "Oracle WebLogic Server 10.3.6.0.0, 12.1.3.0.0, 12.2.1.3.0, 12.2.1.4.0, 14.1.1.0.0",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-287",
+    "descr": "Oracle WebLogic Server 管理控制台路由访问控制边界缺陷。",
+    "verify_hint": "只读检查 opatch lsinventory 补丁级别并确认 /console 未向公网暴露。",
+    "remediation": "安装 Oracle 2020年10月及之后最新 CPU 安全补丁并将控制台限制在运维专网。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2020-14882",
+      "https://www.oracle.com/security-alerts/cpuoct2020.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.999 },
+    "published": "2020-10-21"
+  },
+  {
+    "cve_id": "CVE-2023-21839",
+    "product": "weblogic",
+    "affected_versions": "Oracle WebLogic Server 12.2.1.3.0, 12.2.1.4.0, 14.1.1.0.0",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-284",
+    "descr": "Oracle WebLogic Server Core 组件 T3/IIOP 协议对象访问权限校验不足。",
+    "verify_hint": "只读核对 WebLogic 补丁清单及 T3/IIOP 协议外网访问隔离策略。",
+    "remediation": "安装 Oracle 2023年1月及之后最新 CPU 补丁并在网络边界封禁外部 T3/IIOP 通信。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-21839",
+      "https://www.oracle.com/security-alerts/cpujan2023.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2023-01-18"
+  },
+  {
+    "cve_id": "CVE-2021-29441",
+    "product": "nacos",
+    "affected_versions": "Alibaba Nacos < 1.4.1",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-287",
+    "descr": "Alibaba Nacos 旧版本内部认证过滤器基于请求头标识豁免鉴权的逻辑缺陷。",
+    "verify_hint": "只读检查 Nacos 发行版本是否低于 1.4.1 及是否启用鉴权与随机密钥。",
+    "remediation": "升级至 Nacos 2.3+ 安全维护版本，开启鉴权并禁止配置中心对公网开放。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-29441",
+      "https://github.com/alibaba/nacos/releases"
+    ],
+    "kev": false,
+    "epss": { "score": 0.94, "percentile": 0.994 },
+    "published": "2021-05-10"
+  },
+  {
+    "cve_id": "CVE-2023-29217",
+    "product": "nacos",
+    "affected_versions": "Alibaba Nacos < 2.2.3（开启默认未配置密钥或旧版本组件）",
+    "severity": "HIGH",
+    "cvss": 8.8,
+    "cwe": "CWE-502",
+    "descr": "Alibaba Nacos 服务端内部通信及反序列化白名单边界加固相关历史缺陷。",
+    "verify_hint": "只读核对 Nacos 运行版本及 8848/9848/7848 端口内网访问控制。",
+    "remediation": "升级至 Nacos 2.3+ 最新安全版本，替换默认 token.secret.key 并实施网络隔离。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-29217",
+      "https://nacos.io/docs/latest/manual/admin/auth/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.35, "percentile": 0.92 },
+    "published": "2023-06-15"
+  },
+  {
+    "cve_id": "CVE-2015-1427",
+    "product": "elasticsearch",
+    "affected_versions": "Elasticsearch < 1.3.8, 1.4.x < 1.4.3",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-94",
+    "descr": "早期 Elasticsearch 1.x Groovy 动态脚本引擎沙盒边界不足。",
+    "verify_hint": "只读检查 elasticsearch --version 是否处于已停服的 1.x 旧分支及脚本开关配置。",
+    "remediation": "升级至受官方支持的 Elastic 8.x 分支并开启 xpack.security 认证与网络隔离。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2015-1427",
+      "https://www.elastic.co/community/security"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.998 },
+    "published": "2015-03-09"
+  },
+  {
+    "cve_id": "CVE-2021-22145",
+    "product": "elasticsearch",
+    "affected_versions": "Elasticsearch 7.10.0 - 7.13.3",
+    "severity": "MEDIUM",
+    "cvss": 6.5,
+    "cwe": "CWE-200",
+    "descr": "Elasticsearch 错误处理路径中可能返回内存缓冲区残留片段的信息暴露缺陷。",
+    "verify_hint": "只读核对 Elasticsearch 节点版本号是否落于 7.10.0 至 7.13.3。",
+    "remediation": "升级至 Elasticsearch 7.13.4 及以上或 8.x 维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-22145",
+      "https://www.elastic.co/community/security"
+    ],
+    "kev": false,
+    "epss": { "score": 0.08, "percentile": 0.81 },
+    "published": "2021-07-29"
+  },
+  {
+    "cve_id": "CVE-2019-7609",
+    "product": "kibana",
+    "affected_versions": "Kibana < 5.6.15, < 6.6.1",
+    "severity": "HIGH",
+    "cvss": 7.6,
+    "cwe": "CWE-1321",
+    "descr": "旧版 Kibana Timelion 可视化模块属性合并处理时的原型边界缺陷。",
+    "verify_hint": "只读检查 kibana --version 是否低于 5.6.15 / 6.6.1。",
+    "remediation": "升级至 Kibana 8.x 最新安全维护版本并实施统一鉴权。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2019-7609",
+      "https://www.elastic.co/community/security"
+    ],
+    "kev": false,
+    "epss": { "score": 0.95, "percentile": 0.995 },
+    "published": "2019-02-22"
+  },
+  {
+    "cve_id": "CVE-2024-37287",
+    "product": "kibana",
+    "affected_versions": "Kibana 8.x < 8.15.0",
+    "severity": "HIGH",
+    "cvss": 8.8,
+    "cwe": "CWE-1321",
+    "descr": "Kibana 特定集成规则解析配置中的对象属性校验缺陷。",
+    "verify_hint": "只读核对 Kibana 版本是否低于 8.15.0 及用户角色权限配置。",
+    "remediation": "升级至 Kibana 8.15.0 及以上安全版本，按空间实施最小权限授权。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-37287",
+      "https://www.elastic.co/community/security"
+    ],
+    "kev": false,
+    "epss": { "score": 0.25, "percentile": 0.9 },
+    "published": "2024-08-08"
+  },
+  {
+    "cve_id": "CVE-2021-20329",
+    "product": "mongodb",
+    "affected_versions": "MongoDB < 4.2.16, < 4.4.9, < 5.0.3",
+    "severity": "MEDIUM",
+    "cvss": 6.5,
+    "cwe": "CWE-74",
+    "descr": "MongoDB Go 驱动与服务端 BSON 编解码字段边界校验不足。",
+    "verify_hint": "只读检查 mongod --version 及客户端驱动依赖版本。",
+    "remediation": "升级至受支持的 MongoDB 7.0/8.0 分支与最新官方驱动，开启鉴权和 TLS。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-20329",
+      "https://www.mongodb.com/alerts"
+    ],
+    "kev": false,
+    "epss": { "score": 0.03, "percentile": 0.65 },
+    "published": "2021-09-20"
+  },
+  {
+    "cve_id": "CVE-2019-2389",
+    "product": "mongodb",
+    "affected_versions": "MongoDB < 3.6.13, < 4.0.9",
+    "severity": "MEDIUM",
+    "cvss": 5.3,
+    "cwe": "CWE-287",
+    "descr": "旧版 MongoDB 启动早期阶段日志或初始化流程中的访问边界提示缺陷。",
+    "verify_hint": "只读核对 mongod --version 及 security.authorization 开关状态。",
+    "remediation": "升级至受支持的 MongoDB 版本并确认默认开启认证与内网监听。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2019-2389",
+      "https://www.mongodb.com/alerts"
+    ],
+    "kev": false,
+    "epss": { "score": 0.02, "percentile": 0.52 },
+    "published": "2019-10-08"
+  },
+  {
+    "cve_id": "CVE-2023-28432",
+    "product": "minio",
+    "affected_versions": "MinIO < RELEASE.2023-03-20T20-16-18Z (集群部署)",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-200",
+    "descr": "MinIO 集群模式下验证端点返回完整环境变量配置的信息泄露缺陷。",
+    "verify_hint": "只读核对 minio --version 发布时间戳是否早于 2023-03-20T20-16-18Z。",
+    "remediation": "立即升级至最新 MinIO Release 并轮换根凭据与所有 Access Key。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-28432",
+      "https://github.com/minio/minio/security/advisories/GHSA-6xvq-wj2x-3h3q"
+    ],
+    "kev": true,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2023-03-24"
+  },
+  {
+    "cve_id": "CVE-2024-24747",
+    "product": "minio",
+    "affected_versions": "MinIO < RELEASE.2024-01-31T20-20-33Z",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-863",
+    "descr": "MinIO 管理员接口对部分权限操作校验边界不严谨的授权缺陷。",
+    "verify_hint": "只读检查 minio --version 时间戳是否早于 2024-01-31T20-20-33Z。",
+    "remediation": "升级至最新 MinIO Release 并限制管理端口仅运维内网可达。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-24747",
+      "https://github.com/minio/minio/security/advisories"
+    ],
+    "kev": false,
+    "epss": { "score": 0.05, "percentile": 0.76 },
+    "published": "2024-02-02"
+  },
+  {
+    "cve_id": "CVE-2021-28164",
+    "product": "jetty",
+    "affected_versions": "Eclipse Jetty 9.4.37 - 9.4.38",
+    "severity": "MEDIUM",
+    "cvss": 5.3,
+    "cwe": "CWE-200",
+    "descr": "Eclipse Jetty 特定小版本 URI 编码路径规范化导致的受保护资源边界差异。",
+    "verify_hint": "只读检查 jetty-server-*.jar 或依赖清单是否恰好为 9.4.37/9.4.38。",
+    "remediation": "升级至 Jetty 9.4.39+ 或官方维护的 Jetty 12 稳定版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-28164",
+      "https://github.com/jetty/jetty.project/security/advisories"
+    ],
+    "kev": false,
+    "epss": { "score": 0.93, "percentile": 0.992 },
+    "published": "2021-04-01"
+  },
+  {
+    "cve_id": "CVE-2023-36478",
+    "product": "jetty",
+    "affected_versions": "Eclipse Jetty < 9.4.53, < 10.0.16, < 11.0.16, < 12.0.2",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-400",
+    "descr": "Eclipse Jetty HTTP/2 HPACK 头部解码处理异常导致的服务可用性退化风险。",
+    "verify_hint": "只读核对 Jetty 组件版本号及是否启用 HTTP/2 连接器。",
+    "remediation": "升级至 Jetty 10.0.16 / 11.0.16 / 12.0.2 及以上安全维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-36478",
+      "https://github.com/jetty/jetty.project/security/advisories"
+    ],
+    "kev": false,
+    "epss": { "score": 0.16, "percentile": 0.88 },
+    "published": "2023-10-10"
+  },
+  {
+    "cve_id": "CVE-2015-1635",
+    "product": "iis",
+    "affected_versions": "未打补丁的 Windows 7 / Server 2008 R2 / Server 2012 (IIS 7.5-8.5)",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-190",
+    "descr": "Windows HTTP.sys 协议栈解析 Range 请求头数值边界时的整数溢出缺陷（MS15-034）。",
+    "verify_hint": "只读核对 Windows Server 操作系统版本与 MS15-034 / 后续累积更新安装状态。",
+    "remediation": "安装 Microsoft 官方安全累积更新并淘汰已停止生命周期的旧版系统。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2015-1635",
+      "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2015-1635"
+    ],
+    "kev": false,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2015-04-14"
+  },
+  {
+    "cve_id": "CVE-2021-31166",
+    "product": "iis",
+    "affected_versions": "Windows 10 2004/20H2, Windows Server 2004/20H2 (HTTP.sys)",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-416",
+    "descr": "Windows HTTP.sys 协议栈处理编码请求头时的内存生命周期管理缺陷。",
+    "verify_hint": "只读检查 Windows 系统构建号与 2021年5月及之后安全更新安装状态。",
+    "remediation": "应用 Microsoft 官方最新月度安全累积补丁。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-31166",
+      "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-31166"
+    ],
+    "kev": false,
+    "epss": { "score": 0.95, "percentile": 0.995 },
+    "published": "2021-05-11"
+  },
+  {
+    "cve_id": "CVE-2024-6387",
+    "product": "openssh",
+    "affected_versions": "OpenSSH < 4.4p1, 8.5p1 <= version < 9.8p1 (glibc Linux 平台)",
+    "severity": "HIGH",
+    "cvss": 8.1,
+    "cwe": "CWE-362",
+    "descr": "OpenSSH sshd 在基于 glibc 的 Linux 平台上信号处理函数异步安全竞态缺陷。",
+    "verify_hint": "只读核对 sshd -V 及发行版包管理器安全补丁修订号（注意排查反向移植补丁）。",
+    "remediation": "升级至 OpenSSH 9.8p1 或发行版官方安全修复包，并限制 SSH 端口访问来源。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-6387",
+      "https://www.openssh.com/txt/release-9.8"
+    ],
+    "kev": false,
+    "epss": { "score": 0.45, "percentile": 0.95 },
+    "published": "2024-07-01"
+  },
+  {
+    "cve_id": "CVE-2023-38408",
+    "product": "openssh",
+    "affected_versions": "OpenSSH < 9.3p2",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-427",
+    "descr": "OpenSSH ssh-agent PKCS#11 转发场景下动态库路径边界校验不足。",
+    "verify_hint": "只读核对 ssh -V 版本是否低于 9.3p2 及配置中是否启用 ForwardAgent。",
+    "remediation": "升级至 OpenSSH 9.3p2 及以上（推荐 9.8p1+），非必要时禁用代理转发。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-38408",
+      "https://www.openssh.com/txt/release-9.3p2"
+    ],
+    "kev": false,
+    "epss": { "score": 0.62, "percentile": 0.97 },
+    "published": "2023-07-20"
+  },
+  {
+    "cve_id": "CVE-2024-42005",
+    "product": "django",
+    "affected_versions": "Django 4.2 < 4.2.15, 5.0 < 5.0.8",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-89",
+    "descr": "Django QuerySet.values()/values_list() 传入未校验 JSONField 键名时的查询边界缺陷。",
+    "verify_hint": "只读检查 Django 依赖版本是否低于 4.2.15 / 5.0.8。",
+    "remediation": "升级至 Django 4.2.15 / 5.0.8 / 5.1 及以上安全版本，严格白名单过滤查询键。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-42005",
+      "https://www.djangoproject.com/weblog/2024/aug/06/security-releases/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.11, "percentile": 0.84 },
+    "published": "2024-08-06"
+  },
+  {
+    "cve_id": "CVE-2022-34265",
+    "product": "django",
+    "affected_versions": "Django 3.2 < 3.2.14, 4.0 < 4.0.6",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-89",
+    "descr": "Django Trunc() 与 Extract() 数据库函数接受外部可控参数时的输入校验缺陷。",
+    "verify_hint": "只读核对 requirements.txt/poetry.lock 中 Django 版本是否低于 3.2.14 / 4.0.6。",
+    "remediation": "升级至受支持的 Django LTS 最新修补版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-34265",
+      "https://www.djangoproject.com/weblog/2022/jul/04/security-releases/"
+    ],
+    "kev": false,
+    "epss": { "score": 0.84, "percentile": 0.99 },
+    "published": "2022-07-04"
+  },
+  {
+    "cve_id": "CVE-2023-30861",
+    "product": "flask",
+    "affected_versions": "Flask < 2.2.5, 2.3.x < 2.3.2",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-539",
+    "descr": "Flask 搭配缓存代理且开启永久会话配置时缺失 Vary: Cookie 响应头的缓存隔离缺陷。",
+    "verify_hint": "只读检查 pip show flask 版本及 SESSION_REFRESH_EACH_REQUEST 配置。",
+    "remediation": "升级至 Flask 2.2.5 / 2.3.2 / 3.x 最新维护版本，并规范下游代理缓存策略。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-30861",
+      "https://github.com/pallets/flask/security/advisories/GHSA-m2qf-hxjv-5gpq"
+    ],
+    "kev": false,
+    "epss": { "score": 0.08, "percentile": 0.81 },
+    "published": "2023-05-02"
+  },
+  {
+    "cve_id": "CVE-2021-3129",
+    "product": "laravel",
+    "affected_versions": "Laravel <= 8.4.2 搭配 facade/ignition <= 2.5.1 且开启 APP_DEBUG=true",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-94",
+    "descr": "Laravel 生产环境误开调试模式搭配旧版 Ignition 扩展引发的安全边界缺陷。",
+    "verify_hint": "只读检查 composer.lock 中 facade/ignition 版本并确认线上 APP_DEBUG=false。",
+    "remediation": "关闭线上 APP_DEBUG，移除生产环境的开发调试包并升级 Laravel/Ignition。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2021-3129",
+      "https://github.com/facade/ignition/releases"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.999 },
+    "published": "2021-01-12"
+  },
+  {
+    "cve_id": "CVE-2024-52301",
+    "product": "laravel",
+    "affected_versions": "Laravel < 11.31.0, < 10.48.23",
+    "severity": "HIGH",
+    "cvss": 8.7,
+    "cwe": "CWE-454",
+    "descr": "Laravel 在 PHP 开启 register_argc_argv 配置时通过查询串影响运行环境判定的配置边界缺陷。",
+    "verify_hint": "只读核对 Laravel 版本及 php.ini 中 register_argc_argv 配置值。",
+    "remediation": "升级至 Laravel 11.31.0 / 10.48.23 及以上，并在 Web PHP 配置中关闭 register_argc_argv。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-52301",
+      "https://github.com/laravel/framework/security/advisories"
+    ],
+    "kev": false,
+    "epss": { "score": 0.14, "percentile": 0.87 },
+    "published": "2024-11-12"
+  },
+  {
+    "cve_id": "CVE-2018-7600",
+    "product": "drupal",
+    "affected_versions": "Drupal 6.x, 7.x < 7.58, 8.x < 8.5.1",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-20",
+    "descr": "Drupal Form API 渲染数组键名校验不足引发的高危输入处理缺陷（SA-CORE-2018-002）。",
+    "verify_hint": "只读检查 Drupal 核心版本号（core/lib/Drupal.php 或 composer.lock）。",
+    "remediation": "升级至受官方支持的 Drupal 10/11 最新安全维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2018-7600",
+      "https://www.drupal.org/sa-core-2018-002"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.999 },
+    "published": "2018-03-29"
+  },
+  {
+    "cve_id": "CVE-2023-22515",
+    "product": "confluence",
+    "affected_versions": "Atlassian Confluence Data Center & Server 8.0.0 - 8.5.1",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-287",
+    "descr": "Atlassian Confluence 8.x 外部可控属性绑定导致初始化流程状态变更的访问控制缺陷。",
+    "verify_hint": "只读核对 Confluence 版本是否位于 8.0.0 至 8.5.1 区间及公网暴露情况。",
+    "remediation": "立即升级至 Confluence 8.5.2 / 8.6.0 及以上安全版本，并核查管理员账号清单。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2023-22515",
+      "https://confluence.atlassian.com/security/cve-2023-22515-privilege-escalation-vulnerability-in-confluence-data-center-and-server-1295682276.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.999 },
+    "published": "2023-10-04"
+  },
+  {
+    "cve_id": "CVE-2022-26134",
+    "product": "confluence",
+    "affected_versions": "Atlassian Confluence Server & Data Center >= 1.3.0 (未修补版本)",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-917",
+    "descr": "Atlassian Confluence URI 表达式求值边界缺陷。",
+    "verify_hint": "只读检查 Confluence 构建版本是否达到官方修复基线（7.4.17/7.13.7/7.18.1+）。",
+    "remediation": "升级至官方最新维护版本，并将协同文档服务收敛至内网或零信任网关后方。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-26134",
+      "https://confluence.atlassian.com/doc/confluence-security-advisory-2022-06-02-1130377146.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.97, "percentile": 0.999 },
+    "published": "2022-06-02"
+  },
+  {
+    "cve_id": "CVE-2022-0540",
+    "product": "jira",
+    "affected_versions": "Atlassian Jira & Jira Service Management < 8.13.18, < 8.20.6, < 8.22.0",
+    "severity": "CRITICAL",
+    "cvss": 9.9,
+    "cwe": "CWE-287",
+    "descr": "Atlassian Seraph 认证框架在特定应用配置下的访问控制边界缺陷。",
+    "verify_hint": "只读核对 Jira 系统信息版本号及第三方插件权限配置。",
+    "remediation": "升级至 Jira 8.13.18 / 8.20.6 / 8.22.0 及以上 LTS 维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-0540",
+      "https://confluence.atlassian.com/jira/jira-security-advisory-2022-04-20-1115127899.html"
+    ],
+    "kev": true,
+    "epss": { "score": 0.96, "percentile": 0.996 },
+    "published": "2022-04-20"
+  },
+  {
+    "cve_id": "CVE-2024-4956",
+    "product": "nexus",
+    "affected_versions": "Sonatype Nexus Repository 3 < 3.68.1",
+    "severity": "HIGH",
+    "cvss": 7.5,
+    "cwe": "CWE-22",
+    "descr": "Sonatype Nexus Repository 3 静态资源路径解析边界校验缺陷。",
+    "verify_hint": "只读检查 Nexus 3 版本是否低于 3.68.1 以及是否公网暴露。",
+    "remediation": "升级至 Nexus Repository 3.68.1 及以上安全版本，并将制品库隔离在受控内网。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-4956",
+      "https://support.sonatype.com/hc/en-us/articles/29416509323923"
+    ],
+    "kev": true,
+    "epss": { "score": 0.95, "percentile": 0.995 },
+    "published": "2024-05-16"
+  },
+  {
+    "cve_id": "CVE-2019-16097",
+    "product": "harbor",
+    "affected_versions": "Harbor 1.7.0 - 1.8.2",
+    "severity": "CRITICAL",
+    "cvss": 9.8,
+    "cwe": "CWE-269",
+    "descr": "Harbor 旧版本用户自助注册接口角色属性绑定校验不足的越权配置缺陷。",
+    "verify_hint": "只读核查 Harbor 部署版本（/api/v2.0/systeminfo 或 Helm 版本）及自助注册开关。",
+    "remediation": "升级至 Harbor 最新受支持版本，关闭公开自助注册并接入企业 SSO。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2019-16097",
+      "https://github.com/goharbor/harbor/wiki/Harbor-FAQs"
+    ],
+    "kev": false,
+    "epss": { "score": 0.94, "percentile": 0.993 },
+    "published": "2019-09-12"
+  },
+  {
+    "cve_id": "CVE-2022-31668",
+    "product": "harbor",
+    "affected_versions": "Harbor < 2.4.3, < 2.5.3",
+    "severity": "HIGH",
+    "cvss": 8.1,
+    "cwe": "CWE-863",
+    "descr": "Harbor 特定权限配置下的制品管理接口访问边界控制缺陷。",
+    "verify_hint": "只读检查 Harbor 版本号及项目成员/Robot Account 权限矩阵。",
+    "remediation": "升级至 Harbor 2.5.3+ 或最新 2.10+/2.11+ 维护版本。",
+    "advisories": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2022-31668",
+      "https://github.com/goharbor/harbor/security/advisories"
+    ],
+    "kev": false,
+    "epss": { "score": 0.04, "percentile": 0.72 },
+    "published": "2022-07-14"
+  }
+]
