@@ -75,6 +75,104 @@ export const DEFAULT_PROBE_TOOLS = [
 	"sqlite3",
 ] as const;
 
+/**
+ * 可作为真实执行证据源的工具白名单（read 需额外满足读取目标 URL 或 /tmp/nuwa/ 产物条件）。
+ */
+export const TRUSTED_EVIDENCE_TOOLS = [
+	"bash",
+	"sh",
+	"shell",
+	"exec",
+	"autoexec",
+	"browser",
+	"fetch",
+	"web_fetch",
+	"http",
+	"curl",
+	"ssh",
+	"read",
+] as const;
+
+const TRUSTED_TOOL_SET = new Set<string>(TRUSTED_EVIDENCE_TOOLS);
+
+/**
+ * 严禁记入执行证据账本的编排、思考、交互与本地修改工具集合（彻底阻断 task 子代理文本幻觉污染账本）。
+ */
+const UNTRUSTED_ORCHESTRATION_TOOLS = new Set<string>([
+	"task",
+	"subagent",
+	"agent",
+	"delegate",
+	"eval",
+	"todo",
+	"todowrite",
+	"todo_write",
+	"todoread",
+	"todo_read",
+	"think",
+	"thinking",
+	"thought",
+	"ask",
+	"ask_user",
+	"ask_question",
+	"plan",
+	"enter_plan_mode",
+	"exit_plan_mode",
+	"write",
+	"edit",
+	"multi_edit",
+	"apply_patch",
+	"notebook_edit",
+	"web_search",
+	"websearch",
+	"google_search",
+]);
+
+function isNuwaTmpArtifactPath(rawPath: string): boolean {
+	const trimmed = rawPath.trim();
+	if (!trimmed) return false;
+	const resolved = resolve(trimmed).replace(/\\/g, "/");
+	return resolved.startsWith("/tmp/nuwa/") || resolved.startsWith("/private/tmp/nuwa/");
+}
+
+function extractReadTarget(input?: Record<string, unknown> | string | null): string {
+	if (typeof input === "string") return input.trim();
+	if (!input || typeof input !== "object") return "";
+	for (const key of ["path", "file_path", "file", "url", "command"]) {
+		const val = input[key];
+		if (typeof val === "string" && val.trim()) {
+			return val.trim();
+		}
+	}
+	return "";
+}
+
+/**
+ * 判断一次工具事件是否允许作为可信执行证据源记入 exec-ledger：
+ * - 明确拒绝 task、eval、todo、think、ask 及所有 nuwa_* 工具；
+ * - read 仅在读取 http(s):// 目标 URL 或 /tmp/nuwa/ 产物文件时返回 true；
+ * - 其余工具需命中 TRUSTED_EVIDENCE_TOOLS（含 browser_* 子动作）。
+ */
+export function isTrustedEvidenceEvent(
+	toolName: string,
+	input?: Record<string, unknown> | string | null,
+): boolean {
+	const name = String(toolName ?? "").trim().toLowerCase();
+	if (!name) return false;
+	if (name.startsWith("nuwa_") || UNTRUSTED_ORCHESTRATION_TOOLS.has(name)) {
+		return false;
+	}
+	if (name === "read" || name === "read_file") {
+		const target = extractReadTarget(input);
+		if (!target) return false;
+		return /^https?:\/\//i.test(target) || isNuwaTmpArtifactPath(target);
+	}
+	if (name.startsWith("browser_")) {
+		return true;
+	}
+	return TRUSTED_TOOL_SET.has(name);
+}
+
 interface MemoryLedgerRecord extends ExecLedgerEntry {
 	rawOutput?: string;
 }
@@ -149,13 +247,25 @@ function writeDiskLedger(root: string, entries: readonly ExecLedgerEntry[]): voi
 
 /**
  * 记录一次真实工具执行结果：同步更新进程内环形缓冲与 <root>/.nuwa/exec-ledger.jsonl（滚动保留最近 200 条摘要与 SHA1）。
+ * 防御性拒绝 task / eval / todo / think / ask / nuwa_* 等非执行编排工具，防止子代理幻觉文本污染账本。
  */
 export function recordToolExecution(root: string, rec: ExecRecordInput): void {
+	const rawTool = String(rec.tool ?? "").trim();
+	const normTool = rawTool.toLowerCase();
+	if (!normTool || normTool.startsWith("nuwa_") || UNTRUSTED_ORCHESTRATION_TOOLS.has(normTool)) {
+		return;
+	}
+	if (normTool === "read" || normTool === "read_file") {
+		if (!isTrustedEvidenceEvent(normTool, { path: rec.command })) {
+			return;
+		}
+	}
+
 	const normRoot = resolve(root || process.cwd());
 	const rawOutput = String(rec.output ?? "");
 	const entry: MemoryLedgerRecord = {
 		ts: new Date().toISOString(),
-		tool: String(rec.tool || "unknown"),
+		tool: rawTool,
 		...(rec.command ? { command: String(rec.command).slice(0, 1000) } : {}),
 		...(rec.sessionId ? { sessionId: String(rec.sessionId) } : {}),
 		sha1: sha1Hex(rawOutput),
@@ -301,12 +411,21 @@ export function verifyExecutionEvidence(root: string, input: VerifyEvidenceInput
 
 	const hasHist = memRecords.length > 0 || diskRecords.length > 0;
 	const strictActive = Boolean(input.strict) || envMode === "1";
+	const normKind = String(input.kind ?? "").trim().toLowerCase();
 
 	if (isFlagCheck && (strictActive || hasHist)) {
 		return {
 			ok: false,
 			verified: false,
 			reason: `证据复验未通过: flag 未在近期真实执行账本或 /tmp/nuwa/${input.projectId}/ 产物中出现`,
+		};
+	}
+
+	if ((normKind === "vuln" || normKind === "cred") && (strictActive || hasHist)) {
+		return {
+			ok: false,
+			verified: false,
+			reason: `证据复验未通过: ${input.kind} 的关键回显未在近期真实执行账本或 /tmp/nuwa/${input.projectId}/ 产物中命中`,
 		};
 	}
 
