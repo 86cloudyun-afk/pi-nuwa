@@ -1,0 +1,80 @@
+{
+  "replace": false,
+  "rules": [
+    {
+      "key": "recon:http",
+      "phase": "recon",
+      "timeoutMs": 18000,
+      "parse": "http"
+    },
+    {
+      "key": "recon:ports",
+      "phase": "recon",
+      "timeoutMs": 45000,
+      "parse": "ports",
+      "ports": [22, 80, 443, 3000, 3306, 5432, 6379, 8000, 8080, 8443, 9000]
+    },
+    {
+      "key": "recon:dirs",
+      "phase": "recon",
+      "timeoutMs": 45000,
+      "parse": "dirs",
+      "paths": [
+        "/admin",
+        "/login",
+        "/api",
+        "/api/v1",
+        "/openapi.json",
+        "/swagger.json",
+        "/graphql",
+        "/health",
+        "/metrics",
+        "/robots.txt"
+      ]
+    },
+    {
+      "key": "recon:tlsjs",
+      "phase": "recon",
+      "timeoutMs": 15000,
+      "parse": "tls"
+    },
+    {
+      "key": "surface:sensitive",
+      "phase": "surface",
+      "timeoutMs": 32000,
+      "parse": "probe",
+      "paths": [
+        "/robots.txt",
+        "/sitemap.xml",
+        "/.git/HEAD",
+        "/.env",
+        "/config.json",
+        "/backup.zip"
+      ]
+    },
+    {
+      "key": "surface:api",
+      "phase": "surface",
+      "timeoutMs": 28000,
+      "parse": "probe",
+      "paths": [
+        "/openapi.json",
+        "/swagger.json",
+        "/swagger/v1/swagger.json",
+        "/api/v1",
+        "/graphql"
+      ]
+    },
+    {
+      "key": "surface:health",
+      "phase": "surface",
+      "timeoutMs": 12000,
+      "parse": "probe",
+      "paths": [
+        "/healthz",
+        "/readyz",
+        "/actuator/health"
+      ]
+    }
+  ]
+}
