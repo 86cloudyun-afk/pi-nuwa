@@ -1,0 +1,254 @@
+[
+  {
+    "key": "nginx:nginx",
+    "tech_key": "nginx",
+    "title": "Nginx 反向代理与 Web 服务配置基线审计卡",
+    "keywords": "nginx,openresty,reverse-proxy,http",
+    "body": "【指纹特征】HTTP 响应头 Server: nginx 或常见 80/443 代理端口。\n【版本确认】只读核对 `nginx -v`、包管理器版本或受控环境响应头中的版本号。\n【配置核查点】核查 `server_tokens off` 是否关闭版本暴露；检查 `location` 与 `alias` 尾部斜杠是否成对一致；检查 `proxy_pass` 与 `X-Forwarded-*` 信任头边界；核查 `autoindex off` 与敏感状态页访问限制。\n【常见关联 CVE】CVE-2021-23017 (<1.20.1)、CVE-2022-41741 (<1.22.1)、CVE-2019-20372 (<1.17.7)。\n【加固建议】升级至官方稳定维护分支，最小化启用模块，配置 TLS 1.2+ 与严格访问控制列表。"
+  },
+  {
+    "key": "apache:tomcat",
+    "tech_key": "tomcat",
+    "title": "Apache Tomcat Servlet 容器配置基线审计卡",
+    "keywords": "tomcat,apache-tomcat,catalina,jsp,ajp",
+    "body": "【指纹特征】常见 8080/8443/8009 端口、JSESSIONID Cookie 或默认错误页标识。\n【版本确认】只读检查 `catalina.sh version`、`RELEASE-NOTES` 或受控响应元信息。\n【配置核查点】确认非必要时关闭或仅内网监听 8009 AJP 连接器；核查 `/manager`、`/host-manager` 是否启用强认证与来源 IP 白名单；核查 `readonly` 静态写入参数及目录列表关闭状态；确认默认示例应用已移除。\n【常见关联 CVE】CVE-2020-1938 (<9.0.31)、CVE-2024-50379 (<9.0.98)、CVE-2025-24813 (<9.0.99)。\n【加固建议】升级至最新安全版本，以低权限系统账号运行服务，最小化开放连接器与管理端点。"
+  },
+  {
+    "key": "apache:httpd",
+    "tech_key": "apache",
+    "title": "Apache HTTP Server (httpd) 配置基线审计卡",
+    "keywords": "apache,httpd,apache2,mod_proxy,htaccess",
+    "body": "【指纹特征】HTTP 响应头 Server: Apache 或 httpd 服务进程。\n【版本确认】只读查看 `httpd -v`、`apache2 -v` 或操作系统软件源版本记录。\n【配置核查点】检查 `ServerTokens Prod` 与 `ServerSignature Off`；核查 `<Directory>` 权限声明是否遵循默认拒绝；核查 `Options -Indexes`、`mod_status` 访问限制及 `mod_proxy` 规则边界。\n【常见关联 CVE】CVE-2021-41773 (2.4.49)、CVE-2021-42013 (2.4.49-2.4.50)、CVE-2024-38476 (<2.4.60)。\n【加固建议】升级至 httpd 2.4 最新修补版，禁用未使用模块，严格限定目录映射与代理转发规则。"
+  },
+  {
+    "key": "php:php",
+    "tech_key": "php",
+    "title": "PHP 运行时与 FPM 配置基线审计卡",
+    "keywords": "php,php-fpm,phpinfo,composer",
+    "body": "【指纹特征】响应头 X-Powered-By: PHP、PHPSESSID Cookie 或 `.php` 扩展路由。\n【版本确认】只读核对 `php -v` 或 `composer.lock` 运行时版本约束。\n【配置核查点】确认生产环境设置 `expose_php = Off`、`display_errors = Off`；核查 `allow_url_include = Off`、`open_basedir` 目录隔离与 `disable_functions` 限制；确认未公开暴露测试页或 phpinfo 页面。\n【常见关联 CVE】CVE-2024-4577 (<8.3.8)、CVE-2019-11043 (<7.3.11)、CVE-2023-3824 (<8.2.8)。\n【加固建议】迁移至受官方安全支持的 PHP 8.2/8.3+ 分支，开启 HttpOnly/Secure 会话 Cookie，并限制上传目录脚本解析。"
+  },
+  {
+    "key": "vmware:spring",
+    "tech_key": "spring",
+    "title": "Spring Framework / Spring Boot 配置基线审计卡",
+    "keywords": "spring,spring-boot,spring-cloud,spring-mvc,actuator",
+    "body": "【指纹特征】Whitelabel Error Page、Spring Boot 应用配置或 Actuator 管理路径。\n【版本确认】只读核查 `pom.xml`、`build.gradle` 或 Jar 包 `MANIFEST.MF` 中的依赖版本。\n【配置核查点】核查 `management.endpoints.web.exposure.include` 是否仅开放必要健康探针（如 `health`），避免公开敏感监控端点；确认管理端口与业务端口隔离并要求鉴权；核查参数绑定白名单与依赖组件版本。\n【常见关联 CVE】CVE-2022-22965 (<5.3.18)、CVE-2022-22963 (<3.2.3)、CVE-2024-38816 (<6.1.13)。\n【加固建议】保持 Spring Framework/Boot/Cloud 处于官方维护小版本，收敛 Actuator 暴露范围并启用统一鉴权。"
+  },
+  {
+    "key": "alibaba:fastjson",
+    "tech_key": "fastjson",
+    "title": "Fastjson 序列化组件配置基线审计卡",
+    "keywords": "fastjson,fastjson2,json,alibaba",
+    "body": "【指纹特征】Java 服务端 JSON 接口依赖 `com.alibaba:fastjson` 或 `fastjson2`。\n【版本确认】只读检查 `pom.xml`、`build.gradle` 或部署包 `WEB-INF/lib/fastjson-*.jar` 版本号。\n【配置核查点】确认未启用不安全的动态类型自动解析开关；核查是否开启 SafeMode 模式或已迁移至 `fastjson2`；检查全局反序列化白名单配置。\n【常见关联 CVE】CVE-2022-25845 (<=1.2.80)、CVE-2017-18349 (<=1.2.24)。\n【加固建议】升级至 Fastjson 1.2.83 并开启 SafeMode，或迁移至官方长期维护的 Fastjson2 或 Jackson。"
+  },
+  {
+    "key": "topthink:thinkphp",
+    "tech_key": "thinkphp",
+    "title": "ThinkPHP 框架配置基线审计卡",
+    "keywords": "thinkphp,topthink,php-framework",
+    "body": "【指纹特征】PHP 应用目录含 `thinkphp/`、`vendor/topthink` 或框架风格路由结构。\n【版本确认】只读核对 `composer.lock` 或框架版本常量定义文件。\n【配置核查点】确认生产环境关闭 `app_debug` 与 `app_trace` 调试模式；核查多语言包与路由解析白名单配置；检查日志目录 `runtime/log` 是否禁止 Web 直接访问。\n【常见关联 CVE】CVE-2018-20062 (<5.0.24)、CVE-2022-47945 (<6.0.14)。\n【加固建议】升级至官方最新维护版本，强制关闭线上调试开关，使用参数化查询并隔离可写目录。"
+  },
+  {
+    "key": "apache:shiro",
+    "tech_key": "shiro",
+    "title": "Apache Shiro 认证授权框架配置基线审计卡",
+    "keywords": "shiro,apache-shiro,rememberme,java-auth",
+    "body": "【指纹特征】HTTP 响应 Set-Cookie 中出现 `rememberMe=deleteMe` 标识或 Java 依赖 `shiro-core`。\n【版本确认】只读核查构建清单或 `shiro-core-*.jar` 实际版本号。\n【配置核查点】确认 RememberMe 加密密钥采用环境独立随机强密钥并定期轮换（严禁沿用默认密钥）；核查路径鉴权规则与底层 Web 框架路径归一化行为是否一致。\n【常见关联 CVE】CVE-2016-4437 (<1.2.5)、CVE-2020-1957 (<1.5.2)、CVE-2022-32532 (<1.9.1)。\n【加固建议】升级至最新 Shiro 版本，非必要场景关闭 RememberMe 功能，并统一网关与应用层鉴权路径匹配策略。"
+  },
+  {
+    "key": "redis:redis",
+    "tech_key": "redis",
+    "title": "Redis 内存数据库配置基线审计卡",
+    "keywords": "redis,redis-server,cache,kv",
+    "body": "【指纹特征】默认 TCP 6379 端口及 Redis RESP 协议服务标识。\n【版本确认】只读执行 `redis-server --version` 或受控内网查看 `INFO server` 中的 `redis_version`。\n【配置核查点】核查 `bind` 是否限定在受信任内网网卡与 `protected-mode yes`；确认启用强口令或 Redis 6+ ACL 细粒度权限；确认禁用公网直连并按需重命名/禁用高风险管理命令；核查 TLS 传输加密。\n【常见关联 CVE】CVE-2022-0543 (Debian/Ubuntu Lua 打包缺陷)、CVE-2024-31449 (<7.4.1)、CVE-2023-41056 (<7.2.4)。\n【加固建议】升级至官方稳定版，始终仅内网监听，启用 ACL 最小权限与 TLS，并以非特权系统账号运行。"
+  },
+  {
+    "key": "oracle:mysql",
+    "tech_key": "mysql",
+    "title": "MySQL / MariaDB 关系数据库配置基线审计卡",
+    "keywords": "mysql,mysqld,mariadb,sql,database",
+    "body": "【指纹特征】默认 TCP 3306 端口与 MySQL 协议握手版本信息。\n【版本确认】只读核对 `mysqld --version` 或授权查询 `SELECT VERSION();`。\n【配置核查点】核查监听地址是否限制在内网并开启 TLS；确认不存在匿名账号、空口令或过度授权的 `%` 远程管理员；核查 `secure_file_priv` 与 `local_infile = OFF` 配置；核查审计日志与慢查询日志归档。\n【常见关联 CVE】CVE-2012-2122 (<5.5.24)、CVE-2016-6662 (<5.7.15)、CVE-2024-20960 (<8.0.36)。\n【加固建议】保持官方季度安全更新，应用账号按库表授予最小读写权限，并强制所有客户端走参数化查询。"
+  },
+  {
+    "key": "postgresql:postgres",
+    "tech_key": "postgres",
+    "title": "PostgreSQL 关系数据库配置基线审计卡",
+    "keywords": "postgres,postgresql,pgsql,database",
+    "body": "【指纹特征】默认 TCP 5432 端口及 PostgreSQL 启动协议服务。\n【版本确认】只读查看 `postgres --version` 或授权查询 `SELECT version();`。\n【配置核查点】审查 `pg_hba.conf` 认证方式（优先 `scram-sha-256`，禁止对非本机使用 `trust`）；核查 `ssl = on` 与监听地址限制；审查超级用户角色清单及外部扩展安装权限。\n【常见关联 CVE】CVE-2019-9193 (角色权限配置关注项)、CVE-2024-10979 (<17.1)、CVE-2023-5869 (<16.1)。\n【加固建议】及时升级次版本安全补丁，业务连接严禁使用超级用户账号，开启行级/模式级最小权限控制。"
+  },
+  {
+    "key": "grafana:grafana",
+    "tech_key": "grafana",
+    "title": "Grafana 监控可视化平台配置基线审计卡",
+    "keywords": "grafana,dashboard,observability,metrics",
+    "body": "【指纹特征】默认 3000 端口、登录页 Grafana 标识或 `/api/health` 健康元数据。\n【版本确认】只读核对 `grafana-server -v`、包版本或受控 `/api/health` 返回的 `version` 字段。\n【配置核查点】核查 `auth.anonymous` 是否关闭匿名访问；确认禁用公开自助注册 `allow_sign_up = false`；核查数据源只读账号权限与已安装插件清单；确认反向代理认证头仅信任可信网关。\n【常见关联 CVE】CVE-2021-43798 (8.0.0-8.3.0)、CVE-2022-39201 (<9.1.8)、CVE-2024-9264 (<11.2.2)。\n【加固建议】升级至官方最新维护版，启用 SSO/MFA 认证，清理冗余插件并限制仅内网或 VPN 访问。"
+  },
+  {
+    "key": "gitlab:gitlab",
+    "tech_key": "gitlab",
+    "title": "GitLab 代码托管与 DevSecOps 平台配置基线审计卡",
+    "keywords": "gitlab,git,ci-cd,devops",
+    "body": "【指纹特征】GitLab 登录界面、`_gitlab_session` Cookie 或 `/users/sign_in` 路由。\n【版本确认】只读查看 `gitlab-rake gitlab:env:info` 或授权管理面板版本号。\n【配置核查点】确认已关闭非预期公开注册并强制开启 2FA；核查仓库默认可见性为 Private；检查 Runner 隔离配置与 CI 变量掩码/保护标记；核查 SAML/OAuth 身份提供方签名校验状态。\n【常见关联 CVE】CVE-2021-22205 (<13.10.3)、CVE-2023-7028 (<16.7.2)、CVE-2024-45409 (<17.3.3)。\n【加固建议】紧跟 GitLab 官方双周安全发布及时打补丁，收敛公网暴露面并定期轮换访问令牌。"
+  },
+  {
+    "key": "jenkins:jenkins",
+    "tech_key": "jenkins",
+    "title": "Jenkins 持续集成平台配置基线审计卡",
+    "keywords": "jenkins,x-jenkins,ci,hudson",
+    "body": "【指纹特征】响应头 `X-Jenkins`、默认 8080 端口或 Jenkins 登录与构建控制台。\n【版本确认】只读核对 `jenkins.war` 清单、包版本或受控环境中的版本信息。\n【配置核查点】确认已禁用匿名只读访问与无鉴权构建触发；核查基于矩阵/角色的细粒度授权及代理节点最小权限；审查 Script Console 仅管理员可用并限制公网访问；定期更新核心与插件版本。\n【常见关联 CVE】CVE-2024-23897 (<2.442 / LTS <2.426.3)、CVE-2024-43044 (<2.471 / LTS <2.452.4)。\n【加固建议】升级至最新 LTS 与插件基线，启用 CSRF 保护，隔离构建节点并保护凭据存储。"
+  },
+  {
+    "key": "wordpress:wordpress",
+    "tech_key": "wordpress",
+    "title": "WordPress 内容管理系统配置基线审计卡",
+    "keywords": "wordpress,wp-content,wp-admin,wp-json,cms",
+    "body": "【指纹特征】页面引用 `/wp-content/`、`/wp-includes/` 或存在 `/wp-json/` REST 元数据路由。\n【版本确认】只读核查 `wp-includes/version.php` 或 `wp core version`（WP-CLI）。\n【配置核查点】核查核心、主题与所有插件是否为最新维护版并删除停用插件；确认关闭后台文件编辑 `DISALLOW_FILE_EDIT`；核查 `xmlrpc.php` 是否按需禁用；确认 `wp-config.php` 权限为 600 且不暴露备份文件。\n【常见关联 CVE】CVE-2023-2745 (<6.2.1)、CVE-2022-21661 (<5.8.3)、CVE-2024-27956 (第三方插件生态缺陷示例)。\n【加固建议】启用核心自动安全更新，限制 `/wp-admin` 来源访问并开启登录限流与双因素认证。"
+  },
+  {
+    "key": "graphql:graphql",
+    "tech_key": "graphql",
+    "title": "GraphQL API 网关与查询引擎配置基线审计卡",
+    "keywords": "graphql,graphiql,apollo,api",
+    "body": "【指纹特征】常见 `/graphql`、`/api/graphql` 端点或开发环境 GraphiQL 界面。\n【版本确认】只读核查服务端依赖清单（如 `graphql-js`、`apollo-server`、`graphql-java` 等版本）。\n【配置核查点】确认生产环境关闭 Introspection 内省与 GraphiQL 调试台；核查查询深度限制（Depth Limit）、复杂度计费（Complexity Limit）与批量查询上限；核查字段级与对象级授权校验。\n【常见关联 CVE】CVE-2022-37734 (graphql-java 嵌套指令处理缺陷)、CVE-2023-44487 (HTTP/2 流重置生态影响)。\n【加固建议】强制持久化查询（Persisted Queries）或复杂度配额，收敛错误信息细节，所有解析器实施统一鉴权。"
+  },
+  {
+    "key": "swagger:swagger",
+    "tech_key": "swagger",
+    "title": "Swagger UI / OpenAPI 文档暴露面审计卡",
+    "keywords": "swagger,swagger-ui,openapi,api-docs",
+    "body": "【指纹特征】路径 `/swagger-ui/`、`/v2/api-docs`、`/v3/api-docs` 或 `/openapi.json`。\n【版本确认】只读检查前端静态包或依赖清单中的 `swagger-ui` / `springdoc-openapi` 版本。\n【配置核查点】核查生产环境是否已禁用或鉴权保护 API 文档端点；确认文档中无测试账号、内网地址或内部运维接口说明；核查 Swagger UI 是否禁用了外部远程 YAML/JSON URL 加载参数。\n【常见关联 CVE】CVE-2019-17495 (swagger-ui <3.23.11)、CVE-2018-25031 (swagger-ui <3.18.0)。\n【加固建议】生产环境默认关闭交互式 API 文档或仅限内网网关访问，升级最新 Swagger UI 并在接口层统一鉴权。"
+  },
+  {
+    "key": "apache:log4j",
+    "tech_key": "log4j",
+    "title": "Apache Log4j2 日志组件依赖基线审计卡",
+    "keywords": "log4j,log4j2,log4j-core,java-logging",
+    "body": "【指纹特征】Java 应用依赖 `org.apache.logging.log4j:log4j-core`（含传递依赖）。\n【版本确认】只读检索构建依赖树（`mvn dependency:tree`）或检查部署包中 `log4j-core-*.jar` 版本号。\n【配置核查点】全面盘点主应用与第三方组件中的传递依赖；核查日志模板是否禁止动态 JNDI 查找配置；确认已将全部受影响 2.x 依赖升级至修复基线。\n【常见关联 CVE】CVE-2021-44228 (2.0-beta9 至 2.14.1)、CVE-2021-45046 (<=2.15.0)。\n【加固建议】统一升级至 Log4j 2.17.1+ 或最新 2.2x 稳定版本，并将依赖版本扫描纳入 CI 门禁。"
+  },
+  {
+    "key": "apache:struts",
+    "tech_key": "struts",
+    "title": "Apache Struts2 Web 框架配置基线审计卡",
+    "keywords": "struts,struts2,action,ognl,java",
+    "body": "【指纹特征】URL 中出现 `.action`/`.do` 扩展或应用依赖 `struts2-core`。\n【版本确认】只读核对 `pom.xml` 或 `WEB-INF/lib/struts2-core-*.jar` 实际版本号。\n【配置核查点】确认生产环境关闭 `struts.devMode`；核查文件上传拦截器配置、大小与类型白名单；检查动态方法调用（DMI）是否关闭；持续跟踪官方安全通告。\n【常见关联 CVE】CVE-2017-5638 (<2.3.32 / <2.5.10.1)、CVE-2020-17530 (<2.5.26)、CVE-2023-50164 (<6.3.0.2)。\n【加固建议】升级至官方最新 Struts 6.x 安全版本，禁用开发模式与非必要插件，加强边界输入校验。"
+  },
+  {
+    "key": "oracle:weblogic_server",
+    "tech_key": "weblogic",
+    "title": "Oracle WebLogic Server 应用服务器配置基线审计卡",
+    "keywords": "weblogic,oracle-weblogic,t3,iiop,console",
+    "body": "【指纹特征】默认 7001/7002 端口、管理控制台路径 `/console` 或 T3/IIOP 服务监听。\n【版本确认】只读查看 `$WL_HOME` 补丁清单（`opatch lsinventory`）或版本日志。\n【配置核查点】确认 `/console` 管理控制台仅限运维专网访问；核查 T3/IIOP 协议连接过滤器与公网隔离策略；核查是否及时安装 Oracle 季度 CPU 关键补丁更新；确认生产模式已启用。\n【常见关联 CVE】CVE-2020-14882 (10.3.6/12.1.3/12.2.1/14.1.1)、CVE-2023-21839 (12.2.1/14.1.1)、CVE-2019-2725。\n【加固建议】按季度同步应用 Oracle CPU 补丁，网络层封禁非授权管理端口与 T3/IIOP 外部访问。"
+  },
+  {
+    "key": "alibaba:nacos",
+    "tech_key": "nacos",
+    "title": "Alibaba Nacos 配置与服务发现中心配置基线审计卡",
+    "keywords": "nacos,config-center,registry,alibaba",
+    "body": "【指纹特征】默认 8848/9848 端口、控制台 `/nacos/` 路径或配置中心 API。\n【版本确认】只读核查启动日志、发布包版本或受控内部管理状态信息。\n【配置核查点】确认强制开启鉴权 `nacos.core.auth.enabled=true`；核查 `nacos.core.auth.plugin.nacos.token.secret.key` 已替换为高熵随机 Base64 密钥并禁用默认值；确认配置中心仅在内网运行且客户端按命名空间最小权限隔离。\n【常见关联 CVE】CVE-2021-29441 (<1.4.1)、CVE-2023-29217 (配置与鉴权边界修复)。\n【加固建议】升级至 Nacos 2.3+ 最新安全版，严格隔离 8848/9848 端口至内部网格并启用配置加密。"
+  },
+  {
+    "key": "elastic:elasticsearch",
+    "tech_key": "elasticsearch",
+    "title": "Elasticsearch 搜索引擎配置基线审计卡",
+    "keywords": "elasticsearch,es,elastic,lucene",
+    "body": "【指纹特征】默认 9200/9300 端口及集群健康与节点信息 JSON 接口。\n【版本确认】只读查看 `elasticsearch --version` 或受控查询根端点 `version.number`。\n【配置核查点】确认启用 `xpack.security.enabled: true` 与节点间 TLS 加密；确认 9200/9300 禁止对公网开放；核查基于角色的索引读写权限分离与快照仓库访问控制。\n【常见关联 CVE】CVE-2015-1427 (<1.4.3)、CVE-2021-22145 (<7.13.4)。\n【加固建议】升级至受支持的 Elastic 8.x 分支，默认启用安全认证、TLS 与最小权限 API Key。"
+  },
+  {
+    "key": "elastic:kibana",
+    "tech_key": "kibana",
+    "title": "Kibana 日志分析与可视化平台配置基线审计卡",
+    "keywords": "kibana,elastic,kbn,dashboard",
+    "body": "【指纹特征】默认 5601 端口、响应头 `kbn-name` 或 Kibana 登录页面。\n【版本确认】只读检查 `kibana --version` 或受控管理界面状态页版本号。\n【配置核查点】核查与 Elasticsearch 通信是否启用 HTTPS 及最小权限服务账号；确认 `server.host` 仅绑定内网或受鉴权反向代理保护；核查空间（Space）隔离与只读角色授权。\n【常见关联 CVE】CVE-2019-7609 (<6.6.1)、CVE-2024-37287 (<8.15.0)。\n【加固建议】与 Elasticsearch 同步升级至最新安全版本，启用统一身份认证与访问审计日志。"
+  },
+  {
+    "key": "mongodb:mongodb",
+    "tech_key": "mongodb",
+    "title": "MongoDB 文档数据库配置基线审计卡",
+    "keywords": "mongodb,mongo,mongod,nosql",
+    "body": "【指纹特征】默认 TCP 27017 端口与 MongoDB Wire 协议服务。\n【版本确认】只读执行 `mongod --version` 或授权查询 `db.version()`。\n【配置核查点】确认配置文件开启 `security.authorization: enabled`；核查 `net.bindIp` 仅限受控内网地址；确认启用 TLS 传输加密与副本集密钥认证；核查应用账号仅限目标业务库权限。\n【常见关联 CVE】CVE-2021-20329 (<4.4.9 / <5.0.3)、CVE-2019-2389 (<4.0.9)。\n【加固建议】升级至官方支持分支，禁用公网暴露，启用 RBAC 与静态/传输加密，规范服务端查询参数类型校验。"
+  },
+  {
+    "key": "minio:minio",
+    "tech_key": "minio",
+    "title": "MinIO 对象存储服务配置基线审计卡",
+    "keywords": "minio,s3,object-storage,bucket",
+    "body": "【指纹特征】默认 9000/9001 端口、响应头 `Server: MinIO` 或 S3 兼容接口。\n【版本确认】只读执行 `minio --version` 或核对容器镜像 Release 标签。\n【配置核查点】核查存储桶（Bucket）策略，确保非公开资源禁止匿名列表或读取；确认已替换默认初始凭据并启用独立 IAM Access Key；核查控制台端口仅限内网访问并开启 TLS。\n【常见关联 CVE】CVE-2023-28432 (<RELEASE.2023-03-20T20-16-18Z)、CVE-2024-24747 (<RELEASE.2024-01-31T20-20-33Z)。\n【加固建议】及时更新至最新 MinIO Release，遵循最小桶策略原则并定期轮换访问密钥。"
+  },
+  {
+    "key": "eclipse:jetty",
+    "tech_key": "jetty",
+    "title": "Eclipse Jetty Servlet 引擎配置基线审计卡",
+    "keywords": "jetty,eclipse-jetty,java-http,servlet",
+    "body": "【指纹特征】HTTP 响应头 `Server: Jetty(...)` 或嵌入式 Java HTTP 服务。\n【版本确认】只读核查依赖清单、`jetty-server-*.jar` 或启动日志中的版本号。\n【配置核查点】确认设置 `sendServerVersion=false` 隐藏版本标识；核查静态资源映射与 URI 路径规范化配置；检查 HTTP/2 流控与并发连接限额。\n【常见关联 CVE】CVE-2021-28164 (9.4.37-9.4.38)、CVE-2023-36478 (<10.0.16 / <11.0.16)。\n【加固建议】升级至 Jetty 12 或当前维护分支最新修补版，严格隔离 `WEB-INF` 等受保护目录访问。"
+  },
+  {
+    "key": "microsoft:iis",
+    "tech_key": "iis",
+    "title": "Microsoft IIS Web 服务器配置基线审计卡",
+    "keywords": "iis,microsoft-iis,aspnet,windows-web",
+    "body": "【指纹特征】HTTP 响应头 `Server: Microsoft-IIS/<ver>` 或 `X-Powered-By: ASP.NET`。\n【版本确认】只读核对 Windows Server 版本与系统补丁安装记录（KB 编号）。\n【配置核查点】核查请求筛选（Request Filtering）规则及隐藏敏感目录段；确认禁用目录浏览、短文件名暴露与不必要的 WebDAV/HTTP 动词；核查应用程序池使用独立低权限标识。\n【常见关联 CVE】CVE-2015-1635 (HTTP.sys)、CVE-2017-7269 (IIS 6.0 WebDAV)、CVE-2021-31166 (HTTP.sys)。\n【加固建议】保持 Windows 操作系统与 .NET 安全更新同步，最小化启用 IIS 功能角色并移除冗余响应头。"
+  },
+  {
+    "key": "openbsd:openssh",
+    "tech_key": "openssh",
+    "title": "OpenSSH 远程管理服务配置基线审计卡",
+    "keywords": "openssh,ssh,sshd,sftp",
+    "body": "【指纹特征】TCP 22 端口或自定义管理端口的 `SSH-2.0-OpenSSH_*` 服务标识。\n【版本确认】只读检查 `ssh -V`、`sshd -V` 或发行版安全公告补丁版本号（如 Debian/RHEL 反向移植版本）。\n【配置核查点】核查 `PermitRootLogin no` 与 `PasswordAuthentication no`（优先公钥认证）；检查 `AllowUsers`/`AllowGroups` 与堡垒机来源限制；核查 `LoginGraceTime` 与加密算法套件是否淘汰弱算法。\n【常见关联 CVE】CVE-2024-6387 (glibc 平台 8.5p1-9.7p1)、CVE-2023-38408 (<9.3p2)、CVE-2018-15473 (<7.8)。\n【加固建议】安装发行版最新 OpenSSH 安全更新，结合网络白名单/VPN 隔离管理端口并开启登录审计。"
+  },
+  {
+    "key": "djangoproject:django",
+    "tech_key": "django",
+    "title": "Django Python Web 框架配置基线审计卡",
+    "keywords": "django,python-web,csrftoken,wsgi",
+    "body": "【指纹特征】Cookie `csrftoken`/`sessionid`、`/admin/` 路由或 Python 依赖 `Django`。\n【版本确认】只读检查 `python3 -m django --version` 或 `requirements.txt`/`poetry.lock`。\n【配置核查点】确认生产环境 `DEBUG = False` 且 `ALLOWED_HOSTS` 明确列出合法域名；核查 `SECRET_KEY` 通过环境变量注入且不入库；核查 `SESSION_COOKIE_SECURE`、`CSRF_COOKIE_HTTPONLY` 与 `manage.py check --deploy` 告警。\n【常见关联 CVE】CVE-2024-42005 (<4.2.15 / <5.0.8)、CVE-2022-34265 (<4.0.6)、CVE-2023-36053 (<4.2.3)。\n【加固建议】保持 Django LTS 安全更新，统一使用 ORM 参数化查询并限制 `/admin` 管理后台访问来源。"
+  },
+  {
+    "key": "pallets:flask",
+    "tech_key": "flask",
+    "title": "Flask / Werkzeug Python Web 框架配置基线审计卡",
+    "keywords": "flask,werkzeug,jinja2,python-web",
+    "body": "【指纹特征】响应头 `Server: Werkzeug/...`、签名 `session` Cookie 或 Python 依赖 `Flask`。\n【版本确认】只读检查 `pip show flask werkzeug jinja2` 或锁定依赖文件。\n【配置核查点】严禁在生产环境开启 Werkzeug 交互式调试器（`debug=False`）；确认使用高熵 `SECRET_KEY` 并配合生产级 WSGI/ASGI 服务器（如 Gunicorn/Uvicorn）；核查模板渲染自动转义与 Cookie `SameSite/Secure/HttpOnly` 属性。\n【常见关联 CVE】CVE-2023-30861 (<2.3.2 / <2.2.5)、CVE-2019-14806 (Werkzeug <0.15.3)。\n【加固建议】升级 Flask、Werkzeug、Jinja2 至最新维护版本，分离开发调试配置与生产部署配置。"
+  },
+  {
+    "key": "laravel:laravel",
+    "tech_key": "laravel",
+    "title": "Laravel PHP 框架配置基线审计卡",
+    "keywords": "laravel,php-laravel,ignition,eloquent",
+    "body": "【指纹特征】Cookie `laravel_session`/`XSRF-TOKEN` 或 PHP 依赖 `laravel/framework`。\n【版本确认】只读检查 `php artisan --version` 或 `composer.lock` 版本信息。\n【配置核查点】确认生产环境 `APP_DEBUG=false` 且 `.env` 文件位于 Web 根目录之外或已被 Web 服务器禁止访问；核查 `APP_KEY` 定期轮换及 `storage/` 权限；确认开发调试依赖（如 Ignition）未暴露在线上。\n【常见关联 CVE】CVE-2021-3129 (facade/ignition <=2.5.1)、CVE-2024-52301 (<11.31.0)。\n【加固建议】升级 Laravel 及核心依赖至官方支持版本，开启配置缓存与安全响应头，禁用危险环境变量覆盖。"
+  },
+  {
+    "key": "drupal:drupal",
+    "tech_key": "drupal",
+    "title": "Drupal 内容管理系统配置基线审计卡",
+    "keywords": "drupal,drupal-cms,php-cms",
+    "body": "【指纹特征】响应头 `X-Generator: Drupal`、`/core/` 目录结构或 Drupal 站点元标记。\n【版本确认】只读核对 `composer.lock`、`core/lib/Drupal.php` 或 `drush status`。\n【配置核查点】确认及时跟进 Drupal 安全团队周三安全公告并更新核心与 Contrib 模块；核查文件上传目录禁止脚本执行；审查角色权限矩阵，限制匿名与普通注册用户的内容格式权限。\n【常见关联 CVE】CVE-2018-7600 (<7.58 / <8.5.1)、CVE-2019-6340 (<8.6.10)。\n【加固建议】迁移至受支持的 Drupal 10/11 分支，启用只读配置同步工作流并移除未使用模块。"
+  },
+  {
+    "key": "atlassian:confluence",
+    "tech_key": "confluence",
+    "title": "Atlassian Confluence 协同知识库配置基线审计卡",
+    "keywords": "confluence,atlassian-confluence,wiki",
+    "body": "【指纹特征】Confluence 登录页、`JSESSIONID`/Atlassian 标识或 `/wiki/` 路径。\n【版本确认】只读查看管理后台系统信息或安装包版本号。\n【配置核查点】核查初始化安装路径是否已锁定且禁止匿名注册与匿名空间访问；确认仅通过内网或受信任零信任网关访问；核查第三方市场插件版本与 Webhook 权限。\n【常见关联 CVE】CVE-2023-22515 (8.0.0-8.5.1)、CVE-2022-26134 (<7.18.1)、CVE-2023-22518 (<8.5.3)。\n【加固建议】第一时间升级至 Atlassian 官方修复版本，收敛公网暴露并启用强认证与操作审计日志。"
+  },
+  {
+    "key": "atlassian:jira",
+    "tech_key": "jira",
+    "title": "Atlassian Jira 项目协作平台配置基线审计卡",
+    "keywords": "jira,atlassian-jira,issue-tracker",
+    "body": "【指纹特征】Jira 登录界面、`atlassian.xsrf.token` Cookie 或 `/rest/api/2/serverInfo`。\n【版本确认】只读核对管理控制台系统信息或安装包构建版本。\n【配置核查点】核查匿名访问与公开看板/过滤器权限配置，防止内部项目元数据泄露；确认关闭公开自助注册；核查 SAML/SSO 与邮件模板渲染组件补丁级别。\n【常见关联 CVE】CVE-2019-11581 (<8.2.3)、CVE-2022-0540 (<8.22.2)、CVE-2020-14179 (<8.11.1)。\n【加固建议】升级至最新 Jira Data Center LTS 版本，限制未认证接口信息回显并实施最小权限空间隔离。"
+  },
+  {
+    "key": "sonatype:nexus",
+    "tech_key": "nexus",
+    "title": "Sonatype Nexus Repository 制品库配置基线审计卡",
+    "keywords": "nexus,sonatype,repository,artifact",
+    "body": "【指纹特征】默认 8081 端口、响应头 `Server: Nexus/...` 或 `NXSESSIONID` Cookie。\n【版本确认】只读检查安装包版本或受控管理界面系统状态页。\n【配置核查点】核查初始管理员口令是否已修改；确认按需关闭匿名读写访问；检查制品上传权限与代理仓库上游白名单，防止供应链依赖混淆；核查路径访问隔离。\n【常见关联 CVE】CVE-2019-7238 (<3.15.0)、CVE-2020-10199 (<3.21.2)、CVE-2024-4956 (<3.68.1)。\n【加固建议】升级至 Nexus 3 最新安全维护版本，将制品库隔离在研发内网并开启制品签名校验。"
+  },
+  {
+    "key": "goharbor:harbor",
+    "tech_key": "harbor",
+    "title": "Harbor 容器镜像仓库配置基线审计卡",
+    "keywords": "harbor,goharbor,container-registry,oci,docker",
+    "body": "【指纹特征】Harbor Web 控制台、`/api/v2.0/systeminfo` 或 OCI Registry 端点。\n【版本确认】只读核对部署版本清单、Helm Chart 版本或受控系统信息接口。\n【配置核查点】确认关闭公开用户自助注册并对接企业 OIDC/LDAP 身份源；核查项目可见性（避免核心业务镜像设为 Public）；确认开启镜像签名校验（Cosign/Notary）与 Trivy 自动漏洞扫描门禁。\n【常见关联 CVE】CVE-2019-16097 (<1.8.3)、CVE-2022-31668 (<2.5.4)。\n【加固建议】保持 Harbor 处于官方支持版本，开启最小权限机器人账号（Robot Account）并限制管理接口来源。"
+  }
+]

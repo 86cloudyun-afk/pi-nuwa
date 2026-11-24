@@ -1,0 +1,242 @@
+[
+  {
+    "id": "T1595",
+    "name": "Active Scanning（主动网络测绘）",
+    "tactics": "Reconnaissance",
+    "platforms": "PRE",
+    "summary": "通过外部网络探测识别开放端口、服务版本与可达入口的侦察类别。",
+    "detection_hint": "关注边界防火墙、WAF 与访问日志中的短时高频路径/端口探活基线异常。"
+  },
+  {
+    "id": "T1592",
+    "name": "Gather Victim Host Information（主机与组件信息收集）",
+    "tactics": "Reconnaissance",
+    "platforms": "PRE",
+    "summary": "通过公开响应头、错误页面或元信息识别软硬件组件及版本号的类别。",
+    "detection_hint": "核查服务配置是否关闭版本头暴露（如 server_tokens、expose_php）并统一错误页。"
+  },
+  {
+    "id": "T1590",
+    "name": "Gather Victim Network Information（网络与域名拓扑收集）",
+    "tactics": "Reconnaissance",
+    "platforms": "PRE",
+    "summary": "通过 DNS 记录、证书 SAN 扩展与公开路由信息梳理网络边界资产的类别。",
+    "detection_hint": "定期盘点公网证书透明度日志、DNS 子域记录及边缘暴露面清单。"
+  },
+  {
+    "id": "T1190",
+    "name": "Exploit Public-Facing Application（面向公网应用缺陷风险）",
+    "tactics": "Initial Access",
+    "platforms": "Linux, Windows, Containers, Network",
+    "summary": "公网暴露 Web 应用、API 或中间件因版本未及时修补或输入校验不足导致的入口风险。",
+    "detection_hint": "建立 SBOM 与组件版本基线核查，监控应用错误日志与异常 HTTP 状态码突增。"
+  },
+  {
+    "id": "T1133",
+    "name": "External Remote Services（外部远程服务入口）",
+    "tactics": "Initial Access, Persistence",
+    "platforms": "Linux, Windows, Network",
+    "summary": "通过 VPN、SSH、管理后台或云控制台等外部远程服务进入内部环境的访问类别。",
+    "detection_hint": "强制多因素认证与来源 IP 白名单，审计非常规时间或地理位置的远程登录日志。"
+  },
+  {
+    "id": "T1078",
+    "name": "Valid Accounts（合法账号凭据滥用）",
+    "tactics": "Defense Evasion, Persistence, Privilege Escalation, Initial Access",
+    "platforms": "Linux, Windows, macOS, SaaS, Containers",
+    "summary": "默认凭据、弱口令或泄露账号被用于合法身份认证的访问控制风险。",
+    "detection_hint": "清查默认账号、休眠账号与特权账号，结合登录行为基线监测异常登录事件。"
+  },
+  {
+    "id": "T1110",
+    "name": "Brute Force（凭据尝试与认证防护）",
+    "tactics": "Credential Access",
+    "platforms": "Linux, Windows, macOS, SaaS, Containers",
+    "summary": "高频认证失败或凭据撞库对登录入口造成的访问安全风险。",
+    "detection_hint": "核查账号锁定策略、速率限制与 MFA 配置，监控认证日志中的连续失败告警。"
+  },
+  {
+    "id": "T1059",
+    "name": "Command and Scripting Interpreter（命令与脚本解释器）",
+    "tactics": "Execution",
+    "platforms": "Linux, Windows, macOS, Containers",
+    "summary": "通过 Shell、Python、PowerShell 等解释器执行未授权系统指令的执行类别。",
+    "detection_hint": "审计 Web/应用服务进程派生异常子进程的 EDR/auditd 告警，落实参数隔离与最小权限。"
+  },
+  {
+    "id": "T1203",
+    "name": "Exploitation for Client Execution（客户端解析缺陷执行）",
+    "tactics": "Execution",
+    "platforms": "Linux, Windows, macOS",
+    "summary": "客户端软件或文档解析组件缺陷导致的非预期代码执行类别。",
+    "detection_hint": "保持终端与浏览器组件最新安全更新，启用沙盒隔离与进程完整性策略。"
+  },
+  {
+    "id": "T1505",
+    "name": "Server Software Component（服务端组件变更与驻留）",
+    "tactics": "Persistence",
+    "platforms": "Linux, Windows, Network",
+    "summary": "Web 根目录或应用扩展目录被写入非预期脚本/模块引发的持久化风险。",
+    "detection_hint": "实施文件完整性监控（FIM）、只读容器文件系统及上传目录脚本执行隔离。"
+  },
+  {
+    "id": "T1098",
+    "name": "Account Manipulation（账号与权限配置篡改）",
+    "tactics": "Persistence, Privilege Escalation",
+    "platforms": "Linux, Windows, macOS, SaaS, Containers",
+    "summary": "新增未授权 SSH 公钥、访问令牌或提升账号角色权限的持久化风险。",
+    "detection_hint": "审计 IAM 策略、sudoers、authorized_keys 及 API Token 签发变更日志。"
+  },
+  {
+    "id": "T1543",
+    "name": "Create or Modify System Process（系统服务与守护进程变更）",
+    "tactics": "Persistence, Privilege Escalation",
+    "platforms": "Linux, Windows, macOS",
+    "summary": "通过修改 systemd 单元、Windows 服务或启动项维持长期驻留的风险类别。",
+    "detection_hint": "监控服务配置文件完整性及非发布窗口内新增的系统守护进程。"
+  },
+  {
+    "id": "T1068",
+    "name": "Exploitation for Privilege Escalation（权限提升组件缺陷）",
+    "tactics": "Privilege Escalation",
+    "platforms": "Linux, Windows, macOS, Containers",
+    "summary": "利用内核、运行时或特权服务历史补丁缺失提升本地权限的风险类别。",
+    "detection_hint": "持续跟踪宿主机内核与容器运行时补丁状态，移除不必要的特权能力（cap-drop=ALL）。"
+  },
+  {
+    "id": "T1548",
+    "name": "Abuse Elevation Control Mechanism（提权控制机制配置审查）",
+    "tactics": "Privilege Escalation, Defense Evasion",
+    "platforms": "Linux, Windows, macOS",
+    "summary": "过度宽松的 sudo、SUID/SGID 或 UAC 策略导致的本地权限边界薄弱问题。",
+    "detection_hint": "定期基线核查特权位文件清单与最小化 sudo 授权规则。"
+  },
+  {
+    "id": "T1003",
+    "name": "OS Credential Dumping（操作系统凭据存储保护）",
+    "tactics": "Credential Access",
+    "platforms": "Linux, Windows, macOS",
+    "summary": "系统内存、哈希文件或密钥库中的认证凭据面临未授权读取的风险类别。",
+    "detection_hint": "强化特权进程保护、最小权限隔离与系统敏感文件访问审计。"
+  },
+  {
+    "id": "T1552",
+    "name": "Unsecured Credentials（明文与未受保护凭据）",
+    "tactics": "Credential Access",
+    "platforms": "Linux, Windows, macOS, Containers, SaaS",
+    "summary": "配置文件、环境变量、代码仓库或元数据服务中明文存放密钥与口令的风险。",
+    "detection_hint": "执行仓库密钥扫描、配置文件权限审计（0600）与云元数据 IMDSv2 加固。"
+  },
+  {
+    "id": "T1555",
+    "name": "Credentials from Password Stores（凭据库与密钥托管风险）",
+    "tactics": "Credential Access",
+    "platforms": "Linux, Windows, macOS",
+    "summary": "浏览器、系统钥匙串或本地凭据管理器存储的敏感凭据暴露风险。",
+    "detection_hint": "使用集中化秘密管理服务并限制非必要宿主凭据目录挂载到容器或子环境。"
+  },
+  {
+    "id": "T1046",
+    "name": "Network Service Discovery（内部网络服务发现）",
+    "tactics": "Discovery",
+    "platforms": "Linux, Windows, macOS, Containers",
+    "summary": "在主机或容器内部探测周边服务端口与内网可达资产的发现类别。",
+    "detection_hint": "部署东西向微隔离策略，监控工作负载内非预期的多端口连接尝试。"
+  },
+  {
+    "id": "T1082",
+    "name": "System Information Discovery（系统环境与配置信息查询）",
+    "tactics": "Discovery",
+    "platforms": "Linux, Windows, macOS, Containers",
+    "summary": "采集操作系统版本、内核补丁与宿主硬件环境的发现行为类别。",
+    "detection_hint": "结合上下文审计低权限 Web/应用进程异常执行系统盘点命令的日志。"
+  },
+  {
+    "id": "T1083",
+    "name": "File and Directory Discovery（文件与目录结构枚举）",
+    "tactics": "Discovery",
+    "platforms": "Linux, Windows, macOS, Containers",
+    "summary": "遍历文件系统或 Web 目录以定位配置文件与敏感数据文件的行为类别。",
+    "detection_hint": "核查 Web 服务器禁用目录索引（autoindex off）及文件权限最小化配置。"
+  },
+  {
+    "id": "T1087",
+    "name": "Account Discovery（账号与角色信息枚举）",
+    "tactics": "Discovery",
+    "platforms": "Linux, Windows, macOS, SaaS",
+    "summary": "识别系统本地账号、域账号或云身份角色清单的发现行为类别。",
+    "detection_hint": "审计异常的目录服务查询与认证接口用户名枚举响应差异。"
+  },
+  {
+    "id": "T1018",
+    "name": "Remote System Discovery（关联主机与网段资产发现）",
+    "tactics": "Discovery",
+    "platforms": "Linux, Windows, macOS, Network",
+    "summary": "识别同一内网网段或集群中其他关联节点与主机地址的发现类别。",
+    "detection_hint": "限制容器与业务主机内网扫描权限并监控异常 ARP/DNS/ICMP 探测。"
+  },
+  {
+    "id": "T1021",
+    "name": "Remote Services（远程管理协议横向移动）",
+    "tactics": "Lateral Movement",
+    "platforms": "Linux, Windows, macOS, Containers",
+    "summary": "通过 SSH、RDP、SMB、WinRM 等远程协议在内部主机间跳转访问的类别。",
+    "detection_hint": "实施跳板机集中审计、凭证分层隔离与内部主机间管理端口访问限制。"
+  },
+  {
+    "id": "T1210",
+    "name": "Exploitation of Remote Services（内网远程服务补丁缺陷）",
+    "tactics": "Lateral Movement",
+    "platforms": "Linux, Windows, Containers",
+    "summary": "内部数据库、缓存或中间件因疏于打补丁和缺少鉴权导致的横向扩散风险。",
+    "detection_hint": "内网服务同样执行零信任鉴权、TLS 加密与定期安全补丁基线升级。"
+  },
+  {
+    "id": "T1005",
+    "name": "Data from Local System（本地敏感数据采集保护）",
+    "tactics": "Collection",
+    "platforms": "Linux, Windows, macOS",
+    "summary": "本地配置文件、数据库备份或业务敏感文档面临未授权读取的风险类别。",
+    "detection_hint": "对敏感静态数据实施加密存储、脱敏归档与细粒度文件系统权限管控。"
+  },
+  {
+    "id": "T1530",
+    "name": "Data from Cloud Storage（云对象存储配置暴露）",
+    "tactics": "Collection",
+    "platforms": "SaaS, IaaS",
+    "summary": "对象存储桶（S3/MinIO/OSS）权限策略配置过宽导致的公开读取风险。",
+    "detection_hint": "定期巡检存储桶 ACL 与匿名访问策略，默认开启阻止公共访问并记录访问日志。"
+  },
+  {
+    "id": "T1041",
+    "name": "Exfiltration Over C2 Channel（异常出向通道数据外泄）",
+    "tactics": "Exfiltration",
+    "platforms": "Linux, Windows, macOS, Network",
+    "summary": "内部数据经未授权外部连接通道向外传输的数据泄露风险类别。",
+    "detection_hint": "配置严格的出向白名单（Egress Policy），监测非常规目的地址与大流量外传。"
+  },
+  {
+    "id": "T1567",
+    "name": "Exfiltration Over Web Service（经公开 Web 服务外传数据）",
+    "tactics": "Exfiltration",
+    "platforms": "Linux, Windows, macOS",
+    "summary": "利用合法外部云盘、代码托管或公共 HTTP 接口外传内部数据的风险类别。",
+    "detection_hint": "在出口代理审计外部域名白名单与异常上传行为，防止敏感信息外泄。"
+  },
+  {
+    "id": "T1562",
+    "name": "Impair Defenses（防护与审计机制完整性）",
+    "tactics": "Defense Evasion",
+    "platforms": "Linux, Windows, macOS, Containers, SaaS",
+    "summary": "安全日志关闭、监控停用或规则被篡改导致可观测性失效的风险类别。",
+    "detection_hint": "将日志实时同步至独立只追加审计中心，对安全策略与配置变更触发告警。"
+  },
+  {
+    "id": "T1499",
+    "name": "Endpoint Denial of Service（服务端资源耗尽与可用性防护）",
+    "tactics": "Impact",
+    "platforms": "Linux, Windows, macOS, Containers, Network",
+    "summary": "因缺少速率限制、查询深度限制或超时控制引发的服务可用性下降风险。",
+    "detection_hint": "核查网关限流、连接并发上限、超时配置及 GraphQL/正则复杂度保护。"
+  }
+]
