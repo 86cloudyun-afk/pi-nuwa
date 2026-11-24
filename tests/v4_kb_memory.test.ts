@@ -661,6 +661,262 @@ describe("自进化经验脱敏蒸馏与 UCB1 跨项目提权", () => {
 		expect(lookupWithExp).not.toContain("nuwa_v4_secret_flag");
 	});
 
+	test("派生意图键归一化与非常规 TLD / Scope / SAN / output 非花括号 Flag 端到端零泄漏", () => {
+		// 1. 派生意图键全量归一化规则校验
+		expect(canonicalizeExperienceIntentKey("san:f001:admin.target-secret-corp.internal")).toBe("san:domain");
+		expect(canonicalizeExperienceIntentKey("e2:san:F009:api.hema.ai")).toBe("san:domain");
+		expect(canonicalizeExperienceIntentKey("svc:f002:18443")).toBe("svc:port");
+		expect(canonicalizeExperienceIntentKey("e3:svc:F002:9443")).toBe("svc:port");
+		expect(canonicalizeExperienceIntentKey("ep:f003:/tenant-acme-corp/login")).toBe("ep:login");
+		expect(canonicalizeExperienceIntentKey("ep:f003:/secret-tenant")).toBe("ep:endpoint");
+		expect(canonicalizeExperienceIntentKey("ep:f003:/v3/openapi.json")).toBe("ep:openapi");
+		expect(canonicalizeExperienceIntentKey("ep:f003:/actuator/env")).toBe("ep:actuator");
+		expect(canonicalizeExperienceIntentKey("ep:f003")).toBe("ep:endpoint");
+		expect(canonicalizeExperienceIntentKey("exp:F007")).toBe("exp");
+		expect(canonicalizeExperienceIntentKey("pivot:f008")).toBe("pivot");
+		expect(canonicalizeExperienceIntentKey("reuse:F009")).toBe("reuse");
+		expect(canonicalizeExperienceIntentKey("migrated:I002")).toBe("migrated");
+		expect(canonicalizeExperienceIntentKey("waf-bypass:I003")).toBe("waf-bypass");
+		expect(canonicalizeExperienceIntentKey("waf-bypass:4")).toBe("waf-bypass");
+		expect(canonicalizeExperienceIntentKey("reflect:e2:vuln:3")).toBe("reflect:vuln");
+		expect(canonicalizeExperienceIntentKey("reflect:surface:retry")).toBe("reflect:surface");
+
+		// 2. 非常规 TLD 与国家二级域脱敏 + 静态文件/框架配置名防误杀校验
+		const domainSanitized = sanitizeExperienceText(
+			"跳转至 admin.hema.ai、auth.hema.ai 及 api.client.co.uk 与 portal.corp.beer 失败，端口 18443 无响应",
+		);
+		expect(domainSanitized).not.toContain("hema.ai");
+		expect(domainSanitized).not.toContain("client.co.uk");
+		expect(domainSanitized).not.toContain("corp.beer");
+		expect(domainSanitized).not.toContain("18443");
+		expect(domainSanitized).toContain("<HOST>");
+		expect(domainSanitized).toContain("端口 <PORT>");
+
+		const safeTechText = sanitizeExperienceText(
+			"核查 openapi.json、web.xml、wp-config.php、HTTP.sys、WebMvc.fn 与 management.endpoints.web 配置",
+		);
+		expect(safeTechText).toContain("openapi.json");
+		expect(safeTechText).toContain("web.xml");
+		expect(safeTechText).toContain("wp-config.php");
+		expect(safeTechText).toContain("HTTP.sys");
+		expect(safeTechText).toContain("WebMvc.fn");
+		expect(safeTechText).toContain("management.endpoints.web");
+
+		// 3. 端到端蒸馏：含 Scope/SAN 域名、真实派生意图键及仅存于 output 的非花括号 Flag
+		const dir = makeTmpDir("nuwa-kb-derived-sanitize-");
+		const dbPath = join(dir, "kb.db");
+		ensureBundledKb(dbPath, { seedDir: KB_DIR });
+
+		const derivedState = makeMockState({
+			project: {
+				...makeMockState().project,
+				id: "portal-hema-ai-18443",
+				target: "https://portal.hema.ai:18443",
+				url: "https://portal.hema.ai:18443",
+				host: "portal.hema.ai",
+				port: 18443,
+				scope: {
+					allowHosts: ["*.hema.ai", "billing.client.co.uk"],
+					allowCidrs: [],
+					denyHosts: ["vault.corp.beer"],
+					allowSubdomains: true,
+					allowPrivateNetwork: false,
+					allowDestructive: false,
+				},
+			},
+			facts: {
+				F001: {
+					id: "F001",
+					kind: "service",
+					title: "Nginx 1.24 反向代理服务",
+					detail: "TLS 证书发现 SAN 域名",
+					meta: {
+						tech: ["nginx"],
+						ports: [18443],
+						san: ["admin.hema.ai", "api.client.co.uk", "portal.corp.beer"],
+					},
+					intent: "I001",
+					createdAt: "2026-11-24T12:00:00.000Z",
+				},
+				F002: {
+					id: "F002",
+					kind: "asset",
+					title: "SAN 资产 admin.hema.ai 与 billing.client.co.uk 存活",
+					detail: "跳转至 portal.corp.beer 并拒连 vault.corp.beer",
+					intent: "I002",
+					createdAt: "2026-11-24T12:01:00.000Z",
+				},
+				F003: {
+					id: "F003",
+					kind: "vuln",
+					title: "端点 /tenant-acme-corp/login 认证配置缺陷",
+					detail: "涉及端口 18443 与 api.client.co.uk",
+					meta: { paths: ["/tenant-acme-corp/login", "/secret-tenant"] },
+					intent: "I004",
+					createdAt: "2026-11-24T12:02:00.000Z",
+				},
+				F004: {
+					id: "F004",
+					kind: "flag",
+					title: "完成验收目标读取",
+					detail: "已获取主凭证证明",
+					output: "stdout:\nFLAG-2026-SECRET-9988\nRAW_OUTPUT_PROOF_7788\n",
+					intent: "I006",
+					createdAt: "2026-11-24T12:03:00.000Z",
+				},
+				F005: {
+					id: "F005",
+					kind: "vuln",
+					title: "二次复核中附带引用 FLAG-2026-SECRET-9988 与 RAW_OUTPUT_PROOF_7788",
+					detail: "命中 /secret-tenant",
+					intent: "I007",
+					createdAt: "2026-11-24T12:04:00.000Z",
+				},
+			},
+			intents: {
+				I002: {
+					id: "I002",
+					phase: "recon",
+					key: "san:F001:admin.hema.ai",
+					title: "SAN 资产枚举 admin.hema.ai",
+					detail: "",
+					from: ["F001"],
+					to: "F002",
+					status: "done",
+					priority: 74,
+					attempts: 1,
+					createdAt: "2026-11-24T12:00:30.000Z",
+				},
+				I003: {
+					id: "I003",
+					phase: "surface",
+					key: "svc:F002:18443",
+					title: "服务深挖 portal.hema.ai:18443",
+					detail: "",
+					from: ["F001"],
+					status: "blocked",
+					note: "端口 18443 连接至 portal.corp.beer 超时，跳过 vault.corp.beer",
+					priority: 70,
+					attempts: 2,
+					createdAt: "2026-11-24T12:00:40.000Z",
+				},
+				I004: {
+					id: "I004",
+					phase: "vuln",
+					key: "ep:F003:/tenant-acme-corp/login",
+					title: "端点审计 /tenant-acme-corp/login",
+					detail: "",
+					from: ["F003"],
+					to: "F003",
+					status: "done",
+					priority: 68,
+					attempts: 1,
+					createdAt: "2026-11-24T12:01:30.000Z",
+				},
+				I005: {
+					id: "I005",
+					phase: "vuln",
+					key: "ep:F003:/secret-tenant",
+					title: "端点审计 /secret-tenant",
+					detail: "",
+					from: ["F003"],
+					status: "blocked",
+					note: "路径 /secret-tenant 跳转至 api.client.co.uk 无有效接口",
+					priority: 68,
+					attempts: 2,
+					createdAt: "2026-11-24T12:01:50.000Z",
+				},
+				I006: {
+					id: "I006",
+					phase: "post",
+					key: "exp:F003",
+					title: "利用验证 FLAG-2026-SECRET-9988",
+					detail: "",
+					from: ["F003"],
+					to: "F004",
+					status: "done",
+					priority: 92,
+					attempts: 1,
+					createdAt: "2026-11-24T12:02:30.000Z",
+				},
+				I007: {
+					id: "I007",
+					phase: "vuln",
+					key: "reflect:e2:vuln:1",
+					title: "战略复盘 billing.client.co.uk",
+					detail: "",
+					from: ["F003"],
+					to: "F005",
+					status: "done",
+					priority: 85,
+					attempts: 1,
+					createdAt: "2026-11-24T12:03:30.000Z",
+				},
+				I008: {
+					id: "I008",
+					phase: "vuln",
+					key: "waf-bypass:I005",
+					title: "WAF 换路验证",
+					detail: "",
+					from: ["F003"],
+					status: "blocked",
+					note: "admin.hema.ai 持续返回 429",
+					priority: 75,
+					attempts: 2,
+					createdAt: "2026-11-24T12:04:30.000Z",
+				},
+			},
+		});
+
+		const res = distillProjectExperience(derivedState, { dbPath });
+		expect(res.ok).toBe(true);
+		expect(res.techKeys).toEqual(["nginx"]);
+
+		const db = new Database(dbPath, { readonly: true });
+		try {
+			const rows = db.query("SELECT * FROM experience ORDER BY intent_key").all() as Array<Record<string, any>>;
+			const keys = rows.map((r) => r.intent_key);
+			expect(keys).toEqual(["ep:endpoint", "ep:login", "exp", "reflect:vuln", "san:domain", "svc:port", "waf-bypass"]);
+
+			const dumped = JSON.stringify(rows);
+			const forbidden = [
+				"hema.ai",
+				"client.co.uk",
+				"corp.beer",
+				"secret-tenant",
+				"tenant-acme-corp",
+				"18443",
+				"f001",
+				"f002",
+				"f003",
+				"FLAG-2026-SECRET-9988",
+				"RAW_OUTPUT_PROOF_7788",
+			];
+			for (const bad of forbidden) {
+				expect(dumped.toLowerCase()).not.toContain(bad.toLowerCase());
+			}
+		} finally {
+			db.close();
+		}
+
+		// 验证二期新靶标下不同 F-ID/域名/端口/租户路径可无缝命中聚合 UCB1 经验
+		const sanBoost1 = computeExperiencePriorityBoost(["nginx"], "san:F099:new-corp.example.ai", { dbPath });
+		const loginBoost1 = computeExperiencePriorityBoost(["nginx"], "ep:F088:/other-org/login", { dbPath });
+		const svcBoost1 = computeExperiencePriorityBoost(["nginx"], "svc:F077:28443", { dbPath });
+		const epPrivateBoost1 = computeExperiencePriorityBoost(["nginx"], "ep:F066:/other-private-path", { dbPath });
+		expect(sanBoost1).toBeGreaterThan(0);
+		expect(loginBoost1).toBeGreaterThan(0);
+		expect(sanBoost1).toBeGreaterThan(svcBoost1);
+		expect(loginBoost1).toBeGreaterThan(epPrivateBoost1);
+
+		// 再叠加一期同类经验后，持续受阻的 svc:port 与 ep:endpoint 严格转负降权
+		distillProjectExperience(derivedState, { dbPath });
+		const svcBoost2 = computeExperiencePriorityBoost(["nginx"], "svc:F077:28443", { dbPath });
+		const epPrivateBoost2 = computeExperiencePriorityBoost(["nginx"], "ep:F066:/other-private-path", { dbPath });
+		expect(svcBoost2).toBeLessThan(0);
+		expect(epPrivateBoost2).toBeLessThan(0);
+	});
+
 	test("同类二期项目 UCB1 算法稳定实现高胜率提权、坑路径降权并严格限幅于 [-8, +15]", () => {
 		const dir = makeTmpDir("nuwa-kb-ucb1-");
 		const dbPath = join(dir, "kb.db");

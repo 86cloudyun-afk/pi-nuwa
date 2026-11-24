@@ -786,6 +786,56 @@ function escapeRegexLiteral(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const SAFE_GENERIC_PATH_SEGS = new Set([
+	"api",
+	"v1",
+	"v2",
+	"v3",
+	"graphql",
+	"graphiql",
+	"swagger",
+	"swagger-ui",
+	"openapi",
+	"api-docs",
+	"actuator",
+	"health",
+	"info",
+	"env",
+	"metrics",
+	"admin",
+	"console",
+	"manager",
+	"dashboard",
+	"login",
+	"signin",
+	"sign-in",
+	"logout",
+	"auth",
+	"oauth",
+	"sso",
+	"upload",
+	"uploads",
+	"file",
+	"files",
+	"static",
+	"assets",
+	"public",
+	"index",
+	"status",
+	"ping",
+	"users",
+	"user",
+	"search",
+	"config",
+	"nacos",
+	"wiki",
+	"rest",
+	"wp-admin",
+	"wp-json",
+	"wp-content",
+	"wp-login",
+]);
+
 function collectSensitiveLiterals(st?: NuwaState): string[] {
 	if (!st) return [];
 	const lits = new Set<string>();
@@ -793,21 +843,63 @@ function collectSensitiveLiterals(st?: NuwaState): string[] {
 		const s = String(val ?? "").trim();
 		if (s.length >= 3) lits.add(s);
 	};
+	const addHost = (raw?: string) => {
+		const h = String(raw ?? "")
+			.trim()
+			.replace(/^\*\./, "")
+			.replace(/^\.+|\.+$/g, "");
+		if (h.length >= 3) add(h);
+	};
+	const addPrivatePathSegs = (rawPath?: string) => {
+		const p = String(rawPath ?? "").trim();
+		if (!p.startsWith("/")) return;
+		const segs = p
+			.split(/[/?#]+/)
+			.map((s) => s.trim())
+			.filter(Boolean);
+		for (const seg of segs) {
+			const lower = seg.toLowerCase();
+			if (lower.length < 4 || SAFE_GENERIC_PATH_SEGS.has(lower)) continue;
+			// 跳过已知通用技术关键词或常见扩展文件（如 openapi.json）
+			if (TECH_PATTERNS.some((tp) => tp.name === lower)) continue;
+			if (/^[a-z0-9_-]+\.(?:json|ya?ml|xml|php|jsp|html?)$/i.test(lower)) continue;
+			add(seg);
+		}
+	};
 
 	add(st.project?.url);
 	add(st.project?.target);
-	add(st.project?.host);
+	addHost(st.project?.host);
 	if (st.project?.host && st.project?.port) {
 		add(`${st.project.host}:${st.project.port}`);
 	}
 	add(st.project?.id);
 
-	// 主动收集项目中所有 flag 与 cred 事实的具体敏感值，确保绝不穿透进入经验库
+	// 收集 Scope 白/黑名单主机名与通配基域，防止关联业务域名穿透进入经验库
+	for (const h of st.project?.scope?.allowHosts ?? []) addHost(h);
+	for (const h of st.project?.scope?.denyHosts ?? []) addHost(h);
+
+	// 收集派生意图 key 中携带的 SAN 域名与私有业务路径段，确保意图标题/备注中同样零残留
+	for (const intent of Object.values(st.intents ?? {})) {
+		const k = String(intent.key ?? "").trim();
+		const sanMatch = k.match(/^(?:e\d+:)*san:f\d+:(.+)$/i);
+		if (sanMatch) addHost(sanMatch[1]);
+		const epMatch = k.match(/^(?:e\d+:)*ep:f\d+:(\/.*)$/i);
+		if (epMatch) addPrivatePathSegs(epMatch[1]);
+	}
+
+	// 主动收集全部事实的 SAN 关联域名、私有路径，以及 flag / cred 事实的具体敏感值
 	for (const fact of Object.values(st.facts ?? {})) {
+		for (const san of fact.meta?.san ?? []) addHost(san);
+		for (const p of fact.meta?.paths ?? []) addPrivatePathSegs(p);
+
 		if (fact.kind === "flag" || fact.kind === "cred") {
 			for (const field of [fact.title, fact.detail, fact.output]) {
 				const txt = String(field ?? "");
 				for (const m of txt.matchAll(/[A-Za-z0-9_-]{2,20}\{[^}\s]{2,160}\}/g)) {
+					add(m[0]);
+				}
+				for (const m of txt.matchAll(/\b(?:FLAG|CTF)[-_:=][A-Za-z0-9_.-]{4,120}\b/gi)) {
 					add(m[0]);
 				}
 				for (const m of txt.matchAll(
@@ -825,11 +917,20 @@ function collectSensitiveLiterals(st?: NuwaState): string[] {
 					}
 				}
 			}
-			// 针对纯 flag 事实，如果 detail 较短直接整段列为禁止入库字面量
+			// 针对 flag 事实，同时收集 detail 与 output 中的短行字面量（含非花括号自定义格式）
 			if (fact.kind === "flag") {
-				for (const line of String(fact.detail ?? "").split(/\r?\n/)) {
-					const clean = line.trim();
-					if (clean.length >= 6 && clean.length <= 128) add(clean);
+				for (const rawField of [fact.detail, fact.output]) {
+					for (const line of String(rawField ?? "").split(/\r?\n/)) {
+						const clean = line.trim();
+						if (clean.length >= 4 && clean.length <= 160) {
+							add(clean);
+							for (const tok of clean.split(/\s+/)) {
+								if (tok.length >= 6 && tok.length <= 128 && /^[A-Za-z0-9_.:{}-]+$/.test(tok)) {
+									add(tok);
+								}
+							}
+						}
+					}
 				}
 			}
 		}
@@ -838,15 +939,195 @@ function collectSensitiveLiterals(st?: NuwaState): string[] {
 	return [...lits].sort((a, b) => b.length - a.length);
 }
 
+const SAFE_NON_DOMAIN_EXTS = new Set([
+	"js",
+	"ts",
+	"jsx",
+	"tsx",
+	"mjs",
+	"cjs",
+	"json",
+	"yaml",
+	"yml",
+	"xml",
+	"html",
+	"htm",
+	"css",
+	"scss",
+	"php",
+	"jsp",
+	"jspx",
+	"asp",
+	"aspx",
+	"py",
+	"rb",
+	"go",
+	"rs",
+	"java",
+	"class",
+	"jar",
+	"war",
+	"ear",
+	"sh",
+	"bash",
+	"zsh",
+	"bat",
+	"ps1",
+	"sql",
+	"db",
+	"sqlite",
+	"conf",
+	"cfg",
+	"ini",
+	"env",
+	"properties",
+	"toml",
+	"lock",
+	"txt",
+	"md",
+	"log",
+	"csv",
+	"pdf",
+	"png",
+	"jpg",
+	"jpeg",
+	"gif",
+	"svg",
+	"ico",
+	"woff",
+	"woff2",
+	"ttf",
+	"zip",
+	"tar",
+	"gz",
+	"tgz",
+	"bak",
+	"old",
+	"swp",
+	"exe",
+	"dll",
+	"so",
+	"dylib",
+	"action",
+	"do",
+	"vue",
+	"map",
+	"pem",
+	"crt",
+	"key",
+	"cer",
+	"csr",
+	"p12",
+	"jks",
+	"pub",
+	"sys",
+	"fn",
+	"core",
+]);
+
+const SAFE_CONFIG_PATH_PREFIXES = [
+	"org.apache.",
+	"com.alibaba.",
+	"java.",
+	"javax.",
+	"jakarta.",
+	"management.endpoints.",
+	"nacos.core.",
+	"xpack.security.",
+];
+
+const COMMON_DOMAIN_TLDS = new Set([
+	"com",
+	"net",
+	"org",
+	"gov",
+	"edu",
+	"mil",
+	"int",
+	"biz",
+	"info",
+	"name",
+	"pro",
+	"xyz",
+	"top",
+	"site",
+	"online",
+	"store",
+	"tech",
+	"app",
+	"dev",
+	"cloud",
+	"page",
+	"link",
+	"live",
+	"work",
+	"shop",
+	"club",
+	"vip",
+	"beer",
+	"wiki",
+	"blog",
+	"news",
+	"plus",
+	"team",
+	"zone",
+	"space",
+	"world",
+	"today",
+	"email",
+	"games",
+	"media",
+	"local",
+	"internal",
+	"lan",
+	"corp",
+	"intranet",
+	"ctf",
+	"target",
+	"lab",
+	"box",
+	"htb",
+	"thm",
+	"test",
+	"example",
+	"svc",
+	"cluster",
+	"home",
+	"arpa",
+]);
+
+function shouldRedactDomainToken(token: string): boolean {
+	const lower = token.toLowerCase();
+	const labels = lower.split(".");
+	if (labels.length < 2) return false;
+	const tld = labels[labels.length - 1];
+	// 排除静态文件扩展名与纯数字版本号
+	if (SAFE_NON_DOMAIN_EXTS.has(tld)) return false;
+	if (labels.every((seg) => /^\d+$/.test(seg))) return false;
+	// 仅放行精确已知的 Java/框架配置命名空间（且末端非真实国家码/常见顶级域）
+	if (
+		SAFE_CONFIG_PATH_PREFIXES.some((prefix) => lower.startsWith(prefix)) &&
+		tld.length !== 2 &&
+		!COMMON_DOMAIN_TLDS.has(tld)
+	) {
+		return false;
+	}
+	// 3 级及以上域名（如 admin.hema.ai / auth.hema.ai / api.client.co.uk / portal.corp.beer）一律脱敏
+	if (labels.length >= 3 && /^[a-z]{2,24}$/.test(tld)) return true;
+	// 2 级域名：覆盖全部 2 字母 ccTLD（已排除 js/ts/py/rb/go/rs/sh/md/db/so/do/fn）及常见 gTLD/新顶级域
+	if (tld.length === 2 || COMMON_DOMAIN_TLDS.has(tld)) return true;
+	return false;
+}
+
 /**
- * 强脱敏清洗：彻底剥离目标 URL、IPv4/IPv6、端口、凭据、JWT、Cookie、邮箱、私钥与 Flag。
+ * 强脱敏清洗：彻底剥离目标 URL、IPv4/IPv6、端口、凭据、JWT、Cookie、邮箱、私钥、域名与 Flag。
  * 任何写入 `experience` 表的文本均必须经过本函数过滤。
  */
 export function sanitizeExperienceText(text: string, st?: NuwaState, maxLen = 180): string {
 	let out = String(text ?? "").replace(/\r/g, " ").replace(/\n+/g, " ");
 	if (!out.trim()) return "";
 
-	// 1. 优先精准擦除当前项目的靶标地址、主机、项目 ID 以及 flag/cred 明文字面量
+	// 1. 优先精准擦除当前项目的靶标地址、主机、Scope/SAN 域名、项目 ID 以及 flag/cred 明文字面量
 	for (const lit of collectSensitiveLiterals(st)) {
 		const re = new RegExp(escapeRegexLiteral(lit), "gi");
 		out = out.replace(re, "<REDACTED>");
@@ -861,8 +1142,9 @@ export function sanitizeExperienceText(text: string, st?: NuwaState, maxLen = 18
 		"<URL>",
 	);
 
-	// 4. Flag 格式（flag{...} / CTF{...} / DASCTF{...} / HTB{...} / NUWA{...} 等）
+	// 4. Flag 格式（花括号格式 flag{...}/CTF{...} 与非花括号格式 FLAG-2026-...）
 	out = out.replace(/\b[A-Za-z0-9_-]{2,20}\{[^}\s]{2,160}\}/g, "<FLAG>");
+	out = out.replace(/\b(?:FLAG|CTF)[-_][A-Za-z0-9_-]{6,120}\b/gi, "<FLAG>");
 
 	// 5. JWT / Bearer / Basic 认证凭据与 Cookie
 	out = out.replace(/\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*\b/g, "<TOKEN>");
@@ -889,14 +1171,16 @@ export function sanitizeExperienceText(text: string, st?: NuwaState, maxLen = 18
 		m.includes("::") || (m.match(/:/g)?.length ?? 0) >= 3 ? "<IP>" : m,
 	);
 
-	// 10. 显式端口表达（:8080 / port 8080 / 端口 8080）
+	// 10. 显式端口表达（:8080 / port 8080 / 端口 8080，注意中文不走 ASCII \b）
 	out = out.replace(/(?<=[^\d:]):(\d{2,5})\b/g, ":<PORT>");
-	out = out.replace(/\b(port|端口)\s*[:=]?\s*\d{1,5}\b/gi, "$1 <PORT>");
+	out = out.replace(/(?:\bport|端口)\s*[:=]?\s*\d{1,5}\b/gi, (m) =>
+		m.startsWith("端口") ? "端口 <PORT>" : "port <PORT>",
+	);
 
-	// 11. 常见私有、靶场或目标域名（保留常见技术/文件名后缀）
+	// 11. 通用域名脱敏（覆盖 .ai / .co.uk / .hk / .beer / .internal 等任意国家二级域与新顶级域，排除静态文件扩展名）
 	out = out.replace(
-		/\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|cn|gov|edu|local|internal|lan|corp|intranet|dev|app|xyz|top|site|cloud|ctf|target|lab|box|htb|thm|test|example|svc|cluster)\b/gi,
-		"<HOST>",
+		/\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b/gi,
+		(match) => (shouldRedactDomainToken(match) ? "<HOST>" : match),
 	);
 
 	// 12. 合并冗余占位与空白
@@ -908,22 +1192,86 @@ export function sanitizeExperienceText(text: string, st?: NuwaState, maxLen = 18
 	return out.length > maxLen ? `${out.slice(0, maxLen - 3)}...` : out;
 }
 
-/** 归一化意图键名，剥离世代/轮次前缀 `e<N>:`、具体事实编号及目标主机后缀，用于跨项目复用。 */
+const EP_SAFE_CATEGORIES: ReadonlyArray<{ category: string; re: RegExp }> = [
+	{ category: "graphql", re: /\b(?:graphql|graphiql)\b/i },
+	{ category: "swagger", re: /\bswagger(?:[-_]?ui)?\b/i },
+	{ category: "openapi", re: /\b(?:openapi|api-docs)\b/i },
+	{ category: "actuator", re: /\bactuator\b/i },
+	{ category: "upload", re: /\buploads?\b/i },
+	{ category: "admin", re: /\b(?:admin|console|manager|dashboard)\b/i },
+	{ category: "login", re: /\b(?:login|signin|sign-in|auth|oauth|sso)\b/i },
+	{ category: "api", re: /\bapi\b/i },
+];
+
+/**
+ * 归一化意图键名，彻底剥离世代/轮次前缀 `e<N>:`、单项目事实编号（`fNNN`/`iNNN`）、
+ * 目标域名、端口号及私有租户路径，确保跨项目聚合复用且零靶标信息泄漏。
+ */
 export function canonicalizeExperienceIntentKey(rawKey: string): string {
 	let key = String(rawKey ?? "")
 		.trim()
 		.toLowerCase();
 	if (!key) return "unknown";
+
 	// 剥离 e2: / e10: 等多轮扩张前缀
-	key = key.replace(/^e\d+:/i, "");
-	// 剥离 kb:F003:spring -> kb:spring
+	key = key.replace(/^(?:e\d+:)+/i, "");
+
+	// 1. SAN 域名派生意图：san:f001:admin.example.internal -> san:domain
+	if (/^san:(?:f\d+:)?/.test(key) && key !== "san") {
+		return "san:domain";
+	}
+
+	// 2. 端口服务深挖意图：svc:f002:18443 / svc:8080 -> svc:port
+	if (/^svc:(?:f\d+(?::.*)?|\d+)$/.test(key)) {
+		return "svc:port";
+	}
+
+	// 3. 端点审计意图：ep:f003:/tenant-acme-corp/login -> 仅映射受控白名单类别，其余统一归为 ep:endpoint
+	const epMatch = key.match(/^ep:(?:f\d+(?::(.*))?|(\/.*))$/);
+	if (epMatch) {
+		const rawPath = epMatch[1] ?? epMatch[2] ?? "";
+		if (rawPath) {
+			const normalizedSegs = rawPath.replace(/[^a-z0-9-]+/g, " ");
+			for (const { category, re } of EP_SAFE_CATEGORIES) {
+				if (re.test(normalizedSegs)) return `ep:${category}`;
+			}
+		}
+		return "ep:endpoint";
+	}
+
+	// 4. 事实/意图 ID 绑定型派生键剥离单项目编号
+	const derivedIdMatch = key.match(/^(exp|pivot|reuse|migrated):[fi]\d+(?::.*)?$/);
+	if (derivedIdMatch) {
+		return derivedIdMatch[1];
+	}
+
+	// 5. WAF 换路与战略复盘键归一化
+	if (/^waf-bypass:[fi]?\d+(?::.*)?$/.test(key)) {
+		return "waf-bypass";
+	}
+	const reflectMatch = key.match(/^reflect:(?:e\d+:)?([a-z]+)(?::.*)?$/);
+	if (reflectMatch) {
+		return `reflect:${reflectMatch[1]}`;
+	}
+	if (/^custom:[a-f0-9]{6,}$/.test(key)) {
+		return "custom";
+	}
+
+	// 6. 知识库与双盲复验键剥离具体事实 ID
 	key = key.replace(/^kb:f\d+:/i, "kb:");
-	// 剥离 verify-vuln:F005:sqli -> verify-vuln:sqli
-	key = key.replace(/^(verify(?:-[a-z]+)?):f\d+:/i, "$1:");
-	// 替换残留 IPv4 形态
-	key = key.replace(/(?:\d{1,3}[.-]){3}\d{1,3}(?:[:-]\d{1,5})?/g, "target");
-	// 清理空白并限长
-	key = key.replace(/\s+/g, "-").replace(/[^a-z0-9:_-]+/g, "").slice(0, 64);
+	key = key.replace(/^(verify(?:-[a-z]+)?):f\d+(?::|$)/i, (_, p1: string) => `${p1}:`).replace(/:$/, "");
+
+	// 7. 兜底剥离残留 IPv4、数字端口或单项目事实编号
+	key = key
+		.replace(/(?:\d{1,3}[.-]){3}\d{1,3}(?:[:-]\d{1,5})?/g, "target")
+		.replace(/:[fi]\d+(?=:|$)/g, "")
+		.replace(/:\d{2,5}(?=:|$)/g, ":port")
+		.replace(/\s+/g, "-")
+		.replace(/[^a-z0-9:_-]+/g, "")
+		.replace(/:{2,}/g, ":")
+		.replace(/^:|:$/g, "")
+		.slice(0, 64);
+
 	return key || "unknown";
 }
 
