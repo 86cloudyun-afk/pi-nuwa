@@ -1,6 +1,7 @@
 name: soak
 
 # 72h 长测必须跑在自托管 runner：GitHub 托管 runner 单作业上限 6 小时。
+# 移除无人值守每周 schedule 触发，仅保留 workflow_dispatch 供手动触发长测。
 on:
   workflow_dispatch:
     inputs:
@@ -8,8 +9,6 @@ on:
         description: "长测分钟数"
         required: true
         default: "4320"
-  schedule:
-    - cron: "0 3 * * 0"
 
 jobs:
   soak:

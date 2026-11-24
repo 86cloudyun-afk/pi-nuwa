@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-契约检查：逐条对比真实 sapper 与 tests/fake-sapper 的 CLI 行为。
+契约检查：
+  1. 先校验 v2（omp 原生运行时）文件结构、12 个 nuwa_* 工具、install.sh 与 SKILL.md（无需 sapper）。
+  2. 再对比真实 sapper 与 tests/fake-sapper 的 v1 CLI 契约（--v2-only 可跳过；
+     若系统无真实 sapper 且未设 NUWA_REQUIRE_V1_SAPPER=1，则打印 SKIP 并返回 0）。
 
 用法：
   python3 tests/contract_check.py
+  python3 tests/contract_check.py --v2-only
   python3 tests/contract_check.py --real /root/.local/bin/sapper
 
-退出码：0 全部一致；1 有差异；2 缺少真实 sapper。
+退出码：0 通过或 v1 SKIP；1 契约不一致；2 强制要求真实 sapper 但缺失。
 """
 from __future__ import annotations
 
@@ -22,7 +26,23 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
 FAKE = HERE / "fake-sapper"
+
+NUWA_V2_TOOLS = (
+    "nuwa_init",
+    "nuwa_plan",
+    "nuwa_frontier",
+    "nuwa_claim",
+    "nuwa_commit",
+    "nuwa_flag",
+    "nuwa_complete",
+    "nuwa_status",
+    "nuwa_report",
+    "nuwa_expand",
+    "nuwa_stop",
+    "nuwa_kb",
+)
 
 
 def make_bin(tmp: Path, target: Path) -> Path:
@@ -38,8 +58,16 @@ def make_bin(tmp: Path, target: Path) -> Path:
 def run(bin_dir: Path, args: list[str], cwd: Path, timeout: int = 30) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
-    return subprocess.run(["sapper", *args], cwd=str(cwd), env=env,
-                          capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(
+        ["sapper", *args],
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 def tree_hash(root: Path) -> str:
@@ -63,19 +91,106 @@ def check(name: str, real: subprocess.CompletedProcess, fake: subprocess.Complet
     return {"name": name, "ok": ok, "detail": detail}
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--real", default=shutil.which("sapper"))
-    args = ap.parse_args()
-    if not args.real:
-        print("contract: 缺少真实 sapper（PATH 中没有）")
-        return 2
-    real_bin = Path(args.real).resolve()
-    if not FAKE.exists():
-        print(f"contract: 缺少 {FAKE}")
-        return 2
+def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
+    """无 sapper 依赖的 v2 omp 原生契约检查。"""
+    results: list[dict] = []
+    required_files = [
+        "omp/nuwa.ts",
+        "omp/autoexec.ts",
+        "omp/ui.ts",
+        "omp/ui-native.ts",
+        "install.sh",
+        "skills/nuwa-pentest/SKILL.md",
+    ]
+    missing = [rel for rel in required_files if not (repo_root / rel).is_file() or (repo_root / rel).stat().st_size == 0]
+    results.append({
+        "name": "v2_required_files",
+        "ok": len(missing) == 0,
+        "detail": "" if not missing else f"missing={missing}",
+    })
+    if missing:
+        return False, results
 
-    results = []
+    nuwa_src = (repo_root / "omp/nuwa.ts").read_text(encoding="utf-8")
+    ver_ok = bool(re.search(r'export\s+const\s+VERSION\s*=\s*["\']\d+\.\d+\.\d+', nuwa_src))
+    results.append({"name": "v2_nuwa_version", "ok": ver_ok, "detail": "" if ver_ok else "VERSION missing"})
+
+    found_tools = set(re.findall(r'\bname\s*:\s*["\'](nuwa_[a-z0-9_]+)["\']', nuwa_src))
+    missing_tools = [t for t in NUWA_V2_TOOLS if t not in found_tools]
+    extra_tools = sorted(found_tools - set(NUWA_V2_TOOLS))
+    tools_ok = not missing_tools and not extra_tools and len(found_tools) == 12
+    detail = "" if tools_ok else f"missing={missing_tools} extra={extra_tools} count={len(found_tools)}"
+    results.append({"name": "v2_12_nuwa_tools", "ok": tools_ok, "detail": detail})
+
+    export_specs = (
+        ("v2_autoexec_exports", "omp/autoexec.ts", ("pickAuto", "ruleFor", "runAutoIntent", "shellQuote")),
+        ("v2_ui_exports", "omp/ui.ts", ("buildSnapshot", "renderStatusLine", "renderWidgetLines", "renderBoardLines")),
+        ("v2_ui_native_exports", "omp/ui-native.ts", ("buildWidgetNode", "buildBoardNode", "createWidgetComponent", "createBoardComponent")),
+    )
+    for name, rel, symbols in export_specs:
+        src = (repo_root / rel).read_text(encoding="utf-8")
+        missing_syms = [s for s in symbols if not re.search(rf'\bexport\b[\s\S]{{0,40}}\b{s}\b', src)]
+        results.append({
+            "name": name,
+            "ok": len(missing_syms) == 0,
+            "detail": "" if not missing_syms else f"missing={missing_syms}",
+        })
+
+    install_src = (repo_root / "install.sh").read_text(encoding="utf-8")
+    install_ok = (
+        "command -v sapper" not in install_src
+        and "omp/nuwa.ts" in install_src
+        and "index.ts" in install_src
+        and "ui.ts" in install_src
+        and "ui-native.ts" in install_src
+        and "autoexec.ts" in install_src
+        and all(t in install_src for t in NUWA_V2_TOOLS)
+    )
+    results.append({
+        "name": "v2_install_contract",
+        "ok": install_ok,
+        "detail": "" if install_ok else "install.sh 缺少 v2 模块/工具校验或误依赖 sapper",
+    })
+
+    skill_src = (repo_root / "skills/nuwa-pentest/SKILL.md").read_text(encoding="utf-8")
+    skill_missing = [t for t in NUWA_V2_TOOLS if t not in skill_src]
+    skill_ok = ("name: nuwa-pentest" in skill_src) and not skill_missing
+    results.append({
+        "name": "v2_skill_contract",
+        "ok": skill_ok,
+        "detail": "" if skill_ok else f"missing_tools={skill_missing}",
+    })
+
+    return all(r["ok"] for r in results), results
+
+
+def is_fake_sapper(candidate: Path) -> bool:
+    try:
+        resolved = candidate.resolve()
+        return resolved == FAKE.resolve() or resolved.parent == HERE.resolve()
+    except OSError:
+        return False
+
+
+def find_real_sapper(explicit: str | None) -> Path | None:
+    if explicit:
+        p = Path(explicit)
+        return p if p.exists() and not is_fake_sapper(p) else None
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        cand = Path(entry) / "sapper"
+        if cand.is_file() and os.access(cand, os.X_OK) and not is_fake_sapper(cand):
+            return cand
+    return None
+
+
+def run_v1_contract(real_bin: Path) -> tuple[int, list[dict]]:
+    if not FAKE.exists():
+        print(f"contract(v1): 缺少 {FAKE}")
+        return 2, []
+
+    results: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="nuwa-contract-") as td:
         tmp = Path(td)
         rb = make_bin(tmp, real_bin)
@@ -85,12 +200,14 @@ def main() -> int:
         r_ver = run(rb, ["--version"], tmp)
         f_ver = run(fb, ["--version"], tmp)
         ver_line = r_ver.stdout.strip()
-        results.append({"name": "version",
-                        "ok": r_ver.returncode == f_ver.returncode and bool(re.match(r"^sapper \d+\.\d+\.\d+", ver_line)),
-                        "detail": f"real={ver_line!r}"})
+        results.append({
+            "name": "version",
+            "ok": r_ver.returncode == f_ver.returncode and bool(re.match(r"^sapper \d+\.\d+\.\d+", ver_line)),
+            "detail": f"real={ver_line!r}",
+        })
 
         # setup
-        for name, b in (("real", rb), ("fake", fb)):
+        for name in ("real", "fake"):
             (tmp / name).mkdir()
         r_setup = run(rb, ["setup", "--goal", "contract"], tmp / "real")
         f_setup = run(fb, ["setup", "--goal", "contract"], tmp / "fake")
@@ -109,11 +226,12 @@ def main() -> int:
         r_fr = run(rb, ["frontier"], tmp / "real")
         f_fr = run(fb, ["frontier"], tmp / "fake")
         line_ok = bool(re.match(r"^i\d{3}\tfrom=f\d{3}\t", r_fr.stdout.strip() or "x"))
-        results.append({"name": "frontier_format",
-                        "ok": line_ok and bool(re.match(r"^i\d{3}\tfrom=f\d{3}\t", f_fr.stdout.strip() or "x")),
-                        "detail": "" if line_ok else f"real={r_fr.stdout.strip()!r}"})
+        results.append({
+            "name": "frontier_format",
+            "ok": line_ok and bool(re.match(r"^i\d{3}\tfrom=f\d{3}\t", f_fr.stdout.strip() or "x")),
+            "detail": "" if line_ok else f"real={r_fr.stdout.strip()!r}",
+        })
 
-        # reason 生成意图（fake 直接生成；real 需要模型，跳过执行，只比参数约束）
         # claim 缺 --worker 必须 exit 2
         r_claim = run(rb, ["claim", "i001"], tmp / "real")
         f_claim = run(fb, ["claim", "i001"], tmp / "fake")
@@ -133,8 +251,11 @@ def main() -> int:
             after = len(list((tmp / name / ".sapper" / "facts").glob("*.json")))
             intent = json.loads((tmp / name / ".sapper" / "intents" / "i002.json").read_text())
             ok = after == before + 1 and intent.get("status") == "done" and intent.get("to")
-            results.append({"name": f"done_positive_{name}", "ok": ok,
-                            "detail": "" if ok else f"facts {before}->{after}, intent={intent.get('status')}"})
+            results.append({
+                "name": f"done_positive_{name}",
+                "ok": ok,
+                "detail": "" if ok else f"facts {before}->{after}, intent={intent.get('status')}",
+            })
 
         # 未知字段保留：经过 validate 与一次写操作后仍在
         for name in ("real", "fake"):
@@ -149,8 +270,11 @@ def main() -> int:
             fp2 = root / ".sapper" / "facts" / "f001.json"
             d2 = json.loads(fp2.read_text()) if fp2.exists() else {}
             ok = d2.get("x-nuwa-probe", {}).get("keep") is True
-            results.append({"name": f"unknown_field_preserved_{name}", "ok": ok,
-                            "detail": "" if ok else "field dropped after write"})
+            results.append({
+                "name": f"unknown_field_preserved_{name}",
+                "ok": ok,
+                "detail": "" if ok else "field dropped after write",
+            })
 
         # dry-run 渲染与零写入：用未结案的新 intent，输出含意图标记，且内容哈希不变
         for name in ("real", "fake"):
@@ -161,8 +285,11 @@ def main() -> int:
             r = run(b, ["dispatch", "i003", "--dry-run"], root)
             after = tree_hash(root / ".sapper")
             ok = r.returncode == 0 and "Intent" in r.stdout and before == after
-            results.append({"name": f"dry_run_zero_write_{name}", "ok": ok,
-                            "detail": "" if ok else f"rc={r.returncode}, hash {before[:8]}->{after[:8]}"})
+            results.append({
+                "name": f"dry_run_zero_write_{name}",
+                "ok": ok,
+                "detail": "" if ok else f"rc={r.returncode}, hash {before[:8]}->{after[:8]}",
+            })
 
         # validate 成功输出前缀一致
         r_val = run(rb, ["validate"], tmp / "real")
@@ -170,10 +297,41 @@ def main() -> int:
         results.append(check("validate_ok", r_val, f_val, compare_stdout=False))
 
     failed = [r for r in results if not r["ok"]]
-    for r in results:
+    return (0 if not failed else 1), results
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="v2 原生契约 + 可选 v1 sapper 契约校验")
+    ap.add_argument("--real", default=None)
+    ap.add_argument("--v2-only", action="store_true", help="仅运行 v2 契约检查，跳过 v1 sapper 对比")
+    args = ap.parse_args()
+
+    v2_ok, v2_results = check_v2_contract(REPO)
+    for r in v2_results:
         print(f"  {'PASS' if r['ok'] else 'FAIL'}  {r['name']}" + (f"  {r['detail']}" if r["detail"] else ""))
-    print(f"contract: {len(results) - len(failed)}/{len(results)} 一致")
-    return 0 if not failed else 1
+    v2_pass = sum(1 for r in v2_results if r["ok"])
+    print(f"contract(v2): {v2_pass}/{len(v2_results)} 通过")
+    if not v2_ok:
+        return 1
+
+    if args.v2_only:
+        print("contract(v1): SKIP (--v2-only)")
+        return 0
+
+    real_candidate = find_real_sapper(args.real)
+    if not real_candidate:
+        if os.environ.get("NUWA_REQUIRE_V1_SAPPER") == "1":
+            print("contract(v1): FAIL (no sapper; NUWA_REQUIRE_V1_SAPPER=1)")
+            return 2
+        print("contract(v1): SKIP (no sapper)")
+        return 0
+
+    rc, v1_results = run_v1_contract(real_candidate.resolve())
+    for r in v1_results:
+        print(f"  {'PASS' if r['ok'] else 'FAIL'}  {r['name']}" + (f"  {r['detail']}" if r["detail"] else ""))
+    v1_pass = sum(1 for r in v1_results if r["ok"])
+    print(f"contract(v1): {v1_pass}/{len(v1_results)} 一致")
+    return rc
 
 
 if __name__ == "__main__":

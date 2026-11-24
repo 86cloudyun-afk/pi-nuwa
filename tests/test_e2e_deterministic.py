@@ -36,14 +36,20 @@ class E2E(unittest.TestCase):
         self.env["SAPPER_BIN"] = str(FAKE)
         self.env["FAKE_ENGINE_COUNTER"] = str(self.tmp / "engine.count")
 
-        # 真实 sapper 缺失时不得静默回退到 tests/sapper
+        # 真实 sapper 缺失时不得静默回退到 tests/sapper；无替身许可时直接 skip
         real = shutil.which("sapper", path=self.env["PATH"])
         allow_fake = os.environ.get("NUWA_ALLOW_FAKE_SAPPER") == "1"
         if not real:
             if not allow_fake:
-                raise RuntimeError("E2E 需要真实 sapper；仅 NUWA_ALLOW_FAKE_SAPPER=1 时允许使用替身")
+                shutil.rmtree(self.tmp, ignore_errors=True)
+                self.skipTest("E2E 需要真实 sapper；仅 NUWA_ALLOW_FAKE_SAPPER=1 时允许使用替身")
         elif Path(real).resolve().parent == Path(__file__).resolve().parent and not allow_fake:
-            raise RuntimeError(f"E2E 解析到 tests/sapper 替身（{real}），拒绝静默回退")
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            self.skipTest(f"E2E 解析到 tests/sapper 替身（{real}），跳过以免静默回退")
+
+        if not shutil.which("flock", path=self.env["PATH"]):
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            self.skipTest("E2E 需要 flock（bin/nuwa v1 依赖）")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -52,8 +58,16 @@ class E2E(unittest.TestCase):
         env = dict(self.env)
         if extra:
             env.update(extra)
-        return subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True,
-                              text=True, timeout=timeout)
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
 
     def project(self, name="p1") -> Path:
         d = self.tmp / "lab" / name
