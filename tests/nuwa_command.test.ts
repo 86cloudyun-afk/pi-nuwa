@@ -21,6 +21,7 @@ beforeAll(async () => {
 	const home = mkdtempSync(join(tmpdir(), "nuwa-home-"));
 	dirs.push(home);
 	process.env.PI_AGENT_HOME = home;
+	process.env.NUWA_KB_DB = join(home, "nuwa-kb", "kb.db");
 	delete process.env.NUWA_TARGET;
 	delete process.env.TARGET;
 	// 动态导入是刻意的：PI_AGENT_HOME 在模块加载时求值，必须先改环境变量再载入。

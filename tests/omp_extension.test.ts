@@ -24,11 +24,18 @@ const z: any = new Proxy(
 );
 
 const dirs: string[] = [];
+const AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-omp-ext-home-"));
+dirs.push(AGENT_HOME);
+process.env.PI_AGENT_HOME = AGENT_HOME;
+process.env.NUWA_KB_DB = join(AGENT_HOME, "nuwa-kb", "kb.db");
+
 afterAll(() => {
 	for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 
 function setup(cwd: string) {
+	process.env.PI_AGENT_HOME = AGENT_HOME;
+	process.env.NUWA_KB_DB = join(cwd, ".nuwa-test-kb", "kb.db");
 	const tools = new Map<string, any>();
 	const hooks = new Map<string, Array<(...args: any[]) => any>>();
 	const pi: any = {

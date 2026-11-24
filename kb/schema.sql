@@ -3,7 +3,7 @@
 -- 并新增 card_fts 全文索引与 v4 自进化经验表 experience。
 -- 严禁在本库任何表中存储武器化攻击载荷或目标隐私信息（URL/IP/凭据/Flag）。
 
-PRAGMA journal_mode = WAL;
+PRAGMA journal_mode = DELETE;
 PRAGMA synchronous = NORMAL;
 
 CREATE TABLE IF NOT EXISTS kb_meta (

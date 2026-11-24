@@ -1,6 +1,6 @@
 # 女娲模式演进路线图（v0.3 → v4.0）
 
-## 当前里程碑：v4.0.0（2026-11-25 已交付）
+## 当前里程碑：v4.0.1（2026-11-25 已交付）
 
 - **架构解耦与离线构建**：`omp/nuwa.ts` 拆分为 `types.ts`、`storage.ts`、`graph.ts`、`nuwa.ts` 四层核心 + 14 个专职能力模块；配套 `omp/env.d.ts` 与 `tsconfig.json` 零外置依赖静态构建；v1 Python 遗产归档至 `archive/v1/`。
 - **血缘追踪与全工具护栏**：`omp/lineage.ts` 打通父子异构 `sessionId` 血缘与动态模型路由；`checkToolScopeAndRisk` 覆盖 `bash`/`read`/`browser`/`web_search`/`eval`；`isTrustedEvidenceEvent` 根治编排工具账本污染。

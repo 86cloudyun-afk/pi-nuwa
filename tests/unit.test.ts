@@ -57,6 +57,7 @@ function makeGraph(root: string, opts: {
 // 扩展在模块顶层读 PI_AGENT_HOME，必须在导入前固定一个测试专用 agent 目录。
 const AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-agent-"));
 process.env.PI_AGENT_HOME = AGENT_HOME;
+process.env.NUWA_KB_DB = join(AGENT_HOME, "nuwa-kb", "kb.db");
 
 // 动态导入是测试边界：扩展路径由 NUWA_WORK 在运行时决定，静态导入无法覆盖多仓库布局。
 const mod = await import(EXT);

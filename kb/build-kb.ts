@@ -380,13 +380,65 @@ function tableCount(db: Database, table: string): number {
 	return Number(row?.cnt ?? 0);
 }
 
+function finalizeWritableKbDb(db: Database): void {
+	try {
+		db.exec("PRAGMA busy_timeout = 3000;");
+	} catch {
+		/* ignore */
+	}
+	try {
+		db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+	} catch {
+		/* ignore */
+	}
+	try {
+		db.exec("PRAGMA journal_mode = DELETE;");
+	} catch {
+		/* ignore */
+	}
+}
+
+function openReadonlyKbDb(filePath: string): Database {
+	let roDb: Database | null = null;
+	try {
+		roDb = new Database(filePath, { readonly: true });
+		try {
+			roDb.exec("PRAGMA busy_timeout = 3000;");
+		} catch {
+			/* ignore */
+		}
+		roDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+		return roDb;
+	} catch {
+		try {
+			roDb?.close();
+		} catch {
+			/* ignore */
+		}
+	}
+
+	const fallbackDb = new Database(filePath);
+	try {
+		fallbackDb.exec("PRAGMA busy_timeout = 3000; PRAGMA query_only = ON;");
+		fallbackDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+		return fallbackDb;
+	} catch (err) {
+		try {
+			fallbackDb.close();
+		} catch {
+			/* ignore */
+		}
+		throw err;
+	}
+}
+
 /** 读取已构建知识库各表统计。 */
 export function readKbStats(dbPath: string): BuildKbStats {
 	const resolved = resolve(dbPath);
 	if (!existsSync(resolved)) {
 		throw new Error(`知识库文件不存在: ${resolved}`);
 	}
-	const db = new Database(resolved, { readonly: true });
+	const db = openReadonlyKbDb(resolved);
 	try {
 		const builtRow = db.query("SELECT value FROM kb_meta WHERE key = ?").get("built_at") as { value?: string } | null;
 		return {
@@ -615,6 +667,7 @@ export function buildKb(opts: BuildKbOptions): BuildKbStats {
 			setMeta.run("nuclei_added_cves", String(nucleiAddedCves));
 		});
 		rebuildFts();
+		finalizeWritableKbDb(db);
 
 		return {
 			dbPath: outPath,

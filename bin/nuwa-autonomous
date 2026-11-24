@@ -514,12 +514,51 @@ function checkExtensionInstallation(agentHome) {
 	};
 }
 
-function checkKnowledgeBase(agentHome, explicitPath) {
+function openReadonlyKbDb(filePath) {
+	let roDb = null;
+	try {
+		roDb = new Database(filePath, { readonly: true });
+		try {
+			roDb.exec("PRAGMA busy_timeout = 3000;");
+		} catch {
+			/* ignore */
+		}
+		roDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+		return roDb;
+	} catch {
+		try {
+			roDb?.close();
+		} catch {
+			/* ignore */
+		}
+	}
+
+	const fallbackDb = new Database(filePath);
+	try {
+		fallbackDb.exec("PRAGMA busy_timeout = 3000; PRAGMA query_only = ON;");
+		fallbackDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+		return fallbackDb;
+	} catch (err) {
+		try {
+			fallbackDb.close();
+		} catch {
+			/* ignore */
+		}
+		throw err;
+	}
+}
+
+function checkKnowledgeBase(agentHome, explicitPath, explicitAgentHome = false) {
 	const candidates = [];
 	if (explicitPath && explicitPath.trim()) {
 		candidates.push(resolve(explicitPath.trim()));
 	} else if (process.env.NUWA_KB_DB && process.env.NUWA_KB_DB.trim()) {
 		candidates.push(resolve(process.env.NUWA_KB_DB.trim()));
+		if (explicitAgentHome) {
+			candidates.push(join(agentHome, "nuwa-kb", "kb.db"));
+		}
+	} else if (explicitAgentHome || (process.env.PI_AGENT_HOME && process.env.PI_AGENT_HOME.trim())) {
+		candidates.push(join(agentHome, "nuwa-kb", "kb.db"));
 	} else {
 		candidates.push(join(agentHome, "nuwa-kb", "kb.db"));
 		candidates.push("/data/nuwa-kb/kb.db");
@@ -544,17 +583,20 @@ function checkKnowledgeBase(agentHome, explicitPath) {
 	let totalRecords = 0;
 	let db = null;
 	try {
-		db = new Database(foundPath, { readonly: true });
+		db = openReadonlyKbDb(foundPath);
+		const existingTables = new Set(
+			db
+				.query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+				.all()
+				.map((r) => String(r?.name ?? "")),
+		);
 		for (const table of KB_TABLES) {
-			try {
-				const row = db.query(`SELECT COUNT(*) AS cnt FROM "${table}"`).get();
-				const cnt = Number(row?.cnt ?? 0);
-				if (Number.isFinite(cnt)) {
-					counts[table] = cnt;
-					totalRecords += cnt;
-				}
-			} catch {
-				/* 表不存在时跳过，兼容历史 schema */
+			if (!existingTables.has(table)) continue;
+			const row = db.query(`SELECT COUNT(*) AS cnt FROM "${table}"`).get();
+			const cnt = Number(row?.cnt ?? 0);
+			if (Number.isFinite(cnt)) {
+				counts[table] = cnt;
+				totalRecords += cnt;
 			}
 		}
 		return {
@@ -756,7 +798,7 @@ function runDoctor(argv) {
 	const extensionCheck = checkExtensionInstallation(agentHome);
 
 	// 4. 检查 KB 数据库与记录数
-	const kbCheck = checkKnowledgeBase(agentHome, opts.kbDb);
+	const kbCheck = checkKnowledgeBase(agentHome, opts.kbDb, Boolean(opts.agentHome));
 
 	// 5. 检查子代理模板 fujiang.md / nuwa-verifier.md
 	const agentsCheck = checkAgentTemplates(agentHome);

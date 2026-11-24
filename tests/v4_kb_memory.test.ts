@@ -11,7 +11,7 @@
  * 7. 同类二期项目 UCB1 提权与避坑降权严格落在 [-8, +15] 且单调有序；
  * 8. 向后兼容原 Python 模块 nuwa/kb.py（test_kb.py 全绿）。
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -40,6 +40,13 @@ const BUILD_SCRIPT_PATH = join(REPO_ROOT, "kb", "build-kb.ts");
 
 const tmpDirs: string[] = [];
 const savedEnv: Record<string, string | undefined> = {};
+const SUITE_AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-kb-suite-home-"));
+process.env.PI_AGENT_HOME = SUITE_AGENT_HOME;
+process.env.NUWA_KB_DB = join(SUITE_AGENT_HOME, "nuwa-kb", "kb.db");
+
+afterAll(() => {
+	rmSync(SUITE_AGENT_HOME, { recursive: true, force: true });
+});
 
 function makeTmpDir(prefix: string): string {
 	const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -1042,5 +1049,209 @@ describe("向后兼容 Python nuwa/kb.py 回归测试", () => {
 		expect(combined).toContain("Ran 5 tests");
 		expect(combined).not.toContain("skipped");
 		expect(combined).toContain("OK");
+	});
+});
+
+describe("v4.0.1 SQLite DELETE 模式、无伴生文件冷启动与遗留 WAL 库健壮读取回归", () => {
+	const DAEMON_BIN_PATH = join(REPO_ROOT, "bin", "nuwa-autonomous");
+
+	function stripWalSidecars(dbPath: string): void {
+		rmSync(`${dbPath}-shm`, { force: true });
+		rmSync(`${dbPath}-wal`, { force: true });
+	}
+
+	test("新建知识库默认为 DELETE 日志模式，强删 -shm/-wal 后全链路冷启动 100% 命中", () => {
+		const dir = makeTmpDir("nuwa-kb-delete-mode-");
+		const dbPath = join(dir, "kb.db");
+		buildKb({ outPath: dbPath, seedDir: KB_DIR });
+
+		// 写入一条脱敏经验并确认关闭后仍为 DELETE 模式
+		const mockState = {
+			schema: 1,
+			version: "4.0.1",
+			project: {
+				id: "proj-del-1",
+				target: "127.0.0.1:18080",
+				url: "http://127.0.0.1:18080",
+				host: "127.0.0.1",
+				port: 18080,
+				scheme: "http" as const,
+				goal: "audit",
+				mode: "pentest" as const,
+				phase: "vuln" as const,
+				episode: 1,
+				status: "completed" as const,
+				createdAt: "2026-11-25T00:00:00.000Z",
+				updatedAt: "2026-11-25T00:01:00.000Z",
+			},
+			intents: {
+				i001: {
+					id: "i001",
+					key: "vuln:component",
+					phase: "vuln" as const,
+					episode: 1,
+					priority: 85,
+					status: "done" as const,
+					brief: "组件审计",
+					prompt: "check",
+					attempts: 1,
+					createdAt: "2026-11-25T00:00:00.000Z",
+					doneAt: "2026-11-25T00:01:00.000Z",
+					to: "f001",
+				},
+			},
+			facts: {
+				f001: {
+					id: "f001",
+					kind: "vuln" as const,
+					key: "vuln:component",
+					intent: "i001",
+					title: "Spring Boot Actuator 未授权端点暴露",
+					detail: "Actuator env endpoint accessible",
+					command: "curl -sS http://127.0.0.1:18080/actuator/env",
+					output: "HTTP/1.1 200 OK activeProfiles",
+					createdAt: "2026-11-25T00:01:00.000Z",
+				},
+			},
+			flags: [],
+			runtime: {
+				startedAt: 1,
+				turns: 2,
+				tokens: 100,
+				stall: 0,
+				idle: 0,
+				dispatches: 1,
+				commits: 1,
+				autoRuns: 0,
+				emptyStreak: 0,
+				compactions: 0,
+				nextIntent: 2,
+				nextFact: 2,
+			},
+		} satisfies NuwaState;
+
+		distillProjectExperience(mockState, { dbPath, seedDir: KB_DIR });
+		stripWalSidecars(dbPath);
+
+		const checkModeDb = new Database(dbPath, { readonly: true });
+		const modeRow = checkModeDb.query("PRAGMA journal_mode").get() as { journal_mode?: string } | null;
+		checkModeDb.close();
+		expect(String(modeRow?.journal_mode ?? "").toLowerCase()).toBe("delete");
+
+		stripWalSidecars(dbPath);
+		const springHit = kbLookupSafe("spring", "auto", 3, { dbPath, autoInit: false });
+		expect(springHit).toContain("Spring");
+		expect(springHit).not.toContain("未命中");
+
+		stripWalSidecars(dbPath);
+		const stats = getKbStats(dbPath);
+		expect(stats.exists).toBe(true);
+		expect(stats.cards).toBeGreaterThanOrEqual(36);
+		expect(stats.cves).toBeGreaterThanOrEqual(60);
+		expect(stats.experiences).toBeGreaterThanOrEqual(1);
+
+		stripWalSidecars(dbPath);
+		const boost = computeExperiencePriorityBoost(["spring"], "vuln:component", { dbPath });
+		expect(boost).toBeGreaterThan(0);
+
+		stripWalSidecars(dbPath);
+		const cliStats = spawnSync(process.execPath, [BUILD_SCRIPT_PATH, "--out", dbPath, "--stats-only"], {
+			cwd: REPO_ROOT,
+			encoding: "utf8",
+			env: { ...process.env, BUN_OPTIONS: undefined },
+			timeout: 15_000,
+		});
+		expect(cliStats.status).toBe(0);
+		const parsedStats = JSON.parse(cliStats.stdout.trim());
+		expect(parsedStats.cards).toBeGreaterThanOrEqual(36);
+		expect(parsedStats.cves).toBeGreaterThanOrEqual(60);
+
+		stripWalSidecars(dbPath);
+		const doctorRes = spawnSync(process.execPath, [DAEMON_BIN_PATH, "doctor", "--json", "--agent-home", dir], {
+			cwd: REPO_ROOT,
+			encoding: "utf8",
+			env: { ...process.env, BUN_OPTIONS: undefined, NUWA_KB_DB: dbPath },
+			timeout: 15_000,
+		});
+		const doctorJson = JSON.parse(doctorRes.stdout.trim());
+		expect(doctorJson.checks.kb.ok).toBe(true);
+		expect(doctorJson.checks.kb.totalRecords).toBeGreaterThan(300);
+		expect(doctorJson.checks.kb.counts.card).toBeGreaterThanOrEqual(36);
+	});
+
+	test("即使外部遗留库先被设为 WAL 并强删 -shm/-wal，全套只读入口仍健壮命中且 ensureBundledKb 原地转回 DELETE", () => {
+		const dir = makeTmpDir("nuwa-kb-legacy-wal-");
+		const dbPath = join(dir, "legacy-wal.db");
+		buildKb({ outPath: dbPath, seedDir: KB_DIR });
+
+		// 人为把被测库切换为旧版 WAL 模式并写入经验记录，随后强删 -shm / -wal 伴生文件
+		const forceWalDb = new Database(dbPath);
+		forceWalDb.exec("PRAGMA journal_mode = WAL;");
+		forceWalDb
+			.query(
+				`INSERT INTO experience (tech_key, intent_key, phase, success_count, fail_count, helpful_pattern, pitfall_note, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run("spring", "vuln:component", "vuln", 9, 0, "Actuator 审计有效", "", "2026-11-25T00:00:00.000Z");
+		forceWalDb.exec("PRAGMA wal_checkpoint(PASSIVE);");
+		forceWalDb.close();
+		stripWalSidecars(dbPath);
+
+		// 1) kbLookupSafe 在无 -shm/-wal 的遗留 WAL 库上不抛 SQLITE_CANTOPEN 且正常命中
+		const lookupOut = kbLookupSafe("spring", "auto", 3, { dbPath, autoInit: false });
+		expect(lookupOut).toContain("Spring");
+		expect(lookupOut).toContain("【历史经验提示】");
+
+		// 2) 再次强删 -shm/-wal，验证 getKbStats 正常统计
+		stripWalSidecars(dbPath);
+		const stats = getKbStats(dbPath);
+		expect(stats.cards).toBeGreaterThanOrEqual(36);
+		expect(stats.cves).toBeGreaterThanOrEqual(60);
+		expect(stats.experiences).toBe(1);
+
+		// 3) 再次强删 -shm/-wal，验证 computeExperiencePriorityBoost 正常提权
+		stripWalSidecars(dbPath);
+		const boost = computeExperiencePriorityBoost("spring", "vuln:component", { dbPath });
+		expect(boost).toBeGreaterThan(0);
+
+		// 4) 再次强删 -shm/-wal，验证 build-kb.ts --stats-only 正常返回统计
+		stripWalSidecars(dbPath);
+		const cliStats = spawnSync(process.execPath, [BUILD_SCRIPT_PATH, "--out", dbPath, "--stats-only"], {
+			cwd: REPO_ROOT,
+			encoding: "utf8",
+			env: { ...process.env, BUN_OPTIONS: undefined },
+			timeout: 15_000,
+		});
+		expect(cliStats.status).toBe(0);
+		expect(JSON.parse(cliStats.stdout.trim()).experiences).toBe(1);
+
+		// 5) 再次强删 -shm/-wal，验证 nuwa-autonomous doctor 正常读取全部表记录数（绝非 0）
+		stripWalSidecars(dbPath);
+		const doctorRes = spawnSync(process.execPath, [DAEMON_BIN_PATH, "doctor", "--json", "--agent-home", dir], {
+			cwd: REPO_ROOT,
+			encoding: "utf8",
+			env: { ...process.env, BUN_OPTIONS: undefined, NUWA_KB_DB: dbPath },
+			timeout: 15_000,
+		});
+		const doctorJson = JSON.parse(doctorRes.stdout.trim());
+		expect(doctorJson.checks.kb.ok).toBe(true);
+		expect(doctorJson.checks.kb.totalRecords).toBeGreaterThan(300);
+		expect(doctorJson.checks.kb.counts.experience).toBe(1);
+
+		// 6) 调用 ensureBundledKb 后原地无损转回 DELETE 模式，且既有 experience 记录 100% 保留
+		stripWalSidecars(dbPath);
+		const healed = ensureBundledKb(dbPath, { seedDir: KB_DIR });
+		expect(healed.ok).toBe(true);
+		expect(healed.stats.experiences).toBe(1);
+		stripWalSidecars(dbPath);
+
+		const pureRo = new Database(dbPath, { readonly: true });
+		const healedMode = pureRo.query("PRAGMA journal_mode").get() as { journal_mode?: string } | null;
+		const expCnt = pureRo.query("SELECT COUNT(*) AS cnt FROM experience WHERE tech_key = 'spring'").get() as {
+			cnt?: number;
+		} | null;
+		pureRo.close();
+		expect(String(healedMode?.journal_mode ?? "").toLowerCase()).toBe("delete");
+		expect(Number(expCnt?.cnt ?? 0)).toBe(1);
 	});
 });

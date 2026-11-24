@@ -1,7 +1,15 @@
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+const AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-omp-core-home-"));
+process.env.PI_AGENT_HOME = AGENT_HOME;
+process.env.NUWA_KB_DB = join(AGENT_HOME, "nuwa-kb", "kb.db");
+
+afterAll(() => {
+	rmSync(AGENT_HOME, { recursive: true, force: true });
+});
 import {
 	VERSION,
 	buildDirective,

@@ -1,7 +1,7 @@
 /**
  * 女娲 v3.0 多领域 Profile 引擎、KB 自动富化、战略复盘与外层无头守护器（bin/nuwa-autonomous）测试。
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -20,6 +20,14 @@ import {
 const REPO_ROOT = resolve(import.meta.dir, "..");
 const DAEMON_BIN = join(REPO_ROOT, "bin", "nuwa-autonomous");
 const PROFILES_SRC = join(REPO_ROOT, "omp", "profiles.ts");
+
+const SUITE_AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-profiles-suite-home-"));
+process.env.PI_AGENT_HOME = SUITE_AGENT_HOME;
+process.env.NUWA_KB_DB = join(SUITE_AGENT_HOME, "nuwa-kb", "kb.db");
+
+afterAll(() => {
+	rmSync(SUITE_AGENT_HOME, { recursive: true, force: true });
+});
 
 const tmpDirs: string[] = [];
 

@@ -1,9 +1,18 @@
 /**
  * 2.2.0 永动引擎测试：预算不停机、frontier 永不空、episode 无限扩张、续跑只走 decision:block。
  */
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+const AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-forever-home-"));
+process.env.PI_AGENT_HOME = AGENT_HOME;
+process.env.NUWA_KB_DB = join(AGENT_HOME, "nuwa-kb", "kb.db");
+
+afterAll(() => {
+	rmSync(AGENT_HOME, { recursive: true, force: true });
+});
 import {
 	addFallbackIntent,
 	autoPlan,

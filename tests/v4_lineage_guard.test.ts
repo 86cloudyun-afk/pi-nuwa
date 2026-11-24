@@ -28,6 +28,10 @@ import {
 import { findRoot } from "../omp/nuwa";
 
 const cleanupDirs: string[] = [];
+const DEFAULT_TEST_HOME = mkdtempSync(join(tmpdir(), "nuwa-lineage-suite-home-"));
+cleanupDirs.push(DEFAULT_TEST_HOME);
+process.env.PI_AGENT_HOME = DEFAULT_TEST_HOME;
+process.env.NUWA_KB_DB = join(DEFAULT_TEST_HOME, "nuwa-kb", "kb.db");
 
 function makeTempDir(prefix: string): string {
 	const dir = mkdtempSync(join(tmpdir(), prefix));

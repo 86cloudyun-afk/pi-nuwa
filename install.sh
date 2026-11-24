@@ -10,6 +10,7 @@ SAPPER_HOME="${SAPPER_HOME:-$HOME/sapper-lab}"
 NUWA_MIN_OMP="18.16.0"
 KEEP_LEGACY=0
 FORCE_AGENTS=0
+CLEAN_KB=0
 DO_ROLLBACK=0
 
 say() { printf '[install] %s\n' "$*"; }
@@ -62,9 +63,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
       cat <<'EOF'
-用法: ./install.sh [--keep-legacy] [--force-agents] [--rollback]
+用法: ./install.sh [--keep-legacy] [--force-agents] [--clean-kb] [--rollback]
   --keep-legacy   保留旧的 $SAPPER_HOME/bin/nuwa（默认改名为 nuwa.legacy）
   --force-agents  强制用仓库最新模板覆盖已存在的 $AGENT_HOME/agents/{fujiang,nuwa-verifier}.md
+  --clean-kb      删除已有 $AGENT_HOME/nuwa-kb/kb.db 并从随仓种子全新构建纯净知识库
   --rollback      恢复最近一次安装前的 nuwa-omp 扩展
 
 环境变量:
@@ -75,6 +77,7 @@ EOF
       ;;
     --keep-legacy) KEEP_LEGACY=1 ;;
     --force-agents) FORCE_AGENTS=1 ;;
+    --clean-kb) CLEAN_KB=1 ;;
     --rollback) DO_ROLLBACK=1 ;;
     *) die "未知参数: $1（--help 查看用法）" 2 ;;
   esac
@@ -183,7 +186,12 @@ fi
 say "[2/5] 构建便携知识库、安装 skill 与合规子代理模板"
 KB_OUT="$AGENT_HOME/nuwa-kb/kb.db"
 mkdir -p "$(dirname "$KB_OUT")"
+if [[ "$CLEAN_KB" -eq 1 ]]; then
+  rm -f "$KB_OUT" "${KB_OUT}-shm" "${KB_OUT}-wal"
+  say "  已按 --clean-kb 清理旧知识库，准备全新构建"
+fi
 KB_BUILD_OUT="$(env -u BUN_OPTIONS bun "$EXT_DIR/kb/build-kb.ts" --out "$KB_OUT" 2>&1)" || die "便携知识库构建失败: $KB_BUILD_OUT" 1
+rm -f "${KB_OUT}-shm" "${KB_OUT}-wal"
 [[ -s "$KB_OUT" ]] || die "便携知识库未成功生成: $KB_OUT" 1
 say "  知识库就绪: $KB_OUT"
 
@@ -263,13 +271,17 @@ fi
 extra="$(find -L "$AGENT_HOME/extensions" -maxdepth 1 -type d -name 'nuwa-*' ! -name 'nuwa-omp' -print 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$extra" -eq 0 ]] || die "extensions/ 下仍有 $extra 个旧 nuwa 扩展，会与 nuwa-omp 抢 session_stop；先移出再装" 1
 
-# 运行时加载冒烟（复刻 omp 异步 Bun.plugin，覆盖 12 工具 + init/status + 便携 KB 命中 + 子代理血缘越界拦截）
+# 显式清理历史冒烟残留产物与 SQLite WAL/SHM 伴生文件，确保真实 kb.db 纯净且单文件冷启动可读
+rm -f "$AGENT_HOME/cache/nuwa-current.d/install-smoke"* "${KB_OUT}-shm" "${KB_OUT}-wal" 2>/dev/null || true
+
+# 运行时加载冒烟（复刻 omp 异步 Bun.plugin，使用独立临时会话目录避免污染真实 cache/kb.db，同时校验无 -shm/-wal 下的真实 kb.db 命中与血缘越界拦截）
 SMOKE_OUT="$(
-  PI_AGENT_HOME="$AGENT_HOME" EXT_DIR="$EXT_DIR" EXPECT_VER="$INSTALLED_VER" env -u BUN_OPTIONS bun -e '
-    import { mkdtempSync, rmSync } from "node:fs";
+  REAL_KB_OUT="$KB_OUT" EXT_DIR="$EXT_DIR" EXPECT_VER="$INSTALLED_VER" env -u BUN_OPTIONS bun -e '
+    import { existsSync, mkdtempSync, rmSync } from "node:fs";
     import { tmpdir } from "node:os";
     import { join } from "node:path";
     const extDir = process.env.EXT_DIR!;
+    const realKbOut = process.env.REAL_KB_OUT!;
     const escaped = extDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     Bun.plugin({
       name: "nuwa-install-async-smoke",
@@ -280,53 +292,64 @@ SMOKE_OUT="$(
         });
       },
     });
-    const mod = await import(`${extDir}/index.ts`);
-    if (mod.VERSION !== process.env.EXPECT_VER) {
-      throw new Error(`VERSION mismatch: ${mod.VERSION} != ${process.env.EXPECT_VER}`);
-    }
-    const tools = new Map<string, any>();
-    const hooks = new Map<string, Array<(...a: any[]) => any>>();
-    const chain = (): any => new Proxy(() => chain(), { get: () => () => chain() });
-    const z = new Proxy({}, { get: () => () => chain() });
-    mod.default({
-      zod: z,
-      registerTool: (t: any) => tools.set(t.name, t),
-      registerCommand: () => {},
-      on: (ev: string, fn: any) => {
-        const arr = hooks.get(ev) ?? [];
-        arr.push(fn);
-        hooks.set(ev, arr);
-      },
-    });
-    if (tools.size !== 12) {
-      throw new Error(`Expected 12 tools, got ${tools.size}`);
-    }
-    const dir = mkdtempSync(join(tmpdir(), "nuwa-install-smoke-"));
+    const smokeHome = mkdtempSync(join(tmpdir(), "nuwa-install-smoke-home-"));
+    const dir = mkdtempSync(join(tmpdir(), "nuwa-install-smoke-proj-"));
+    process.env.PI_AGENT_HOME = smokeHome;
     try {
+      const mod = await import(`${extDir}/index.ts`);
+      if (mod.VERSION !== process.env.EXPECT_VER) {
+        throw new Error(`VERSION mismatch: ${mod.VERSION} != ${process.env.EXPECT_VER}`);
+      }
+      const tools = new Map<string, any>();
+      const hooks = new Map<string, Array<(...a: any[]) => any>>();
+      const chain = (): any => new Proxy(() => chain(), { get: () => () => chain() });
+      const z = new Proxy({}, { get: () => () => chain() });
+      mod.default({
+        zod: z,
+        registerTool: (t: any) => tools.set(t.name, t),
+        registerCommand: () => {},
+        on: (ev: string, fn: any) => {
+          const arr = hooks.get(ev) ?? [];
+          arr.push(fn);
+          hooks.set(ev, arr);
+        },
+      });
+      if (tools.size !== 12) {
+        throw new Error(`Expected 12 tools, got ${tools.size}`);
+      }
       const ctx: any = {
         cwd: dir,
         agent: { kind: "main", id: "smoke-main-0" },
         sessionManager: { getSessionId: () => "install-smoke-main" },
       };
-      const r1 = await tools.get("nuwa_init").execute("1", { target: "http://127.0.0.1:18080", mode: "ctf", root: dir }, undefined, undefined, ctx);
-      const t1 = r1?.content?.[0]?.text ?? "";
-      if (!t1.includes("女娲已上膛") || t1.includes("ERROR:")) {
-        throw new Error(`nuwa_init failed: ${t1}`);
-      }
-      const r2 = await tools.get("nuwa_status").execute("2", { root: dir }, undefined, undefined, ctx);
-      const t2 = r2?.content?.[0]?.text ?? "";
-      if (!t2.includes("phase=recon") || !t2.includes("kb=ready") || t2.includes("ERROR:")) {
-        throw new Error(`nuwa_status failed: ${t2}`);
-      }
-      const kbSpring = await tools.get("nuwa_kb").execute("3", { query: "spring", kind: "auto", limit: 3 }, undefined, undefined, ctx);
+
+      // 1) 在无 -shm/-wal 伴生文件冷启动状态下，直接只读查询刚部署的真实 kb.db 验证 100% 命中且不生成伴生写文件
+      process.env.NUWA_KB_DB = realKbOut;
+      const kbSpring = await tools.get("nuwa_kb").execute("1", { query: "spring", kind: "auto", limit: 3 }, undefined, undefined, ctx);
       const kbSpringText = kbSpring?.content?.[0]?.text ?? "";
       if (!kbSpringText || kbSpringText.includes("未命中") || kbSpringText.includes("ERROR:")) {
         throw new Error(`nuwa_kb(spring) failed: ${kbSpringText}`);
       }
-      const kbCve = await tools.get("nuwa_kb").execute("4", { query: "CVE-2021-44228", kind: "auto", limit: 3 }, undefined, undefined, ctx);
+      const kbCve = await tools.get("nuwa_kb").execute("2", { query: "CVE-2021-44228", kind: "auto", limit: 3 }, undefined, undefined, ctx);
       const kbCveText = kbCve?.content?.[0]?.text ?? "";
       if (!kbCveText.includes("CVE-2021-44228") || kbCveText.includes("未命中") || kbCveText.includes("ERROR:")) {
         throw new Error(`nuwa_kb(CVE-2021-44228) failed: ${kbCveText}`);
+      }
+      if (existsSync(`${realKbOut}-shm`) || existsSync(`${realKbOut}-wal`)) {
+        throw new Error("readonly nuwa_kb unexpectedly created -shm/-wal sidecar files");
+      }
+
+      // 2) 切换至隔离临时 NUWA_KB_DB 验证 nuwa_init / nuwa_status 与子代理血缘越界拦截，绝不污染真实 kb.db
+      process.env.NUWA_KB_DB = join(smokeHome, "nuwa-kb", "kb.db");
+      const r1 = await tools.get("nuwa_init").execute("3", { target: "http://127.0.0.1:18080", mode: "ctf", root: dir }, undefined, undefined, ctx);
+      const t1 = r1?.content?.[0]?.text ?? "";
+      if (!t1.includes("女娲已上膛") || t1.includes("ERROR:")) {
+        throw new Error(`nuwa_init failed: ${t1}`);
+      }
+      const r2 = await tools.get("nuwa_status").execute("4", { root: dir }, undefined, undefined, ctx);
+      const t2 = r2?.content?.[0]?.text ?? "";
+      if (!t2.includes("phase=recon") || !t2.includes("kb=ready") || t2.includes("ERROR:")) {
+        throw new Error(`nuwa_status failed: ${t2}`);
       }
 
       // 绑定子代理派生并验证不同 subSessionId 的子代理越界请求被 N-007 精准拦截
@@ -348,10 +371,34 @@ SMOKE_OUT="$(
       console.log(`SMOKE_OK ${mod.VERSION} tools=${tools.size}`);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+      rmSync(smokeHome, { recursive: true, force: true });
     }
   ' 2>&1
 )" || die "扩展运行时异步加载冒烟失败: $SMOKE_OUT" 1
 say "  运行时冒烟: $SMOKE_OUT"
+
+# 验证删除 -shm/-wal 后守护器 doctor 能准确读取真实知识库各表记录数
+rm -f "${KB_OUT}-shm" "${KB_OUT}-wal"
+DOCTOR_CHECK_BIN="$REPO_DIR/bin/nuwa-autonomous"
+if [[ "$BIN_INSTALLED" -eq 1 ]]; then
+  DOCTOR_CHECK_BIN="$BIN_TARGET"
+fi
+DOCTOR_KB_SUMMARY="$(
+  DOCTOR_BIN="$DOCTOR_CHECK_BIN" TARGET_HOME="$AGENT_HOME" TARGET_KB="$KB_OUT" env -u BUN_OPTIONS bun -e '
+    import { spawnSync } from "node:child_process";
+    const res = spawnSync(process.execPath, [process.env.DOCTOR_BIN!, "doctor", "--json", "--agent-home", process.env.TARGET_HOME!], {
+      encoding: "utf8",
+      env: { ...process.env, BUN_OPTIONS: undefined, NUWA_KB_DB: process.env.TARGET_KB! },
+    });
+    const payload = JSON.parse((res.stdout || "").trim() || "{}");
+    const kb = payload?.checks?.kb;
+    if (!kb?.ok || !(Number(kb?.totalRecords ?? 0) > 300) || !(Number(kb?.counts?.card ?? 0) >= 36)) {
+      throw new Error(`doctor KB check failed: ${JSON.stringify(kb)}`);
+    }
+    console.log(`ok totalRecords=${kb.totalRecords} card=${kb.counts.card} cve=${kb.counts.cve}`);
+  ' 2>&1
+)" || die "无伴生文件状态下 doctor 知识库验收失败: $DOCTOR_KB_SUMMARY" 1
+say "  doctor 知识库验收: $DOCTOR_KB_SUMMARY"
 
 MOD_TOTAL=$(( ${#EXT_MODULES[@]} + 1 ))
 say "  工具面完整 · 模块齐备（${MOD_TOTAL}/${MOD_TOTAL}） · 便携知识库就绪 · 单一扩展（无旧版共存）"

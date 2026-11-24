@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.0.1 — 2026-11-25
+
+热修复与部署门禁加固版本：彻底根治 SQLite WAL 模式在冷启动/缺失伴生文件时只读打开失败缺陷，全面隔离单测环境变量杜绝污染宿主机知识库，并强化 `install.sh` 一键安装与 `doctor` 体检门禁。
+
+### 关键缺陷修复与加固
+
+- **根治 SQLite WAL 模式无 `-shm` 伴生文件时只读打开抛 `SQLITE_CANTOPEN`**：
+  - `kb/schema.sql` 切换为 `PRAGMA journal_mode = DELETE; PRAGMA synchronous = NORMAL;`，确保便携知识库以单文件模式落盘，零 `-shm` / `-wal` 伴生文件依赖。
+  - `kb/build-kb.ts`、`omp/kb.ts`（`ensureBundledKb` 与 `distillProjectExperience`）在写事务收尾关闭前显式执行 `PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;`，将已有设备上的旧版 WAL 知识库原地无损转回 `DELETE` 模式（100% 保护既有 `experience` 自进化记录）。
+  - `omp/kb.ts`、`kb/build-kb.ts` 与 `bin/nuwa-autonomous`（`doctor`）统一接入健壮只读打开器 `openReadonlyKbDb`：优先以 `{ readonly: true }` + `PRAGMA busy_timeout = 3000` 并经 `sqlite_master` 探针验证可读；若遇外部遗留 WAL 库缺失 `-shm` 伴生文件，自动安全回退为普通连接并立即锁定 `PRAGMA query_only = ON`。
+  - `tests/v4_kb_memory.test.ts` 新增强删 `-shm` / `-wal` 冷启动及强制遗留 WAL 库只读回退与原地自愈回归测试，覆盖 `kbLookupSafe`、`getKbStats`、`computeExperiencePriorityBoost`、`build-kb.ts --stats-only` 与 `nuwa-autonomous doctor`。
+- **单测环境双重硬隔离（杜绝污染宿主机 `~/.omp/agent/nuwa-kb/kb.db`）**：
+  - 为 `tests/omp_extension.test.ts`、`tests/omp_nuwa.test.ts`、`tests/nuwa_forever.test.ts`、`tests/nuwa_v3_core.test.ts` 等全部测试套件及 `run-tests.sh` / `tests/run.sh` 补齐临时沙盒 `PI_AGENT_HOME` 与 `NUWA_KB_DB` 隔离，确保任何单测执行绝不向宿主机真实知识库或缓存写入测试数据。
+- **`install.sh` 部署与验收加固**：
+  - 新增 `--clean-kb` 选项支持一键全新重建纯净 `kb.db`；`[5/5] 验收` 阶段使用独立临时会话目录隔离冒烟测试状态、清理临时产物、显式移除 `-shm`/`-wal` 后实测 `nuwa_kb` 冷启动命中及 `nuwa-autonomous doctor` 真实表记录数校验。
+
 ## 4.0.0 — 2026-11-25
 
 三期工程化全量总装升级：模块化分层解耦、主从会话血缘与动态模型路由、全工具面安全护栏与纯净证据账本、Soft-404 校准与 SPA 前端感知、随仓便携 SQLite FTS5 知识库与跨项目自进化记忆、多角色会话保险箱、候选漏洞双盲独立复验闸门、零信任 Docker 容器沙盒以及外部设备一键全量部署。

@@ -21,6 +21,7 @@ beforeAll(async () => {
 	AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-v3-agent-"));
 	dirs.push(AGENT_HOME);
 	process.env.PI_AGENT_HOME = AGENT_HOME;
+	process.env.NUWA_KB_DB = join(AGENT_HOME, "nuwa-kb", "kb.db");
 	delete process.env.NUWA_PROJECT;
 	delete process.env.NUWA_HEADLESS_DAEMON;
 	delete process.env.NUWA_AUTO_ON_INIT;
@@ -108,8 +109,8 @@ function setupExt(
 }
 
 describe("v3.0 版本、工具红线、Profile 模式与开局防抢跑", () => {
-	test("VERSION 为 4.0.0 且严格保持 12 个注册工具", () => {
-		expect(mod.VERSION).toBe("4.0.0");
+	test("VERSION 为 4.0.1 且严格保持 12 个注册工具", () => {
+		expect(mod.VERSION).toBe("4.0.1");
 		const dir = makeTempDir();
 		const { tools } = setupExt(dir);
 		expect(tools.size).toBe(12);

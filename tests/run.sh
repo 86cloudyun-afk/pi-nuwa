@@ -83,8 +83,16 @@ else
   run contract python3 contract_check.py
 fi
 
-run unit bun test --isolate unit.test.ts
-run omp bun test --isolate \
+_NUWA_TS_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/nuwa-ts-sandbox.XXXXXX")"
+trap 'rm -rf "$_NUWA_TS_SANDBOX"' EXIT
+run_bun_isolated() {
+  env -u NUWA_KB_DB \
+    PI_AGENT_HOME="$_NUWA_TS_SANDBOX/agent" \
+    bun test --isolate "$@"
+}
+
+run unit run_bun_isolated unit.test.ts
+run omp run_bun_isolated \
   omp_nuwa.test.ts \
   omp_extension.test.ts \
   nuwa_forever.test.ts \
@@ -92,7 +100,7 @@ run omp bun test --isolate \
   ui.test.ts \
   ui_native.test.ts \
   autoexec.test.ts
-run isolation bun test --isolate nuwa_isolation.test.ts
+run isolation run_bun_isolated nuwa_isolation.test.ts
 
 v3_tests=()
 for f in nuwa_v3_core.test.ts scope_evidence.test.ts profiles_daemon.test.ts; do
@@ -108,7 +116,7 @@ for f in *.test.ts; do
   esac
 done
 if (( ${#v3_tests[@]} > 0 )); then
-  run v3 bun test --isolate "${v3_tests[@]}"
+  run v3 run_bun_isolated "${v3_tests[@]}"
 fi
 
 run shell run_shell_suite

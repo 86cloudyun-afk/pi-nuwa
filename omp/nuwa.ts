@@ -1,5 +1,5 @@
 /**
- * nuwa-omp v4.0.0 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
+ * nuwa-omp v4.0.1 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
  *
  * 子模块分工：
  *   - `./types`         共享类型契约与常量
@@ -57,7 +57,7 @@ import { redactVaultSecrets } from "./session-vault";
 import { isVerifyVulnIntentKey } from "./verifier-gate";
 import { readSandboxConfig, wrapCommandInDockerSandbox } from "./sandbox";
 
-export const VERSION = "4.0.0";
+export const VERSION = "4.0.1";
 
 export {
 	PHASE_ORDER, SCHEMA, SEEDS, addFallbackIntent, addIntent, appendIntentSpecs, applyAutoItemResult,

@@ -7,4 +7,8 @@ set -u
 unset BUN_OPTIONS
 cd "$(dirname "$0")" || exit 1
 export NUWA_WORK="${NUWA_WORK:-$(pwd)}"
-exec bun test --isolate "$@"
+_NUWA_TEST_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/nuwa-test-sandbox.XXXXXX")"
+trap 'rm -rf "$_NUWA_TEST_SANDBOX"' EXIT
+export PI_AGENT_HOME="$_NUWA_TEST_SANDBOX/agent"
+unset NUWA_KB_DB
+bun test --isolate "$@"

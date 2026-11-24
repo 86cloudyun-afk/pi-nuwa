@@ -35,6 +35,10 @@ import { defaultScopeForTarget } from "../omp/scope";
 
 const cfg: Cfg = { ...readCfg(), auto: true, autoMax: 3, emptyLimit: 3, maxAttempts: 3 };
 const tempDirs: string[] = [];
+const DEFAULT_TEST_HOME = mkdtempSync(join(tmpdir(), "nuwa-recon-suite-home-"));
+tempDirs.push(DEFAULT_TEST_HOME);
+process.env.PI_AGENT_HOME = DEFAULT_TEST_HOME;
+process.env.NUWA_KB_DB = join(DEFAULT_TEST_HOME, "nuwa-kb", "kb.db");
 
 function makeDir(prefix: string): string {
 	const d = mkdtempSync(join(tmpdir(), prefix));

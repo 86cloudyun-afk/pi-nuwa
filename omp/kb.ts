@@ -169,6 +169,11 @@ export function resolveKbPath(agentHome?: string): string {
 		return join(resolve(agentHome.trim()), "nuwa-kb", "kb.db");
 	}
 
+	const explicitEnvHome = process.env.PI_AGENT_HOME?.trim();
+	if (explicitEnvHome) {
+		return join(resolve(explicitEnvHome), "nuwa-kb", "kb.db");
+	}
+
 	const homePath = join(defaultAgentHome(), "nuwa-kb", "kb.db");
 	if (existsSync(homePath)) return homePath;
 	if (existsSync(LEGACY_KB_PATH)) return LEGACY_KB_PATH;
@@ -230,6 +235,67 @@ function hasTable(db: Database, name: string): boolean {
 		.query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?")
 		.get(name) as { name?: string } | null;
 	return Boolean(row?.name);
+}
+
+/**
+ * 写连接收尾辅助：关闭前执行 WAL 截断检查点并切换回 DELETE 模式。
+ * 确保既有旧 WAL 库原地无损转回单文件 DELETE 模式（完整保留 experience 记录），消除对 -shm/-wal 的依赖。
+ */
+export function finalizeWritableKbDb(db: Database): void {
+	try {
+		db.exec("PRAGMA busy_timeout = 3000;");
+	} catch {
+		/* ignore */
+	}
+	try {
+		db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+	} catch {
+		/* ignore */
+	}
+	try {
+		db.exec("PRAGMA journal_mode = DELETE;");
+	} catch {
+		/* ignore */
+	}
+}
+
+/**
+ * 健壮只读打开辅助：
+ * 1) 优先以 `{ readonly: true }` + `PRAGMA busy_timeout = 3000` 打开并立即查询 sqlite_master 校验可读；
+ * 2) 若外部遗留 WAL 库缺失 `-shm` 导致首条查询抛 `SQLITE_CANTOPEN`，安全回退普通连接并立即设 `PRAGMA query_only = ON`。
+ */
+export function openReadonlyKbDb(filePath: string): Database {
+	let roDb: Database | null = null;
+	try {
+		roDb = new Database(filePath, { readonly: true });
+		try {
+			roDb.exec("PRAGMA busy_timeout = 3000;");
+		} catch {
+			/* ignore */
+		}
+		roDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+		return roDb;
+	} catch {
+		try {
+			roDb?.close();
+		} catch {
+			/* ignore */
+		}
+	}
+
+	const fallbackDb = new Database(filePath);
+	try {
+		fallbackDb.exec("PRAGMA busy_timeout = 3000; PRAGMA query_only = ON;");
+		fallbackDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+		return fallbackDb;
+	} catch (err) {
+		try {
+			fallbackDb.close();
+		} catch {
+			/* ignore */
+		}
+		throw err;
+	}
 }
 
 function safeTableCount(db: Database, table: string): number {
@@ -399,12 +465,14 @@ export function ensureBundledKb(dbPath?: string, opts?: EnsureKbOptions): Ensure
 					db.exec(EXPERIENCE_DDL);
 					migrated = true;
 				}
+				const stats = readStatsFromDb(db, target);
+				finalizeWritableKbDb(db);
 				return {
 					ok: true,
 					dbPath: target,
 					created: false,
 					migrated,
-					stats: readStatsFromDb(db, target),
+					stats,
 				};
 			}
 		} finally {
@@ -422,6 +490,7 @@ export function ensureBundledKb(dbPath?: string, opts?: EnsureKbOptions): Ensure
 	try {
 		compileSeedIntoDb(db, seedDir);
 		const stats = readStatsFromDb(db, target);
+		finalizeWritableKbDb(db);
 		return {
 			ok: true,
 			dbPath: target,
@@ -458,7 +527,7 @@ export function getKbStats(dbPath?: string, opts?: KbCommonOptions): KbStats {
 		};
 	}
 
-	const db = new Database(target, { readonly: true });
+	const db = openReadonlyKbDb(target);
 	try {
 		return readStatsFromDb(db, target);
 	} finally {
@@ -574,7 +643,7 @@ export function kbLookupSafe(
 		}
 	}
 
-	const db = new Database(targetPath, { readonly: true });
+	const db = openReadonlyKbDb(targetPath);
 	try {
 		const cveMatch = q.match(CVE_RE)?.[0]?.toUpperCase();
 		const likeParam = `%${escapeLike(q)}%`;
@@ -1536,6 +1605,7 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 			}
 		});
 		tx();
+		finalizeWritableKbDb(db);
 	} finally {
 		db.close();
 	}
@@ -1588,7 +1658,7 @@ export function computeExperiencePriorityBoost(
 		}
 	}
 
-	const db = new Database(targetPath, { readonly: true });
+	const db = openReadonlyKbDb(targetPath);
 	try {
 		if (!hasTable(db, "experience")) return 0;
 

@@ -2,7 +2,7 @@
  * 女娲 v4.0 多角色会话保险箱（session-vault）、双盲复验闸门（verifier-gate）、
  * 零信任 Docker 沙盒（sandbox）与守护器健康自检（bin/nuwa-autonomous）单元测试。
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import {
@@ -55,6 +55,13 @@ const DOCKERFILE_PATH = join(REPO_ROOT, "docker", "Dockerfile.sandbox");
 const tmpDirs: string[] = [];
 const tmpNuwaProjectIds: string[] = [];
 const savedEnv = new Map<string, string | undefined>();
+const SUITE_AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-vault-suite-home-"));
+process.env.PI_AGENT_HOME = SUITE_AGENT_HOME;
+delete process.env.NUWA_KB_DB;
+
+afterAll(() => {
+	rmSync(SUITE_AGENT_HOME, { recursive: true, force: true });
+});
 
 function makeTmpDir(prefix: string): string {
 	const dir = mkdtempSync(join(tmpdir(), prefix));

@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 const AGENT_HOME = mkdtempSync(join(tmpdir(), "nuwa-isolation-agent-"));
 const SHARED = mkdtempSync("/var/tmp/nuwa-shared-root-");
 process.env.PI_AGENT_HOME = AGENT_HOME;
+process.env.NUWA_KB_DB = join(AGENT_HOME, "nuwa-kb", "kb.db");
 process.env.NUWA_SHARED_CWDS = SHARED;
 delete process.env.NUWA_PROJECT;
 const mod = await import("../omp/nuwa");
