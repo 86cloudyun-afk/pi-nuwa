@@ -1,34 +1,103 @@
 #!/usr/bin/env bun
 /**
- * bin/nuwa-autonomous — 女娲 v3.0 外层轻量无头守护器。
+ * bin/nuwa-autonomous — 女娲 v4.0 外层轻量无头守护器与环境健康体检工具。
  *
  * 职责：
- * 1. 注入无头运行与世代轮转环境变量（NUWA_LOOP/NUWA_INFINITE/NUWA_HEADLESS_DAEMON 等）。
+ * 1. 注入无头运行、世代轮转、沙盒隔离与动态模型分流环境变量
+ *    （NUWA_LOOP/NUWA_INFINITE/NUWA_HEADLESS_DAEMON/NUWA_SANDBOX/NUWA_MODEL_* 等）。
  * 2. 以干净上下文循环拉起 omp 无头会话，读取磁盘 `.nuwa/state.json` 完成跨世代换血接力。
- * 3. 在目标完成（status=completed）时打印报告路径与摘要并退出 0；
+ * 3. 提供 `doctor [--json]` 子命令一键核验外部设备依赖（bun、omp、12 工具/模块、
+ *    `<agentHome>/nuwa-kb/kb.db` 记录数、子代理模板 fujiang.md/nuwa-verifier.md、工具链与 Docker 沙盒）。
+ * 4. 在目标完成（status=completed）时打印报告路径与摘要并退出 0；
  *    在非换代人工/硬闸停机（status=stopped）时打印停机原因并退出 2；
  *    在子进程异常退出（如 API 429/5xx 断流或崩溃）时按指数退避重启并继续读取磁盘接力。
  *
  * 退出码：
- *   0 — 任务完成或 --dry-run / --help 成功
- *   1 — 子进程连续崩溃超限或超过世代/时长上限
+ *   0 — 任务完成、--dry-run / --help 成功，或 doctor 核心依赖全部就绪
+ *   1 — 子进程连续崩溃超限、超过世代/时长上限，或 doctor 缺失核心依赖
  *   2 — 参数错误或项目非换代停机（status=stopped）
  *   130 / 143 — 收到 SIGINT / SIGTERM 优雅退出
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import {
+	accessSync,
+	constants,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join, resolve } from "node:path";
+import { Database } from "bun:sqlite";
 
 const VALID_MODES = new Set(["ctf", "pentest", "audit", "coding", "ops"]);
+const VALID_SANDBOX_MODES = new Set(["none", "docker"]);
 const REINCARNATE_STOP_RE = /(reincarnat|handoff|generation|换代)/i;
 
-const HELP_TEXT = `女娲 v3.0 外层无头守护器 (nuwa-autonomous)
+const REQUIRED_NUWA_TOOLS = [
+	"nuwa_init",
+	"nuwa_plan",
+	"nuwa_frontier",
+	"nuwa_claim",
+	"nuwa_commit",
+	"nuwa_flag",
+	"nuwa_complete",
+	"nuwa_status",
+	"nuwa_report",
+	"nuwa_expand",
+	"nuwa_stop",
+	"nuwa_kb",
+];
+
+const CORE_EXT_MODULES = [
+	"types.ts",
+	"ui.ts",
+	"ui-native.ts",
+	"autoexec.ts",
+	"scope.ts",
+	"evidence.ts",
+	"profiles.ts",
+	"reincarnate.ts",
+];
+
+const V4_EXT_MODULES = [
+	"lineage.ts",
+	"session-vault.ts",
+	"verifier-gate.ts",
+	"sandbox.ts",
+	"kb.ts",
+	"browser-recon.ts",
+];
+
+const DOCTOR_PROBE_TOOLS = [
+	"curl",
+	"openssl",
+	"nmap",
+	"ffuf",
+	"nuclei",
+	"sqlmap",
+	"whatweb",
+	"hydra",
+	"python3",
+	"nc",
+	"sqlite3",
+	"jq",
+];
+
+const KB_TABLES = ["card", "cve", "poc", "technique", "kev", "epss", "experience"];
+
+const HELP_TEXT = `女娲 v4.0 外层无头守护器与环境自检工具 (nuwa-autonomous)
 
 用法:
   nuwa-autonomous --target <目标> [选项]
   nuwa-autonomous --root <已有项目目录> [选项]
+  nuwa-autonomous doctor [--json] [选项]
 
-选项:
+守护模式选项:
   --target <t>                 目标 URL、主机或本地目录/服务标识（新项目必填）
   --mode <m>                   任务模式: ctf | pentest | audit | coding | ops（默认: ctf）
   --goal <g>                   任务目标描述（可选，默认按模式与目标自动生成）
@@ -39,14 +108,42 @@ const HELP_TEXT = `女娲 v3.0 外层无头守护器 (nuwa-autonomous)
   --reincarnate-turns <n>      单代触发换血的轮次阈值（默认: 30）
   --allow-subdomains           放行目标主域的子域名（NUWA_SCOPE_ALLOW_SUBDOMAINS=1）
   --allow-cidr <cidr>          追加放行的 IPv4 CIDR 网段，可重复传入或逗号分隔
-  --model <m>                  透传给 omp 的模型名（可选）
+  --model <m>                  透传给 omp 的主模型名（可选）
+  --fast-model <m>             侦察/表面枚举子代理模型（透传 NUWA_MODEL_FAST）
+  --deep-model <m>             深度漏洞/利用/复盘子代理模型（透传 NUWA_MODEL_DEEP）
+  --verify-model <m>           双盲复验子代理模型（透传 NUWA_MODEL_VERIFY）
+  --sandbox <none|docker>      命令执行沙盒隔离模式（透传 NUWA_SANDBOX，默认: none）
+  --sandbox-image <img>        Docker 沙盒镜像名（透传 NUWA_SANDBOX_IMAGE，默认: nuwa-sandbox:latest）
   --omp-bin <path>             指定 omp 可执行路径（默认: omp，测试可注入 stub）
   --dry-run                    仅打印规划配置与首轮启动命令并退出 0
   -h, --help                   显示本帮助信息
 
+自检子命令 (doctor):
+  nuwa-autonomous doctor [--json] [--agent-home <dir>] [--omp-bin <path>] [--sandbox <none|docker>] [--sandbox-image <img>]
+  核验 bun、omp、12 工具/模块、kb.db 记录数、子代理模板、工具链与 Docker 沙盒可用性。
+  核心依赖全部就绪退出 0，缺失核心依赖退出 1。
+
 环境变量:
   NUWA_DAEMON_BACKOFF_MS       异常重试基础退避毫秒数（默认: 2000，测试可设小值）
   NUWA_DAEMON_MAX_ERRORS       连续异常退出最大重试次数（默认: 5）
+  PI_AGENT_HOME                指定 omp/pi agent 目录（默认自动探测 ~/.omp/agent 或 ~/.pi/agent）
+`;
+
+const DOCTOR_HELP_TEXT = `女娲 v4.0 环境自检子命令 (nuwa-autonomous doctor)
+
+用法:
+  nuwa-autonomous doctor [选项]
+
+选项:
+  --json                       以标准 JSON 格式输出体检结果
+  --agent-home <dir>           指定 agent home 目录（覆盖 PI_AGENT_HOME 自动探测）
+  --omp-bin <path>             指定 omp 可执行文件路径（默认: omp）
+  --bun-bin <path>             指定 bun 可执行文件路径（默认: bun）
+  --kb-db <path>               指定知识库 SQLite 路径（覆盖 NUWA_KB_DB）
+  --sandbox <none|docker>      指定预期运行模式；为 docker 时将 Docker 可用性纳入核心门禁
+  --sandbox-image <img>        指定校验的沙盒镜像名（默认: nuwa-sandbox:latest）
+  --docker-bin <path>          指定 docker 可执行文件路径（默认: docker）
+  -h, --help                   显示本帮助信息
 `;
 
 function log(msg) {
@@ -79,6 +176,12 @@ function parseArgs(argv) {
 		allowSubdomains: false,
 		allowCidrs: [],
 		model: "",
+		fastModel: "",
+		deepModel: "",
+		verifyModel: "",
+		sandbox: "none",
+		sandboxExplicit: false,
+		sandboxImage: "",
 		ompBin: "omp",
 		dryRun: false,
 		help: false,
@@ -146,6 +249,29 @@ function parseArgs(argv) {
 			case "--model":
 				opts.model = take().trim();
 				break;
+			case "--fast-model":
+				opts.fastModel = take().trim();
+				break;
+			case "--deep-model":
+				opts.deepModel = take().trim();
+				break;
+			case "--verify-model":
+				opts.verifyModel = take().trim();
+				break;
+			case "--sandbox":
+				opts.sandbox = take().trim().toLowerCase();
+				opts.sandboxExplicit = true;
+				break;
+			case "--sandbox-image":
+				opts.sandboxImage = take().trim();
+				if (
+					!opts.sandboxImage ||
+					opts.sandboxImage.includes("..") ||
+					!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,255}$/.test(opts.sandboxImage)
+				) {
+					throw new Error(`参数 --sandbox-image 取值非法: ${JSON.stringify(opts.sandboxImage)}`);
+				}
+				break;
 			case "--omp-bin":
 				opts.ompBin = take().trim() || "omp";
 				break;
@@ -160,8 +286,569 @@ function parseArgs(argv) {
 	if (!VALID_MODES.has(opts.mode)) {
 		throw new Error(`不支持的 --mode: ${opts.mode}（可选: ${[...VALID_MODES].join(", ")}）`);
 	}
+	if (!VALID_SANDBOX_MODES.has(opts.sandbox)) {
+		throw new Error(`不支持的 --sandbox: ${opts.sandbox}（可选: none, docker）`);
+	}
 	opts.root = resolve(opts.root || process.cwd());
 	return opts;
+}
+
+function parseDoctorArgs(argv) {
+	const opts = {
+		json: false,
+		help: false,
+		agentHome: "",
+		ompBin: (process.env.NUWA_OMP_BIN ?? "").trim() || "omp",
+		bunBin: (process.env.NUWA_DOCTOR_BUN_BIN ?? "").trim() || "bun",
+		kbDb: "",
+		sandbox: "none",
+		sandboxImage: (process.env.NUWA_SANDBOX_IMAGE ?? "").trim() || "nuwa-sandbox:latest",
+		dockerBin: (process.env.NUWA_DOCKER_BIN ?? "").trim() || "docker",
+	};
+
+	const needVal = (flag, i) => {
+		if (i + 1 >= argv.length) throw new Error(`参数 ${flag} 缺少取值`);
+		return argv[i + 1];
+	};
+
+	for (let i = 0; i < argv.length; i += 1) {
+		const raw = argv[i];
+		let flag = raw;
+		let inlineVal = null;
+		if (raw.startsWith("--") && raw.includes("=")) {
+			const idx = raw.indexOf("=");
+			flag = raw.slice(0, idx);
+			inlineVal = raw.slice(idx + 1);
+		}
+		const take = () => (inlineVal !== null ? inlineVal : needVal(flag, i++));
+
+		switch (flag) {
+			case "-h":
+			case "--help":
+				opts.help = true;
+				break;
+			case "--json":
+				opts.json = true;
+				break;
+			case "--agent-home":
+				opts.agentHome = take().trim();
+				break;
+			case "--omp-bin":
+				opts.ompBin = take().trim() || "omp";
+				break;
+			case "--bun-bin":
+				opts.bunBin = take().trim() || "bun";
+				break;
+			case "--kb-db":
+				opts.kbDb = take().trim();
+				break;
+			case "--sandbox":
+				opts.sandbox = take().trim().toLowerCase();
+				break;
+			case "--sandbox-image":
+				opts.sandboxImage = take().trim() || "nuwa-sandbox:latest";
+				break;
+			case "--docker-bin":
+				opts.dockerBin = take().trim() || "docker";
+				break;
+			default:
+				throw new Error(`doctor 未知参数: ${raw}（使用 nuwa-autonomous doctor --help 查看用法）`);
+		}
+	}
+
+	if (!VALID_SANDBOX_MODES.has(opts.sandbox)) {
+		throw new Error(`doctor 不支持的 --sandbox: ${opts.sandbox}（可选: none, docker）`);
+	}
+	return opts;
+}
+
+function resolveExecutable(binName) {
+	const name = String(binName ?? "").trim();
+	if (!name) return null;
+	if (name.includes("/") || name.includes("\\")) {
+		try {
+			const full = resolve(name);
+			if (statSync(full).isFile()) {
+				accessSync(full, constants.X_OK);
+				return full;
+			}
+		} catch {
+			return null;
+		}
+		return null;
+	}
+	const pathEnv = process.env.PATH ?? "";
+	for (const dir of pathEnv.split(delimiter)) {
+		if (!dir) continue;
+		const full = join(dir, name);
+		try {
+			if (statSync(full).isFile()) {
+				accessSync(full, constants.X_OK);
+				return full;
+			}
+		} catch {
+			/* 继续查找下一 PATH 目录 */
+		}
+	}
+	return null;
+}
+
+function probeBinaryVersion(binPath, versionArgs = ["--version"]) {
+	try {
+		const res = spawnSync(binPath, versionArgs, {
+			encoding: "utf8",
+			timeout: 3000,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (res.error) return null;
+		const out = `${res.stdout ?? ""}\n${res.stderr ?? ""}`
+			.split("\n")
+			.map((s) => s.trim())
+			.find(Boolean);
+		return out || null;
+	} catch {
+		return null;
+	}
+}
+
+function resolveAgentHome(overrideDir) {
+	if (overrideDir && overrideDir.trim()) {
+		return resolve(overrideDir.trim());
+	}
+	if (process.env.PI_AGENT_HOME && process.env.PI_AGENT_HOME.trim()) {
+		return resolve(process.env.PI_AGENT_HOME.trim());
+	}
+	const ompAgent = join(homedir(), ".omp", "agent");
+	if (existsSync(ompAgent)) return ompAgent;
+	return join(homedir(), ".pi", "agent");
+}
+
+function checkExtensionInstallation(agentHome) {
+	const extRoot = join(agentHome, "extensions");
+	const extDir = join(extRoot, "nuwa-omp");
+	const indexPath = join(extDir, "index.ts");
+	const indexExists = existsSync(indexPath);
+
+	let indexSrc = "";
+	let version = null;
+	if (indexExists) {
+		try {
+			indexSrc = readFileSync(indexPath, "utf8");
+			const m = /export\s+const\s+VERSION\s*=\s*["']([^"']+)["']/.exec(indexSrc);
+			if (m?.[1]) version = m[1];
+		} catch {
+			/* 无法读取 index.ts */
+		}
+	}
+
+	const toolsFound = [];
+	const toolsMissing = [];
+	for (const tool of REQUIRED_NUWA_TOOLS) {
+		const re = new RegExp(`name\\s*:\\s*["']${tool}["']`);
+		if (indexSrc && re.test(indexSrc)) {
+			toolsFound.push(tool);
+		} else {
+			toolsMissing.push(tool);
+		}
+	}
+
+	const coreModulesFound = [];
+	const coreModulesMissing = [];
+	for (const mod of CORE_EXT_MODULES) {
+		if (existsSync(join(extDir, mod))) {
+			coreModulesFound.push(mod);
+		} else {
+			coreModulesMissing.push(mod);
+		}
+	}
+
+	const v4ModulesFound = [];
+	const v4ModulesMissing = [];
+	for (const mod of V4_EXT_MODULES) {
+		if (existsSync(join(extDir, mod))) {
+			v4ModulesFound.push(mod);
+		} else {
+			v4ModulesMissing.push(mod);
+		}
+	}
+
+	const conflicts = [];
+	if (existsSync(extRoot)) {
+		try {
+			for (const entry of readdirSync(extRoot)) {
+				if (entry.startsWith("nuwa-") && entry !== "nuwa-omp") {
+					conflicts.push(entry);
+				}
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+
+	const ok = indexExists && toolsMissing.length === 0 && coreModulesMissing.length === 0;
+	let reason = "";
+	if (!indexExists) {
+		reason = `未检测到已安装扩展入口 ${indexPath}（请运行 ./install.sh）`;
+	} else if (toolsMissing.length > 0) {
+		reason = `扩展缺少必需工具 (${toolsMissing.join(", ")})`;
+	} else if (coreModulesMissing.length > 0) {
+		reason = `扩展缺少核心模块 (${coreModulesMissing.join(", ")})`;
+	}
+
+	return {
+		ok,
+		critical: true,
+		dir: extDir,
+		indexExists,
+		version,
+		toolsCount: toolsFound.length,
+		toolsRequired: REQUIRED_NUWA_TOOLS.length,
+		toolsFound,
+		toolsMissing,
+		coreModulesFound,
+		coreModulesMissing,
+		v4ModulesFound,
+		v4ModulesMissing,
+		conflicts,
+		...(reason ? { reason } : {}),
+	};
+}
+
+function checkKnowledgeBase(agentHome, explicitPath) {
+	const candidates = [];
+	if (explicitPath && explicitPath.trim()) {
+		candidates.push(resolve(explicitPath.trim()));
+	} else if (process.env.NUWA_KB_DB && process.env.NUWA_KB_DB.trim()) {
+		candidates.push(resolve(process.env.NUWA_KB_DB.trim()));
+	} else {
+		candidates.push(join(agentHome, "nuwa-kb", "kb.db"));
+		candidates.push("/data/nuwa-kb/kb.db");
+	}
+
+	const foundPath = candidates.find((p) => existsSync(p)) ?? candidates[0];
+	const exists = existsSync(foundPath);
+
+	if (!exists) {
+		return {
+			ok: false,
+			critical: false,
+			path: foundPath,
+			exists: false,
+			counts: {},
+			totalRecords: 0,
+			reason: `未找到知识库文件 ${foundPath}`,
+		};
+	}
+
+	const counts = {};
+	let totalRecords = 0;
+	let db = null;
+	try {
+		db = new Database(foundPath, { readonly: true });
+		for (const table of KB_TABLES) {
+			try {
+				const row = db.query(`SELECT COUNT(*) AS cnt FROM "${table}"`).get();
+				const cnt = Number(row?.cnt ?? 0);
+				if (Number.isFinite(cnt)) {
+					counts[table] = cnt;
+					totalRecords += cnt;
+				}
+			} catch {
+				/* 表不存在时跳过，兼容历史 schema */
+			}
+		}
+		return {
+			ok: totalRecords > 0,
+			critical: false,
+			path: foundPath,
+			exists: true,
+			counts,
+			totalRecords,
+			...(totalRecords === 0 ? { reason: "知识库文件存在但尚无有效记录" } : {}),
+		};
+	} catch (err) {
+		return {
+			ok: false,
+			critical: false,
+			path: foundPath,
+			exists: true,
+			counts,
+			totalRecords: 0,
+			reason: `读取知识库失败: ${err instanceof Error ? err.message : String(err)}`,
+		};
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+function checkAgentTemplates(agentHome) {
+	const agentsDir = join(agentHome, "agents");
+	const checkOne = (filename) => {
+		const full = join(agentsDir, filename);
+		let exists = false;
+		let bytes = 0;
+		try {
+			const st = statSync(full);
+			exists = st.isFile() && st.size > 0;
+			bytes = st.size;
+		} catch {
+			exists = false;
+		}
+		return { exists, path: full, bytes };
+	};
+
+	const fujiang = checkOne("fujiang.md");
+	const nuwaVerifier = checkOne("nuwa-verifier.md");
+	const missing = [];
+	if (!fujiang.exists) missing.push("fujiang.md");
+	if (!nuwaVerifier.exists) missing.push("nuwa-verifier.md");
+
+	return {
+		ok: missing.length === 0,
+		critical: false,
+		dir: agentsDir,
+		fujiang,
+		nuwaVerifier,
+		missing,
+		...(missing.length > 0 ? { reason: `缺少子代理模板: ${missing.join(", ")}` } : {}),
+	};
+}
+
+function checkToolchain() {
+	const available = [];
+	const missing = [];
+	for (const tool of DOCTOR_PROBE_TOOLS) {
+		if (resolveExecutable(tool)) {
+			available.push(tool);
+		} else {
+			missing.push(tool);
+		}
+	}
+	const hasBasic = available.includes("curl") || available.includes("python3");
+	return {
+		ok: hasBasic,
+		critical: false,
+		available,
+		missing,
+		...(hasBasic ? {} : { reason: "缺少基础网络/脚本工具 curl 与 python3" }),
+	};
+}
+
+function checkDockerSandbox(dockerBin, image, critical) {
+	const binPath = resolveExecutable(dockerBin);
+	if (!binPath) {
+		return {
+			ok: false,
+			critical,
+			available: false,
+			daemonRunning: false,
+			image,
+			imagePresent: false,
+			dockerBin,
+			reason: `未找到 Docker 可执行文件: ${dockerBin}`,
+		};
+	}
+
+	try {
+		const info = spawnSync(binPath, ["info", "--format", "{{.ServerVersion}}"], {
+			encoding: "utf8",
+			timeout: 3000,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (info.error || info.status !== 0) {
+			const msg = info.error?.message || (info.stderr ?? "").trim() || `docker info 退出码 ${info.status}`;
+			return {
+				ok: false,
+				critical,
+				available: false,
+				daemonRunning: false,
+				image,
+				imagePresent: false,
+				dockerBin: binPath,
+				reason: msg,
+			};
+		}
+
+		const serverVersion = (info.stdout ?? "").trim() || undefined;
+		const inspect = spawnSync(binPath, ["image", "inspect", image], {
+			encoding: "utf8",
+			timeout: 3000,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		const imagePresent = !inspect.error && inspect.status === 0;
+		const ok = imagePresent;
+
+		return {
+			ok,
+			critical,
+			available: true,
+			daemonRunning: true,
+			image,
+			imagePresent,
+			dockerBin: binPath,
+			...(serverVersion ? { serverVersion } : {}),
+			...(!imagePresent ? { reason: `Docker 运行中但本地缺少沙盒镜像 ${image}` } : {}),
+		};
+	} catch (err) {
+		return {
+			ok: false,
+			critical,
+			available: false,
+			daemonRunning: false,
+			image,
+			imagePresent: false,
+			dockerBin: binPath,
+			reason: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
+
+function runDoctor(argv) {
+	let opts;
+	try {
+		opts = parseDoctorArgs(argv);
+	} catch (err) {
+		logErr(err instanceof Error ? err.message : String(err));
+		process.exit(2);
+	}
+
+	if (opts.help) {
+		console.log(DOCTOR_HELP_TEXT.trimEnd());
+		process.exit(0);
+	}
+
+	const agentHome = resolveAgentHome(opts.agentHome);
+
+	// 1. 检查 bun
+	const bunExplicit = opts.bunBin !== "bun";
+	const bunPath = resolveExecutable(opts.bunBin) ?? (!bunExplicit ? process.execPath : null);
+	const bunVersion = bunPath
+		? !bunExplicit && typeof Bun !== "undefined"
+			? Bun.version
+			: probeBinaryVersion(bunPath, ["--version"])
+		: null;
+	const bunCheck = {
+		ok: Boolean(bunPath),
+		critical: true,
+		bin: opts.bunBin,
+		path: bunPath,
+		version: bunVersion,
+		...(!bunPath ? { reason: `未找到 bun 可执行文件: ${opts.bunBin}` } : {}),
+	};
+
+	// 2. 检查 omp
+	const ompPath = resolveExecutable(opts.ompBin);
+	const ompVersion = ompPath ? probeBinaryVersion(ompPath, ["--version"]) : null;
+	const ompCheck = {
+		ok: Boolean(ompPath),
+		critical: true,
+		bin: opts.ompBin,
+		path: ompPath,
+		version: ompVersion,
+		...(!ompPath ? { reason: `未找到 omp 可执行文件: ${opts.ompBin}` } : {}),
+	};
+
+	// 3. 检查 12 工具与扩展模块
+	const extensionCheck = checkExtensionInstallation(agentHome);
+
+	// 4. 检查 KB 数据库与记录数
+	const kbCheck = checkKnowledgeBase(agentHome, opts.kbDb);
+
+	// 5. 检查子代理模板 fujiang.md / nuwa-verifier.md
+	const agentsCheck = checkAgentTemplates(agentHome);
+
+	// 6. 检查本地工具链
+	const toolchainCheck = checkToolchain();
+
+	// 7. 检查 Docker 沙盒可用性
+	const dockerCheck = checkDockerSandbox(opts.dockerBin, opts.sandboxImage, opts.sandbox === "docker");
+
+	const checks = {
+		bun: bunCheck,
+		omp: ompCheck,
+		extension: extensionCheck,
+		kb: kbCheck,
+		agents: agentsCheck,
+		toolchain: toolchainCheck,
+		docker: dockerCheck,
+	};
+
+	const allEntries = Object.entries(checks);
+	const criticalEntries = allEntries.filter(([, c]) => c.critical);
+	const criticalPassed = criticalEntries.filter(([, c]) => c.ok).length;
+	const criticalFailed = criticalEntries.filter(([, c]) => !c.ok).map(([k]) => k);
+	const warnings = [];
+
+	if (extensionCheck.conflicts.length > 0) {
+		warnings.push(`检测到冲突扩展目录: ${extensionCheck.conflicts.join(", ")}`);
+	}
+	for (const [name, c] of allEntries) {
+		if (!c.critical && !c.ok && c.reason) {
+			warnings.push(`${name}: ${c.reason}`);
+		}
+	}
+
+	const overallOk = criticalFailed.length === 0;
+	const exitCode = overallOk ? 0 : 1;
+
+	const report = {
+		ok: overallOk,
+		exitCode,
+		checkedAt: new Date().toISOString(),
+		agentHome,
+		checks,
+		summary: {
+			criticalPassed,
+			criticalTotal: criticalEntries.length,
+			criticalFailed,
+			warnings,
+		},
+	};
+
+	if (opts.json) {
+		console.log(JSON.stringify(report, null, 2));
+		process.exit(exitCode);
+	}
+
+	const badge = (c) => (c.ok ? "[OK]" : c.critical ? "[FAIL]" : "[WARN]");
+	const lines = [
+		`女娲环境健康体检 (nuwa-autonomous doctor)`,
+		`Agent Home: ${agentHome}`,
+		`------------------------------------------------------------`,
+		`${badge(bunCheck)} bun: ${bunCheck.ok ? `${bunCheck.version ?? "ok"} (${bunCheck.path})` : bunCheck.reason}`,
+		`${badge(ompCheck)} omp: ${ompCheck.ok ? `${ompCheck.version ?? "ok"} (${ompCheck.path})` : ompCheck.reason}`,
+		`${badge(extensionCheck)} 扩展与工具: ${
+			extensionCheck.ok
+				? `v${extensionCheck.version ?? "?"} · 工具 ${extensionCheck.toolsCount}/${extensionCheck.toolsRequired} · 核心模块 ${extensionCheck.coreModulesFound.length}/${CORE_EXT_MODULES.length} · v4模块 ${extensionCheck.v4ModulesFound.length}/${V4_EXT_MODULES.length}`
+				: extensionCheck.reason
+		}`,
+		`${badge(kbCheck)} 知识库 KB: ${
+			kbCheck.exists
+				? `${kbCheck.path} (总记录 ${kbCheck.totalRecords}；${Object.entries(kbCheck.counts)
+						.map(([k, v]) => `${k}=${v}`)
+						.join(", ") || "无表"})`
+				: kbCheck.reason
+		}`,
+		`${badge(agentsCheck)} 子代理模板: fujiang.md=${agentsCheck.fujiang.exists ? "就绪" : "缺失"}, nuwa-verifier.md=${agentsCheck.nuwaVerifier.exists ? "就绪" : "缺失"} (${agentsCheck.dir})`,
+		`${badge(toolchainCheck)} 本地工具链: 可用 ${toolchainCheck.available.length}/${DOCTOR_PROBE_TOOLS.length} (${toolchainCheck.available.join(", ") || "无"})${
+			toolchainCheck.missing.length ? ` | 缺失: ${toolchainCheck.missing.join(", ")}` : ""
+		}`,
+		`${badge(dockerCheck)} Docker 沙盒: ${
+			dockerCheck.ok
+				? `就绪 (daemon ${dockerCheck.serverVersion ?? "ok"}, 镜像 ${dockerCheck.image})`
+				: dockerCheck.reason
+		}`,
+		`------------------------------------------------------------`,
+		overallOk
+			? `体检结论: 核心依赖就绪 (${criticalPassed}/${criticalEntries.length})${warnings.length ? `，存在 ${warnings.length} 项非阻断提醒` : ""}。`
+			: `体检结论: 缺失核心依赖 (${criticalFailed.join(", ")})，请先修复后再运行。`,
+	];
+	console.log(lines.join("\n"));
+	process.exit(exitCode);
 }
 
 function stateFilePath(root) {
@@ -228,6 +915,21 @@ function buildChildEnv(opts, gen) {
 	}
 	if (opts.allowCidrs.length > 0) {
 		env.NUWA_SCOPE_ALLOW_CIDRS = opts.allowCidrs.join(",");
+	}
+	if (opts.sandboxExplicit || opts.sandbox !== "none") {
+		env.NUWA_SANDBOX = opts.sandbox;
+	}
+	if (opts.sandboxImage) {
+		env.NUWA_SANDBOX_IMAGE = opts.sandboxImage;
+	}
+	if (opts.fastModel) {
+		env.NUWA_MODEL_FAST = opts.fastModel;
+	}
+	if (opts.deepModel) {
+		env.NUWA_MODEL_DEEP = opts.deepModel;
+	}
+	if (opts.verifyModel) {
+		env.NUWA_MODEL_VERIFY = opts.verifyModel;
 	}
 	return env;
 }
@@ -329,6 +1031,11 @@ function persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal
 			allowSubdomains: opts.allowSubdomains,
 			allowCidrs: opts.allowCidrs,
 			model: opts.model || undefined,
+			fastModel: opts.fastModel || undefined,
+			deepModel: opts.deepModel || undefined,
+			verifyModel: opts.verifyModel || undefined,
+			sandbox: opts.sandbox,
+			sandboxImage: opts.sandboxImage || undefined,
 			updatedAt: new Date().toISOString(),
 		};
 		writeFileSync(cfgPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
@@ -342,9 +1049,15 @@ function shellQuotePreview(arg) {
 }
 
 async function main() {
+	const rawArgv = process.argv.slice(2);
+	if (rawArgv[0] === "doctor") {
+		runDoctor(rawArgv.slice(1));
+		return;
+	}
+
 	let opts;
 	try {
-		opts = parseArgs(process.argv.slice(2));
+		opts = parseArgs(rawArgv);
 	} catch (err) {
 		logErr(err instanceof Error ? err.message : String(err));
 		process.exit(2);
@@ -385,6 +1098,11 @@ async function main() {
 			allowSubdomains: opts.allowSubdomains,
 			allowCidrs: opts.allowCidrs,
 			model: opts.model || null,
+			fastModel: opts.fastModel || null,
+			deepModel: opts.deepModel || null,
+			verifyModel: opts.verifyModel || null,
+			sandbox: opts.sandbox,
+			sandboxImage: opts.sandboxImage || null,
 			ompBin: opts.ompBin,
 			existingState: Boolean(initialState),
 			env: {
@@ -401,6 +1119,11 @@ async function main() {
 				...(envPreview.NUWA_SCOPE_ALLOW_CIDRS
 					? { NUWA_SCOPE_ALLOW_CIDRS: envPreview.NUWA_SCOPE_ALLOW_CIDRS }
 					: {}),
+				...(envPreview.NUWA_SANDBOX ? { NUWA_SANDBOX: envPreview.NUWA_SANDBOX } : {}),
+				...(envPreview.NUWA_SANDBOX_IMAGE ? { NUWA_SANDBOX_IMAGE: envPreview.NUWA_SANDBOX_IMAGE } : {}),
+				...(envPreview.NUWA_MODEL_FAST ? { NUWA_MODEL_FAST: envPreview.NUWA_MODEL_FAST } : {}),
+				...(envPreview.NUWA_MODEL_DEEP ? { NUWA_MODEL_DEEP: envPreview.NUWA_MODEL_DEEP } : {}),
+				...(envPreview.NUWA_MODEL_VERIFY ? { NUWA_MODEL_VERIFY: envPreview.NUWA_MODEL_VERIFY } : {}),
 			},
 			command: [opts.ompBin, ...ompArgs],
 		};

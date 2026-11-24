@@ -1,0 +1,34 @@
+# 女娲 v4.0 零信任安全评估沙盒镜像（轻量 Alpine + 非 root nuwa 用户）
+#
+# 构建示例：
+#   docker build -f docker/Dockerfile.sandbox -t nuwa-sandbox:latest .
+FROM alpine:3.20
+
+LABEL org.opencontainers.image.title="nuwa-sandbox" \
+      org.opencontainers.image.description="Nuwa v4.0 zero-trust non-root security assessment sandbox" \
+      org.opencontainers.image.licenses="MIT"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8
+
+# 安装标准只读评估与诊断工具：curl / openssl / nmap / python3 / jq / sqlite3 / netcat
+RUN apk add --no-cache \
+      ca-certificates \
+      curl \
+      openssl \
+      nmap \
+      python3 \
+      jq \
+      sqlite \
+      netcat-openbsd \
+    && addgroup -g 10001 -S nuwa \
+    && adduser -u 10001 -S -G nuwa -h /home/nuwa -s /bin/sh nuwa \
+    && mkdir -p /tmp/nuwa /home/nuwa \
+    && chown -R nuwa:nuwa /tmp/nuwa /home/nuwa \
+    && chmod 0700 /tmp/nuwa /home/nuwa
+
+USER nuwa
+WORKDIR /tmp/nuwa
+
+CMD ["/bin/sh"]
