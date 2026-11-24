@@ -1,10 +1,12 @@
 /**
- * 女娲 v3.0 共享类型定义。
+ * 女娲 v4.0 共享类型定义。
  *
- * 汇总核心状态机、范围护栏、证据账本、多领域 Profile 与世代轮转的公共类型，
+ * 汇总核心状态机、范围护栏、证据账本、多领域 Profile、会话保险箱、
+ * 双盲复验闸门、零信任沙盒与世代轮转的公共类型，
  * 供各子模块 `import type` 使用，并由 `omp/nuwa.ts` 完整 re-export 以保持 100% 向后兼容。
  */
 
+export const NUWA_VERSION = "4.0.0";
 export const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
 export type ProfileMode = "ctf" | "pentest" | "audit" | "coding" | "ops";
@@ -24,6 +26,7 @@ export type FactKind =
 
 export type Phase = (typeof PHASE_ORDER)[number];
 export type IntentStatus = "open" | "claimed" | "done" | "blocked";
+export type VerifyStage = "candidate" | "confirmed" | "rejected";
 
 export interface AutoFactMeta {
 	ports?: number[];
@@ -33,6 +36,9 @@ export interface AutoFactMeta {
 	status?: number;
 	san?: string[];
 	waf?: string;
+	routes?: string[];
+	bundles?: string[];
+	graphql?: boolean;
 }
 
 export interface ScopePolicy {
@@ -99,6 +105,11 @@ export interface Fact {
 	createdAt: string;
 	meta?: AutoFactMeta;
 	verified?: boolean;
+	/** v4.0 双盲独立复验状态：candidate 待复验 / confirmed 已证实 / rejected 已证伪驳回。 */
+	verifyStage?: VerifyStage;
+	verifyNote?: string;
+	verifiedAt?: string;
+	verifiedBy?: string;
 }
 
 export interface Intent {
@@ -145,6 +156,10 @@ export interface Project {
 	scope?: ScopePolicy;
 	/** v3.0 本地可用工具链能力快照。 */
 	toolchain?: ToolchainCaps;
+	/** v4.0 会话保险箱中已收纳的角色名列表（不含任何敏感值）。 */
+	activeRoles?: string[];
+	/** v4.0 沙盒隔离模式标识。 */
+	sandboxMode?: "none" | "docker";
 }
 
 export interface Runtime {
@@ -183,7 +198,7 @@ export interface Runtime {
 	saveCount?: number;
 	/** 最近一次 state.json 字节数。 */
 	stateBytes?: number;
-	/** 当前自动批规则来源标识（builtin/project/agent）。 */
+	/** 当前自动批规则来源标识（builtin/project/global）。 */
 	rulesSource?: string;
 }
 
@@ -271,6 +286,7 @@ export interface CommitInput {
 	note?: string;
 	meta?: AutoFactMeta;
 	verified?: boolean;
+	verifyStage?: VerifyStage;
 }
 
 export interface PolicyVerdict {

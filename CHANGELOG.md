@@ -1,5 +1,38 @@
 # Changelog
 
+## 4.0.0 — 2026-11-25
+
+三期工程化全量总装升级：模块化分层解耦、主从会话血缘与动态模型路由、全工具面安全护栏与纯净证据账本、Soft-404 校准与 SPA 前端感知、随仓便携 SQLite FTS5 知识库与跨项目自进化记忆、多角色会话保险箱、候选漏洞双盲独立复验闸门、零信任 Docker 容器沙盒以及外部设备一键全量部署。
+
+### 核心架构与模块总装
+
+- **巨石拆分解耦与离线严格构建门禁**：
+  - 将原 4,391 行 `omp/nuwa.ts` 拆分为 `omp/storage.ts`（配置、文件锁、原子写、增量 `.json.gz` 快照、journal 恢复、多会话指针与 `.sapper` 迁移）、`omp/graph.ts`（六阶段种子、状态机、经验提权排序、双盲复验流转与纪律策略）与精简入口 `omp/nuwa.ts`（静态无后缀 ESM 导入、100% 向后兼容 re-export、12 个 `nuwa_*` 工具、`/nuwa` 命令与事件钩子）。
+  - 新增自包含离线类型声明 `omp/env.d.ts` 与根目录严格 `tsconfig.json`，无需外置 `node_modules` 即可通过 `bun build` 全模块静态构建。
+- **主从会话血缘追踪与动态模型分流（`omp/lineage.ts`）**：
+  - 新增 `registerActiveSession`、`bindSubagentSpawn`、`resolveLineageRoot`（进程内缓存 + `<agentHome>/cache/nuwa-lineage.json` 原子持久化），接入 `nuwa_init`、`/nuwa`、`session_start`、`before_subagent_spawn`、`tool_call` 与 `tool_execution_end`，彻底根治 `task` 子代理独立 `subSessionId` 下护栏与证据账本断层。
+  - 新增 `routeSubagentModel`：按角色（`fujiang` / `nuwa-verifier`）、阶段、待复验与战略复盘特征在 `NUWA_MODEL_FAST` / `NUWA_MODEL_DEEP` / `NUWA_MODEL_VERIFY` 间动态分流。
+- **全工具面范围护栏与纯净执行账本（`omp/scope.ts` + `omp/evidence.ts`）**：
+  - 新增 `checkToolScopeAndRisk` 覆盖 `read`、`browser`（`http/https/ws/wss`、`allowed_domains`、禁非 `coding` 本地文件访问）、`web_search`（拦截靶标私网 IP 与内网特征外泄）与 `eval` 代码 URL/防篡改检查。
+  - 新增 `TRUSTED_EVIDENCE_TOOLS` 与 `isTrustedEvidenceEvent`，在 `tool_execution_end` 与 `recordToolExecution` 双层屏蔽 `task`/`eval`/`todo`/`think`/`ask` 编排输出进入 `exec-ledger.jsonl`，并在有执行历史时对 `vuln`/`cred`/`flag` 强验真实回显。
+  - 新增便携合规子代理模板 `agents/fujiang.md` 与 `agents/nuwa-verifier.md`。
+- **Soft-404 基线去噪、语义实锤、工具链升档与 SPA 感知（`omp/autoexec.ts` + `omp/browser-recon.ts`）**：
+  - `dirsRule` 与 `probePaths` 引入双随机路径 Soft-404 基线校准（状态码 + 体积容差 + HTML title 去噪）与内容级语义指纹实锤，`.env` 密钥自动掩码脱敏，杜绝 SPA HTML 兜底页误报敏感泄漏。
+  - 按 `st.project.toolchain` 自适应升档 `nmap`、`ffuf -ac`、`katana` 与合规非破坏性 `nuclei`（仅限 `tech,exposure,misconfig` 标签）。
+  - 新增 `omp/browser-recon.ts`（`runSpaRecon`）：支持受控只读 Playwright 动态拦截模式与零外部依赖静态 JS Bundle（最多 8 个同源包 + 受控跳转范围校验）回退模式，融入自动批与 `/nuwa spa` 工作流。
+- **随仓便携知识库与跨项目自进化经验回流（`kb/*` + `omp/kb.ts`）**：
+  - 随仓内置 `kb/schema.sql`、36 张技术栈防御审计卡、74 条公开 CVE、30 条 ATT&CK 技术与纯 `bun:sqlite` 幂等建库脚本 `kb/build-kb.ts`（保护既有 `experience` 表不清空）。
+  - `nuwa_kb` 与 `deriveKbIntents` 全面切换至全参数化防注入 `kbLookupSafe`，彻底移除 `sqlite3` CLI 外部依赖与 SQL 拼接；`nuwa_init` / `session_start` 支持懒初始化建库。
+  - `nuwa_complete` 验收成功时自动调用 `distillProjectExperience` 强脱敏沉淀成败经验（零 URL/IP/端口/凭据/Flag 残留），`frontierList` 接入 `computeExperiencePriorityBoost` 基于 UCB1 实现跨项目自适应提权与避坑降权。
+- **多角色会话保险箱、双盲独立复验闸门与零信任容器沙盒（`omp/session-vault.ts` + `omp/verifier-gate.ts` + `omp/sandbox.ts`）**：
+  - 新增 `0o700/0o600` 原子持久化会话保险箱：`/nuwa session [list|set|remove|clear]` 管理多角色凭据，`nuwa_commit(kind="cred")` 自动收纳并对落盘事实与报告执行 `redactVaultSecrets` 全量脱敏；`nuwa_claim` 对鉴权相关意图自动物化头文件并注入零明文差分重放指引。
+  - 新增双盲复验闸门：手动/子代理提交的 `vuln` 默认暂存为 `verifyStage="candidate"` 并自动派生 P96 `verify-vuln:<fid>` 独立挑刺正负对照意图；`nuwa_complete` 调用 `filterConfirmedProofs` 阻断仅凭未复验候选漏洞过早结案。
+  - 新增零信任 Docker 沙盒包裹器（`--read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256`，仅挂载 `/tmp/nuwa/<projectId>`，阻断宿主敏感目录与 API Key 透传，附容器内 `ScopePolicy` 前置白名单校验与 `docker/Dockerfile.sandbox`）；`tool_call(bash)` 在 `NUWA_SANDBOX=docker` 时强制校验（`N-009`）。
+  - `bin/nuwa-autonomous` 新增 `--sandbox`/`--sandbox-image`/`--fast-model`/`--deep-model`/`--verify-model` 及 `doctor [--json]` 一键体检子命令；会话内同步新增 `/nuwa doctor`。
+- **v1 遗产归档与一键全量部署升级**：
+  - 旧版 Python 模块归档至 `archive/v1/nuwa/`（由 `nuwa/__init__.py` 透明兼容转发，历史测试全绿），历史发布纪要归档至 `docs/archive/v1/`。
+  - `install.sh` 升级为一键安装全部 18 个扩展模块、`kb/`、`config/`、自动构建 `kb.db`、无损安装子代理模板（支持 `--force-agents`）并执行含 KB 查询与子代理血缘拦截的异步插件冒烟验收。
+
 ## 3.0.1 — 2026-11-24
 
 彻底根治 Issue #10（ESM 异步插件运行时加载问题）并对齐 Issues #1–#9 全部细节判据：

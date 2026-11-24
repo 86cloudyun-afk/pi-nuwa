@@ -1,173 +1,118 @@
-# pi-nuwa · 女娲模式 v3（omp 原生自治运行时）
+# pi-nuwa · 女娲模式 v4.0（全自主安全评估与多领域原生引擎）
 
-把「长任务不会停、证据不造假、范围不越界、上下文可换血」做成 omp 会话内运行时 + 极薄外层无头守护器。
+把「长任务不会停、证据不造假、范围不越界、漏洞双盲复验、经验跨项目自进化、零信任沙盒可隔离、任意新机一键部署」做成纯 `omp` 原生扩展运行时 + 外层无头守护器。
 
-**女娲模式 v3 = 一套执行纪律（SKILL.md）+ 模块化 omp 原生运行时（9 个 TS 模块，12 个 `nuwa_*` 工具）+ 外层无头换血守护器（`bin/nuwa-autonomous`）。**
-无需 Python、无需 `sapper`、无需 tmux/watchdog；支持安全评估（`ctf`/`pentest`/`audit`）与通用工程运维（`coding`/`ops`）五种领域模式。
+**女娲模式 v4.0 = 执行纪律（`SKILL.md`）+ 模块化 `omp` 原生运行时（18 个 TS 文件，12 个 `nuwa_*` 工具）+ 随仓便携 SQLite FTS5 知识库（`kb/`）+ 合规双子代理（`fujiang` + `nuwa-verifier`）+ 外层无头守护器（`bin/nuwa-autonomous`）。**
+无需外部 `sapper`、无需 `sqlite3` CLI、无需外置私有资产库；支持安全评估（`ctf`/`pentest`/`audit`）与通用工程运维（`coding`/`ops`）五种领域模式。
 
-## 为什么演进到 v3
+## v4.0 核心能力演进
 
-- v1 靠 `bin/nuwa (bash) → nuwa/cli.py (Python) → sapper → omp-claude` 四层进程拼接，故障面大且难复现。
-- v2 将状态机、续跑循环、确定性自渗透与可视化全部收进 omp 进程，实现了单会话内永动推进。
-- **v3.0 在保留 12 个 `nuwa_*` 工具完全向后兼容的基础上，补齐了长程自治最关键的 6 块工程拼图**：
-  1. **外层无头守护与跨世代自动换血（`bin/nuwa-autonomous` + `omp/reincarnate.ts`）**：单代上下文 token/轮次达阈值时自动精炼 ≤1500 字交接摘要并优雅放行，由外层守护进程以全新上下文自动拉起下一代，遇到 API 429/5xx 断流或崩溃按指数退避自动从磁盘续跑。
-  2. **知识库自动富化与战略复盘规划（`omp/profiles.ts`）**：自动从 `service`/`endpoint`/`vuln` 提取技术栈与 CVE 查库派生核验意图；阶段将尽或连续 `stall >= 3` 时生成战略复盘意图引导 `nuwa_plan` 重规划。
-  3. **真实执行账本防幻觉（`omp/evidence.ts`）**：记录 `tool_execution_end` 输出至 `.nuwa/exec-ledger.jsonl`，对 `flag`/`vuln`/`cred` 复验真实执行证据，杜绝口头编造结论。
-  4. **靶标 Scope 护栏与防篡改（`omp/scope.ts`）**：新增 `N-007` 越界外链拦截、`N-008` 高危破坏命令拦截、增强 `N-003` `.nuwa/` 防篡改，支持 `/nuwa scope` 查看/调整。
-  5. **武器库能力探针与自适配（`omp/evidence.ts`）**：初始化自动探测本地可用工具链，派单时对缺失工具自动附带本地合规替代指引。
-  6. **多领域 Profile 解耦（`omp/profiles.ts`）**：`mode` 扩展为 `ctf` / `pentest` / `audit` / `coding` / `ops`，`coding`/`ops` 原生支持本地目录与服务标识目标。
+在保留 12 个 `nuwa_*` 工具 100% 向后兼容的基础上，v4.0 完成了工程化三期全量闭环：
 
-## 组成
+1. **巨石解耦与离线严格构建（`omp/types.ts` + `omp/storage.ts` + `omp/graph.ts` + `omp/nuwa.ts` + `omp/env.d.ts`）**：单向无环模块架构，零 `node_modules` 依赖即可通过 `bun build` 全模块静态构建与异步 `Bun.plugin` 加载。
+2. **主从会话血缘追踪与动态模型分流（`omp/lineage.ts`）**：`before_subagent_spawn` 持久化父子血缘至 `<agentHome>/cache/nuwa-lineage.json`，根治子代理独立 `subSessionId` 下护栏与证据账本断层；按角色/阶段/复验/复盘自动路由 `fast` / `deep` / `verify` 模型。
+3. **全工具面 Scope 护栏与纯净证据账本（`omp/scope.ts` + `omp/evidence.ts`）**：范围拦截从 `bash` 扩展至 `read`/`browser`/`web_search`/`eval`；`isTrustedEvidenceEvent` 彻底屏蔽 `task`/`eval` 等编排输出污染 `exec-ledger.jsonl`，杜绝伪造回显。
+4. **Soft-404 校准、工具链重武器升档与 SPA 感知（`omp/autoexec.ts` + `omp/browser-recon.ts`）**：双随机探针自动过滤 SPA 假 200 HTML 兜底页，内容级语义指纹实锤并掩码脱敏 `.env`；自适应升档 `nmap`/`ffuf -ac`/`katana`/合规 `nuclei`；内置 Playwright 只读拦截与静态 JS Bundle 双模 SPA 路由提取（`/nuwa spa`）。
+5. **便携知识库与跨项目自进化记忆（`kb/*` + `omp/kb.ts`）**：随仓内置 36 张审计卡、74 条 CVE、30 条 ATT&CK 技术，纯 `bun:sqlite` 参数化防注入查询；`nuwa_complete` 验收后自动强脱敏蒸馏成败经验，`nuwa_frontier` 基于 UCB1 算法对同类项目自适应提权与避坑降权。
+6. **多角色会话保险箱、双盲独立复验与零信任容器沙盒（`omp/session-vault.ts` + `omp/verifier-gate.ts` + `omp/sandbox.ts`）**：`0o600` 加密掩码管理多角色会话并生成零明文差分重放指引；新发现 `vuln` 先入 `candidate` 并自动派生 `verify-vuln:<fid>` 交由 `nuwa-verifier` 正负对照复验，未升格 `confirmed` 前阻断过早收口；支持零信任只读 Docker 沙盒包裹执行（`N-009`）与 `nuwa-autonomous doctor` 一键体检。
 
-| 路径 | 作用 |
+## 模块组成
+
+| 路径 | 职责 |
 |---|---|
-| `omp/nuwa.ts` | 主运行时入口（部署为 `index.ts`）：状态机、12 个 `nuwa_*` 工具、事件钩子、增量快照与容量治理 |
-| `omp/types.ts` | 共享类型定义（由 `omp/nuwa.ts` 完整 re-export） |
-| `omp/autoexec.ts` | 自渗透执行器：跨平台并发端口/HTTP/目录/TLS 探测、外置 `.nuwa/autoexec.json` 热更新、失败三分类、预算与取消 |
-| `omp/scope.ts` | 靶标范围策略（`N-007`）、高危破坏拦截（`N-008`）与 `.nuwa/` 权威状态防篡改（`N-003`） |
-| `omp/evidence.ts` | 真实执行账本（`.nuwa/exec-ledger.jsonl`）防幻觉复验与本地工具链探针自适配 |
-| `omp/profiles.ts` | 5 种领域 Profile（`ctf`/`pentest`/`audit`/`coding`/`ops`）、技术栈提取与 KB 富化、战略复盘规划 |
-| `omp/reincarnate.ts` | 会话世代轮转策略与 ≤1500 字交接摘要生成 |
-| `omp/ui.ts` / `omp/ui-native.ts` | 三层可视化面（状态栏 / mini 看板 / `/nuwa board`）与 Tern 原生 TSP 节点降级层 |
-| `bin/nuwa-autonomous` | 外层轻量无头守护器（支持跨世代换血、指数退避重试、Scope 透传、`--dry-run`） |
-| `skills/nuwa-pentest/SKILL.md` | 执行纪律：触发词、每轮固定动作、Scope 与证据复验规范 |
-| `install.sh` | 安装全部 9 个扩展模块 + skill + `nuwa-autonomous`，回显 `installed version = 3.0.0` |
+| `omp/nuwa.ts` | 组装入口（部署为 `index.ts`）：12 个 `nuwa_*` 工具、`/nuwa` 命令、6 类生命周期与护栏事件、全量兼容导出 |
+| `omp/types.ts` | 共享类型契约与常量定义 |
+| `omp/storage.ts` | 配置读取、文件锁 `withLock`、原子写、增量 `.json.gz` 快照、journal 恢复、多会话指针与 `.sapper` 迁移 |
+| `omp/graph.ts` | 6 阶段种子、图状态机、UCB1 经验提权排序、双盲复验门禁流转、SPA 工作流与纪律校验策略 |
+| `omp/lineage.ts` | 主从会话血缘绑定（内存 + 磁盘缓存）与子代理 `fast`/`deep`/`verify` 动态模型路由器 |
+| `omp/scope.ts` | 全工具面（`bash`/`read`/`browser`/`web_search`/`eval`）靶标范围策略（`N-007`）、高危拦截（`N-008`）与防篡改（`N-003`） |
+| `omp/evidence.ts` | 可信证据源白名单（屏蔽编排幻觉）、`.nuwa/exec-ledger.jsonl` 强复验与工具链能力探针 |
+| `omp/autoexec.ts` | Soft-404 基线去噪、内容语义实锤、工具链重武器自适应升档、外置规则热更新与预算取消控制 |
+| `omp/browser-recon.ts` | SPA 动态只读无头浏览器感知与零依赖静态同源 JS Bundle API 提取层 |
+| `omp/kb.ts` & `kb/*` | 随仓种子资产、纯 `bun:sqlite` 幂等建库器、参数化 FTS5 检索与跨项目强脱敏经验蒸馏引擎 |
+| `omp/session-vault.ts` | 多角色认证会话保险箱（`0o700/0o600`）、全文本凭据掩码脱敏与零明文鉴权差分重放指引 |
+| `omp/verifier-gate.ts` | 候选漏洞 `candidate → confirmed / rejected` 双盲挑刺复验闸门 |
+| `omp/sandbox.ts` & `docker/` | 零信任 Docker 容器隔离包裹器与非 root 标准评估沙盒镜像定义 |
+| `omp/profiles.ts` | 5 种领域 Profile（`ctf`/`pentest`/`audit`/`coding`/`ops`）、技术栈提取与战略复盘生成 |
+| `omp/reincarnate.ts` | 长程无头守护跨世代轮转判定与 ≤1500 字交接摘要生成 |
+| `omp/ui.ts` / `omp/ui-native.ts` | 三层常驻可视面与 Tern 原生 TSP 组件按能力自动降级层 |
+| `agents/*.md` | 便携合规子代理模板：`fujiang.md`（执行取证）与 `nuwa-verifier.md`（独立双盲证伪复验） |
+| `bin/nuwa-autonomous` | 外层无头守护器（跨世代换血、模型路由透传、容器沙盒透传、`doctor [--json]` 一键体检） |
+| `archive/v1/` & `docs/archive/v1/` | 已归档的 v1 Python 历史模块与早期发布记录（保留 `nuwa/__init__.py` 透明兼容转发） |
 
-## 安装
+## 一键部署与环境体检
 
 ```bash
 git clone https://github.com/86cloudyun-afk/pi-nuwa.git
 cd pi-nuwa
-./install.sh                 # 安装到 ~/.omp/agent/extensions/nuwa-omp 与 ~/.local/bin/nuwa-autonomous
-./install.sh --rollback      # 回滚扩展与 nuwa-loop
+env -u BUN_OPTIONS ./install.sh                 # 一键部署 18 模块 + 构建便携 kb.db + 安装子代理与守护器
+env -u BUN_OPTIONS ./install.sh --force-agents  # 强制刷新已存在的子代理模板
+./install.sh --rollback                         # 一键回滚至上一版备份
+
+# 部署后一键环境健康体检
+~/.local/bin/nuwa-autonomous doctor
+~/.local/bin/nuwa-autonomous doctor --json
 ```
 
-安装器支持环境变量 `PI_AGENT_HOME`（指定 agent 目录）与 `NUWA_BIN_DIR`（指定 `nuwa-autonomous` 安装目录）。
-备份与退役目录写到 `$AGENT_HOME/backups/`，**绝不放在 `extensions/` 下**：omp 会把每个含 `index.ts` 的目录都当扩展加载，避免新旧两个 `session_stop` 同时抢跑。
+依赖：`omp` ≥ 18.16.0，`bun` ≥ 1.1。随仓自带 `kb/` 种子并通过 `bun:sqlite` 自动构建 `~/.omp/agent/nuwa-kb/kb.db`，开箱即用。
 
-依赖：omp ≥ 18.16.0，bun ≥ 1.1（用于运行 `nuwa-autonomous` 与测试）。`nuwa_kb` 额外需要 `sqlite3` 与 `/data/nuwa-kb/kb.db`，缺失时自动降级不影响其余工具。
+## 快速使用
 
-## 使用
-
-### 1. 交互式会话内开工
-
-会话里说「女娲模式，打 http://TARGET:PORT」，或使用 `/nuwa` 命令：
+### 1. 交互式会话命令与工具
 
 ```text
 /nuwa 打 http://TARGET:PORT 拿 flag
-/nuwa board                  # 全屏只读面板（q/Esc 关闭）
-/nuwa scope                  # 查看或调整当前项目的 Scope 范围策略
-/nuwa status / log / why / stop / resume
+/nuwa status                 # 查看阶段、待复验 cand、Vault 角色 roles、kb 状态与 frontier
+/nuwa board                  # 全屏 TUI 看板（q/Esc 关闭）
+/nuwa scope                  # 查看或动态调整靶标 Scope 白名单/子域策略
+/nuwa session list           # 查看多角色会话保险箱摘要（全量掩码脱敏）
+/nuwa session set admin cookie="sid=..."
+/nuwa spa                    # 执行受控只读 SPA 前端路由与同源 JS Bundle 接口提取
+/nuwa doctor                 # 会话内一键组件与环境体检
+/nuwa log / why / stop / resume
 ```
 
-或直接调用工具（支持五种领域模式）：
-
-```text
-nuwa_init(target="http://TARGET:PORT", mode="ctf", goal="打穿并拿 flag")
-nuwa_init(target="/path/to/repo", mode="coding", goal="重构模块并跑通全量测试")
-nuwa_init(target="svc://payments-api", mode="ops", goal="定位 5xx 峰值并验证恢复")
-```
-
-### 2. 长程无头守护（跨世代自动换血）
-
-对于需要持续数小时的深度任务，推荐使用外层守护器：
+### 2. 长程无头守护（跨世代换血 + 动态模型分流 + 零信任容器沙盒）
 
 ```bash
 nuwa-autonomous \
   --target http://TARGET:PORT \
   --mode pentest \
   --root ./work-target \
+  --sandbox docker \
+  --sandbox-image nuwa-sandbox:latest \
+  --fast-model gemini-3.8-flash-high \
+  --deep-model gemini-4-neon-xhigh \
+  --verify-model gemini-4-carbon-high \
   --max-generations 20 \
-  --max-hours 12 \
-  --reincarnate-tokens 140000 \
-  --reincarnate-turns 30 \
-  --allow-subdomains \
-  --allow-cidr 10.0.0.0/24
-
-# 仅预检规划配置与首轮启动命令（零副作用）
-nuwa-autonomous --target http://TARGET:PORT --dry-run
+  --max-hours 12
 ```
 
-当单代会话上下文 token 或轮次到达阈值，`session_stop` 自动精炼交接摘要写入 `.nuwa/state.json` 并放行退出，守护器随即拉起全新上下文的第 N+1 代会话接力推进；若遇到 API 429/5xx 断流或子进程崩溃，自动按指数退避重启并从磁盘继续。任务验收完成退出码 `0`，人工停机退出码 `2`。
+## 纪律与安全护栏（N-001..N-009）
 
-## 自渗透与自动富化
-
-每轮 `session_stop` 扩展自动完成确定性侦察、结构化回灌与知识库富化，模型专注高价值判断：
-
-- **跨平台自动批**：`recon:http` / `recon:ports`（`python3` 短超时并发探测，兼容 macOS/Linux）/ `recon:dirs` / `recon:tlsjs` / `surface:sensitive` / `surface:api`，E2+ 轮次 key（如 `e2:recon:http`）经 `canonicalAutoKey` 自动归一化。
-- **外置规则热更新**：按 `<root>/.nuwa/autoexec.json` > `<agentHome>/nuwa-autoexec.json` > 内置加载，`mtimeMs` 缓存热更新无需重启扩展。
-- **失败三分类**：`network` 错误释放回 `open` 并冷却重试（不烧 `attempts`），`blocked_by_waf` 标注拦截特征换路，`empty` 正常收口。
-- **同轮回灌 + KB 富化**：自动批产出结构化 `meta`（端口/路径/SAN/指纹/WAF）后立即触发 `deriveFromFacts` 与 `deriveKbIntents`，无需等下一轮。
-- **二维空转闸 + 预算取消**：区分无工具空转（`emptyRounds`）与有工具无产出（`suspectRounds=5`）；支持 90s 总预算与 `AbortSignal` 即时取消。
-
-详见 [`docs/AUTOPILOT.md`](docs/AUTOPILOT.md)。
-
-## 工具面（严格保持 12 个）
-
-| 工具 | 作用 |
+| 规则 | 拦截行为 |
 |---|---|
-| `nuwa_init` | 建/恢复/迁移项目，探测工具链并初始化 Scope；支持 `mode` (`ctf/pentest/audit/coding/ops`)、`scope`、`autoStart` |
-| `nuwa_plan` | 播种阶段或追加带 `from` 依赖链的自定义意图 |
-| `nuwa_frontier` | 列 eligible 意图（依赖满足、冷却到期、未有效认领） |
-| `nuwa_claim` | 认领并返回经武器库能力自适配的完整 packet |
-| `nuwa_commit` | 提交结果生成 fact；对 `vuln`/`cred`/`flag` 走执行账本复验；幂等；可 blocked 收口 |
-| `nuwa_flag` | 立即入账 flag；要求 output 含完整值且通过真实执行账本核验 |
-| `nuwa_complete` | 完成验收；按 Profile 的 `proofKinds` 校验证据（`ctf`: flag、`audit`: vuln/loot、`pentest`: vuln/loot/flag、`coding`/`ops`: loot/note） |
-| `nuwa_status` | ASCII 看板（含 `state=xxKB`、`rules=<source>`、`net-retry=<n>`、`gen=<g>`） |
-| `nuwa_report` | Markdown 报告，可写 `.nuwa/REPORT.md` |
-| `nuwa_expand` | 强制扩张攻击面（live → 复盘 → 补播 → 事实+KB 派生 → 推进 → 新 episode → 兜底） |
-| `nuwa_stop` | 人工停机并中止在途自动批；永动模式需 `confirm="STOP"` |
-| `nuwa_kb` | 本地知识库只读查询（产品卡/CVE/PoC/ATT&CK） |
+| N-001 | 主线程直接运行扫描工具 → 必须派发子代理（`NUWA_SCANNER_GUARD=0` 可动态放行） |
+| N-002 | 调用已退役的 `bin/nuwa` / `nuwa/cli.py` / `sapper` CLI |
+| N-003 | 写入、重定向、删除或脚本篡改 `.nuwa/` 权威状态与账本文件 |
+| N-004 | `task` / `eval agent()` 未使用合规子代理（`fujiang` 或 `nuwa-verifier`） |
+| N-005 | 子代理越权调用主线程专属记账工具 `nuwa_*` |
+| N-006 | `task` 误传 `tools` 字段导致子代理内建工具表被清空 |
+| N-007 | 全工具面（`bash`/`read`/`browser`/`web_search`/`eval`）访问授权 Scope 之外的主机、网段或外泄内网特征 |
+| N-008 | 未显式开启 `allowDestructive` 时执行高危破坏性系统或数据库命令 |
+| N-009 | 开启 `NUWA_SANDBOX=docker` 时子代理绕过零信任只读容器沙盒裸跑宿主命令 |
 
-## 纪律与安全护栏（N-001..N-008）
-
-| 规则 | 拦截 |
-|---|---|
-| N-001 | 主线程直接跑扫描工具 → 必须走 fujiang 子代理（`NUWA_SCANNER_GUARD=0` 可动态放行） |
-| N-002 | `bin/nuwa` / `nuwa/cli.py` / `nuwa dispatch` → v1 CLI 已退役 |
-| N-003 | 写入、重定向、`rm`/`mv`/`cp`/`sed -i`/`truncate` 或脚本篡改 `.nuwa/` 权威状态文件 |
-| N-004 | `task` / `eval agent()` 未使用 `agent:"fujiang"` |
-| N-005 | 子代理调用记账类 `nuwa_*` 工具 |
-| N-006 | `task` 传入 `tools` 字段导致子代理内建工具表被清空 |
-| N-007 | bash 命令访问授权 Scope 之外的主机、域名或网段 |
-| N-008 | 未启用 `allowDestructive` 时执行 `rm -rf`/`mkfs`/`dd if=`/`shutdown`/`reboot`/`DROP TABLE`/`TRUNCATE` 等破坏性命令 |
-
-## 可视化
-
-三层常驻可视面（状态栏 / mini 看板 / `/nuwa board`），Tern 下通过 `describe(cx)` 返回手写 TSP 原生节点并按 `cx.supports()` 逐项降级，零外部依赖。完整降级与 40 列窄宽度验证矩阵见 [`docs/UI-DESIGN.md`](docs/UI-DESIGN.md)。
-
-## 常用配置
-
-| 变量 | 默认 | 含义 |
-|---|---|---|
-| `NUWA_LOOP` | `1` | `0` 关闭 `session_stop` 续跑 |
-| `NUWA_INFINITE` | `1` | `1` 永动模式（预算仅降档不停机）；`0` 启用旧预算硬闸 |
-| `NUWA_HEADLESS_DAEMON` | `0` | `1` 开启世代轮转放行（由 `nuwa-autonomous` 自动注入） |
-| `NUWA_REINCARNATE_TOKENS` | `140000` | 单代换血上下文 token 阈值 |
-| `NUWA_REINCARNATE_TURNS` | `30` | 单代换血轮次阈值 |
-| `NUWA_STRICT_EVIDENCE` | `1` | `1` 启用执行账本证据复验；`0` 关闭 |
-| `NUWA_SCOPE_ALLOW_SUBDOMAINS` | `0` | `1` 允许目标主域子域名 |
-| `NUWA_SCOPE_ALLOW_CIDRS` | — | 额外放行 IPv4 CIDR 列表（逗号分隔） |
-| `NUWA_AUTO` / `NUWA_AUTO_MAX` | `1` / `3` | 自动批开关与每轮并发上限 |
-| `NUWA_AUTO_BUDGET_MS` | `90000` | 单批自动执行总时间预算（ms） |
-| `NUWA_AUTO_CONCURRENCY` | `1` | 自动批并发度（`recon:ports` 始终独占） |
-| `NUWA_EMPTY_LIMIT` | `3` | 无工具空转收口阈值（有工具疑似空转默认 5 轮） |
-| `NUWA_MAX_ATTEMPTS` | `3` | 单意图尝试上限（网络失败重试不计入） |
-| `NUWA_SCANNER_GUARD` | `1` | `0` 关闭 N-001 |
-| `NUWA_REQUIRE_FUJIANG` | `1` | `0` 关闭 N-004 |
-| `NUWA_KB_DB` | `/data/nuwa-kb/kb.db` | 本地只读知识库路径 |
-
-## 测试
+## 测试与门禁
 
 ```bash
-# 运行全部 TS 隔离测试（含 v3 核心、Scope/证据、自渗透、Profile/守护器、UI 矩阵）
-./run-tests.sh
+# 运行全部 TS 隔离测试（16 个套件，覆盖 v2/v3/v4 全链路能力）
+env -u BUN_OPTIONS ./run-tests.sh
 
-# 运行 v2/v3 快速门禁（版本一致性 + 无 sapper 契约 + 全量 TS + shell + kb）
+# 运行快速契约与原生套件门禁（版本一致性 + 离线构建契约 + 全量 TS + shell + kb）
 ./tests/run.sh --v2-only
 
-# 运行完整回归套件（含 v1 兼容测试，缺真实 sapper 时自动 SKIP）
+# 运行完整回归套件（含 v1 归档兼容回归与 g0..g3 阶段门禁）
 ./tests/run.sh
 ```
 
-更多架构细节见 [`docs/OMP-NATIVE.md`](docs/OMP-NATIVE.md)、[`docs/AUTOPILOT.md`](docs/AUTOPILOT.md) 与 [`docs/UI-DESIGN.md`](docs/UI-DESIGN.md)。
+更多设计细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、[`docs/OMP-NATIVE.md`](docs/OMP-NATIVE.md)、[`docs/AUTOPILOT.md`](docs/AUTOPILOT.md) 与 [`docs/UI-DESIGN.md`](docs/UI-DESIGN.md)。

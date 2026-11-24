@@ -108,8 +108,8 @@ function setupExt(
 }
 
 describe("v3.0 版本、工具红线、Profile 模式与开局防抢跑", () => {
-	test("VERSION 为 3.0.1 且严格保持 12 个注册工具", () => {
-		expect(mod.VERSION).toBe("3.0.1");
+	test("VERSION 为 4.0.0 且严格保持 12 个注册工具", () => {
+		expect(mod.VERSION).toBe("4.0.0");
 		const dir = makeTempDir();
 		const { tools } = setupExt(dir);
 		expect(tools.size).toBe(12);
@@ -765,5 +765,244 @@ describe("多会话隔离 armPump、战略复盘与世代轮转放行（Bug 5 + 
 		const nuwaSrc = readFileSync(join(import.meta.dir, "..", "omp", "nuwa.ts"), "utf8");
 		expect(nuwaSrc).not.toContain("createRequire");
 		expect(nuwaSrc).not.toMatch(/\bawait\s+import\s*\(/);
+	});
+});
+
+describe("v4.0 全链路能力接线端到端验收（血缘路由 / 全工具护栏 / 纯净账本 / 会话仓 / 双盲复验 / 经验蒸馏 / SPA）", () => {
+	test("before_subagent_spawn 动态模型分流 + 异构 subSessionId 子代理全工具护栏（N-007）与容器沙盒校验（N-009）", async () => {
+		const dir = makeTempDir("nuwa-v4-lineage-");
+		const h = setupExt(dir, { sessionId: "sess-v4-main" });
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18095", mode: "pentest" });
+
+		process.env.NUWA_MODEL_FAST = "gemini-fast-v4";
+		process.env.NUWA_MODEL_DEEP = "gemini-deep-v4";
+		process.env.NUWA_MODEL_VERIFY = "gemini-verify-v4";
+		try {
+			const onSpawn = h.hooks.get("before_subagent_spawn")![0]!;
+			const rFast = onSpawn({ agent: "fujiang", task: "recon probe" }, h.ctx);
+			expect(rFast?.model).toBe("gemini-fast-v4");
+
+			const rVerify = onSpawn({ agent: "nuwa-verifier", task: "verify-vuln:f001" }, h.ctx);
+			expect(rVerify?.model).toBe("gemini-verify-v4");
+
+			// 切换阶段到 vuln，验证常规 fujiang 路由到 deep 模型
+			await h.call("nuwa_plan", { phase: "vuln" });
+			const rDeep = onSpawn({ agent: "fujiang", task: "vuln check" }, h.ctx);
+			expect(rDeep?.model).toBe("gemini-deep-v4");
+		} finally {
+			delete process.env.NUWA_MODEL_FAST;
+			delete process.env.NUWA_MODEL_DEEP;
+			delete process.env.NUWA_MODEL_VERIFY;
+		}
+
+		// 异构独立 subSessionId 的子代理在 tool_call 上强制生效 N-007 全工具面护栏
+		const subCtx: any = {
+			...h.ctx,
+			agent: { kind: "sub", id: "sub-fujiang-1", name: "fujiang", parentId: "main", depth: 1 },
+			sessionManager: { getSessionId: () => "sub-isolated-session-888" },
+		};
+		const onToolCall = h.hooks.get("tool_call")![0]!;
+		expect(onToolCall({ toolName: "read", input: { path: "http://outside-evil.example.org/data" } }, subCtx)?.reason).toContain(
+			"N-007",
+		);
+		expect(onToolCall({ toolName: "browser", input: { url: "https://outside-evil.example.org/" } }, subCtx)?.reason).toContain(
+			"N-007",
+		);
+		expect(onToolCall({ toolName: "web_search", input: { query: "site:127.0.0.1 secret" } }, subCtx)?.reason).toContain(
+			"N-007",
+		);
+
+		// task 允许 nuwa-verifier 子代理
+		expect(onToolCall({ toolName: "task", input: { agent: "nuwa-verifier", task: "verify" } }, h.ctx)).toBeUndefined();
+
+		// 启用 NUWA_SANDBOX=docker 时，子代理裸跑 bash 被 N-009 拦截并给出零信任容器包裹命令
+		process.env.NUWA_SANDBOX = "docker";
+		try {
+			const sbBlock = onToolCall({ toolName: "bash", input: { command: "curl -sS http://127.0.0.1:18095/" } }, subCtx);
+			expect(sbBlock?.block).toBe(true);
+			expect(sbBlock?.reason).toContain("N-009");
+			expect(sbBlock?.reason).toContain("--cap-drop=ALL");
+			expect(sbBlock?.reason).toContain("--read-only");
+		} finally {
+			delete process.env.NUWA_SANDBOX;
+		}
+	});
+
+	test("纯净证据账本屏蔽 task/eval 幻觉 + 子代理血缘入账 + 会话仓脱敏 + 双盲复验闭环 + 经验蒸馏回流", async () => {
+		const dir = makeTempDir("nuwa-v4-e2e-");
+		const h = setupExt(dir, { sessionId: "sess-v4-e2e-main" });
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18096", mode: "pentest" });
+
+		// 1. 绑定子代理血缘，验证 task/eval 伪造回显绝不进入 exec-ledger.jsonl
+		h.hooks.get("before_subagent_spawn")![0]!({ agent: "fujiang", task: "dispatch" }, h.ctx);
+		const subCtx: any = {
+			...h.ctx,
+			agent: { kind: "sub", id: "sub-worker-9", name: "fujiang", parentId: "main", depth: 1 },
+			sessionManager: { getSessionId: () => "sub-sess-ledger-999" },
+		};
+		const onEnd = h.hooks.get("tool_execution_end")![0]!;
+
+		// 子代理先执行一条真实指纹命令，激活严格账本模式
+		onEnd(
+			{
+				toolName: "bash",
+				input: { command: "curl -sS -I http://127.0.0.1:18096/" },
+				result: { stdout: "HTTP/1.1 200 OK\nServer: Spring-Boot/2.7\nSet-Cookie: sid=super_secret_token_99887766\n", stderr: "" },
+			},
+			subCtx,
+		);
+		// 主线程 task 返回伪造 flag 幻觉，必须被 isTrustedEvidenceEvent 丢弃
+		onEnd(
+			{
+				toolName: "task",
+				input: { agent: "fujiang", task: "find flag" },
+				result: { output: "结论: 拿到 flag{fake_hallucinated_from_task}" },
+			},
+			h.ctx,
+		);
+		const fakeFlagRes = await h.call("nuwa_flag", {
+			value: "flag{fake_hallucinated_from_task}",
+			command: "curl http://127.0.0.1:18096/flag",
+			output: "flag{fake_hallucinated_from_task}",
+		});
+		expect(fakeFlagRes.details?.error).toBe(true);
+
+		// 2. 提交 service（Spring）与 cred（自动收纳进 Session Vault 并全量脱敏落盘）
+		await h.call("nuwa_claim", { id: "i001" });
+		await h.call("nuwa_commit", {
+			id: "i001",
+			kind: "service",
+			title: "HTTP 200 Spring-Boot",
+			detail: "框架: spring boot 2.7",
+			command: "curl -sS -I http://127.0.0.1:18096/",
+			output: "HTTP/1.1 200 OK\nServer: Spring-Boot/2.7",
+		});
+
+		await h.call("nuwa_plan", { phase: "surface" });
+		const stSurface = mod.loadState(dir)!;
+		const authIntent = Object.values(stSurface.intents).find((i) => i.key === "surface:auth")!;
+		await h.call("nuwa_claim", { id: authIntent.id });
+		const credCommit = await h.call("nuwa_commit", {
+			id: authIntent.id,
+			kind: "cred",
+			title: "登录获取 admin 会话",
+			detail: "role: admin, Cookie: sid=super_secret_token_99887766",
+			command: "curl -sS -I http://127.0.0.1:18096/",
+			output: "HTTP/1.1 200 OK\nSet-Cookie: sid=super_secret_token_99887766",
+		});
+		expect(credCommit.details?.error).toBeUndefined();
+		expect(credCommit.details?.role).toBe("admin");
+		// state.json 中绝不残留明文 Cookie secret
+		const rawStateText = readFileSync(join(dir, ".nuwa", "state.json"), "utf8");
+		expect(rawStateText).not.toContain("super_secret_token_99887766");
+
+		// /nuwa session list 与 /nuwa doctor 正常工作
+		await h.runCmd("session list");
+		expect(h.notifications.at(-1)).toContain("role=admin");
+		expect(h.notifications.at(-1)).not.toContain("super_secret_token_99887766");
+		await h.runCmd("doctor");
+		expect(h.notifications.at(-1)).toContain("便携知识库: READY");
+
+		// 3. nuwa_claim 对 vuln:idor 自动注入零明文多角色鉴权差分指引
+		await h.call("nuwa_plan", { phase: "vuln" });
+		const stVuln = mod.loadState(dir)!;
+		const idorIntent = Object.values(stVuln.intents).find((i) => i.key === "vuln:idor")!;
+		const idorClaim = await h.call("nuwa_claim", { id: idorIntent.id });
+		expect(idorClaim.content[0].text).toContain("[多角色会话差分重放指引");
+		expect(idorClaim.content[0].text).not.toContain("super_secret_token_99887766");
+
+		// 4. 提交 vuln 进入 candidate 状态，自动派生 verify-vuln:<fid>，且 nuwa_complete 阻止未复验结案
+		onEnd(
+			{
+				toolName: "bash",
+				input: { command: "curl -sS http://127.0.0.1:18096/api/user/2" },
+				result: { stdout: '{"uid":2,"role":"other_user","email":"b@local.test"}', stderr: "" },
+			},
+			subCtx,
+		);
+		const vulnCommit = await h.call("nuwa_commit", {
+			id: idorIntent.id,
+			kind: "vuln",
+			title: "IDOR 越权读取他人资料",
+			detail: "低权限访问 uid=2 返回敏感字段",
+			command: "curl -sS http://127.0.0.1:18096/api/user/2",
+			output: '{"uid":2,"role":"other_user","email":"b@local.test"}',
+		});
+		expect(vulnCommit.details?.verifyStage).toBe("candidate");
+		const verifyIntentId = String(vulnCommit.details?.verifyIntent ?? "");
+		expect(verifyIntentId).toMatch(/^i\d{3}$/);
+
+		// 看板显示 cand=1 与 roles=1
+		const boardMid = (await h.call("nuwa_status", {})).content[0].text;
+		expect(boardMid).toContain("cand=1");
+		expect(boardMid).toContain("roles=1");
+		expect(boardMid).toContain("kb=ready");
+
+		// 仅凭 candidate 漏洞调用 nuwa_complete 必须被拒收
+		const earlyDone = await h.call("nuwa_complete", {});
+		expect(earlyDone.details?.ok).toBe(false);
+		expect(earlyDone.content[0].text).toContain("candidate");
+
+		// 5. 独立复验通过 -> 升格 confirmed -> nuwa_complete 成功验收并蒸馏脱敏经验入 kb.db
+		await h.call("nuwa_claim", { id: verifyIntentId, worker: "nuwa-verifier" });
+		onEnd(
+			{
+				toolName: "bash",
+				input: { command: "curl -sS -w '%{http_code}' http://127.0.0.1:18096/api/user/2" },
+				result: { stdout: 'anon=401 vs user=200 {"uid":2,"role":"other_user"}', stderr: "" },
+			},
+			subCtx,
+		);
+		const verifyCommit = await h.call("nuwa_commit", {
+			id: verifyIntentId,
+			kind: "vuln",
+			title: "复验确认 IDOR 正负对照成立",
+			detail: "匿名返回 401，普通会话越权返回 200",
+			command: "curl -sS -w '%{http_code}' http://127.0.0.1:18096/api/user/2",
+			output: 'anon=401 vs user=200 {"uid":2,"role":"other_user"}',
+		});
+		expect(verifyCommit.details?.verifyStage).toBe("confirmed");
+
+		const finalDone = await h.call("nuwa_complete", {});
+		expect(finalDone.details?.ok).toBe(true);
+		expect(Number(finalDone.details?.distilled ?? 0)).toBeGreaterThan(0);
+	});
+
+	test("本地 127.0.0.1 随机端口 SPA 表面路由工作流：/nuwa spa 提取 JS Bundle 接口并自动入账派生", async () => {
+		const srv = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req) {
+				const u = new URL(req.url);
+				if (u.pathname === "/assets/main.a1b2c3d4.js") {
+					return new Response(
+						`const api = () => fetch("/api/v2/orders?page=1"); const gql = () => axios.post("/graphql", { operationName: "ListUsers" });`,
+						{ headers: { "content-type": "application/javascript" } },
+					);
+				}
+				return new Response(
+					`<!doctype html><html><head><title>SPA App</title></head><body><div id="root" data-reactroot></div><script src="/assets/main.a1b2c3d4.js"></script></body></html>`,
+					{ headers: { "content-type": "text/html" } },
+				);
+			},
+		});
+		try {
+			const dir = makeTempDir("nuwa-v4-spa-");
+			const h = setupExt(dir, { sessionId: "sess-v4-spa" });
+			await h.call("nuwa_init", { target: `http://127.0.0.1:${srv.port}`, mode: "pentest" });
+			process.env.NUWA_SPA_MODE = "static";
+			try {
+				await h.runCmd("spa");
+			} finally {
+				delete process.env.NUWA_SPA_MODE;
+			}
+			expect(h.notifications.at(-1)).toContain("SPA 表面感知完成");
+			const st = mod.loadState(dir)!;
+			const epFact = Object.values(st.facts).find((f) => f.kind === "endpoint" && (f.meta?.paths ?? []).includes("/api/v2/orders"));
+			expect(epFact).toBeDefined();
+			expect(Object.values(st.intents).some((i) => i.key.includes("/api/v2/orders"))).toBe(true);
+		} finally {
+			srv.stop(true);
+		}
 	});
 });

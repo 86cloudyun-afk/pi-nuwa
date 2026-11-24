@@ -1,114 +1,43 @@
-# 架构：女娲模式为什么能在会话里续跑
+# 架构设计：女娲 v4.0 原生全自主运行时
 
-## 1. 病根
+## 1. 架构总览
 
-agent 的 `session_stop` 是「模型认为这一轮结束了」。SKILL.md 能告诉模型该做什么，但决定不了它什么时候停。sapper-v2 在终端里靠 `watchdog.sh` 外部循环反复拉起进程；会话内部没有这个循环，task 批次一返回，turn 就结束。
+女娲 v4.0 采用**纯 `omp` 进程内模块化原生扩展 + 极薄外层无头换血守护器**的双层架构，彻底消除了早期 v1 四层外部脚本拼接（已归档至 `archive/v1/`）带来的状态分裂与环境耦合。
 
-## 2. 三段式
-
-### 上膛
-
-三个入口任一命中即 `armed=true`：
-
-- `before_agent_start`：prompt 命中 `女娲模式|女娲渗透|开图|接入 sapper|sapper 模式`
-- `input`：用户输入命中同一正则
-- `tool_call`：结构化判定——`bash` 的 `command` 匹配 `\bsapper\b`，或 `task` 的 `agent === "fujiang"`
-
-`tool_call` 是最可靠的信号——它证明这一会话真的动过图，而不只是提了一句。
-
-上膛写 `armedAt`，超过 `NUWA_GUARD_HOURS`（默认 12h）自动失效，防止几天后残留状态把无关会话顶起来。
-
-### 续跑
-
-`session_stop` 触发时按顺序判定：
-
-1. 未上膛或已过有效期 → 放行
-2. `findRoot(cwd, sessionId)` 找不到 `.sapper` → 放行
-3. `status === "completed"`：
-   - 有 `flag/vuln/loot` 证据 → 解除武装，放行
-   - 无证据 → `revertCompletion()` 打回 `active`，最多 3 次
-4. 项目锁 `.nuwa.lock` 被外部活进程持有 → 放行（让 bash 循环主导）
-5. `turns++`，累计 token 消耗
-6. 计算图签名 `sig = status|open|claimed|done|effective|flags`（`effective` 排除 note 噪声）
-7. `sig` 与上轮相同 → `stall++`，否则清零并更新
-8. 工具调用数未增长 → `idle++`，否则清零
-9. 超过 `MAX_TURNS / MAX_STALL / MAX_IDLE / MAX_TOKENS` → 停机，放行
-10. 否则 `return { decision: "block", reason: buildDirective(g, st) }`
-
-`reason` 里带四段：图计数与 goal、本批待办 intent 与派发要求、收工判据、卡住时的换路指令。
-
-### 找图
-
-`findRoot` 依次尝试：cwd 向上逐级找 `.sapper/project.json` → `NUWA_PROJECT` → `$AGENT_HOME/cache/nuwa-current` 指针。
-
-指针是 JSON：
-
-```json
-{ "root": "/path/to/project", "sessionId": "01a1...", "ts": 1762500000000 }
+```text
+bin/nuwa-autonomous (外层守护：跨世代接力 / 指数退避恢复 / 模型与沙盒策略透传 / doctor 体检)
+  └── omp 会话进程 (加载 ~/.omp/agent/extensions/nuwa-omp/index.ts)
+        ├── 组装与事件层: omp/nuwa.ts (12 个 nuwa_* 工具 + /nuwa 命令 + 6 类事件钩子)
+        ├── 图与规划层:   omp/graph.ts + omp/profiles.ts + omp/reincarnate.ts
+        ├── 状态存储层:   omp/storage.ts + omp/types.ts (withLock + 原子写 + 增量 .json.gz 快照)
+        ├── 血缘与护栏层: omp/lineage.ts + omp/scope.ts + omp/sandbox.ts
+        ├── 证据与复验层: omp/evidence.ts + omp/verifier-gate.ts + omp/session-vault.ts
+        ├── 侦察与感知层: omp/autoexec.ts + omp/browser-recon.ts
+        └── 知识与进化层: omp/kb.ts + kb/{schema.sql, seed-*.json, build-kb.ts}
 ```
 
-`sessionId` 不匹配时拒绝接管，防止多项目并行串台。旧格式（纯路径）按兼容放行。
+**硬性模块依赖约束**：所有子模块仅单向引用 `./types` 或下层基础模块，**严禁运行时反向 `import "./nuwa"`**，且入口文件保持纯静态无后缀 ESM 导入（零 `createRequire`、零顶层 `await import`），确保在 `omp` 异步 `Bun.plugin` 加载器与离线 `bun build` 下 100% 稳定运行。
 
-## 3. 为什么用 block
+## 2. 六大闭环机制
 
-omp 的 continue 路径有 `SESSION_STOP_CONTINUATION_CAP = 8` 的硬上限。8 轮对渗透远远不够，且到顶后是静默停止。`block` 走的是另一条判定，不受该上限约束，靠 `MAX_TURNS / MAX_STALL / MAX_IDLE / MAX_TOKENS` 自己兜底。
+### 2.1 永动续跑与跨世代换血（`session_stop` + `reincarnate.ts`）
+- `omp` 对 `continue: true` 设有硬上限（8 次），而 `decision: "block"` 不计入该上限。`session_stop` 在目标未达成前持续返回 `{ decision: "block", reason: directive }` 驱动下一轮。
+- 在无头守护模式（`NUWA_HEADLESS_DAEMON=1`）下，当单代 token 或轮次触及阈值时，`session_stop` 自动中止并释放在途自动批，生成 ≤1500 字结构化交接摘要写入 `.nuwa/state.json` 后返回 `undefined` 优雅退出，由 `bin/nuwa-autonomous` 拉起全新上下文的第 `G+1` 代会话无缝接力。
 
-代价是每轮都算一次 turn，所以四个上限必须存在。
+### 2.2 主从会话血缘与全工具面安全护栏（`lineage.ts` + `scope.ts` + `sandbox.ts`）
+- 主代理在 `nuwa_init`、`/nuwa`、`session_start` 注册活跃会话，并在 `before_subagent_spawn`（及 `task` 调用前）将父子血缘原子持久化至 `<agentHome>/cache/nuwa-lineage.json`，同时通过 `routeSubagentModel` 按角色（`fujiang` / `nuwa-verifier`）与阶段动态分配 `fast`/`deep`/`verify` 模型。
+- 子代理即便运行于独立 `subSessionId`，`tool_call` 与 `tool_execution_end` 也能经 `resolveLineageRoot` 100% 还原父项目根，强制执行 `N-001..N-009` 全工具面范围护栏（覆盖 `bash`/`read`/`browser`/`web_search`/`eval`/`write`）及零信任只读 Docker 沙盒校验。
 
-block 链过长（`NUWA_BLOCK_STREAK`，默认 3）且 `event.stop_hook_active` 为真时，切一次 `continue + additionalContext`，降低与其他 `session_stop` handler 的抢占。
+### 2.3 纯净证据账本与候选漏洞双盲复验（`evidence.ts` + `verifier-gate.ts`）
+- `tool_execution_end` 经 `isTrustedEvidenceEvent` 严格过滤，拒绝 `task`/`eval`/`todo`/`think`/`ask` 等编排工具输出进入 `.nuwa/exec-ledger.jsonl`，从源头阻断子代理口头幻觉污染账本。
+- 非自动批提交的 `vuln` 默认标记为 `verifyStage="candidate"`，并自动派生 P96 `verify-vuln:<fid>` 意图，引导独立审查子代理 `nuwa-verifier` 执行正负对照实验；未升格为 `confirmed` 前，`nuwa_complete` 通过 `filterConfirmedProofs` 拒绝收口结案。
 
-## 4. 状态
+### 2.4 Soft-404 去噪、工具链升档与 SPA 表面感知（`autoexec.ts` + `browser-recon.ts`）
+- 自动批探测前先请求随机不存在路径建立 Soft-404 基线（状态码 + 体积容差 + 标题签名），并对 `.git/HEAD`、`.env`、`openapi.json` 做内容语义指纹校验与密钥脱敏，彻底消除单页应用假 200 误报。
+- 根据 `st.project.toolchain` 自动将轻量探针升档至 `nmap`、`ffuf -ac`、`katana` 及非破坏性 `nuclei`；针对前端 SPA 自动调用 `runSpaRecon`（Playwright 只读拦截或静态同源 JS Bundle 解析）提取隐藏 API 路由并同轮派生端点审计意图。
 
-`$AGENT_HOME/cache/nuwa-loop/<sha1(sessionId)[:16]>.json`：
+### 2.5 多角色会话保险箱（`session-vault.ts`）
+- 以 `0o700` 目录与 `0o600` 文件权限将多角色 Cookie / Bearer / 凭据存储于 `.nuwa/sessions/vault.json`；`nuwa_commit(kind="cred")` 自动收纳角色并对全部落盘事实与报告执行 `redactVaultSecrets` 掩码脱敏；`nuwa_claim` 在鉴权类意图上自动物化 `/tmp/nuwa/<projectId>/sessions/<role>.headers` 供零明文差分重放。
 
-```json
-{
-  "schema": 2,
-  "armed": true,
-  "armedAt": 1762500000000,
-  "turns": 7,
-  "stall": 0,
-  "idle": 0,
-  "blockStreak": 1,
-  "spentTokens": 12000,
-  "lastTokens": 9000,
-  "toolCalls": 12,
-  "lastToolCallsSnapshot": 10,
-  "sig": "active|3|1|12|18|2",
-  "lastReason": "..."
-}
-```
-
-按 session 隔离，`schema` 不匹配时重置。写失败落日志，不阻塞主流程。
-
-日志在 `cache/nuwa-loop/log/<sid>.jsonl`，每轮一行，事件包括 `armed` / `block` / `stop` / `completion_rejected`。
-
-## 5. 项目锁
-
-`bin/nuwa` 在项目目录创建 `.nuwa.lock`，用 `flock` 持有整个生命周期；退出时 `trap cleanup_lock EXIT INT TERM` 只删自己 pid 的锁。
-
-`nuwa-loop` 的 `lockHeldByOther()` 读 pid 并 `process.kill(pid, 0)` 探活：活进程持锁 → 扩展放行，避免 bash 循环与会话内循环双跑。
-
-## 6. 完成证据闸门
-
-模型常在 `reason` 阶段直接输出「已拿到 flag」并 `complete`，但实际没有发出任何请求。两个入口都做了拦截：
-
-- `bin/nuwa`：每轮结束检查 `status=completed` 且 facts 里没有 `flag/vuln/loot` → 把 `status` 改回 `active`、删 `completed_at`、写 hint。
-- `nuwa-loop`：`session_stop` 时同样判定，打回最多 3 次；超过则停机并记录 `stop_completed_unverified`。
-
-关闭方式：`NUWA_REQUIRE_EVIDENCE=0`。
-
-## 7. 注入的纪律
-
-续跑指令明确四件事，避免模型把「续跑」当成新任务或提前收工：
-
-- 一轮 task 返回 ≠ 收工，不许输出「本轮战报」「已完成」
-- 每批返回先 `sapper status` / `sapper frontier` 验收，再决定下一批
-- 主线程不自己跑 nmap/ffuf/curl，扫描只发生在子代理里；子代理必须 `agent="fujiang"` 且带齐四个动作
-- 四个动作的参数必须照抄：`claim --worker`、`doc --set`、`done --fact`、`complete --from`
-
-## 8. 边界
-
-纯会话内机制，不依赖 tmux、不切终端、不写外部守护进程。会话结束即失效；跨会话的长跑仍由 `bin/nuwa --detach` 的 bash 循环承担。两者是互补关系：脚本负责「拉起进程」，扩展负责「不让 turn 停」。
-
-两者同时存在时，靠 `.nuwa.lock` 互斥：bash 在跑，扩展就只做验收与补位。
+### 2.6 便携知识库与跨项目自进化记忆（`kb.ts` + `kb/*`）
+- 随仓提供完整 SQLite FTS5 Schema 与安全基线种子，全量采用 `?` 参数化绑定防注入查询；每次项目通过 `nuwa_complete` 验收后，`distillProjectExperience` 自动剥离靶标敏感信息将技术栈成败规律写回 `experience` 表，供后续同类项目在 `frontierList` 中通过 UCB1 公式动态提权高胜率路径。

@@ -16,8 +16,8 @@ from .ledger import Ledger
 from .locks import FileLock, is_locked
 from .paths import ensure_nuwa
 
-REPO = Path(__file__).resolve().parents[1]
-WORKER = REPO / "nuwa" / "worker.py"
+REPO = Path(__file__).resolve().parents[3]
+WORKER = Path(__file__).resolve().parent / "worker.py"
 DEFAULT_TOKENS = 4000
 
 

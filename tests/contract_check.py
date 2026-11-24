@@ -97,13 +97,32 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
     required_files = [
         "omp/nuwa.ts",
         "omp/types.ts",
+        "omp/storage.ts",
+        "omp/graph.ts",
         "omp/autoexec.ts",
+        "omp/browser-recon.ts",
         "omp/scope.ts",
         "omp/evidence.ts",
         "omp/profiles.ts",
         "omp/reincarnate.ts",
+        "omp/lineage.ts",
+        "omp/kb.ts",
+        "omp/session-vault.ts",
+        "omp/verifier-gate.ts",
+        "omp/sandbox.ts",
         "omp/ui.ts",
         "omp/ui-native.ts",
+        "omp/env.d.ts",
+        "tsconfig.json",
+        "kb/schema.sql",
+        "kb/seed-cards.json",
+        "kb/seed-cves.json",
+        "kb/seed-techniques.json",
+        "kb/build-kb.ts",
+        "agents/fujiang.md",
+        "agents/nuwa-verifier.md",
+        "config/autoexec.example.json",
+        "docker/Dockerfile.sandbox",
         "bin/nuwa-autonomous",
         "install.sh",
         "skills/nuwa-pentest/SKILL.md",
@@ -116,6 +135,21 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
     })
     if missing:
         return False, results
+
+    # 校验所有 omp/*.ts 子模块严禁运行时反向 import ./nuwa（仅允许 import type）
+    bad_submodules: list[str] = []
+    for ts_file in sorted((repo_root / "omp").glob("*.ts")):
+        if ts_file.name == "nuwa.ts" or ts_file.name.endswith(".d.ts"):
+            continue
+        ts_src = ts_file.read_text(encoding="utf-8")
+        stripped = re.sub(r'^\s*import\s+type\s+[^;]+from\s+["\']\./nuwa["\'];?\s*$', "", ts_src, flags=re.MULTILINE)
+        if re.search(r'from\s+["\']\./nuwa["\']|import\s*\(\s*["\']\./nuwa["\']\s*\)|require\s*\(\s*["\']\./nuwa["\']\s*\)', stripped):
+            bad_submodules.append(ts_file.name)
+    results.append({
+        "name": "v4_submodule_no_runtime_nuwa_import",
+        "ok": len(bad_submodules) == 0,
+        "detail": "" if not bad_submodules else f"runtime_import_nuwa={bad_submodules}",
+    })
 
     nuwa_src = (repo_root / "omp/nuwa.ts").read_text(encoding="utf-8")
     ver_ok = bool(re.search(r'export\s+const\s+VERSION\s*=\s*["\']\d+\.\d+\.\d+', nuwa_src))
@@ -167,16 +201,46 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
         "detail": "" if skill_ok else f"missing_tools={skill_missing}",
     })
 
-    # 运行时异步 Bun.plugin 加载契约（防止 createRequire async module 回归）
+    # 全量离线静态构建门禁 + 运行时异步 Bun.plugin 加载契约（含 KB 懒建库与子代理血缘拦截）
     bun_bin = shutil.which("bun")
     if bun_bin:
         env = dict(os.environ)
         env.pop("BUN_OPTIONS", None)
+
+        with tempfile.TemporaryDirectory(prefix="nuwa-contract-build-") as build_dir:
+            omp_entries = [str(p) for p in sorted((repo_root / "omp").glob("*.ts"))]
+            build_cmd = [
+                bun_bin,
+                "build",
+                *omp_entries,
+                str(repo_root / "kb" / "build-kb.ts"),
+                "--target",
+                "bun",
+                "--external",
+                "@oh-my-pi/pi-coding-agent",
+                "--external",
+                "playwright",
+                "--external",
+                "playwright-core",
+                "--outdir",
+                build_dir,
+            ]
+            bld = subprocess.run(build_cmd, cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=30)
+            bld_ok = bld.returncode == 0
+            bld_detail = "bun build ok" if bld_ok else (bld.stderr.strip() or bld.stdout.strip() or f"rc={bld.returncode}")
+        results.append({
+            "name": "v4_offline_static_build",
+            "ok": bld_ok,
+            "detail": bld_detail[:200],
+        })
+
         omp_dir = str((repo_root / "omp").resolve())
         smoke_js = """
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+const agentHome = mkdtempSync(join(tmpdir(), "nuwa-contract-home-"));
+process.env.PI_AGENT_HOME = agentHome;
 const ompDir = process.env.NUWA_OMP_DIR!;
 const escaped = ompDir.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
 Bun.plugin({
@@ -190,12 +254,22 @@ Bun.plugin({
 });
 const mod = await import(`${ompDir}/nuwa.ts`);
 const tools = new Map<string, any>();
+const hooks = new Map<string, Array<(...a: any[]) => any>>();
 const chain = (): any => new Proxy(() => chain(), { get: () => () => chain() });
 const z = new Proxy({}, { get: () => () => chain() });
-mod.default({ zod: z, registerTool: (t: any) => tools.set(t.name, t), registerCommand: () => {}, on: () => {} });
+mod.default({
+  zod: z,
+  registerTool: (t: any) => tools.set(t.name, t),
+  registerCommand: () => {},
+  on: (ev: string, fn: any) => {
+    const arr = hooks.get(ev) ?? [];
+    arr.push(fn);
+    hooks.set(ev, arr);
+  },
+});
 const dir = mkdtempSync(join(tmpdir(), "nuwa-contract-rt-"));
 try {
-  const ctx: any = { cwd: dir, agent: { kind: "main" }, sessionManager: { getSessionId: () => "contract-rt" } };
+  const ctx: any = { cwd: dir, agent: { kind: "main", id: "main-0" }, sessionManager: { getSessionId: () => "contract-rt" } };
   const r1 = await tools.get("nuwa_init").execute("1", { target: "http://127.0.0.1:18080", mode: "ctf", root: dir }, undefined, undefined, ctx);
   const t1 = r1?.content?.[0]?.text ?? "";
   if (!t1.includes("女娲已上膛") || t1.includes("ERROR:")) {
@@ -203,12 +277,24 @@ try {
   }
   const r2 = await tools.get("nuwa_status").execute("2", { root: dir }, undefined, undefined, ctx);
   const t2 = r2?.content?.[0]?.text ?? "";
-  if (!t2.includes("phase=recon") || t2.includes("ERROR:")) {
+  if (!t2.includes("phase=recon") || !t2.includes("kb=ready") || t2.includes("ERROR:")) {
     throw new Error(`nuwa_status failed: ${t2}`);
+  }
+  const kbRes = await tools.get("nuwa_kb").execute("3", { query: "spring", kind: "auto", limit: 3 }, undefined, undefined, ctx);
+  const kbText = kbRes?.content?.[0]?.text ?? "";
+  if (!kbText || kbText.includes("未命中") || kbText.includes("ERROR:")) {
+    throw new Error(`nuwa_kb failed: ${kbText}`);
+  }
+  hooks.get("before_subagent_spawn")?.[0]?.({ agent: "fujiang", task: "probe" }, ctx);
+  const subCtx: any = { cwd: dir, agent: { kind: "sub", id: "0-fujiang", parentId: "main-0" }, sessionManager: { getSessionId: () => "contract-sub-99" } };
+  const verdict = hooks.get("tool_call")?.[0]?.({ toolName: "read", input: { path: "http://evil.outside.invalid/x" } }, subCtx);
+  if (!verdict?.block || !String(verdict.reason ?? "").includes("N-007")) {
+    throw new Error(`subagent guard failed: ${JSON.stringify(verdict)}`);
   }
   console.log(`RUNTIME_OK:${mod.VERSION}:tools=${tools.size}`);
 } finally {
   rmSync(dir, { recursive: true, force: true });
+  rmSync(agentHome, { recursive: true, force: true });
 }
 """
         env["NUWA_OMP_DIR"] = omp_dir
@@ -216,6 +302,7 @@ try {
         rt_ok = rt.returncode == 0 and "RUNTIME_OK:" in rt.stdout and "tools=12" in rt.stdout
         rt_detail = rt.stdout.strip() if rt_ok else (rt.stderr.strip() or rt.stdout.strip() or f"rc={rt.returncode}")
     else:
+        results.append({"name": "v4_offline_static_build", "ok": False, "detail": "bun not found in PATH"})
         rt_ok = False
         rt_detail = "bun not found in PATH"
     results.append({

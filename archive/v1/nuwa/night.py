@@ -28,7 +28,7 @@ def prepare(base: str | Path, projects: int) -> list[str]:
 
 def _commit() -> str:
     try:
-        src = Path(__file__).resolve().parent.parent
+        src = Path(__file__).resolve().parents[3]
         stamp = src / "COMMIT"
         if stamp.exists():
             return stamp.read_text(encoding="utf-8").strip()

@@ -1,4 +1,16 @@
-# 女娲模式升级路线图（0.4.0 → 1.0.0）
+# 女娲模式演进路线图（v0.3 → v4.0）
+
+## 当前里程碑：v4.0.0（2026-11-25 已交付）
+
+- **架构解耦与离线构建**：`omp/nuwa.ts` 拆分为 `types.ts`、`storage.ts`、`graph.ts`、`nuwa.ts` 四层核心 + 14 个专职能力模块；配套 `omp/env.d.ts` 与 `tsconfig.json` 零外置依赖静态构建；v1 Python 遗产归档至 `archive/v1/`。
+- **血缘追踪与全工具护栏**：`omp/lineage.ts` 打通父子异构 `sessionId` 血缘与动态模型路由；`checkToolScopeAndRisk` 覆盖 `bash`/`read`/`browser`/`web_search`/`eval`；`isTrustedEvidenceEvent` 根治编排工具账本污染。
+- **反噪侦察与 SPA 感知**：Soft-404 基线校准、内容级语义指纹实锤、工具链重武器升档（`nmap`/`ffuf`/`katana`/`nuclei`）及 Playwright/静态双模 SPA 接口提取（`omp/browser-recon.ts`）。
+- **便携知识库与自进化记忆**：随仓 `kb/` 种子与 `bun:sqlite` 幂等建库器、全参数化防注入 `kbLookupSafe`、`distillProjectExperience` 强脱敏经验回流与 UCB1 动态优先级提权。
+- **会话保险箱、双盲复验与容器沙盒**：`0o600` 多角色会话仓与零明文差分包、`candidate → confirmed` 双盲独立复验闸门、零信任只读 Docker 沙盒（`N-009`）与 `install.sh` / `nuwa-autonomous doctor` 开箱即用体检。
+
+---
+
+## 历史阶段归档记录（0.4.0 → 1.0.0）
 
 基线：0.3.1（2026-11-08）
 - 运行时：`nuwa-loop` 续跑、预算/空转/证据闸门、JSONL 日志
