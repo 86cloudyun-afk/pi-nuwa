@@ -993,7 +993,7 @@ const NUWA_INPLACE_EDIT_RE =
 	/(?:^|[;&|()\s`])(?:sudo\s+)?(?:sed\s+[^;|&]*(?:-[a-zA-Z]*i(?:\b|[.'"])|--in-place\b)|perl\s+[^;|&]*-[a-zA-Z]*i|awk\s+[^;|&]*-i\s+inplace)/i;
 
 const NUWA_SCRIPT_WRITE_RE =
-	/\b(?:writeFileSync|writeFile|appendFileSync|appendFile|unlinkSync|unlink|rmSync|rmdirSync|renameSync|copyFileSync|truncateSync|write_text|write_bytes|rmtree|os\.remove|os\.unlink|os\.rename|os\.replace|shutil\.(?:move|copy|copy2|copyfile|rmtree)|json\.dump|open\s*\([^)]*,\s*['"][wa+x])/i;
+	/\b(?:writeFileSync|writeFile|appendFileSync|appendFile|unlinkSync|unlink|rmSync|rmdirSync|renameSync|copyFileSync|truncateSync|openSync|Bun\.write|write_text|write_bytes|rmtree|os\.remove|os\.unlink|os\.rename|os\.replace|shutil\.(?:move|copy|copy2|copyfile|rmtree)|json\.dump|open\s*\([^)]*,\s*['"][wa+x])/i;
 
 /**
  * 检查命令是否试图篡改 .nuwa/ 下的权威状态（state.json、journal、snap、state.lock 或整个 .nuwa 目录）。
@@ -1112,6 +1112,284 @@ export function checkScopeAndRisk(
 				reason: `nuwa N-007: 靶标越界 (${target}) — ${res.reason ?? "不在授权 Scope 内"}`,
 			};
 		}
+	}
+
+	return null;
+}
+
+const INTERNAL_DOMAIN_LEAK_RE =
+	/\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:local|internal|lan|corp|intranet|intra|priv|private|home|localdomain|htb|thm|ctf|lab|box|test|invalid|onion)\b/i;
+
+function isSensitiveIpv4Int(ipInt: number): boolean {
+	if (isPrivateIpv4(ipInt) || isLoopbackIpv4(ipInt)) return true;
+	const b0 = (ipInt >>> 24) & 0xff;
+	const b1 = (ipInt >>> 16) & 0xff;
+	// 169.254.0.0/16 链路本地/云元数据与 100.64.0.0/10 运营商级内网
+	if (b0 === 169 && b1 === 254) return true;
+	if (b0 === 100 && b1 >= 64 && b1 <= 127) return true;
+	return false;
+}
+
+function detectWebSearchTargetLeak(queryText: string, scope: ScopePolicy): string | null {
+	const text = queryText.trim();
+	if (!text) return null;
+
+	// 1. 检测私网/回环/元数据 IPv4 或 CIDR
+	for (const m of text.matchAll(
+		/(?<![0-9a-zA-Z._-])((?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})(?:\/(?:3[0-2]|[12]?\d))?(?![0-9a-zA-Z._-])/g,
+	)) {
+		const ipStr = m[1];
+		if (!ipStr) continue;
+		const ipInt = parseIpv4(ipStr);
+		if (ipInt !== null && isSensitiveIpv4Int(ipInt)) {
+			return m[0];
+		}
+	}
+
+	// 2. 检测私网/本地 IPv6
+	const v6Match = /\b(?:fe80:[0-9a-f:]*|fc[0-9a-f]{2}:[0-9a-f:]*|fd[0-9a-f]{2}:[0-9a-f:]*|::1)\b/i.exec(text);
+	if (v6Match) return v6Match[0];
+
+	// 3. 检测 localhost 或内网/靶场专属域名特征
+	const localMatch = /\blocalhost(?::\d{1,5})?\b/i.exec(text);
+	if (localMatch) return localMatch[0];
+
+	const domainMatch = INTERNAL_DOMAIN_LEAK_RE.exec(text);
+	if (domainMatch) return domainMatch[0];
+
+	// 4. 检测是否直接外泄当前 Scope 内的具体靶标域名或网段（使用边界匹配防止短主机名误伤普通英文单词）
+	const lower = text.toLowerCase();
+	for (const rawHost of scope.allowHosts ?? []) {
+		const clean = normalizeHostToken(rawHost.replace(/^\*\./, ""), false);
+		if (!clean || clean === "*" || clean.length < 4 || !clean.includes(".")) continue;
+		const escaped = clean.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const hostBoundaryRe = new RegExp(`(?<![a-z0-9.-])${escaped}(?![a-z0-9-])`, "i");
+		if (hostBoundaryRe.test(lower)) {
+			return clean;
+		}
+	}
+	for (const rawCidr of scope.allowCidrs ?? []) {
+		const clean = rawCidr.trim().toLowerCase();
+		if (clean && lower.includes(clean)) {
+			return clean;
+		}
+	}
+
+	return null;
+}
+
+function collectWebSearchQueryText(params: Record<string, unknown>): string {
+	const chunks: string[] = [];
+	for (const key of ["query", "q", "search_query", "prompt"]) {
+		const val = params[key];
+		if (typeof val === "string" && val.trim()) {
+			chunks.push(val.trim());
+		}
+	}
+	if (Array.isArray(params.queries)) {
+		for (const item of params.queries) {
+			if (typeof item === "string" && item.trim()) {
+				chunks.push(item.trim());
+			}
+		}
+	}
+	return chunks.join(" ");
+}
+
+function parseHostnameFromUrlStrict(rawUrl: string): string | null {
+	try {
+		const u = new URL(rawUrl);
+		const h = normalizeHostToken(u.hostname, false);
+		return h || null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 扩展全工具面靶标范围护栏与风险拦截（v4.0）：
+ * - read：当 input.path 为 http(s):// URL 时校验 hostname 满足 isHostInScope，否则返回 nuwa N-007；
+ * - browser：校验 input.url (http/https/ws/wss) 与 input.allowed_domains 满足 isHostInScope，非 coding 模式禁止 allow_file_access: true；
+ * - web_search：安全评估模式下，未设 NUWA_ALLOW_WEB_SEARCH=1 且查询含私网 IP/内网域名/目标特征时拦截；
+ * - eval：提取 input.code 中的 https?:// URL 校验 isHostInScope，并调用 checkNuwaDirTamper(code)；
+ * - bash：兼容委托 checkNuwaDirTamper 与 checkScopeAndRisk。
+ */
+export function checkToolScopeAndRisk(
+	toolName: string,
+	input: Record<string, unknown> | null | undefined,
+	scope: ScopePolicy,
+	mode: Mode | string = "ctf",
+): ScopeBlockVerdict | null {
+	const name = String(toolName ?? "").trim().toLowerCase();
+	if (!name) return null;
+	const params = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+	const normMode = String(mode ?? "ctf").trim().toLowerCase();
+
+	if (name === "bash") {
+		const cmd = typeof params.command === "string" ? params.command : "";
+		const tamper = checkNuwaDirTamper(cmd);
+		if (tamper) return tamper;
+		return checkScopeAndRisk(cmd, scope, normMode);
+	}
+
+	if (name === "read" || name === "read_file" || name === "fetch" || name === "web_fetch") {
+		const rawPath =
+			typeof params.path === "string"
+				? params.path.trim()
+				: typeof params.file_path === "string"
+					? params.file_path.trim()
+					: typeof params.url === "string"
+						? params.url.trim()
+						: "";
+		if (/^https?:\/\//i.test(rawPath)) {
+			const host = parseHostnameFromUrlStrict(rawPath);
+			if (!host) {
+				return {
+					block: true,
+					reason: `nuwa N-007: ${name} URL 非法或缺少有效目标主机 (${rawPath})`,
+				};
+			}
+			const res = isHostInScope(host, scope);
+			if (!res.ok) {
+				return {
+					block: true,
+					reason: `nuwa N-007: ${name} 远程靶标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+				};
+			}
+		}
+		return null;
+	}
+
+	if (name === "browser" || name.startsWith("browser_")) {
+		const allowFileAccess = params.allow_file_access === true || params.allowFileAccess === true;
+		if (allowFileAccess && normMode !== "coding") {
+			return {
+				block: true,
+				reason: `nuwa N-008: browser 在 mode=${normMode} 下禁止开启 allow_file_access: true`,
+			};
+		}
+
+		const rawUrl = typeof params.url === "string" ? params.url.trim() : "";
+		if (rawUrl && rawUrl.toLowerCase() !== "about:blank") {
+			if (/^file:\/\//i.test(rawUrl)) {
+				if (normMode !== "coding") {
+					return {
+						block: true,
+						reason: `nuwa N-008: browser 在 mode=${normMode} 下禁止访问本地 file:// URL`,
+					};
+				}
+			} else if (/^(?:https?|wss?):\/\//i.test(rawUrl)) {
+				const host = parseHostnameFromUrlStrict(rawUrl);
+				if (!host) {
+					return {
+						block: true,
+						reason: `nuwa N-007: browser URL 非法或无法解析主机 (${rawUrl})`,
+					};
+				}
+				const res = isHostInScope(host, scope);
+				if (!res.ok) {
+					return {
+						block: true,
+						reason: `nuwa N-007: browser 目标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+					};
+				}
+			} else if (/^[a-z][a-z0-9+.-]*:/i.test(rawUrl)) {
+				return {
+					block: true,
+					reason: `nuwa N-007: browser 不受支持的非授权协议 (${rawUrl})`,
+				};
+			} else {
+				const host = parseTargetHost(rawUrl);
+				if (host) {
+					const res = isHostInScope(host, scope);
+					if (!res.ok) {
+						return {
+							block: true,
+							reason: `nuwa N-007: browser 目标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+						};
+					}
+				}
+			}
+		}
+
+		const rawDomains = params.allowed_domains ?? params.allowedDomains;
+		const domainList: string[] = Array.isArray(rawDomains)
+			? rawDomains.map((d) => String(d ?? "").trim()).filter(Boolean)
+			: typeof rawDomains === "string"
+				? rawDomains
+						.split(/[,\s]+/)
+						.map((d) => d.trim())
+						.filter(Boolean)
+				: [];
+
+		for (const rawDomain of domainList) {
+			if (rawDomain === "*" && !(scope.allowHosts ?? []).includes("*")) {
+				return {
+					block: true,
+					reason: "nuwa N-007: browser allowed_domains 禁止配置全局通配符 *",
+				};
+			}
+			const candHost = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawDomain)
+				? (parseHostnameFromUrlStrict(rawDomain) ?? rawDomain)
+				: rawDomain;
+			const res = isHostInScope(candHost, scope);
+			if (!res.ok) {
+				return {
+					block: true,
+					reason: `nuwa N-007: browser allowed_domains 越界 (${rawDomain}) — ${res.reason ?? "不在授权 Scope 内"}`,
+				};
+			}
+		}
+
+		return null;
+	}
+
+	if (name === "web_search" || name === "websearch" || name === "google_search") {
+		const isSecurityEvalMode = normMode !== "coding" && normMode !== "ops";
+		if (!isSecurityEvalMode) return null;
+		if ((process.env.NUWA_ALLOW_WEB_SEARCH ?? "").trim() === "1") return null;
+
+		const queryText = collectWebSearchQueryText(params);
+		const leak = detectWebSearchTargetLeak(queryText, scope);
+		if (leak) {
+			return {
+				block: true,
+				reason: `nuwa N-007: web_search 在安全评估模式 (${normMode}) 下禁止外泄目标私网 IP 或内网域名特征 (${leak})；确需开启请设 NUWA_ALLOW_WEB_SEARCH=1`,
+			};
+		}
+		return null;
+	}
+
+	if (name === "eval") {
+		const code =
+			typeof params.code === "string"
+				? params.code
+				: typeof params.script === "string"
+					? params.script
+					: "";
+		if (!code.trim()) return null;
+
+		const tamper = checkNuwaDirTamper(code);
+		if (tamper) return tamper;
+
+		// 将模板插值替换为占位标识，既避免 '}' 截断 URL，又能拦截 https://${x}.evil.org 外带并放行纯变量主机
+		const normalizedCode = code
+			.replace(/:\$\{[^}]*\}/g, ":80")
+			.replace(/\$\{[^}]*\}/g, "nuwa-tpl-var");
+
+		for (const m of normalizedCode.matchAll(/\b(?:https?|wss?):\/\/[^\s'"`<>|;&),}\]]+/gi)) {
+			const rawUrl = m[0].replace(/[.,;:!?]+$/, "");
+			const host = parseHostnameFromUrlStrict(rawUrl);
+			if (!host || host === "nuwa-tpl-var") continue;
+			const res = isHostInScope(host, scope);
+			if (!res.ok) {
+				return {
+					block: true,
+					reason: `nuwa N-007: eval 代码内 URL 靶标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+				};
+			}
+		}
+		return null;
 	}
 
 	return null;
