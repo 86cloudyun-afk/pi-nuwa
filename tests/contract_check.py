@@ -96,9 +96,15 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
     results: list[dict] = []
     required_files = [
         "omp/nuwa.ts",
+        "omp/types.ts",
         "omp/autoexec.ts",
+        "omp/scope.ts",
+        "omp/evidence.ts",
+        "omp/profiles.ts",
+        "omp/reincarnate.ts",
         "omp/ui.ts",
         "omp/ui-native.ts",
+        "bin/nuwa-autonomous",
         "install.sh",
         "skills/nuwa-pentest/SKILL.md",
     ]
@@ -159,6 +165,63 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
         "name": "v2_skill_contract",
         "ok": skill_ok,
         "detail": "" if skill_ok else f"missing_tools={skill_missing}",
+    })
+
+    # 运行时异步 Bun.plugin 加载契约（防止 createRequire async module 回归）
+    bun_bin = shutil.which("bun")
+    if bun_bin:
+        env = dict(os.environ)
+        env.pop("BUN_OPTIONS", None)
+        omp_dir = str((repo_root / "omp").resolve())
+        smoke_js = """
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const ompDir = process.env.NUWA_OMP_DIR!;
+const escaped = ompDir.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+Bun.plugin({
+  name: "nuwa-contract-async-ext",
+  setup(build) {
+    build.onLoad({ filter: new RegExp(`^${escaped}/.*\\\\.ts$`) }, async (args) => {
+      const text = await Bun.file(args.path).text();
+      return { contents: text, loader: "ts" };
+    });
+  },
+});
+const mod = await import(`${ompDir}/nuwa.ts`);
+const tools = new Map<string, any>();
+const chain = (): any => new Proxy(() => chain(), { get: () => () => chain() });
+const z = new Proxy({}, { get: () => () => chain() });
+mod.default({ zod: z, registerTool: (t: any) => tools.set(t.name, t), registerCommand: () => {}, on: () => {} });
+const dir = mkdtempSync(join(tmpdir(), "nuwa-contract-rt-"));
+try {
+  const ctx: any = { cwd: dir, agent: { kind: "main" }, sessionManager: { getSessionId: () => "contract-rt" } };
+  const r1 = await tools.get("nuwa_init").execute("1", { target: "http://127.0.0.1:18080", mode: "ctf", root: dir }, undefined, undefined, ctx);
+  const t1 = r1?.content?.[0]?.text ?? "";
+  if (!t1.includes("女娲已上膛") || t1.includes("ERROR:")) {
+    throw new Error(`nuwa_init failed: ${t1}`);
+  }
+  const r2 = await tools.get("nuwa_status").execute("2", { root: dir }, undefined, undefined, ctx);
+  const t2 = r2?.content?.[0]?.text ?? "";
+  if (!t2.includes("phase=recon") || t2.includes("ERROR:")) {
+    throw new Error(`nuwa_status failed: ${t2}`);
+  }
+  console.log(`RUNTIME_OK:${mod.VERSION}:tools=${tools.size}`);
+} finally {
+  rmSync(dir, { recursive: true, force: true });
+}
+"""
+        env["NUWA_OMP_DIR"] = omp_dir
+        rt = subprocess.run([bun_bin, "-e", smoke_js], cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=30)
+        rt_ok = rt.returncode == 0 and "RUNTIME_OK:" in rt.stdout and "tools=12" in rt.stdout
+        rt_detail = rt.stdout.strip() if rt_ok else (rt.stderr.strip() or rt.stdout.strip() or f"rc={rt.returncode}")
+    else:
+        rt_ok = False
+        rt_detail = "bun not found in PATH"
+    results.append({
+        "name": "v2_omp_async_plugin_runtime",
+        "ok": rt_ok,
+        "detail": rt_detail[:200],
     })
 
     return all(r["ok"] for r in results), results

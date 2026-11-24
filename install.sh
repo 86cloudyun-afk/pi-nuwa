@@ -207,6 +207,64 @@ fi
 # 双扩展自检：extensions/ 下除 nuwa-omp 外不允许再有 nuwa-* 目录（含 .bak/.retired）
 extra="$(find -L "$AGENT_HOME/extensions" -maxdepth 1 -type d -name 'nuwa-*' ! -name 'nuwa-omp' -print 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$extra" -eq 0 ]] || die "extensions/ 下仍有 $extra 个旧 nuwa 扩展，会与 nuwa-omp 抢 session_stop；先移出再装" 1
+
+# 运行时加载冒烟（复刻 omp 异步 Bun.plugin，拦截 createRequire 等 async module 错误）
+if command -v bun >/dev/null 2>&1; then
+  SMOKE_OUT="$(
+    EXT_DIR="$EXT_DIR" EXPECT_VER="$INSTALLED_VER" env -u BUN_OPTIONS bun -e '
+      import { mkdtempSync, rmSync } from "node:fs";
+      import { tmpdir } from "node:os";
+      import { join } from "node:path";
+      const extDir = process.env.EXT_DIR!;
+      const escaped = extDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      Bun.plugin({
+        name: "nuwa-install-async-smoke",
+        setup(build) {
+          build.onLoad({ filter: new RegExp(`^${escaped}/.*\\.ts$`) }, async (args) => {
+            const text = await Bun.file(args.path).text();
+            return { contents: text, loader: "ts" };
+          });
+        },
+      });
+      const mod = await import(`${extDir}/index.ts`);
+      if (mod.VERSION !== process.env.EXPECT_VER) {
+        throw new Error(`VERSION mismatch: ${mod.VERSION} != ${process.env.EXPECT_VER}`);
+      }
+      const tools = new Map<string, any>();
+      const chain = (): any => new Proxy(() => chain(), { get: () => () => chain() });
+      const z = new Proxy({}, { get: () => () => chain() });
+      mod.default({
+        zod: z,
+        registerTool: (t: any) => tools.set(t.name, t),
+        registerCommand: () => {},
+        on: () => {},
+      });
+      const dir = mkdtempSync(join(tmpdir(), "nuwa-install-smoke-"));
+      try {
+        const ctx: any = {
+          cwd: dir,
+          agent: { kind: "main" },
+          sessionManager: { getSessionId: () => "install-smoke" },
+        };
+        const r1 = await tools.get("nuwa_init").execute("1", { target: "http://127.0.0.1:18080", mode: "ctf", root: dir }, undefined, undefined, ctx);
+        const t1 = r1?.content?.[0]?.text ?? "";
+        if (!t1.includes("女娲已上膛") || t1.includes("ERROR:")) {
+          throw new Error(`nuwa_init failed: ${t1}`);
+        }
+        const r2 = await tools.get("nuwa_status").execute("2", { root: dir }, undefined, undefined, ctx);
+        const t2 = r2?.content?.[0]?.text ?? "";
+        if (!t2.includes("phase=recon") || t2.includes("ERROR:")) {
+          throw new Error(`nuwa_status failed: ${t2}`);
+        }
+        console.log(`SMOKE_OK ${mod.VERSION} tools=${tools.size}`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    ' 2>&1
+  )" || die "扩展运行时异步加载冒烟失败: $SMOKE_OUT" 1
+  say "  运行时冒烟: $SMOKE_OUT"
+fi
+
 say "  工具面完整 · 模块齐备（9/9） · 单一扩展（无旧版共存）"
 say "installed version = ${INSTALLED_VER}"
 

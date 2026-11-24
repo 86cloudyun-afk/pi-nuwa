@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -108,8 +108,8 @@ function setupExt(
 }
 
 describe("v3.0 版本、工具红线、Profile 模式与开局防抢跑", () => {
-	test("VERSION 为 3.0.0 且严格保持 12 个注册工具", () => {
-		expect(mod.VERSION).toBe("3.0.0");
+	test("VERSION 为 3.0.1 且严格保持 12 个注册工具", () => {
+		expect(mod.VERSION).toBe("3.0.1");
 		const dir = makeTempDir();
 		const { tools } = setupExt(dir);
 		expect(tools.size).toBe(12);
@@ -734,5 +734,36 @@ describe("多会话隔离 armPump、战略复盘与世代轮转放行（Bug 5 + 
 		// 自动批提前写入的 f099 完好保留，未被锁外旧快照覆盖
 		expect(finalState.facts.f099).toBeDefined();
 		expect(Object.values(finalState.facts).some((f) => f.title === "拿到目标真实凭据" && f.verified === true)).toBe(true);
+	});
+
+	test("Issue #2 & #10：外置规则热更新、非法配置记录 autoexec_config_invalid 且不阻塞，并验证静态 ESM 与异步插件加载", async () => {
+		const dir = makeTempDir("nuwa-rule-invalid-");
+		const h = setupExt(dir, { sessionId: "sess-rule-invalid" });
+		await h.call("nuwa_init", { target: "127.0.0.1:18092", mode: "ctf" });
+
+		// 1. 不重启扩展，写入项目级合法 autoexec.json，看板实时体现 rules=project
+		const cfgFile = join(dir, ".nuwa", "autoexec.json");
+		writeFileSync(
+			cfgFile,
+			JSON.stringify({
+				rules: [{ key: "surface:graphql_probe", phase: "surface", timeoutMs: 9000, parse: "probe", paths: ["/graphql"] }],
+			}),
+			"utf8",
+		);
+		const stRes1 = await h.call("nuwa_status", {});
+		expect(stRes1.content[0].text).toContain("rules=project");
+
+		// 2. 损坏 JSON 后不阻塞 nuwa_status，回退 builtin 且 journal 记录 autoexec_config_invalid
+		writeFileSync(cfgFile, "{ bad json !!!", "utf8");
+		const stRes2 = await h.call("nuwa_status", {});
+		expect(stRes2.details?.error).toBeUndefined();
+		expect(stRes2.content[0].text).toContain("rules=builtin");
+		const journal = readFileSync(join(dir, ".nuwa", "journal.jsonl"), "utf8");
+		expect(journal).toContain('"type":"autoexec_config_invalid"');
+
+		// 3. 源码静态约束（Issue #10 根治）：不含 createRequire，无顶层 await import
+		const nuwaSrc = readFileSync(join(import.meta.dir, "..", "omp", "nuwa.ts"), "utf8");
+		expect(nuwaSrc).not.toContain("createRequire");
+		expect(nuwaSrc).not.toMatch(/\bawait\s+import\s*\(/);
 	});
 });

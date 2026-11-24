@@ -123,6 +123,9 @@ interface UiStyle {
 
 ## 7. Tern 降级与 `describe()` 验证矩阵（Issue #6）
 
+- 实测日期：`2026-11-24`
+- 实测环境：`omp 18.16.0` / `bun 1.4.4` / Tern TSP 节点规范（`card / row / badge / progress / meter / kv / section / table / tree / list / text`）
+
 以下矩阵记录 `omp/ui-native.ts` 中 `buildWidgetNode`、`buildBoardNode`、`createWidgetComponent` 与 `createBoardComponent` 在不同 `cx.supports(kind)` 能力组合及极窄终端宽度下的实际行为，全部由 `tests/ui_native.test.ts` 自动化断言覆盖（13 例全绿）：
 
 | 验证场景 | `cx.supports()` 能力组合 | Widget 节点表现 | Board 节点表现 | 验证断言与说明 |

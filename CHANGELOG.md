@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.0.1 — 2026-11-24
+
+彻底根治 Issue #10（ESM 异步插件运行时加载问题）并对齐 Issues #1–#9 全部细节判据：
+
+- **静态 ESM 导入消除加载断裂（Issue #10）**：移除 `omp/nuwa.ts` 中的 `createRequire`、`loadSibling` 桥接与顶层 `await import().catch(() => null)` 静默吞错机制，改为零 Top-Level Await 的标准静态 ESM 导入（`./scope`、`./evidence`、`./profiles`、`./autoexec`、`./reincarnate`），同时删除 360+ 行冗余 fallback 桩代码。
+- **部署与契约增加异步 `Bun.plugin` 冒烟门禁（Issue #10）**：`install.sh` 末尾与 `tests/contract_check.py` 均挂载模拟 `omp` 异步 `onLoad` 插件的 `Bun.plugin` 加载 `index.ts` / `nuwa.ts` 并实测调用 `nuwa_init` 与 `nuwa_status`，确保同步 `require` 类故障绝不流入部署态。
+- **规则来源命名与异常事件对齐（Issue #2）**：将全局规则来源 `source` 统一为 `"project" | "global" | "builtin"`，`nuwa_status` 实时检测 `.nuwa/autoexec.json` 热更新并去重写入 `autoexec_config_invalid` 日志事件。
+- **失败分类与空转闸文案精确对齐（Issue #3 / #4）**：自动批 `empty` 类失败 `note` 标注 `已测面`，二维空转闸有工具活动超限收口 `note` 标注 `有工具无产出`。
+- **Tern 验证记录与版本对齐（Issue #6 / #9）**：`docs/UI-DESIGN.md` 补充实测日期与 `omp 18.16.0` / `bun 1.4.4` 环境记录，并发布 `v3.0.1`。
+
 ## 3.0.0 — 2026-11-24
 
 女娲自治闭环与多领域引擎全面升级：外层无头世代轮转、知识库自动富化与战略复盘、真实执行账本防幻觉、靶标范围护栏、工具链探针自适配、多领域 Profile 解耦，以及 2.6.0 全部遗留 Issues（#1–#9）清零。

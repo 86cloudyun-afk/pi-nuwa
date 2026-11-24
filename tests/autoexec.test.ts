@@ -335,7 +335,7 @@ describe("E2+ 归一化、调度与冷却", () => {
 });
 
 describe("Issue #2 外置 autoexec.json 配置加载与热更新", () => {
-	test("优先级 project > user > builtin、mtimeMs 热更新以及非法配置安全降级", () => {
+	test("优先级 project > global > builtin、mtimeMs 热更新以及非法配置安全降级", () => {
 		const root = makeDir("nuwa-rules-proj-");
 		const agentHome = makeDir("nuwa-rules-home-");
 		mkdirSync(join(root, ".nuwa"), { recursive: true });
@@ -345,19 +345,19 @@ describe("Issue #2 外置 autoexec.json 配置加载与热更新", () => {
 		expect(b.source).toBe("builtin");
 		expect(b.error).toBeUndefined();
 
-		// 2. agentHome 级别配置生效
-		const userFile = join(agentHome, "nuwa-autoexec.json");
+		// 2. agentHome 全局级别配置生效
+		const globalFile = join(agentHome, "nuwa-autoexec.json");
 		writeFileSync(
-			userFile,
+			globalFile,
 			JSON.stringify({
-				rules: [{ key: "surface:custom_user", phase: "surface", timeoutMs: 9000, parse: "probe", paths: ["/healthz"] }],
+				rules: [{ key: "surface:custom_global", phase: "surface", timeoutMs: 9000, parse: "probe", paths: ["/healthz"] }],
 			}),
 		);
 		const u = loadAutoRules(root, agentHome);
-		expect(u.source).toBe("user");
-		expect(u.rules.some((r) => r.key === "surface:custom_user")).toBe(true);
+		expect(u.source).toBe("global");
+		expect(u.rules.some((r) => r.key === "surface:custom_global")).toBe(true);
 
-		// 3. project 级别配置高于 user，且支持热更新
+		// 3. project 级别配置高于 global，且支持热更新
 		const projFile = join(root, ".nuwa", "autoexec.json");
 		writeFileSync(
 			projFile,

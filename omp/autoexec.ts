@@ -73,7 +73,7 @@ export interface AutoRunResult {
 
 export interface LoadedAutoRules {
 	rules: readonly AutoRule[];
-	source: "project" | "user" | "builtin";
+	source: "project" | "global" | "builtin";
 	path?: string;
 	error?: string;
 }
@@ -104,7 +104,7 @@ export interface AutoBatchManagedResult {
 	skippedIds: string[];
 	skipReason?: BudgetSkipReason;
 	elapsedMs: number;
-	ruleSource: "project" | "user" | "builtin";
+	ruleSource: "project" | "global" | "builtin";
 	ruleError?: string;
 }
 
@@ -710,7 +710,7 @@ function buildRuleFromSpec(spec: ExternalRuleSpec, index: number): AutoRule {
  */
 export function loadAutoRules(root?: string, agentHome?: string): LoadedAutoRules {
 	let targetPath: string | undefined;
-	let source: "project" | "user" | "builtin" = "builtin";
+	let source: "project" | "global" | "builtin" = "builtin";
 
 	if (root && root.trim()) {
 		const projFile = join(resolve(root), ".nuwa", "autoexec.json");
@@ -721,10 +721,10 @@ export function loadAutoRules(root?: string, agentHome?: string): LoadedAutoRule
 	}
 	if (!targetPath) {
 		const home = agentHome && agentHome.trim() ? resolve(agentHome) : defaultAgentHome();
-		const userFile = join(home, "nuwa-autoexec.json");
-		if (existsSync(userFile)) {
-			targetPath = userFile;
-			source = "user";
+		const globalFile = join(home, "nuwa-autoexec.json");
+		if (existsSync(globalFile)) {
+			targetPath = globalFile;
+			source = "global";
 		}
 	}
 
@@ -857,9 +857,9 @@ export function classifyAutoFailure(res: ExecLikeResult): AutoFailureClassificat
  * 选择本轮可自动执行的意图：
  * 满足 open 状态、归一化 key 命中自动规则、尝试未超上限、冷却时间 nextRunAt <= now 且前置依赖已满足。
  */
-export function pickAuto(st: NuwaState, cfg: Cfg, max: number, now = Date.now(), root?: string): string[] {
+export function pickAuto(st: NuwaState, cfg: Cfg, max: number, now = Date.now(), root?: string, agentHome?: string): string[] {
 	const out: Array<{ id: string; priority: number }> = [];
-	const { rules } = loadAutoRules(root);
+	const { rules } = loadAutoRules(root, agentHome);
 	const allowedKeys = new Set(rules.map((r) => r.key));
 
 	for (const it of Object.values(st.intents)) {
