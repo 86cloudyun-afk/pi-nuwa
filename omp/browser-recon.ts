@@ -15,7 +15,9 @@ import type { AutoFact } from "./autoexec";
 
 export const MAX_STATIC_BUNDLES = 8;
 const MAX_BUNDLE_BYTES = 2 * 1024 * 1024;
+const MAX_STATIC_REDIRECTS = 5;
 const ALLOWED_DYNAMIC_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 const STATIC_ASSET_EXT_RE =
 	/\.(?:js|mjs|cjs|jsx|ts|tsx|css|scss|sass|less|map|png|jpe?g|gif|svg|ico|webp|avif|bmp|woff2?|ttf|eot|otf|mp3|mp4|webm|ogg|wav|pdf|zip|tar|gz|br|wasm|xml|txt)$/i;
@@ -71,7 +73,12 @@ export interface FetchLikeResponse {
 
 export type FetchLike = (
 	input: string,
-	init?: { method?: string; headers?: Record<string, string>; signal?: AbortSignal },
+	init?: {
+		method?: string;
+		headers?: Record<string, string>;
+		signal?: AbortSignal;
+		redirect?: "manual" | "follow" | "error";
+	},
 ) => Promise<FetchLikeResponse>;
 
 export interface PlaywrightRequestLike {
@@ -695,6 +702,7 @@ function defaultFetchImpl(): FetchLike {
 			method: init?.method ?? "GET",
 			headers: init?.headers,
 			signal: init?.signal,
+			redirect: init?.redirect ?? "manual",
 		});
 		return {
 			ok: res.ok,
@@ -703,6 +711,100 @@ function defaultFetchImpl(): FetchLike {
 			headers: res.headers,
 		};
 	};
+}
+
+type ScopedFetchOutcome =
+	| { ok: true; response: FetchLikeResponse; finalUrl: string }
+	| { ok: false; blocked: true; reason: string }
+	| { ok: false; blocked: false; error: string };
+
+/**
+ * 受控只读 GET 抓取器：强制 `redirect: "manual"`，逐跳校验 301/302/303/307/308 的 Location
+ * 是否符合 `http:`/`https:`、命中 `isHostInScope`（以及可选的同源约束），越界或超跳立即阻断。
+ */
+async function scopedGetFetch(
+	initialUrl: string,
+	scope: ScopePolicy,
+	fetcher: FetchLike,
+	opts: {
+		headers?: Record<string, string>;
+		signal?: AbortSignal;
+		requireSameOrigin?: string;
+		maxRedirects?: number;
+	},
+): Promise<ScopedFetchOutcome> {
+	const maxRedirects = Math.max(0, Math.min(10, opts.maxRedirects ?? MAX_STATIC_REDIRECTS));
+	let curUrl: URL;
+	try {
+		curUrl = new URL(initialUrl);
+	} catch {
+		return { ok: false, blocked: true, reason: `请求 URL 非法: ${initialUrl}` };
+	}
+
+	for (let hop = 0; hop <= maxRedirects; hop++) {
+		if (curUrl.protocol !== "http:" && curUrl.protocol !== "https:") {
+			return { ok: false, blocked: true, reason: `禁止非 HTTP(S) 协议: ${curUrl.protocol}` };
+		}
+		const scopeCheck = isHostInScope(curUrl.hostname, scope);
+		if (!scopeCheck.ok) {
+			return { ok: false, blocked: true, reason: scopeCheck.reason ?? `主机 ${curUrl.hostname} 超出范围` };
+		}
+		if (opts.requireSameOrigin && curUrl.origin !== opts.requireSameOrigin) {
+			return { ok: false, blocked: true, reason: `跨源目标 ${curUrl.origin} 与预期同源 ${opts.requireSameOrigin} 不符` };
+		}
+
+		let resp: FetchLikeResponse;
+		try {
+			resp = await fetcher(curUrl.href, {
+				method: "GET",
+				headers: opts.headers,
+				signal: opts.signal,
+				redirect: "manual",
+			});
+		} catch (err) {
+			return { ok: false, blocked: false, error: err instanceof Error ? err.message : String(err) };
+		}
+
+		if (!REDIRECT_STATUSES.has(resp.status)) {
+			return { ok: true, response: resp, finalUrl: curUrl.href };
+		}
+
+		const location = resp.headers?.get("location")?.trim() ?? "";
+		if (!location) {
+			return { ok: true, response: resp, finalUrl: curUrl.href };
+		}
+		if (hop >= maxRedirects) {
+			return { ok: false, blocked: true, reason: `重定向次数超过上限 (${maxRedirects})` };
+		}
+
+		let nextUrl: URL;
+		try {
+			nextUrl = new URL(location, curUrl);
+		} catch {
+			return { ok: false, blocked: true, reason: `非法重定向 Location: ${location}` };
+		}
+		if (nextUrl.protocol !== "http:" && nextUrl.protocol !== "https:") {
+			return { ok: false, blocked: true, reason: `阻断非 HTTP(S) 重定向协议: ${nextUrl.protocol}` };
+		}
+		const nextScope = isHostInScope(nextUrl.hostname, scope);
+		if (!nextScope.ok) {
+			return {
+				ok: false,
+				blocked: true,
+				reason: `阻断越界 30x 重定向至 ${nextUrl.hostname}: ${nextScope.reason ?? "超出 ScopePolicy"}`,
+			};
+		}
+		if (opts.requireSameOrigin && nextUrl.origin !== opts.requireSameOrigin) {
+			return {
+				ok: false,
+				blocked: true,
+				reason: `阻断跨源 30x 重定向: ${nextUrl.origin} !== ${opts.requireSameOrigin}`,
+			};
+		}
+		curUrl = nextUrl;
+	}
+
+	return { ok: false, blocked: true, reason: `重定向次数超过上限 (${maxRedirects})` };
 }
 
 function buildSpaAutoFact(
@@ -806,15 +908,20 @@ export async function extractStaticBundleApis(
 		opts?.signal?.addEventListener("abort", onAbort, { once: true });
 		const timer = setTimeout(() => controller.abort(), timeoutMs);
 		try {
-			const resp = await fetcher(bundleUrl, {
-				method: "GET",
+			const fetched = await scopedGetFetch(bundleUrl, scope, fetcher, {
 				headers: { Accept: "application/javascript, text/javascript, */*" },
 				signal: controller.signal,
+				requireSameOrigin: parsedBase.origin,
 			});
+			if (!fetched.ok) {
+				if (fetched.blocked) blockedRequests++;
+				continue;
+			}
+			const resp = fetched.response;
 			if (!resp.ok) continue;
 			const rawText = await resp.text();
 			const jsCode = rawText.length > MAX_BUNDLE_BYTES ? rawText.slice(0, MAX_BUNDLE_BYTES) : rawText;
-			fetchedBundles.push(bundleUrl);
+			fetchedBundles.push(fetched.finalUrl);
 			techSources.push(jsCode);
 			const res = extractApisAndRoutesFromJs(jsCode, parsedBase, scope, "static-bundle", endpointMap, routeSet);
 			blockedRequests += res.blocked;
@@ -1118,12 +1225,42 @@ export async function runSpaRecon(
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 
 	let html = "";
+	let finalBaseUrl = parsedUrl.href;
 	try {
-		const resp = await fetcher(parsedUrl.href, {
-			method: "GET",
+		const fetched = await scopedGetFetch(parsedUrl.href, scope, fetcher, {
 			headers: { Accept: "text/html,application/xhtml+xml,*/*" },
 			signal: controller.signal,
 		});
+		if (!fetched.ok) {
+			if (fetched.blocked) {
+				return {
+					url: parsedUrl.href,
+					mode: "static",
+					fallbackReason: fallbackReason ? `${fallbackReason}；${fetched.reason}` : fetched.reason,
+					tech: [],
+					routes: [],
+					endpoints: [],
+					bundles: [],
+					blockedRequests: 1,
+					fact: null,
+				};
+			}
+			return {
+				url: parsedUrl.href,
+				mode: "static",
+				fallbackReason: fallbackReason
+					? `${fallbackReason}；首屏抓取失败: ${fetched.error}`
+					: `首屏抓取失败: ${fetched.error}`,
+				tech: [],
+				routes: [],
+				endpoints: [],
+				bundles: [],
+				blockedRequests: 0,
+				fact: null,
+			};
+		}
+		finalBaseUrl = fetched.finalUrl;
+		const resp = fetched.response;
 		if (resp.ok || (resp.status >= 200 && resp.status < 500)) {
 			const raw = await resp.text();
 			html = raw.length > MAX_BUNDLE_BYTES ? raw.slice(0, MAX_BUNDLE_BYTES) : raw;
@@ -1146,7 +1283,7 @@ export async function runSpaRecon(
 		opts?.signal?.removeEventListener("abort", onAbort);
 	}
 
-	const extracted = await extractStaticBundleApis(html, parsedUrl.href, scope, fetcher, {
+	const extracted = await extractStaticBundleApis(html, finalBaseUrl, scope, fetcher, {
 		maxBundles,
 		timeoutMs: Math.min(timeoutMs, 8_000),
 		signal: opts?.signal,

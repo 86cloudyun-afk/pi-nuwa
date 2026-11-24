@@ -305,7 +305,7 @@ describe("2. 内容级语义指纹实锤与脱敏单元测试", () => {
 		expect(detached.kind).toBe("vuln");
 		expect(detached.meta?.paths).toEqual(["/.git/HEAD"]);
 
-		// maskEnvSecrets 边界验证
+		// maskEnvSecrets 边界验证（含闭合引号、分号值、以及 256 字节处截断未闭合双/单引号与多行 PEM 私钥）
 		const masked = maskEnvSecrets('export SECRET_KEY="hello world" DB_PASS=p@ss;123 TOKEN=abc');
 		expect(masked).toContain("export SECRET_KEY=***");
 		expect(masked).toContain("DB_PASS=***");
@@ -313,6 +313,36 @@ describe("2. 内容级语义指纹实锤与脱敏单元测试", () => {
 		expect(masked).not.toContain("hello world");
 		expect(masked).not.toContain("p@ss");
 		expect(masked).not.toContain("abc");
+
+		const truncatedDouble = maskEnvSecrets(
+			'APP_ENV=prod PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY----- MIIEpAIBAAKCAQEA778899',
+		);
+		expect(truncatedDouble).toBe("APP_ENV=*** PRIVATE_KEY=***");
+		expect(truncatedDouble).not.toContain("RSA PRIVATE KEY");
+		expect(truncatedDouble).not.toContain("MIIEpAIBAAKCAQEA778899");
+
+		const truncatedSingle = maskEnvSecrets(
+			"DB_HOST=127.0.0.1 CERT='-----BEGIN CERTIFICATE----- MIID998877 truncated",
+		);
+		expect(truncatedSingle).toBe("DB_HOST=*** CERT=***");
+		expect(truncatedSingle).not.toContain("CERTIFICATE");
+		expect(truncatedSingle).not.toContain("MIID998877");
+
+		// 端到端 parseProbeFact 验证：256 字节截断未闭合引号的 .env 仍实锤 vuln 且绝不泄露私钥片段
+		const truncatedEnvFact = rule.parse(
+			{
+				stdout:
+					'/.env 200 SIZE=1680 TITLE=-\tAPP_ENV=prod PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY----- MIIEpAIBAAKCAQEA778899\n',
+				stderr: "",
+				code: 0,
+			},
+			st,
+		)!;
+		expect(truncatedEnvFact.kind).toBe("vuln");
+		expect(truncatedEnvFact.detail).toContain("PRIVATE_KEY=***");
+		expect(truncatedEnvFact.detail).not.toContain("MIIEpAIBAAKCAQEA778899");
+		expect(truncatedEnvFact.output).not.toContain("RSA PRIVATE KEY");
+		expect(truncatedEnvFact.output).not.toContain("MIIEpAIBAAKCAQEA778899");
 	});
 
 	test("/openapi.json 与 /swagger.json 校验 JSON Schema 关键字，不把错误 JSON 误报为 API 文档暴露", () => {
@@ -791,6 +821,116 @@ describe("4. SPA 与 JS Bundle 动态/静态 API 感知层 (omp/browser-recon.ts
 			expect(res.endpoints.some((e) => e.path === "/api/v1/health")).toBe(true);
 		} finally {
 			srv.stop(true);
+		}
+	});
+
+	test("模式 B 静态抓取严格拦截 30x 越界/跨源重定向（零请求泄露）且正常跟随同源站内跳转", async () => {
+		// 1. 陷阱服务器：验证跨源 302 指向该端口时收到 0 次请求
+		let trapHits = 0;
+		const trapSrv = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				trapHits++;
+				return new Response("fetch('/api/should-never-leak');", {
+					status: 200,
+					headers: { "content-type": "application/javascript" },
+				});
+			},
+		});
+
+		// 2. 主靶标服务器：
+		//    - /meta-redir -> 302 到元数据 IP 169.254.169.254（越界必须阻断）
+		//    - /start      -> 302 到同源 /app（合法站内跳转必须放行）
+		//    - /app        -> 引用 2 个恶意重定向 Bundle（分别指向 trapSrv 跨端口与 169.254.169.254）和 1 个合法同源 Bundle
+		const mainSrv = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req) {
+				const u = new URL(req.url);
+				if (u.pathname === "/meta-redir") {
+					return new Response("", {
+						status: 302,
+						headers: { location: "http://169.254.169.254/latest/meta-data/" },
+					});
+				}
+				if (u.pathname === "/start") {
+					return new Response("", { status: 302, headers: { location: "/app" } });
+				}
+				if (u.pathname === "/app") {
+					return new Response(
+						[
+							"<html><body><div data-reactroot></div>",
+							'<script src="/static/redir-trap.js"></script>',
+							'<script src="/static/redir-meta.js"></script>',
+							'<script src="/static/good.js"></script>',
+							"</body></html>",
+						].join("\n"),
+						{ status: 200, headers: { "content-type": "text/html" } },
+					);
+				}
+				if (u.pathname === "/static/redir-trap.js") {
+					return new Response("", {
+						status: 302,
+						headers: { location: `http://127.0.0.1:${trapSrv.port}/leak.js` },
+					});
+				}
+				if (u.pathname === "/static/redir-meta.js") {
+					return new Response("", {
+						status: 301,
+						headers: { location: "http://169.254.169.254/evil.js" },
+					});
+				}
+				if (u.pathname === "/static/good.js") {
+					return new Response("fetch('/api/v1/safe-endpoint');", {
+						status: 200,
+						headers: { "content-type": "application/javascript" },
+					});
+				}
+				return new Response("not found", { status: 404 });
+			},
+		});
+
+		try {
+			const base = `http://127.0.0.1:${mainSrv.port}`;
+			const scope = defaultScopeForTarget(base, "audit");
+
+			// A. 首屏 302 重定向到 169.254.169.254 必须阻断
+			const metaRes = await runSpaRecon(`${base}/meta-redir`, scope, { disablePlaywright: true });
+			expect(metaRes.mode).toBe("static");
+			expect(metaRes.blockedRequests).toBe(1);
+			expect(metaRes.fact).toBeNull();
+			expect(metaRes.fallbackReason).toContain("阻断越界 30x 重定向");
+
+			// B. 同源 /start -> /app 正常跟随，但跨端口与元数据 Bundle 30x 重定向全部阻断，trapSrv 零命中
+			const appRes = await runSpaRecon(`${base}/start`, scope, { disablePlaywright: true });
+			expect(appRes.mode).toBe("static");
+			expect(trapHits).toBe(0);
+			expect(appRes.blockedRequests).toBeGreaterThanOrEqual(2);
+			expect(appRes.bundles).toEqual([`${base}/static/good.js`]);
+			expect(appRes.endpoints.some((e) => e.path === "/api/v1/safe-endpoint")).toBe(true);
+			expect(appRes.endpoints.some((e) => e.path.includes("should-never-leak"))).toBe(false);
+
+			// C. 自定义 fetchFn 验证显式传入 redirect: "manual" 且绝不对越界目标域名发第二跳
+			const visited: Array<{ url: string; redirect?: string }> = [];
+			const spyRes = await runSpaRecon("http://127.0.0.1:49888/", scope, {
+				disablePlaywright: true,
+				fetchFn: async (input, init) => {
+					visited.push({ url: input, redirect: init?.redirect });
+					return {
+						ok: false,
+						status: 307,
+						headers: new Headers({ location: "https://evil.outside.example/ssrf" }),
+						text: async () => "",
+					};
+				},
+			});
+			expect(visited).toEqual([{ url: "http://127.0.0.1:49888/", redirect: "manual" }]);
+			expect(spyRes.blockedRequests).toBe(1);
+			expect(spyRes.fact).toBeNull();
+		} finally {
+			mainSrv.stop(true);
+			trapSrv.stop(true);
 		}
 	});
 });

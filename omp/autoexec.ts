@@ -333,9 +333,10 @@ const SOFT404_CHECK_PATHS = ["/__nuwa_404_check_1", "/__nuwa_404_check_2.json"] 
 const HTML_SIGNATURE_RE = /<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]|<title[\s>]|<meta\s[^>]*charset/i;
 const GIT_HEAD_REF_RE = /^\s*ref:\s*refs\/[A-Za-z0-9._\/-]+(?:\s|$)/;
 const GIT_HEAD_SHA_RE = /^\s*[0-9a-f]{40}(?:\s|$)/i;
-const ENV_PAIR_TEST_RE = /(?:^|\s)(?:export\s+)?([A-Z][A-Z0-9_]{1,63})=([^\s"'`<>]\S*|"[^"\r\n]+"|'[^'\r\n]+')/;
+const ENV_PAIR_TEST_RE =
+	/(?:^|\s)(?:export\s+)?([A-Z][A-Z0-9_]{1,63})=([^\s"'`<>]\S*|"[^"\r\n]+(?:"|$)|'[^'\r\n]+(?:'|$))/;
 const ENV_PAIR_MASK_RE =
-	/(^|\s)((?:export\s+)?[A-Z][A-Z0-9_]{1,63}=)("(?:\\.|[^"\r\n])*"|'(?:\\.|[^'\r\n])*'|\S+)/g;
+	/(^|\s)((?:export\s+)?[A-Z][A-Z0-9_]{1,63}=)("(?:\\.|[^"])*(?:"|$)|'(?:\\.|[^'])*(?:'|$)|\S+)/g;
 const OPENAPI_PATH_RE = /\/(?:openapi|swagger(?:\/[^/]+)*)\.json$/i;
 const STATIC_ASSET_EXT_RE =
 	/\.(?:js|mjs|cjs|jsx|ts|tsx|css|scss|sass|less|map|png|jpe?g|gif|svg|ico|webp|avif|bmp|woff2?|ttf|eot|otf|mp3|mp4|webm|ogg|wav|pdf|zip|tar|gz|br|wasm)$/i;
