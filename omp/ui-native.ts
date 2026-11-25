@@ -1,5 +1,5 @@
 /**
- * Tern 原生渲染层（2.4.0）。
+ * Tern 原生渲染层（v5.x）。
  *
  * 不 import @oh-my-pi/pi-tui：该包的入口依赖 pi-natives 原生模块，扩展目录解析会失败。
  * 这里直接构造 TSP 节点（纯 JSON），组件只暴露 render() 与 describe()：
@@ -38,7 +38,8 @@ export interface WidgetNativeOptions {
 	lines?: 3 | 5;
 }
 
-function phaseTone(phase: string): string {
+function phaseTone(phase: string, edgeBlocked = false): string {
+	if (edgeBlocked) return "error";
 	switch (phase) {
 		case "vuln":
 			return "warning";
@@ -50,9 +51,11 @@ function phaseTone(phase: string): string {
 	}
 }
 
-function statusTone(status: string): string {
+function statusTone(status: string, edgeBlocked = false): string {
 	if (status === "completed") return "success";
+	if (status === "sealed_negative") return "warning";
 	if (status === "stopped") return "error";
+	if (edgeBlocked) return "error";
 	return "accent";
 }
 
@@ -62,7 +65,7 @@ function batchLabel(snap: UiSnapshot): string {
 	return claimed.length ? `${claimed.join(" ")} (claimed)` : "(空)";
 }
 
-/** mini 看板的原生节点：card > row(badge/progress/episode) + kv + row(meter/turns)。 */
+/** mini 看板的原生节点：card > row(badge/progress/episode/last_ok) + kv + row(meter/turns)。 */
 export function buildWidgetNode(
 	snap: UiSnapshot,
 	supports: (kind: string) => boolean = () => true,
@@ -74,9 +77,21 @@ export function buildWidgetNode(
 	const frac = total > 0 ? Math.min(1, (done + blocked) / total) : 0;
 	const pressure = Math.min(1, Math.max(0, snap.runtime.pressure));
 	const mins = Math.max(0, Math.floor((Date.now() - snap.runtime.startedAt) / 60_000));
+	const edgeBlocked = snap.probe?.edgeBlocked ?? false;
+	const lastOk = snap.probe?.lastOk ?? "none";
+	const blkPct = Math.round((snap.probe?.blockedRatio ?? 0) * 100);
+	const bi = snap.totals.blockedIntents ?? snap.totals.blocked;
+	const bc = snap.totals.blockedCommits ?? bi;
+
+	const phaseBadgeText =
+		snap.project.status === "sealed_negative"
+			? `${snap.project.phase} · 已封盘`
+			: edgeBlocked
+				? `${snap.project.phase} · 边缘受阻`
+				: snap.project.phase;
 
 	const row1: NativeNode[] = [
-		{ k: "badge", p: { text: snap.project.phase, tone: phaseTone(snap.project.phase) } },
+		{ k: "badge", p: { text: phaseBadgeText, tone: phaseTone(snap.project.phase, edgeBlocked) } },
 	];
 	if (supports("progress")) {
 		row1.push({ k: "progress", p: { value: frac, label: `${done}/${total}` } });
@@ -84,6 +99,13 @@ export function buildWidgetNode(
 		row1.push({ k: "text", p: { text: `${done}/${total}` } });
 	}
 	row1.push({ k: "text", p: { text: `E${snap.project.episode}`, tone: "muted" } });
+	row1.push({
+		k: "text",
+		p: {
+			text: `last_ok=${lastOk} · blocked_ratio=${blkPct}%`,
+			tone: edgeBlocked ? "error" : "muted",
+		},
+	});
 
 	const row3: NativeNode[] = [];
 	if (supports("meter")) {
@@ -112,7 +134,9 @@ export function buildWidgetNode(
 					{ k: "批", v: batchLabel(snap) },
 					{ k: "claim", v: String(snap.totals.claimed) },
 					{ k: "facts", v: String(snap.totals.facts) },
-					{ k: "blocked", v: String(snap.totals.blocked) },
+					{ k: "blocked", v: `${bi}/${bc}` },
+					{ k: "last_ok", v: lastOk },
+					{ k: "blocked_ratio", v: `${blkPct}%` },
 					{ k: "rate", v: `${snap.rate.toFixed(1)}/min` },
 				],
 			},
@@ -120,33 +144,49 @@ export function buildWidgetNode(
 		{ k: "row", p: { gap: "sm", align: "center" }, c: row3 },
 	];
 
-	if ((snap.runtime.expansions ?? 0) > 0 || snap.runtime.stall > 0) {
+	if ((snap.runtime.expansions ?? 0) > 0 || snap.runtime.stall > 0 || (snap.runtime.noveltyStall ?? 0) > 0) {
 		body.push({
 			k: "text",
-			p: { text: `expand ${snap.runtime.expansions} · stall ${snap.runtime.stall} · idle ${snap.runtime.idle}`, tone: "dim" },
+			p: {
+				text: `expand ${snap.runtime.expansions} · stall ${snap.runtime.stall} · novelty_stall ${snap.runtime.noveltyStall ?? 0} · idle ${snap.runtime.idle}`,
+				tone: "dim",
+			},
 		});
 	}
 
 	return {
 		k: "card",
 		p: {
-			title: `女娲 · ${snap.project.host}:${snap.project.port}`,
-			tone: statusTone(snap.project.status),
+			title: `女娲 · ${snap.project.host}:${snap.project.port}${edgeBlocked ? " · 边缘受阻" : ""}`,
+			tone: statusTone(snap.project.status, edgeBlocked),
 		},
 		c: body,
 	};
 }
 
 function phaseRows(snap: UiSnapshot): NativeNode {
-	const rows = snap.phases.map((p) => ({
-		id: p.phase,
-		cells: {
-			state: p.total > 0 && p.done + p.blocked === p.total ? "✓" : p.open + p.claimed > 0 ? "●" : "○",
-			phase: p.phase,
-			progress: `${p.done}/${p.total}`,
-			extra: p.claimed > 0 ? `claim ${p.claimed}` : p.blocked > 0 ? `blocked ${p.blocked}` : "",
-		},
-	}));
+	const edgeBlocked = snap.probe?.edgeBlocked ?? false;
+	const lastOk = snap.probe?.lastOk ?? "none";
+	const rows = snap.phases.map((p) => {
+		const isCurEdge = edgeBlocked && p.phase === snap.project.phase;
+		const phSettled = p.done + p.blocked;
+		const phBlkPct = phSettled > 0 ? Math.round((p.blocked / phSettled) * 100) : 0;
+		return {
+			id: p.phase,
+			cells: {
+				state: p.total > 0 && p.done + p.blocked === p.total ? "✓" : isCurEdge ? "⚠" : p.open + p.claimed > 0 ? "●" : "○",
+				phase: isCurEdge ? `${p.phase} (边缘受阻)` : p.phase,
+				progress: `${p.done}/${p.total}`,
+				extra: isCurEdge
+					? `边缘受阻 · last_ok=${lastOk} · blocked_ratio=${phBlkPct}%`
+					: p.claimed > 0
+						? `claim ${p.claimed}`
+						: p.blocked > 0
+							? `blocked ${p.blocked} (${phBlkPct}%)`
+							: "",
+			},
+		};
+	});
 	return {
 		k: "table",
 		p: {
@@ -168,6 +208,12 @@ export function buildBoardNode(
 ): NativeNode {
 	const p = snap.project;
 	const mins = Math.max(0, Math.floor((Date.now() - snap.runtime.startedAt) / 60_000));
+	const edgeBlocked = snap.probe?.edgeBlocked ?? false;
+	const lastOk = snap.probe?.lastOk ?? "none";
+	const blkPct = Math.round((snap.probe?.blockedRatio ?? 0) * 100);
+	const stageLabel = snap.probe?.stageLabel ?? p.phase;
+	const bi = snap.totals.blockedIntents ?? snap.totals.blocked;
+	const bc = snap.totals.blockedCommits ?? bi;
 	const sections: NativeNode[] = [];
 
 	sections.push({
@@ -179,14 +225,20 @@ export function buildBoardNode(
 				{ k: "模式", v: p.mode },
 				{ k: "轮次", v: `E${p.episode} · ${mins}min · turns ${snap.runtime.turns}` },
 				{ k: "压力", v: `${Math.round(snap.runtime.pressure * 100)}%${snap.infinite ? " · ∞" : ""}` },
+				{ k: "探测状态", v: `${stageLabel} · last_ok=${lastOk} · blocked_ratio=${blkPct}%` },
+				{ k: "受阻与去重", v: `blocked=${bi}/${bc} · repeat=${(snap.totals.repeatRatio * 100).toFixed(1)}%` },
 			],
 		},
 	});
 
+	const fallbackStageText =
+		snap.phases.map((x) => `${x.phase} ${x.done}/${x.total}`).join(" · ") +
+		` · last_ok=${lastOk} · blocked_ratio=${blkPct}%${edgeBlocked ? " · 边缘受阻" : ""}`;
+
 	sections.push({
 		k: "section",
 		p: { head: "阶段" },
-		c: [supports("table") ? phaseRows(snap) : { k: "text", p: { text: snap.phases.map((x) => `${x.phase} ${x.done}/${x.total}`).join(" · ") } }],
+		c: [supports("table") ? phaseRows(snap) : { k: "text", p: { text: fallbackStageText } }],
 	});
 
 	if (snap.frontier.length) {
@@ -250,7 +302,10 @@ export function buildBoardNode(
 
 	return {
 		k: "card",
-		p: { title: `女娲 ${p.id} · ${p.status}`, tone: statusTone(p.status) },
+		p: {
+			title: `女娲 ${p.id} · ${p.status}${edgeBlocked ? " · 边缘受阻" : ""}`,
+			tone: statusTone(p.status, edgeBlocked),
+		},
 		c: sections,
 	};
 }
