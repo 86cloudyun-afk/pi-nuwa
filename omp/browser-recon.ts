@@ -1,17 +1,46 @@
 /**
- * SPA 与 JS Bundle 动态/静态 API 感知层（v4.0）。
+ * SPA 与 JS Bundle 动态/静态 API 感知层（v5.1 合规增强版）。
  *
- * - 模式 A（Playwright 受控无头页面）：通过请求拦截严格放行 `isHostInScope` 内的
- *   GET/HEAD/OPTIONS 只读请求，零副作用记录 XHR/Fetch/GraphQL 端点（方法、路径、查询键与 Body 键）、
+ * - 模式 A（Playwright 受控浏览器）：支持持久化 `--user-data-dir`、可配置 `headless` / `useXvfb` / `display`、
+ *   通过请求拦截严格放行 `isHostInScope` 内的 GET/HEAD/OPTIONS 只读请求，零副作用记录 XHR/Fetch/GraphQL 端点、
  *   前端路由与 React/Vue/Next/Nuxt/Angular 技术栈。
  * - 模式 B（静态回退模式）：无 Playwright/Chromium 时自动回退，抓取首屏 HTML 与最多 8 个
  *   同源 JS Bundle，静态解析路由与 fetch/axios/XHR/GraphQL 接口并过滤静态资源后缀，
  *   产出统一 `AutoFact`（`kind: "endpoint"`）。
+ * - 软 404 与合规挑战门识别（#33 / #37）：导出 `detectSoft404` 与 `detectChallengeGate`；
+ *   命中 Turnstile/CAPTCHA 挑战门或连续 `net::ERR_FAILED` 立即中止盲目重试并返回结构化 `challenge_gated`，
+ *   支持从 `session-vault` 复用用户手动完成验证后保存的合法 Cookie/Header（绝不包含任何绕过/自动破解逻辑）。
  *
- * 约束：仅允许引用 `./scope` 与 `import type` 引用 `./autoexec`，严禁运行时 `import ./nuwa`。
+ * 约束：仅允许引用 `./scope`、`./autoexec`、`./session-vault`，严禁运行时 `import ./nuwa`。
  */
+import { resolve } from "node:path";
 import { isHostInScope, type ScopePolicy } from "./scope";
-import type { AutoFact } from "./autoexec";
+import {
+	detectSoft404,
+	sampleSoft404Baseline,
+	type AutoFact,
+	type DetectSoft404Input,
+	type HeaderBagLike,
+	type Soft404Baseline,
+	type Soft404BaselineInput,
+	type Soft404DetectionResult,
+} from "./autoexec";
+import {
+	getRoleHeadersMap,
+	loadSessionVault,
+	redactVaultSecrets,
+	upsertSessionRole,
+	type SessionRoleEntry,
+} from "./session-vault";
+
+export {
+	detectSoft404,
+	sampleSoft404Baseline,
+	type DetectSoft404Input,
+	type Soft404Baseline,
+	type Soft404BaselineInput,
+	type Soft404DetectionResult,
+};
 
 export const MAX_STATIC_BUNDLES = 8;
 const MAX_BUNDLE_BYTES = 2 * 1024 * 1024;
@@ -52,9 +81,76 @@ export interface StaticBundleExtractResult {
 	fact: AutoFact | null;
 }
 
+export type ChallengeProvider =
+	| "cloudflare_turnstile"
+	| "cloudflare_challenge"
+	| "hcaptcha"
+	| "recaptcha"
+	| "aws_waf_captcha"
+	| "akamai_bot_manager"
+	| "datadome"
+	| "generic_challenge";
+
+export interface ChallengeGateInput {
+	url?: string;
+	status?: number;
+	headers?: HeaderBagLike;
+	body?: string;
+	html?: string;
+	title?: string;
+	error?: string;
+	observedUrls?: readonly string[];
+	failedRequests?: ReadonlyArray<{ url: string; errorText?: string; status?: number }>;
+}
+
+export interface ChallengeGateDetection {
+	detected: boolean;
+	status: "challenge_gated" | "clear";
+	requiresHumanSession: boolean;
+	provider?: ChallengeProvider;
+	siteKey?: string;
+	signals: string[];
+	retryAllowed: boolean;
+	guidance: string;
+}
+
+export interface BrowserCookieEntry {
+	name: string;
+	value: string;
+	url?: string;
+	domain?: string;
+	path?: string;
+	httpOnly?: boolean;
+	secure?: boolean;
+	sameSite?: "Strict" | "Lax" | "None";
+}
+
+export interface ChromiumLaunchConfig {
+	headless: boolean;
+	args: string[];
+	userDataDir?: string;
+	usePersistentContext: boolean;
+	useXvfb: boolean;
+	display?: string;
+	proxyServer?: string;
+	env: Record<string, string>;
+	xvfbPrefix?: string[];
+}
+
 export interface SpaReconResult {
 	url: string;
 	mode: "playwright" | "static";
+	status?: "ok" | "challenge_gated" | "soft_404" | "error";
+	requiresHumanSession?: boolean;
+	provider?: ChallengeProvider;
+	challenge?: ChallengeGateDetection;
+	soft404?: boolean;
+	soft404Reasons?: string[];
+	launchConfig?: Pick<
+		ChromiumLaunchConfig,
+		"headless" | "userDataDir" | "useXvfb" | "display" | "usePersistentContext"
+	>;
+	sessionRole?: string;
 	fallbackReason?: string;
 	tech: string[];
 	routes: string[];
@@ -86,6 +182,13 @@ export interface PlaywrightRequestLike {
 	method(): string;
 	resourceType(): string;
 	postData(): string | null;
+	failure?(): { errorText?: string } | null;
+}
+
+export interface PlaywrightResponseLike {
+	url?(): string;
+	status?(): number;
+	headers?(): Record<string, string>;
 }
 
 export interface PlaywrightRouteLike {
@@ -96,14 +199,17 @@ export interface PlaywrightRouteLike {
 
 export interface PlaywrightPageLike {
 	route(url: string, handler: (route: PlaywrightRouteLike) => Promise<void> | void): Promise<void>;
-	goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<unknown>;
+	goto(url: string, options?: { waitUntil?: string; timeout?: number }): Promise<PlaywrightResponseLike | unknown>;
 	evaluate<T>(fn: () => T): Promise<T>;
 	content?(): Promise<string>;
+	on?(event: string, listener: (...args: any[]) => void): void;
 	close(): Promise<void>;
 }
 
 export interface PlaywrightContextLike {
 	newPage(): Promise<PlaywrightPageLike>;
+	addCookies?(cookies: BrowserCookieEntry[]): Promise<void>;
+	pages?(): PlaywrightPageLike[];
 	close(): Promise<void>;
 }
 
@@ -117,7 +223,23 @@ export interface PlaywrightBrowserLike {
 
 export interface PlaywrightLike {
 	chromium: {
-		launch(options?: { headless?: boolean; args?: string[] }): Promise<PlaywrightBrowserLike>;
+		launch(options?: {
+			headless?: boolean;
+			args?: string[];
+			env?: Record<string, string>;
+			proxy?: { server: string };
+		}): Promise<PlaywrightBrowserLike>;
+		launchPersistentContext?(
+			userDataDir: string,
+			options?: {
+				headless?: boolean;
+				args?: string[];
+				env?: Record<string, string>;
+				proxy?: { server: string };
+				ignoreHTTPSErrors?: boolean;
+				extraHTTPHeaders?: Record<string, string>;
+			},
+		): Promise<PlaywrightContextLike>;
 	};
 }
 
@@ -125,13 +247,35 @@ export interface SpaReconOptions {
 	timeoutMs?: number;
 	maxBundles?: number;
 	disablePlaywright?: boolean;
+	/** 设为 false 时等价于 disablePlaywright=true（兼容既有调用）。 */
+	preferBrowser?: boolean;
 	playwrightLoader?: () => Promise<PlaywrightLike | null>;
 	fetchFn?: FetchLike;
 	signal?: AbortSignal;
 	/** 认证态只读探测附加请求头（绝不写入命令、日志或事实输出） */
 	authHeaders?: Record<string, string>;
-	/** 认证态角色标识（非敏感，用于标记产出事实来源） */
+	/** 认证态角色标识（非敏感，用于标记产出事实来源或从 session-vault 加载凭据） */
 	authRole?: string;
+	/** 从 session-vault 加载用户人工完成后保存的合法会话角色名 */
+	sessionRole?: string;
+	/** session-vault 所在项目根目录（配合 sessionRole/authRole 自动注入合法 Cookie 与 Header） */
+	vaultRoot?: string;
+	/** 显式传入的合法浏览器 Cookie（如从人工会话导入，绝不写入日志或事实） */
+	cookies?: BrowserCookieEntry[];
+	/** 持久化 Chromium 会话目录（`--user-data-dir`，#37） */
+	userDataDir?: string;
+	/** 是否使用无头模式（默认 true；若启用 useXvfb 且未显式指定则自动为 false） */
+	headless?: boolean;
+	/** 是否启用 Xvfb 虚拟显示有头模式（#37） */
+	useXvfb?: boolean;
+	/** X11 Display 标识（如 `:99`） */
+	display?: string;
+	/** 合规出口代理地址（可选，如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:7890`） */
+	proxyServer?: string;
+	/** 可选预采样 Soft-404 基线（用于阻断软 404 页面污染路由/端点清单，#33） */
+	soft404Baseline?: Soft404BaselineInput | null;
+	/** 非挑战门瞬态导航重试次数上限（默认 0；命中挑战门时强制 0 重试立刻中止） */
+	maxRetries?: number;
 	/** 是否发现并解析同源 .js.map SourceMap（默认 true，严格受 maxBundles 与同源限制） */
 	discoverSourceMaps?: boolean;
 }
@@ -1175,6 +1319,363 @@ export async function extractStaticBundleApis(
 	};
 }
 
+const CHALLENGE_TURNSTILE_URL_RE = /challenges\.cloudflare\.com\/turnstile/i;
+const CHALLENGE_CF_PLATFORM_URL_RE = /challenges\.cloudflare\.com|\/cdn-cgi\/challenge-platform\b/i;
+const CHALLENGE_HCAPTCHA_URL_RE = /(?:js\.|assets\.)?hcaptcha\.com\/1\/api\.js/i;
+const CHALLENGE_RECAPTCHA_URL_RE = /(?:google\.com|recaptcha\.net)\/recaptcha\//i;
+
+const CHALLENGE_TURNSTILE_DOM_RE =
+	/\b(?:cf-turnstile|cf-turnstile-response|turnstile\.render|challenges\.cloudflare\.com\/turnstile)\b/i;
+const CHALLENGE_CF_DOM_RE =
+	/\b(?:just\s+a\s+moment\.\.\.|_cf_chl_opt|cf-browser-verification|cdn-cgi\/challenge-platform|enable\s+javascript\s+and\s+cookies\s+to\s+continue|checking\s+if\s+the\s+site\s+connection\s+is\s+secure)\b/i;
+const CHALLENGE_HCAPTCHA_DOM_RE = /\b(?:class=["'][^"']*h-captcha|data-hcaptcha-response|hcaptcha\.com\/1\/api\.js)\b/i;
+const CHALLENGE_RECAPTCHA_DOM_RE = /\b(?:class=["'][^"']*g-recaptcha|g-recaptcha-response|recaptcha\/api\.js)\b/i;
+const CHALLENGE_AWS_DOM_RE = /\b(?:aws-waf-captcha|awswaf\.com\/|x-amzn-waf-action)\b/i;
+const CHALLENGE_DATADOME_DOM_RE = /\b(?:geo\.captcha-delivery\.com|datadome)\b/i;
+const CHALLENGE_AKAMAI_DOM_RE = /\b(?:_abck|ak_bmsc|akamai\s+bot\s+manager)\b/i;
+const SITEKEY_ATTR_RE = /\bdata-sitekey=["']([A-Za-z0-9._-]{8,128})["']/i;
+const ERR_FAILED_RE = /\bnet::ERR_FAILED\b/i;
+
+const COOKIE_ATTR_SKIP = new Set([
+	"path",
+	"domain",
+	"expires",
+	"max-age",
+	"samesite",
+	"secure",
+	"httponly",
+	"priority",
+	"partitioned",
+	"version",
+]);
+
+function readHeaderValue(headers: HeaderBagLike | undefined, name: string): string {
+	if (!headers) return "";
+	const target = name.toLowerCase();
+	if (typeof (headers as { get?: unknown }).get === "function") {
+		return String((headers as { get(k: string): string | null }).get(name) ?? "").trim();
+	}
+	for (const [k, v] of Object.entries(headers as Record<string, string | string[] | undefined>)) {
+		if (k.toLowerCase() !== target || v === undefined) continue;
+		return Array.isArray(v) ? v.join(", ").trim() : String(v).trim();
+	}
+	return "";
+}
+
+/**
+ * 构建合规的 Chromium 启动参数配置（#37）：
+ * - 支持持久化 `--user-data-dir` 会话目录（优先使用 Playwright `launchPersistentContext`）；
+ * - 支持可配置 `headless`、`useXvfb` 与 `display`（如 `:99`）参数；
+ * - 严禁注入任何绕过/反检测/自动破解人机验证的参数或脚本。
+ */
+export function buildChromiumLaunchConfig(
+	opts?: Pick<SpaReconOptions, "userDataDir" | "headless" | "useXvfb" | "display" | "proxyServer">,
+	baseEnv: Record<string, string | undefined> = process.env,
+): ChromiumLaunchConfig {
+	const rawUserDataDir = String(opts?.userDataDir ?? baseEnv.NUWA_BROWSER_USER_DATA_DIR ?? "").trim();
+	if (rawUserDataDir && /[\r\n\0]/.test(rawUserDataDir)) {
+		throw new Error("非法 userDataDir：禁止包含控制字符");
+	}
+	const userDataDir = rawUserDataDir ? resolve(rawUserDataDir) : undefined;
+
+	const envUseXvfb = ["1", "true", "yes"].includes(String(baseEnv.NUWA_BROWSER_USE_XVFB ?? "").trim().toLowerCase());
+	const useXvfb = opts?.useXvfb !== undefined ? Boolean(opts.useXvfb) : envUseXvfb;
+
+	const rawDisplay = String(
+		opts?.display ?? baseEnv.NUWA_BROWSER_DISPLAY ?? (useXvfb ? baseEnv.DISPLAY || ":99" : ""),
+	).trim();
+	const display = rawDisplay && !/[\r\n\0\s]/.test(rawDisplay) ? rawDisplay : useXvfb ? ":99" : undefined;
+
+	// 启用 Xvfb 且未显式指定 headless 时，默认使用有头模式配合虚拟显示
+	const headless = opts?.headless !== undefined ? Boolean(opts.headless) : !useXvfb;
+
+	const args: string[] = ["--no-sandbox", "--disable-gpu"];
+	if (userDataDir) {
+		args.push(`--user-data-dir=${userDataDir}`);
+	}
+
+	const env: Record<string, string> = {};
+	if (display) {
+		env.DISPLAY = display;
+	}
+
+	const rawProxy = String(opts?.proxyServer ?? "").trim();
+	const proxyServer = rawProxy && !/[\r\n\0\s]/.test(rawProxy) ? rawProxy : undefined;
+
+	return {
+		headless,
+		args,
+		...(userDataDir ? { userDataDir } : {}),
+		usePersistentContext: Boolean(userDataDir),
+		useXvfb,
+		...(display ? { display } : {}),
+		...(proxyServer ? { proxyServer } : {}),
+		env,
+		...(useXvfb
+			? { xvfbPrefix: ["xvfb-run", "-a", "--server-args=-screen 0 1280x800x24"] }
+			: {}),
+	};
+}
+
+/**
+ * 确定性挑战门 / CAPTCHA / Turnstile 识别器（#37 / NW-17）：
+ * - 识别 `cf-mitigated: challenge`、`challenges.cloudflare.com/turnstile`、Turnstile/Cloudflare/hCaptcha/reCAPTCHA DOM、
+ *   以及针对挑战域或连续 `net::ERR_FAILED` 失败；
+ * - 严格遵守合规安全红线：**仅识别并立即停止盲目重试**，返回 `{ status: "challenge_gated", requiresHumanSession: true, provider }`
+ *   引导人工完成验证后通过 `session-vault` 复用合法会话凭据，绝不执行任何点击/计算/绕过动作。
+ */
+export function detectChallengeGate(input: ChallengeGateInput): ChallengeGateDetection {
+	const signals: string[] = [];
+	let provider: ChallengeProvider | undefined;
+
+	const setProvider = (cand: ChallengeProvider) => {
+		// cloudflare_turnstile 优先级高于泛化的 cloudflare_challenge / generic_challenge
+		if (!provider) {
+			provider = cand;
+			return;
+		}
+		if (provider === "generic_challenge" || (provider === "cloudflare_challenge" && cand === "cloudflare_turnstile")) {
+			provider = cand;
+		}
+	};
+
+	const status = typeof input.status === "number" ? input.status : undefined;
+	const html = String(input.html ?? input.body ?? "");
+	const title = String(input.title ?? "");
+	const errorText = String(input.error ?? "");
+	const combinedText = `${title}\n${html}`;
+
+	// 1. 响应头检测
+	const cfMitigated = readHeaderValue(input.headers, "cf-mitigated");
+	if (/challenge/i.test(cfMitigated)) {
+		signals.push(`header:cf-mitigated=${cfMitigated}`);
+		setProvider("cloudflare_challenge");
+	}
+	const amznAction = readHeaderValue(input.headers, "x-amzn-waf-action");
+	if (/challenge|captcha/i.test(amznAction)) {
+		signals.push(`header:x-amzn-waf-action=${amznAction}`);
+		setProvider("aws_waf_captcha");
+	}
+	const datadomeHdr = readHeaderValue(input.headers, "x-datadome");
+	if (/protected/i.test(datadomeHdr)) {
+		signals.push(`header:x-datadome=${datadomeHdr}`);
+		setProvider("datadome");
+	}
+
+	// 2. 观测 URL 与失败请求检测
+	const allUrls: string[] = [];
+	if (input.url) allUrls.push(input.url);
+	for (const u of input.observedUrls ?? []) {
+		if (u) allUrls.push(u);
+	}
+	let errFailedCount = ERR_FAILED_RE.test(errorText) ? 1 : 0;
+	let challengeFailedCount = 0;
+
+	for (const fr of input.failedRequests ?? []) {
+		if (fr.url) allUrls.push(fr.url);
+		const isErrFailed = Boolean(fr.errorText && ERR_FAILED_RE.test(fr.errorText));
+		if (isErrFailed) errFailedCount += 1;
+		if (
+			CHALLENGE_TURNSTILE_URL_RE.test(fr.url) ||
+			CHALLENGE_CF_PLATFORM_URL_RE.test(fr.url) ||
+			CHALLENGE_HCAPTCHA_URL_RE.test(fr.url) ||
+			CHALLENGE_RECAPTCHA_URL_RE.test(fr.url)
+		) {
+			if (isErrFailed || fr.status === 403 || fr.status === 503) {
+				challengeFailedCount += 1;
+			}
+		}
+	}
+
+	for (const u of allUrls) {
+		if (CHALLENGE_TURNSTILE_URL_RE.test(u)) {
+			signals.push("url:challenges.cloudflare.com/turnstile");
+			setProvider("cloudflare_turnstile");
+		} else if (CHALLENGE_CF_PLATFORM_URL_RE.test(u)) {
+			signals.push("url:cloudflare_challenge_platform");
+			setProvider("cloudflare_challenge");
+		} else if (CHALLENGE_HCAPTCHA_URL_RE.test(u)) {
+			signals.push("url:hcaptcha");
+			setProvider("hcaptcha");
+		} else if (CHALLENGE_RECAPTCHA_URL_RE.test(u)) {
+			signals.push("url:recaptcha");
+			setProvider("recaptcha");
+		}
+	}
+
+	// 3. DOM / HTML 特征检测
+	if (CHALLENGE_TURNSTILE_DOM_RE.test(combinedText)) {
+		signals.push("dom:cloudflare_turnstile");
+		setProvider("cloudflare_turnstile");
+	}
+	if (CHALLENGE_CF_DOM_RE.test(combinedText)) {
+		signals.push("dom:cloudflare_challenge");
+		setProvider("cloudflare_challenge");
+	}
+	if (CHALLENGE_HCAPTCHA_DOM_RE.test(combinedText)) {
+		signals.push("dom:hcaptcha");
+		setProvider("hcaptcha");
+	}
+	if (CHALLENGE_RECAPTCHA_DOM_RE.test(combinedText)) {
+		signals.push("dom:recaptcha");
+		setProvider("recaptcha");
+	}
+	if (CHALLENGE_AWS_DOM_RE.test(combinedText)) {
+		signals.push("dom:aws_waf_captcha");
+		setProvider("aws_waf_captcha");
+	}
+	if (CHALLENGE_DATADOME_DOM_RE.test(combinedText) && (status === 403 || /captcha/i.test(combinedText))) {
+		signals.push("dom:datadome");
+		setProvider("datadome");
+	}
+	if (CHALLENGE_AKAMAI_DOM_RE.test(combinedText) && (status === 403 || /challenge|bot\s+manager/i.test(combinedText))) {
+		signals.push("dom:akamai_bot_manager");
+		setProvider("akamai_bot_manager");
+	}
+
+	// 4. 连续 net::ERR_FAILED 或挑战域失败立即触发停止重试信号
+	if (challengeFailedCount > 0) {
+		signals.push(`failed:challenge_net_err(${challengeFailedCount})`);
+		setProvider("cloudflare_turnstile");
+	} else if (errFailedCount >= 2) {
+		signals.push(`failed:repeated_net_err_failed(${errFailedCount})`);
+		setProvider("generic_challenge");
+	} else if (errFailedCount === 1 && (signals.length > 0 || status === 403 || status === 503)) {
+		signals.push("failed:net_err_failed_with_challenge_context");
+		setProvider("generic_challenge");
+	}
+
+	const uniqSignals = [...new Set(signals)];
+	if (uniqSignals.length === 0) {
+		return {
+			detected: false,
+			status: "clear",
+			requiresHumanSession: false,
+			signals: [],
+			retryAllowed: true,
+			guidance: "",
+		};
+	}
+
+	const siteKeyMatch = SITEKEY_ATTR_RE.exec(combinedText);
+	const resolvedProvider = provider ?? "generic_challenge";
+	return {
+		detected: true,
+		status: "challenge_gated",
+		requiresHumanSession: true,
+		provider: resolvedProvider,
+		...(siteKeyMatch?.[1] ? { siteKey: siteKeyMatch[1] } : {}),
+		signals: uniqSignals,
+		retryAllowed: false,
+		guidance:
+			`检测到 ${resolvedProvider} 人机验证挑战门，已立即中止盲目重试。` +
+			`请在合规可见浏览器（可配合 --user-data-dir 与 Xvfb）中由人工完成验证，并将合法 Cookie/Header 存入 session-vault 后复用继续侦察。`,
+	};
+}
+
+/** 将 HTTP Cookie 头字符串解析为 Playwright `addCookies` 所需的标准 Cookie 条目数组。 */
+export function parseCookieHeaderToEntries(cookieHeader: string, targetUrl?: string): BrowserCookieEntry[] {
+	const raw = String(cookieHeader ?? "").trim();
+	if (!raw) return [];
+	let baseUrl: string | undefined;
+	if (targetUrl) {
+		try {
+			const u = new URL(targetUrl);
+			baseUrl = `${u.protocol}//${u.host}/`;
+		} catch {
+			baseUrl = undefined;
+		}
+	}
+	const out: BrowserCookieEntry[] = [];
+	const seen = new Set<string>();
+	for (const part of raw.split(";")) {
+		const seg = part.trim();
+		if (!seg) continue;
+		const eq = seg.indexOf("=");
+		if (eq <= 0) continue;
+		const name = seg.slice(0, eq).trim();
+		const value = seg.slice(eq + 1).trim();
+		if (!name || !value || COOKIE_ATTR_SKIP.has(name.toLowerCase())) continue;
+		if (seen.has(name)) continue;
+		seen.add(name);
+		out.push({
+			name,
+			value,
+			...(baseUrl ? { url: baseUrl } : { path: "/" }),
+		});
+	}
+	return out;
+}
+
+/**
+ * 从 `session-vault` 导入用户手动完成人机验证/登录后保存的合法 Cookie 与 HTTP Header，
+ * 供 `runSpaRecon` 在后续浏览器与静态侦察中直接复用（#37）。
+ */
+export function loadHumanSessionFromVault(
+	vaultRoot: string,
+	role: string,
+	targetUrl?: string,
+): {
+	found: boolean;
+	role: string;
+	headers: Record<string, string>;
+	cookies: BrowserCookieEntry[];
+} {
+	const normRole = String(role ?? "").trim().toLowerCase();
+	if (!vaultRoot || !normRole) {
+		return { found: false, role: normRole, headers: {}, cookies: [] };
+	}
+	const vault = loadSessionVault(vaultRoot);
+	const headers = getRoleHeadersMap(vault, normRole);
+	if (!headers) {
+		return { found: false, role: normRole, headers: {}, cookies: [] };
+	}
+	const cookieEntry = Object.entries(headers).find(([k]) => k.toLowerCase() === "cookie");
+	const cookies = cookieEntry?.[1] ? parseCookieHeaderToEntries(cookieEntry[1], targetUrl) : [];
+	return {
+		found: true,
+		role: normRole,
+		headers,
+		cookies,
+	};
+}
+
+/**
+ * 将用户手动完成验证后获得的合法 Cookie/Header 保存至 `session-vault`（权限 0o600），
+ * 便于跨轮次侦察复用（绝不自动绕过或伪造凭据）。
+ */
+export function saveHumanSessionToVault(
+	vaultRoot: string,
+	input: {
+		role: string;
+		cookie?: string;
+		cookies?: ReadonlyArray<{ name: string; value: string }>;
+		bearer?: string;
+		headers?: Record<string, string>;
+		note?: string;
+		checkUrl?: string;
+		expiresAt?: string;
+	},
+): SessionRoleEntry {
+	const cookieFromList =
+		!input.cookie && Array.isArray(input.cookies) && input.cookies.length > 0
+			? input.cookies
+					.filter((c) => c && c.name && c.value)
+					.map((c) => `${c.name.trim()}=${c.value.trim()}`)
+					.join("; ")
+			: undefined;
+	const cookie = input.cookie?.trim() || cookieFromList;
+	return upsertSessionRole(vaultRoot, {
+		role: input.role,
+		...(cookie ? { cookie } : {}),
+		...(input.bearer ? { bearer: input.bearer } : {}),
+		...(input.headers ? { headers: input.headers } : {}),
+		...(input.note ? { note: input.note } : {}),
+		...(input.checkUrl ? { checkUrl: input.checkUrl } : {}),
+		...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+	});
+}
+
 async function tryLoadPlaywright(customLoader?: () => Promise<PlaywrightLike | null>): Promise<PlaywrightLike | null> {
 	if (customLoader) {
 		try {
@@ -1200,15 +1701,45 @@ async function tryLoadPlaywright(customLoader?: () => Promise<PlaywrightLike | n
 
 interface PageDomSnapshot {
 	html?: string;
+	title?: string;
 	pathname?: string;
 	hash?: string;
 	links?: string[];
 	globals?: string[];
 }
 
+function mergeAuthHeaders(
+	fromVault: Record<string, string>,
+	explicit?: Record<string, string>,
+): Record<string, string> {
+	const merged: Record<string, string> = {};
+	const seenLower = new Map<string, string>();
+	const put = (source?: Record<string, string>) => {
+		if (!source) return;
+		for (const [k, v] of Object.entries(source)) {
+			const cleanK = String(k ?? "").replace(/[\r\n]+/g, " ").trim();
+			const cleanV = String(v ?? "").replace(/[\r\n]+/g, " ").trim();
+			if (!cleanK || !cleanV) continue;
+			const lower = cleanK.toLowerCase();
+			const prevKey = seenLower.get(lower);
+			if (prevKey && prevKey !== cleanK) {
+				delete merged[prevKey];
+			}
+			seenLower.set(lower, cleanK);
+			merged[cleanK] = cleanV;
+		}
+	};
+	put(fromVault);
+	put(explicit);
+	return merged;
+}
+
 /**
  * 执行 SPA 与 JS Bundle 动态/静态 API 感知：
- * - 优先尝试模式 A（Playwright 受控无头页面 + 只读范围请求拦截）；
+ * - 支持从 `session-vault` 加载人工完成验证后的合法 Cookie/Header；
+ * - 模式 A（Playwright 受控浏览器）：支持持久化 `--user-data-dir`、`headless` / `useXvfb` / `display`；
+ * - 命中 Turnstile/CAPTCHA 挑战门或连续 `net::ERR_FAILED` 立即中止重试并返回结构化 `challenge_gated`；
+ * - 集成 `detectSoft404` 阻断软 404 页面污染前端路由与端点清单；
  * - 若 Playwright 或 Chromium 不可用（或显式关闭），自动回退模式 B（静态 HTML + 最多 8 个同源 JS Bundle）。
  */
 export async function runSpaRecon(
@@ -1223,6 +1754,7 @@ export async function runSpaRecon(
 		return {
 			url,
 			mode: "static",
+			status: "error",
 			fallbackReason: "目标 URL 非法",
 			tech: [],
 			routes: [],
@@ -1237,6 +1769,7 @@ export async function runSpaRecon(
 		return {
 			url: parsedUrl.href,
 			mode: "static",
+			status: "error",
 			fallbackReason: `目标主机 ${parsedUrl.hostname} 超出允许范围 (ScopePolicy)`,
 			tech: [],
 			routes: [],
@@ -1250,11 +1783,43 @@ export async function runSpaRecon(
 	const timeoutMs = Math.max(1_000, Math.min(60_000, opts?.timeoutMs ?? 15_000));
 	const maxBundles = Math.min(MAX_STATIC_BUNDLES, Math.max(0, Math.floor(opts?.maxBundles ?? MAX_STATIC_BUNDLES)));
 	const forceStatic =
-		Boolean(opts?.disablePlaywright) || (process.env.NUWA_SPA_MODE ?? "").trim().toLowerCase() === "static";
+		Boolean(opts?.disablePlaywright) ||
+		opts?.preferBrowser === false ||
+		(process.env.NUWA_SPA_MODE ?? "").trim().toLowerCase() === "static";
+
+	// 合并来自 session-vault 与显式参数的合法会话 Cookie / Header
+	const effectiveRole = opts?.sessionRole ?? opts?.authRole;
+	const vaultSession =
+		opts?.vaultRoot && effectiveRole
+			? loadHumanSessionFromVault(opts.vaultRoot, effectiveRole, parsedUrl.href)
+			: { found: false, role: effectiveRole ?? "", headers: {} as Record<string, string>, cookies: [] as BrowserCookieEntry[] };
+	const effectiveAuthHeaders = mergeAuthHeaders(vaultSession.headers, opts?.authHeaders);
+	const hasEffectiveHeaders = Object.keys(effectiveAuthHeaders).length > 0;
+	const effectiveCookies: BrowserCookieEntry[] = [
+		...vaultSession.cookies,
+		...(opts?.cookies ?? []).map((c) => ({
+			...c,
+			...(!c.url && !c.domain ? { url: `${parsedUrl.protocol}//${parsedUrl.host}/` } : {}),
+		})),
+	];
+
+	const safeRedact = (text: string | undefined): string | undefined => {
+		if (!text) return text;
+		return opts?.vaultRoot ? redactVaultSecrets(text, opts.vaultRoot) : text;
+	};
+
+	const launchCfg = buildChromiumLaunchConfig(opts);
+	const launchSummary = {
+		headless: launchCfg.headless,
+		...(launchCfg.userDataDir ? { userDataDir: launchCfg.userDataDir } : {}),
+		useXvfb: launchCfg.useXvfb,
+		...(launchCfg.display ? { display: launchCfg.display } : {}),
+		usePersistentContext: launchCfg.usePersistentContext,
+	};
 
 	let fallbackReason: string | undefined;
 
-	// 模式 A：Playwright 受控无头浏览器动态感知
+	// 模式 A：Playwright 受控浏览器动态感知
 	if (!forceStatic && !opts?.signal?.aborted) {
 		const pw = await tryLoadPlaywright(opts?.playwrightLoader);
 		if (!pw) {
@@ -1264,21 +1829,66 @@ export async function runSpaRecon(
 			let context: PlaywrightContextLike | null = null;
 			let page: PlaywrightPageLike | null = null;
 
+			const observedChallengeUrls: string[] = [];
+			const failedRequests: Array<{ url: string; errorText?: string; status?: number }> = [];
+			let lastResponseStatus: number | undefined;
+			let lastResponseHeaders: HeaderBagLike | undefined;
+
 			try {
-				browser = await pw.chromium.launch({
-					headless: true,
-					args: ["--no-sandbox", "--disable-gpu"],
-				});
-				const hasAuthHeaders = Boolean(opts?.authHeaders && Object.keys(opts.authHeaders).length > 0);
-				context = await browser.newContext({
-					ignoreHTTPSErrors: true,
-					...(hasAuthHeaders ? { extraHTTPHeaders: { ...opts!.authHeaders } } : {}),
-				});
-				page = await context.newPage();
+				const extraLaunchFields: { env?: Record<string, string>; proxy?: { server: string } } = {
+					...(Object.keys(launchCfg.env).length > 0 ? { env: launchCfg.env } : {}),
+					...(launchCfg.proxyServer ? { proxy: { server: launchCfg.proxyServer } } : {}),
+				};
+
+				if (launchCfg.userDataDir && typeof pw.chromium.launchPersistentContext === "function") {
+					context = await pw.chromium.launchPersistentContext(launchCfg.userDataDir, {
+						headless: launchCfg.headless,
+						args: launchCfg.args,
+						...extraLaunchFields,
+						ignoreHTTPSErrors: true,
+						...(hasEffectiveHeaders ? { extraHTTPHeaders: { ...effectiveAuthHeaders } } : {}),
+					});
+					const existingPages = typeof context.pages === "function" ? context.pages() : [];
+					page = existingPages[0] ?? (await context.newPage());
+				} else {
+					browser = await pw.chromium.launch({
+						headless: launchCfg.headless,
+						args: launchCfg.args,
+						...extraLaunchFields,
+					});
+					context = await browser.newContext({
+						ignoreHTTPSErrors: true,
+						...(hasEffectiveHeaders ? { extraHTTPHeaders: { ...effectiveAuthHeaders } } : {}),
+					});
+					page = await context.newPage();
+				}
+
+				if (effectiveCookies.length > 0 && typeof context.addCookies === "function") {
+					await context.addCookies(effectiveCookies);
+				}
 
 				const endpointMap = new Map<string, SpaApiEndpoint>();
 				const routeSet = new Set<string>();
 				let blockedRequests = 0;
+
+				if (typeof page.on === "function") {
+					page.on("requestfailed", (reqLike: PlaywrightRequestLike) => {
+						const failedUrl = typeof reqLike?.url === "function" ? reqLike.url() : "";
+						const errTxt = typeof reqLike?.failure === "function" ? reqLike.failure()?.errorText : undefined;
+						if (failedUrl) {
+							failedRequests.push({ url: failedUrl, ...(errTxt ? { errorText: errTxt } : {}) });
+						}
+					});
+					page.on("response", (respLike: PlaywrightResponseLike) => {
+						const st = typeof respLike?.status === "function" ? respLike.status() : undefined;
+						const hdrs = typeof respLike?.headers === "function" ? respLike.headers() : undefined;
+						const respUrl = typeof respLike?.url === "function" ? respLike.url() : "";
+						if (respUrl === parsedUrl.href || (hdrs && /challenge/i.test(readHeaderValue(hdrs, "cf-mitigated")))) {
+							if (st !== undefined) lastResponseStatus = st;
+							if (hdrs) lastResponseHeaders = hdrs;
+						}
+					});
+				}
 
 				await page.route("**/*", async (route) => {
 					const req = route.request();
@@ -1289,6 +1899,16 @@ export async function runSpaRecon(
 					if (/^(?:data|blob|about):/i.test(reqUrlStr)) {
 						await route.continue();
 						return;
+					}
+
+					// 观测挑战门脚本/平台域（绝不绕过，仅记录以便触发确定性 challenge_gated）
+					if (
+						CHALLENGE_TURNSTILE_URL_RE.test(reqUrlStr) ||
+						CHALLENGE_CF_PLATFORM_URL_RE.test(reqUrlStr) ||
+						CHALLENGE_HCAPTCHA_URL_RE.test(reqUrlStr) ||
+						CHALLENGE_RECAPTCHA_URL_RE.test(reqUrlStr)
+					) {
+						observedChallengeUrls.push(reqUrlStr);
 					}
 
 					let reqUrl: URL;
@@ -1339,12 +1959,84 @@ export async function runSpaRecon(
 					await route.continue();
 				});
 
-				await page.goto(parsedUrl.href, { waitUntil: "networkidle", timeout: timeoutMs });
+				// 导航执行：支持非挑战门有限重试，但一旦命中挑战门或连续 net::ERR_FAILED 立刻中止（绝不盲目重试）
+				const maxRetries = Math.max(0, Math.min(3, Math.floor(opts?.maxRetries ?? 0)));
+				let gotoResp: PlaywrightResponseLike | undefined;
+				let navError: unknown = null;
+				let errFailedStreak = 0;
+
+				for (let attempt = 0; attempt <= maxRetries; attempt++) {
+					try {
+						const rawResp = (await page.goto(parsedUrl.href, {
+							waitUntil: "networkidle",
+							timeout: timeoutMs,
+						})) as PlaywrightResponseLike | undefined;
+						gotoResp = rawResp;
+						navError = null;
+						break;
+					} catch (err) {
+						navError = err;
+						const errMsg = err instanceof Error ? err.message : String(err);
+						if (ERR_FAILED_RE.test(errMsg)) {
+							errFailedStreak += 1;
+							failedRequests.push({ url: parsedUrl.href, errorText: errMsg });
+						}
+						const preCheck = detectChallengeGate({
+							url: parsedUrl.href,
+							status: lastResponseStatus,
+							headers: lastResponseHeaders,
+							error: errMsg,
+							observedUrls: observedChallengeUrls,
+							failedRequests,
+						});
+						if (preCheck.detected || errFailedStreak >= 2) {
+							const gated: ChallengeGateDetection = preCheck.detected
+								? preCheck
+								: {
+										detected: true,
+										status: "challenge_gated",
+										requiresHumanSession: true,
+										provider: "generic_challenge",
+										signals: [`failed:repeated_net_err_failed(${errFailedStreak})`],
+										retryAllowed: false,
+										guidance:
+											"连续触发 net::ERR_FAILED（疑似边缘反自动化挑战门阻断），已立即中止重试。请通过人工浏览器会话完成验证并写入 session-vault 后复用。",
+									};
+							return {
+								url: parsedUrl.href,
+								mode: "playwright",
+								status: "challenge_gated",
+								requiresHumanSession: true,
+								provider: gated.provider,
+								challenge: gated,
+								launchConfig: launchSummary,
+								...(effectiveRole ? { sessionRole: effectiveRole } : {}),
+								fallbackReason: safeRedact(gated.guidance),
+								tech: [],
+								routes: [],
+								endpoints: [],
+								bundles: [],
+								blockedRequests,
+								fact: null,
+							};
+						}
+					}
+				}
+
+				if (navError) {
+					throw navError;
+				}
+
+				const navStatus =
+					(typeof gotoResp?.status === "function" ? gotoResp.status() : undefined) ?? lastResponseStatus ?? 200;
+				const navHeaders =
+					(typeof gotoResp?.headers === "function" ? gotoResp.headers() : undefined) ?? lastResponseHeaders;
 
 				const snap = (await page.evaluate(() => {
 					const g = globalThis as Record<string, unknown>;
 					const doc = g.document as
 						| {
+								title?: string;
 								documentElement?: { outerHTML?: string };
 								querySelectorAll?: (sel: string) => ArrayLike<{ getAttribute(k: string): string | null }>;
 								querySelector?: (sel: string) => unknown;
@@ -1369,6 +2061,7 @@ export async function runSpaRecon(
 					}
 					return {
 						html: doc?.documentElement?.outerHTML ?? "",
+						title: doc?.title ?? "",
 						pathname: loc?.pathname ?? "",
 						hash: loc?.hash ?? "",
 						links,
@@ -1377,6 +2070,66 @@ export async function runSpaRecon(
 				})) as PageDomSnapshot;
 
 				const renderedHtml = snap?.html || (typeof page.content === "function" ? await page.content() : "") || "";
+
+				// 确定性挑战门检测（页面响应头 + 渲染 DOM + 观测到的挑战资源）
+				const domChallenge = detectChallengeGate({
+					url: parsedUrl.href,
+					status: navStatus,
+					headers: navHeaders,
+					html: renderedHtml,
+					title: snap?.title,
+					observedUrls: observedChallengeUrls,
+					failedRequests,
+				});
+				if (domChallenge.detected) {
+					return {
+						url: parsedUrl.href,
+						mode: "playwright",
+						status: "challenge_gated",
+						requiresHumanSession: true,
+						provider: domChallenge.provider,
+						challenge: domChallenge,
+						launchConfig: launchSummary,
+						...(effectiveRole ? { sessionRole: effectiveRole } : {}),
+						fallbackReason: safeRedact(domChallenge.guidance),
+						tech: [],
+						routes: [],
+						endpoints: [],
+						bundles: [],
+						blockedRequests,
+						fact: null,
+					};
+				}
+
+				// 软 404 检测（#33）：阻断 Next.js RSC 404 / 多语言软 404 污染前端路由与端点清单
+				const softCheck = detectSoft404(
+					{
+						url: parsedUrl.href,
+						path: parsedUrl.pathname,
+						status: navStatus,
+						body: renderedHtml,
+						headers: navHeaders,
+					},
+					opts?.soft404Baseline,
+				);
+				if (softCheck.isSoft404) {
+					return {
+						url: parsedUrl.href,
+						mode: "playwright",
+						status: "soft_404",
+						soft404: true,
+						soft404Reasons: softCheck.reasons,
+						launchConfig: launchSummary,
+						...(effectiveRole ? { sessionRole: effectiveRole } : {}),
+						tech: [],
+						routes: [],
+						endpoints: [],
+						bundles: [],
+						blockedRequests,
+						fact: null,
+					};
+				}
+
 				if (snap?.pathname) {
 					const norm = normalizeApiPath(snap.pathname);
 					if (norm) routeSet.add(norm);
@@ -1403,8 +2156,8 @@ export async function runSpaRecon(
 							maxBundles,
 							timeoutMs: Math.min(timeoutMs, 8_000),
 							signal: opts?.signal,
-							authHeaders: opts?.authHeaders,
-							authRole: opts?.authRole,
+							authHeaders: hasEffectiveHeaders ? effectiveAuthHeaders : undefined,
+							authRole: effectiveRole,
 							discoverSourceMaps: opts?.discoverSourceMaps,
 						})
 					: { tech: [], routes: [], endpoints: [], bundles: [], blockedRequests: 0, fact: null };
@@ -1425,12 +2178,15 @@ export async function runSpaRecon(
 					routes,
 					endpoints,
 					staticSuppl.bundles.length,
-					opts?.authRole,
+					effectiveRole,
 				);
 
 				return {
 					url: parsedUrl.href,
 					mode: "playwright",
+					status: "ok",
+					launchConfig: launchSummary,
+					...(effectiveRole ? { sessionRole: effectiveRole } : {}),
 					tech,
 					routes,
 					endpoints,
@@ -1439,7 +2195,35 @@ export async function runSpaRecon(
 					fact,
 				};
 			} catch (err) {
-				fallbackReason = `Playwright 执行失败，已回退静态模式: ${err instanceof Error ? err.message : String(err)}`;
+				const errMsg = err instanceof Error ? err.message : String(err);
+				const errChallenge = detectChallengeGate({
+					url: parsedUrl.href,
+					status: lastResponseStatus,
+					headers: lastResponseHeaders,
+					error: errMsg,
+					observedUrls: observedChallengeUrls,
+					failedRequests,
+				});
+				if (errChallenge.detected) {
+					return {
+						url: parsedUrl.href,
+						mode: "playwright",
+						status: "challenge_gated",
+						requiresHumanSession: true,
+						provider: errChallenge.provider,
+						challenge: errChallenge,
+						launchConfig: launchSummary,
+						...(effectiveRole ? { sessionRole: effectiveRole } : {}),
+						fallbackReason: safeRedact(errChallenge.guidance),
+						tech: [],
+						routes: [],
+						endpoints: [],
+						bundles: [],
+						blockedRequests: 0,
+						fact: null,
+					};
+				}
+				fallbackReason = safeRedact(`Playwright 执行失败，已回退静态模式: ${errMsg}`);
 			} finally {
 				await page?.close().catch(() => {});
 				await context?.close().catch(() => {});
@@ -1459,9 +2243,14 @@ export async function runSpaRecon(
 
 	let html = "";
 	let finalBaseUrl = parsedUrl.href;
+	let staticStatus = 0;
+	let staticHeaders: HeaderBagLike | undefined;
 	try {
 		const fetched = await scopedGetFetch(parsedUrl.href, scope, fetcher, {
-			headers: mergeHeadersWithAccept("text/html,application/xhtml+xml,*/*", opts?.authHeaders),
+			headers: mergeHeadersWithAccept(
+				"text/html,application/xhtml+xml,*/*",
+				hasEffectiveHeaders ? effectiveAuthHeaders : undefined,
+			),
 			signal: controller.signal,
 		});
 		if (!fetched.ok) {
@@ -1469,7 +2258,8 @@ export async function runSpaRecon(
 				return {
 					url: parsedUrl.href,
 					mode: "static",
-					fallbackReason: fallbackReason ? `${fallbackReason}；${fetched.reason}` : fetched.reason,
+					status: "error",
+					fallbackReason: safeRedact(fallbackReason ? `${fallbackReason}；${fetched.reason}` : fetched.reason),
 					tech: [],
 					routes: [],
 					endpoints: [],
@@ -1481,9 +2271,10 @@ export async function runSpaRecon(
 			return {
 				url: parsedUrl.href,
 				mode: "static",
-				fallbackReason: fallbackReason
-					? `${fallbackReason}；首屏抓取失败: ${fetched.error}`
-					: `首屏抓取失败: ${fetched.error}`,
+				status: "error",
+				fallbackReason: safeRedact(
+					fallbackReason ? `${fallbackReason}；首屏抓取失败: ${fetched.error}` : `首屏抓取失败: ${fetched.error}`,
+				),
 				tech: [],
 				routes: [],
 				endpoints: [],
@@ -1494,6 +2285,8 @@ export async function runSpaRecon(
 		}
 		finalBaseUrl = fetched.finalUrl;
 		const resp = fetched.response;
+		staticStatus = resp.status;
+		staticHeaders = resp.headers;
 		if (resp.ok || (resp.status >= 200 && resp.status < 500)) {
 			const raw = await resp.text();
 			html = raw.length > MAX_BUNDLE_BYTES ? raw.slice(0, MAX_BUNDLE_BYTES) : raw;
@@ -1503,7 +2296,10 @@ export async function runSpaRecon(
 		return {
 			url: parsedUrl.href,
 			mode: "static",
-			fallbackReason: fallbackReason ? `${fallbackReason}；首屏抓取失败: ${fetchErr}` : `首屏抓取失败: ${fetchErr}`,
+			status: "error",
+			fallbackReason: safeRedact(
+				fallbackReason ? `${fallbackReason}；首屏抓取失败: ${fetchErr}` : `首屏抓取失败: ${fetchErr}`,
+			),
 			tech: [],
 			routes: [],
 			endpoints: [],
@@ -1516,18 +2312,75 @@ export async function runSpaRecon(
 		opts?.signal?.removeEventListener("abort", onAbort);
 	}
 
+	// 静态模式确定性挑战门检测（#37）：命中立刻中止 bundle 拉取并返回 challenge_gated
+	const staticChallenge = detectChallengeGate({
+		url: finalBaseUrl,
+		status: staticStatus,
+		headers: staticHeaders,
+		html,
+	});
+	if (staticChallenge.detected) {
+		return {
+			url: parsedUrl.href,
+			mode: "static",
+			status: "challenge_gated",
+			requiresHumanSession: true,
+			provider: staticChallenge.provider,
+			challenge: staticChallenge,
+			...(effectiveRole ? { sessionRole: effectiveRole } : {}),
+			fallbackReason: safeRedact(staticChallenge.guidance),
+			tech: [],
+			routes: [],
+			endpoints: [],
+			bundles: [],
+			blockedRequests: 0,
+			fact: null,
+		};
+	}
+
+	// 静态模式软 404 阻断（#33）
+	const staticSoft404 = detectSoft404(
+		{
+			url: finalBaseUrl,
+			path: parsedUrl.pathname,
+			status: staticStatus || 200,
+			body: html,
+			headers: staticHeaders,
+		},
+		opts?.soft404Baseline,
+	);
+	if (staticSoft404.isSoft404) {
+		return {
+			url: parsedUrl.href,
+			mode: "static",
+			status: "soft_404",
+			soft404: true,
+			soft404Reasons: staticSoft404.reasons,
+			...(effectiveRole ? { sessionRole: effectiveRole } : {}),
+			...(fallbackReason ? { fallbackReason } : {}),
+			tech: [],
+			routes: [],
+			endpoints: [],
+			bundles: [],
+			blockedRequests: 0,
+			fact: null,
+		};
+	}
+
 	const extracted = await extractStaticBundleApis(html, finalBaseUrl, scope, fetcher, {
 		maxBundles,
 		timeoutMs: Math.min(timeoutMs, 8_000),
 		signal: opts?.signal,
-		authHeaders: opts?.authHeaders,
-		authRole: opts?.authRole,
+		authHeaders: hasEffectiveHeaders ? effectiveAuthHeaders : undefined,
+		authRole: effectiveRole,
 		discoverSourceMaps: opts?.discoverSourceMaps,
 	});
 
 	return {
 		url: parsedUrl.href,
 		mode: "static",
+		status: "ok",
+		...(effectiveRole ? { sessionRole: effectiveRole } : {}),
 		...(fallbackReason ? { fallbackReason } : {}),
 		tech: extracted.tech,
 		routes: extracted.routes,

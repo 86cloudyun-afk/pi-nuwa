@@ -2268,3 +2268,667 @@ export async function startScopedEgressProxy(
 		},
 	};
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// v5.1 任务级出口注入（#23）与多出口健康度管理池 EgressPoolManager（#36）
+// ══════════════════════════════════════════════════════════════════════════════
+
+const ALLOWED_TASK_EGRESS_PROTOCOLS = new Set(["http:", "https:", "socks5:", "socks5h:", "socks4:", "socks4a:"]);
+const EGRESS_RESET_CURL_EXIT_CODES = new Set([7, 28, 35, 52, 56, 97]);
+const EGRESS_RESET_ERROR_RE =
+	/\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE|socket hang up|connection reset|connection refused|connect failed|proxy connect|timed?\s*out)\b/i;
+
+/**
+ * 规范化并校验任务级代理出口 URL（支持 http/https/socks5/socks5h/socks4/socks4a）。
+ * 拒绝换行、空白、Shell 元字符或非法主机端口，防止命令注入。
+ */
+export function normalizeTaskEgressUrl(raw: string | undefined): string | undefined {
+	const s = String(raw ?? "").trim();
+	if (!s || /[\r\n\s'"`$&;|<>\\]/.test(s)) return undefined;
+	try {
+		const u = new URL(s);
+		if (!ALLOWED_TASK_EGRESS_PROTOCOLS.has(u.protocol)) return undefined;
+		if (!u.hostname) return undefined;
+		if (u.port) {
+			if (!/^\d{1,5}$/.test(u.port)) return undefined;
+			const p = Number(u.port);
+			if (!Number.isInteger(p) || p < 1 || p > 65535) return undefined;
+		}
+		if (u.pathname && u.pathname !== "/") return undefined;
+		if (u.search || u.hash) return undefined;
+		const authPart = u.username ? `${u.username}${u.password ? `:${u.password}` : ""}@` : "";
+		const hostPart = u.hostname.includes(":") && !u.hostname.startsWith("[") ? `[${u.hostname}]` : u.hostname;
+		const portPart = u.port ? `:${u.port}` : "";
+		return `${u.protocol}//${authPart}${hostPart}${portPart}`;
+	} catch {
+		return undefined;
+	}
+}
+
+/** 脱敏展示出口 URL（隐藏代理认证密码，避免明文落日志）。 */
+export function maskEgressUrl(raw: string | undefined): string {
+	const norm = normalizeTaskEgressUrl(raw);
+	if (!norm) return "";
+	try {
+		const u = new URL(norm);
+		const hostPart = u.hostname.includes(":") && !u.hostname.startsWith("[") ? `[${u.hostname}]` : u.hostname;
+		const portPart = u.port ? `:${u.port}` : "";
+		if (u.username || u.password) {
+			return `${u.protocol}//${u.username || "***"}:***@${hostPart}${portPart}`;
+		}
+		return `${u.protocol}//${hostPart}${portPart}`;
+	} catch {
+		return "";
+	}
+}
+
+export interface InjectEgressEnvOptions {
+	/** 显式传入的出口代理 URL；若省略则依次从 baseEnv / process.env 解析。 */
+	egressUrl?: string;
+	/** NO_PROXY 值，默认空串确保不意外绕过已验证出口。 */
+	noProxy?: string;
+	/** 是否同时透传上游已有环境变量，默认 true。 */
+	inheritEnv?: boolean;
+}
+
+/**
+ * 从环境变量对象中解析任务级出口代理 URL：
+ * 默认优先读取女娲任务专用变量 `NUWA_EGRESS` > `NUWA_EGRESS_PROXY` > `EGRESS`；
+ * 当 `opts.includeGenericProxy` 为 true 时再回退读取通用代理环境变量 `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`。
+ */
+export function resolveConfiguredEgressUrl(
+	env: Record<string, string | undefined> = process.env,
+	opts?: { includeGenericProxy?: boolean },
+): string | undefined {
+	const candidates: Array<string | undefined> = [env.NUWA_EGRESS, env.NUWA_EGRESS_PROXY, env.EGRESS];
+	if (opts?.includeGenericProxy) {
+		candidates.push(env.ALL_PROXY, env.all_proxy, env.HTTPS_PROXY, env.https_proxy, env.HTTP_PROXY, env.http_proxy);
+	}
+	for (const c of candidates) {
+		const norm = normalizeTaskEgressUrl(c);
+		if (norm) return norm;
+	}
+	return undefined;
+}
+
+/**
+ * 为子任务/执行环境统一注入出口代理环境变量（#23），覆盖 `NUWA_EGRESS`、`EGRESS`、`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 及其小写形式。
+ * 若显式传入非法代理 URL 则直接抛错（fail-closed）；若未传入且环境中无出口则返回过滤后的基准环境。
+ */
+export function injectEgressEnv(
+	egressUrl?: string,
+	baseEnv: Record<string, string | undefined> = process.env,
+	opts?: Omit<InjectEgressEnvOptions, "egressUrl">,
+): Record<string, string> {
+	const inherit = opts?.inheritEnv !== false;
+	const out: Record<string, string> = {};
+	if (inherit && baseEnv) {
+		for (const [k, v] of Object.entries(baseEnv)) {
+			if (typeof v === "string") {
+				out[k] = v;
+			}
+		}
+	}
+
+	let resolved: string | undefined;
+	if (egressUrl !== undefined && String(egressUrl).trim() !== "") {
+		resolved = normalizeTaskEgressUrl(egressUrl);
+		if (!resolved) {
+			throw new Error(
+				`非法出口代理地址: ${JSON.stringify(egressUrl)}（仅允许 http/https/socks5/socks5h/socks4/socks4a 且禁止控制字符）`,
+			);
+		}
+	} else {
+		resolved = resolveConfiguredEgressUrl(baseEnv, { includeGenericProxy: true });
+	}
+
+	if (!resolved) {
+		return out;
+	}
+
+	const noProxy = opts?.noProxy !== undefined ? String(opts.noProxy).replace(/[\r\n]+/g, "") : "";
+	out.NUWA_EGRESS = resolved;
+	out.EGRESS = resolved;
+	out.HTTP_PROXY = resolved;
+	out.HTTPS_PROXY = resolved;
+	out.ALL_PROXY = resolved;
+	out.http_proxy = resolved;
+	out.https_proxy = resolved;
+	out.all_proxy = resolved;
+	out.NO_PROXY = noProxy;
+	out.no_proxy = noProxy;
+	return out;
+}
+
+/** 为 curl 构造安全的 `-x <egressUrl>` 代理透传参数数组。 */
+export function buildCurlProxyArgs(egressUrl?: string): string[] {
+	if (!egressUrl || !String(egressUrl).trim()) return [];
+	const norm = normalizeTaskEgressUrl(egressUrl);
+	if (!norm) {
+		throw new Error(`非法 curl 代理地址: ${JSON.stringify(egressUrl)}`);
+	}
+	return ["-x", norm];
+}
+
+export interface EgressEndpointConfig {
+	id?: string;
+	url: string;
+	label?: string;
+	priority?: number;
+	maxInFlight?: number;
+}
+
+export interface EgressObservation {
+	ok?: boolean;
+	statusCode?: number;
+	ttfbMs?: number;
+	totalMs?: number;
+	connectionReset?: boolean;
+	exitCode?: number;
+	blocked?: boolean;
+	error?: string;
+}
+
+export type EgressCircuitState = "healthy" | "degraded" | "open";
+
+export interface EgressHealthSnapshot {
+	id: string;
+	url: string;
+	maskedUrl: string;
+	label?: string;
+	priority: number;
+	state: EgressCircuitState;
+	inFlight: number;
+	maxInFlight?: number;
+	totalRequests: number;
+	windowSamples: number;
+	avgTtfbMs: number;
+	p95TtfbMs: number;
+	errorRate: number;
+	resetRate: number;
+	consecutiveFailures: number;
+	circuitOpenUntil?: number;
+	lastFailureReason?: string;
+	lastUpdatedAt?: number;
+}
+
+export interface EgressLease {
+	id: string;
+	url: string;
+	maskedUrl: string;
+	label?: string;
+	degraded: boolean;
+	workerId?: string;
+	acquiredAt: number;
+	/** 归还出口并发槽位并上报本次观测结果（幂等）。 */
+	release: (obs?: EgressObservation) => void;
+}
+
+export interface EgressPoolOptions {
+	/** 平均 TTFB 劣化阈值（ms，默认 8000） */
+	maxTtfbMs?: number;
+	/** 403/5xx/blocked 错误率熔断阈值（0..1，默认 0.5） */
+	maxErrorRate?: number;
+	/** 连接重置/拒绝/超时率熔断阈值（0..1，默认 0.4） */
+	maxResetRate?: number;
+	/** 连续失败触发熔断次数阈值（默认 3） */
+	consecutiveFailureThreshold?: number;
+	/** 触发比率类熔断的最小滑动窗口样本数（默认 3） */
+	minSamplesForRate?: number;
+	/** 滑动窗口最大样本数（默认 20） */
+	windowSize?: number;
+	/** 熔断冷却时长（ms，默认 30000） */
+	cooldownMs?: number;
+	/** 并发分配策略：least-loaded（最少负载+轮询，默认）或 round-robin（纯轮询） */
+	strategy?: "least-loaded" | "round-robin";
+	/** 全部出口熔断时是否允许可控降级到最优残余出口（默认 false） */
+	allowDegradedFallback?: boolean;
+	/** 自定义时钟（用于测试确定性推进时间） */
+	now?: () => number;
+}
+
+interface EgressSampleRecord {
+	ts: number;
+	ok: boolean;
+	isError: boolean;
+	isReset: boolean;
+	isBlocked: boolean;
+	ttfbMs?: number;
+	statusCode?: number;
+	reason?: string;
+}
+
+interface EgressEndpointInternal {
+	id: string;
+	url: string;
+	maskedUrl: string;
+	label?: string;
+	priority: number;
+	maxInFlight?: number;
+	inFlight: number;
+	totalRequests: number;
+	consecutiveFailures: number;
+	state: EgressCircuitState;
+	circuitOpenUntil?: number;
+	lastFailureReason?: string;
+	lastUpdatedAt?: number;
+	samples: EgressSampleRecord[];
+}
+
+function defaultEgressId(url: string, index: number): string {
+	const hash = createHash("sha256").update(url).digest("hex").slice(0, 8);
+	return `egress-${index + 1}-${hash}`;
+}
+
+function percentile95(values: readonly number[]): number {
+	if (values.length === 0) return 0;
+	const sorted = [...values].sort((a, b) => a - b);
+	const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * 0.95) - 1));
+	return sorted[idx]!;
+}
+
+/**
+ * 多出口健康度管理池（#36 / NW-16）：
+ * - 实时追踪每个出口的 TTFB、403/5xx 错误率、连接重置率与连续失败次数；
+ * - 劣化超阈值自动熔断并在冷却期后半开探活，支持向健康出口故障转移或可控降级；
+ * - 多并发 worker 采用最少负载/轮询调度分配出口，防止并发抢占同一节点触发边缘限流。
+ */
+export class EgressPoolManager {
+	private readonly endpoints: EgressEndpointInternal[] = [];
+	private readonly byId = new Map<string, EgressEndpointInternal>();
+	private rrCursor = 0;
+
+	private readonly maxTtfbMs: number;
+	private readonly maxErrorRate: number;
+	private readonly maxResetRate: number;
+	private readonly consecutiveFailureThreshold: number;
+	private readonly minSamplesForRate: number;
+	private readonly windowSize: number;
+	private readonly cooldownMs: number;
+	private readonly strategy: "least-loaded" | "round-robin";
+	private readonly allowDegradedFallback: boolean;
+	private readonly nowFn: () => number;
+
+	constructor(endpoints: readonly (string | EgressEndpointConfig)[] = [], opts: EgressPoolOptions = {}) {
+		this.maxTtfbMs = typeof opts.maxTtfbMs === "number" && opts.maxTtfbMs > 0 ? opts.maxTtfbMs : 8_000;
+		this.maxErrorRate =
+			typeof opts.maxErrorRate === "number" && opts.maxErrorRate > 0 && opts.maxErrorRate <= 1
+				? opts.maxErrorRate
+				: 0.5;
+		this.maxResetRate =
+			typeof opts.maxResetRate === "number" && opts.maxResetRate > 0 && opts.maxResetRate <= 1
+				? opts.maxResetRate
+				: 0.4;
+		this.consecutiveFailureThreshold =
+			typeof opts.consecutiveFailureThreshold === "number" && opts.consecutiveFailureThreshold >= 1
+				? Math.floor(opts.consecutiveFailureThreshold)
+				: 3;
+		this.minSamplesForRate =
+			typeof opts.minSamplesForRate === "number" && opts.minSamplesForRate >= 1
+				? Math.floor(opts.minSamplesForRate)
+				: 3;
+		this.windowSize =
+			typeof opts.windowSize === "number" && opts.windowSize >= 1 ? Math.floor(opts.windowSize) : 20;
+		this.cooldownMs = typeof opts.cooldownMs === "number" && opts.cooldownMs >= 0 ? opts.cooldownMs : 30_000;
+		this.strategy = opts.strategy === "round-robin" ? "round-robin" : "least-loaded";
+		this.allowDegradedFallback = Boolean(opts.allowDegradedFallback);
+		this.nowFn = opts.now ?? (() => Date.now());
+
+		for (const ep of endpoints) {
+			this.addEndpoint(typeof ep === "string" ? { url: ep } : ep);
+		}
+	}
+
+	/** 添加出口节点到管理池（同 id 存在时覆盖配置并保留唯一性）。 */
+	addEndpoint(config: EgressEndpointConfig): EgressHealthSnapshot {
+		const normUrl = normalizeTaskEgressUrl(config.url);
+		if (!normUrl) {
+			throw new Error(`EgressPoolManager 拒绝非法出口地址: ${JSON.stringify(config.url)}`);
+		}
+		const id = (config.id?.trim() || defaultEgressId(normUrl, this.endpoints.length)).replace(/\s+/g, "-");
+		const existing = this.byId.get(id);
+		if (existing) {
+			existing.url = normUrl;
+			existing.maskedUrl = maskEgressUrl(normUrl);
+			existing.label = config.label;
+			existing.priority = typeof config.priority === "number" && Number.isFinite(config.priority) ? config.priority : 100;
+			existing.maxInFlight =
+				typeof config.maxInFlight === "number" && config.maxInFlight > 0
+					? Math.floor(config.maxInFlight)
+					: undefined;
+			return this.snapshotOf(existing);
+		}
+
+		const entry: EgressEndpointInternal = {
+			id,
+			url: normUrl,
+			maskedUrl: maskEgressUrl(normUrl),
+			...(config.label ? { label: config.label } : {}),
+			priority: typeof config.priority === "number" && Number.isFinite(config.priority) ? config.priority : 100,
+			...(typeof config.maxInFlight === "number" && config.maxInFlight > 0
+				? { maxInFlight: Math.floor(config.maxInFlight) }
+				: {}),
+			inFlight: 0,
+			totalRequests: 0,
+			consecutiveFailures: 0,
+			state: "healthy",
+			samples: [],
+		};
+		this.endpoints.push(entry);
+		this.byId.set(id, entry);
+		return this.snapshotOf(entry);
+	}
+
+	/** 池内出口总数。 */
+	size(): number {
+		return this.endpoints.length;
+	}
+
+	/** 刷新已过熔断冷却期的出口状态（从 open 恢复至 degraded 半开态供再次探活）。 */
+	private refreshCircuits(now: number): void {
+		for (const ep of this.endpoints) {
+			if (ep.state === "open" && ep.circuitOpenUntil !== undefined && now >= ep.circuitOpenUntil) {
+				ep.state = "degraded";
+				ep.circuitOpenUntil = undefined;
+				ep.consecutiveFailures = Math.max(0, this.consecutiveFailureThreshold - 1);
+			}
+		}
+	}
+
+	private computeMetrics(ep: EgressEndpointInternal): {
+		avgTtfbMs: number;
+		p95TtfbMs: number;
+		errorRate: number;
+		resetRate: number;
+	} {
+		const n = ep.samples.length;
+		if (n === 0) {
+			return { avgTtfbMs: 0, p95TtfbMs: 0, errorRate: 0, resetRate: 0 };
+		}
+		let errCount = 0;
+		let resetCount = 0;
+		const ttfbs: number[] = [];
+		for (const s of ep.samples) {
+			if (s.isError || s.isBlocked) errCount++;
+			if (s.isReset) resetCount++;
+			if (typeof s.ttfbMs === "number" && Number.isFinite(s.ttfbMs) && s.ttfbMs >= 0) {
+				ttfbs.push(s.ttfbMs);
+			}
+		}
+		const avgTtfbMs = ttfbs.length > 0 ? Math.round(ttfbs.reduce((a, b) => a + b, 0) / ttfbs.length) : 0;
+		const p95TtfbMs = ttfbs.length > 0 ? Math.round(percentile95(ttfbs)) : 0;
+		return {
+			avgTtfbMs,
+			p95TtfbMs,
+			errorRate: Number((errCount / n).toFixed(4)),
+			resetRate: Number((resetCount / n).toFixed(4)),
+		};
+	}
+
+	private snapshotOf(ep: EgressEndpointInternal): EgressHealthSnapshot {
+		const m = this.computeMetrics(ep);
+		return {
+			id: ep.id,
+			url: ep.url,
+			maskedUrl: ep.maskedUrl,
+			...(ep.label ? { label: ep.label } : {}),
+			priority: ep.priority,
+			state: ep.state,
+			inFlight: ep.inFlight,
+			...(ep.maxInFlight !== undefined ? { maxInFlight: ep.maxInFlight } : {}),
+			totalRequests: ep.totalRequests,
+			windowSamples: ep.samples.length,
+			avgTtfbMs: m.avgTtfbMs,
+			p95TtfbMs: m.p95TtfbMs,
+			errorRate: m.errorRate,
+			resetRate: m.resetRate,
+			consecutiveFailures: ep.consecutiveFailures,
+			...(ep.circuitOpenUntil !== undefined ? { circuitOpenUntil: ep.circuitOpenUntil } : {}),
+			...(ep.lastFailureReason ? { lastFailureReason: ep.lastFailureReason } : {}),
+			...(ep.lastUpdatedAt !== undefined ? { lastUpdatedAt: ep.lastUpdatedAt } : {}),
+		};
+	}
+
+	/** 获取单个出口的健康度快照。 */
+	getHealth(id: string): EgressHealthSnapshot | undefined {
+		this.refreshCircuits(this.nowFn());
+		const ep = this.byId.get(id);
+		return ep ? this.snapshotOf(ep) : undefined;
+	}
+
+	/** 获取全部出口的健康度快照列表。 */
+	getSnapshot(): EgressHealthSnapshot[] {
+		this.refreshCircuits(this.nowFn());
+		return this.endpoints.map((ep) => this.snapshotOf(ep));
+	}
+
+	/** 手动重置指定出口或全部出口的健康状态。 */
+	reset(id?: string): void {
+		const targets = id ? [this.byId.get(id)].filter((x): x is EgressEndpointInternal => Boolean(x)) : this.endpoints;
+		for (const ep of targets) {
+			ep.samples = [];
+			ep.consecutiveFailures = 0;
+			ep.state = "healthy";
+			ep.circuitOpenUntil = undefined;
+			ep.lastFailureReason = undefined;
+		}
+	}
+
+	/**
+	 * 记录一次出口请求观测并重新评估健康状态与熔断开关。
+	 */
+	record(id: string, obs: EgressObservation): EgressHealthSnapshot | undefined {
+		const ep = this.byId.get(id);
+		if (!ep) return undefined;
+		const now = this.nowFn();
+
+		const status = typeof obs.statusCode === "number" && Number.isFinite(obs.statusCode) ? obs.statusCode : undefined;
+		const isReset = Boolean(
+			obs.connectionReset ||
+				(typeof obs.exitCode === "number" && EGRESS_RESET_CURL_EXIT_CODES.has(obs.exitCode)) ||
+				(obs.error && EGRESS_RESET_ERROR_RE.test(obs.error)),
+		);
+		const isBlocked = Boolean(obs.blocked);
+		const isHttpError = status !== undefined && (status === 403 || status === 429 || (status >= 500 && status < 600));
+		const isError = isBlocked || isHttpError;
+		const ttfbMs = typeof obs.ttfbMs === "number" && Number.isFinite(obs.ttfbMs) && obs.ttfbMs >= 0 ? obs.ttfbMs : undefined;
+		const isSlow = ttfbMs !== undefined && ttfbMs > this.maxTtfbMs;
+
+		const explicitFail = obs.ok === false;
+		const isFailure = explicitFail || isReset || isError;
+
+		const reasonParts: string[] = [];
+		if (isBlocked) reasonParts.push("egress_blocked");
+		if (status !== undefined && isHttpError) reasonParts.push(`http_${status}`);
+		if (isReset) reasonParts.push(obs.exitCode !== undefined ? `reset_exit_${obs.exitCode}` : "connection_reset");
+		if (isSlow) reasonParts.push(`slow_ttfb_${Math.round(ttfbMs!)}ms`);
+		if (obs.error) reasonParts.push(obs.error);
+
+		ep.totalRequests += 1;
+		ep.lastUpdatedAt = now;
+		ep.samples.push({
+			ts: now,
+			ok: !isFailure,
+			isError,
+			isReset,
+			isBlocked,
+			...(ttfbMs !== undefined ? { ttfbMs } : {}),
+			...(status !== undefined ? { statusCode: status } : {}),
+			...(reasonParts.length > 0 ? { reason: reasonParts.join("; ") } : {}),
+		});
+		if (ep.samples.length > this.windowSize) {
+			ep.samples.splice(0, ep.samples.length - this.windowSize);
+		}
+
+		if (isFailure) {
+			ep.consecutiveFailures += 1;
+			ep.lastFailureReason = reasonParts.join("; ") || "request_failed";
+		} else {
+			ep.consecutiveFailures = 0;
+			if (!isSlow) {
+				ep.lastFailureReason = undefined;
+			} else {
+				ep.lastFailureReason = `slow_ttfb_${Math.round(ttfbMs!)}ms`;
+			}
+		}
+
+		const m = this.computeMetrics(ep);
+		const enoughSamples = ep.samples.length >= this.minSamplesForRate;
+
+		let tripReason: string | undefined;
+		if (ep.consecutiveFailures >= this.consecutiveFailureThreshold) {
+			tripReason = `连续失败 ${ep.consecutiveFailures} 次 (${ep.lastFailureReason ?? "error"})`;
+		} else if (enoughSamples && m.resetRate >= this.maxResetRate) {
+			tripReason = `连接重置率 ${(m.resetRate * 100).toFixed(0)}% >= ${(this.maxResetRate * 100).toFixed(0)}%`;
+		} else if (enoughSamples && m.errorRate >= this.maxErrorRate) {
+			tripReason = `403/5xx 错误率 ${(m.errorRate * 100).toFixed(0)}% >= ${(this.maxErrorRate * 100).toFixed(0)}%`;
+		} else if (enoughSamples && m.avgTtfbMs > this.maxTtfbMs) {
+			tripReason = `平均 TTFB ${m.avgTtfbMs}ms > 阈值 ${this.maxTtfbMs}ms`;
+		}
+
+		if (tripReason) {
+			ep.state = "open";
+			ep.circuitOpenUntil = now + this.cooldownMs;
+			ep.lastFailureReason = tripReason;
+		} else if (
+			isSlow ||
+			ep.consecutiveFailures > 0 ||
+			m.errorRate >= this.maxErrorRate * 0.5 ||
+			m.resetRate >= this.maxResetRate * 0.5 ||
+			m.avgTtfbMs > this.maxTtfbMs * 0.75
+		) {
+			ep.state = "degraded";
+			ep.circuitOpenUntil = undefined;
+		} else {
+			ep.state = "healthy";
+			ep.circuitOpenUntil = undefined;
+		}
+
+		return this.snapshotOf(ep);
+	}
+
+	/**
+	 * 为当前 worker 申请一个可用出口租约：
+	 * - 自动过滤熔断中的出口并跳过 `excludeIds`（支持单次任务内故障转移）；
+	 * - 优先使用 `healthy` 出口，其次 `degraded` 出口；
+	 * - 支持 `least-loaded`（最少负载 + 轮询打破平局）与 `round-robin`，避免并发抢占单一出口；
+	 * - 全部熔断且开启 `allowDegradedFallback` 时，可控降级到错误率最低的出口并标记 `lease.degraded = true`。
+	 */
+	acquire(opts?: string | { workerId?: string; excludeIds?: readonly string[]; allowDegradedFallback?: boolean }): EgressLease | null {
+		if (this.endpoints.length === 0) return null;
+		const now = this.nowFn();
+		this.refreshCircuits(now);
+
+		const workerId = typeof opts === "string" ? opts : opts?.workerId;
+		const excludeSet = new Set(typeof opts === "string" ? [] : (opts?.excludeIds ?? []));
+		const allowFallback =
+			typeof opts === "object" && opts?.allowDegradedFallback !== undefined
+				? opts.allowDegradedFallback
+				: this.allowDegradedFallback;
+
+		const hasCapacity = (ep: EgressEndpointInternal) =>
+			ep.maxInFlight === undefined || ep.inFlight < ep.maxInFlight;
+
+		const rotated = (): EgressEndpointInternal[] => {
+			const len = this.endpoints.length;
+			const start = this.rrCursor % len;
+			const arr: EgressEndpointInternal[] = [];
+			for (let i = 0; i < len; i++) {
+				arr.push(this.endpoints[(start + i) % len]!);
+			}
+			return arr;
+		};
+
+		const order = rotated();
+		const eligible = order.filter((ep) => !excludeSet.has(ep.id) && ep.state !== "open" && hasCapacity(ep));
+
+		let chosen: EgressEndpointInternal | undefined;
+		let isDegradedFallback = false;
+
+		if (eligible.length > 0) {
+			const healthyOnly = eligible.filter((ep) => ep.state === "healthy");
+			const tier = healthyOnly.length > 0 ? healthyOnly : eligible;
+			if (this.strategy === "round-robin") {
+				chosen = tier[0];
+			} else {
+				// least-loaded：先按 inFlight 最少，再按 priority 最小，平局保留轮询先后顺序
+				let best = tier[0]!;
+				for (let i = 1; i < tier.length; i++) {
+					const cand = tier[i]!;
+					if (
+						cand.inFlight < best.inFlight ||
+						(cand.inFlight === best.inFlight && cand.priority < best.priority)
+					) {
+						best = cand;
+					}
+				}
+				chosen = best;
+			}
+			isDegradedFallback = chosen!.state === "degraded";
+		} else if (allowFallback) {
+			const fallbackCandidates = order.filter((ep) => !excludeSet.has(ep.id) && hasCapacity(ep));
+			if (fallbackCandidates.length > 0) {
+				fallbackCandidates.sort((a, b) => {
+					const ma = this.computeMetrics(a);
+					const mb = this.computeMetrics(b);
+					return (
+						ma.resetRate + ma.errorRate - (mb.resetRate + mb.errorRate) ||
+						a.inFlight - b.inFlight ||
+						a.priority - b.priority
+					);
+				});
+				chosen = fallbackCandidates[0];
+				isDegradedFallback = true;
+			}
+		}
+
+		if (!chosen) return null;
+
+		const chosenIdx = this.endpoints.indexOf(chosen);
+		this.rrCursor = (chosenIdx + 1) % this.endpoints.length;
+		chosen.inFlight += 1;
+
+		let released = false;
+		const release = (obs?: EgressObservation) => {
+			if (released) return;
+			released = true;
+			chosen!.inFlight = Math.max(0, chosen!.inFlight - 1);
+			if (obs) {
+				this.record(chosen!.id, obs);
+			}
+		};
+
+		return {
+			id: chosen.id,
+			url: chosen.url,
+			maskedUrl: chosen.maskedUrl,
+			...(chosen.label ? { label: chosen.label } : {}),
+			degraded: isDegradedFallback,
+			...(workerId ? { workerId } : {}),
+			acquiredAt: now,
+			release,
+		};
+	}
+
+	/** 批量主动探测所有出口的门控健康度。 */
+	async probeAll(
+		probeFn: (ep: { id: string; url: string; label?: string }) => Promise<EgressObservation>,
+	): Promise<EgressHealthSnapshot[]> {
+		const out: EgressHealthSnapshot[] = [];
+		for (const ep of this.endpoints) {
+			try {
+				const obs = await probeFn({ id: ep.id, url: ep.url, label: ep.label });
+				const snap = this.record(ep.id, obs);
+				if (snap) out.push(snap);
+			} catch (err) {
+				const snap = this.record(ep.id, {
+					ok: false,
+					connectionReset: true,
+					error: err instanceof Error ? err.message : String(err),
+				});
+				if (snap) out.push(snap);
+			}
+		}
+		return out;
+	}
+}
