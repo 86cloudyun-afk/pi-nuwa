@@ -607,6 +607,7 @@ export function normalizeState(st: NuwaState): NuwaState {
 	st.project.episode = Number.isFinite(st.project.episode) && (st.project.episode as number) > 0 ? st.project.episode : 1;
 	const cur: Partial<Runtime> = st.runtime ?? {};
 	const rt: Runtime = {
+		...cur,
 		startedAt: Number.isFinite(cur.startedAt) ? (cur.startedAt as number) : Date.now(),
 		turns: Number.isFinite(cur.turns) ? (cur.turns as number) : 0,
 		stall: Number.isFinite(cur.stall) ? (cur.stall as number) : 0,
@@ -644,6 +645,16 @@ export function normalizeState(st: NuwaState): NuwaState {
 				: 0,
 		totalTokens: Number.isFinite(cur.totalTokens) ? (cur.totalTokens as number) : 0,
 		totalCostUsd: Number.isFinite(cur.totalCostUsd) ? (cur.totalCostUsd as number) : 0,
+		...(cur.status ? { status: cur.status } : {}),
+		...(cur.sealMeta && typeof cur.sealMeta === "object" ? { sealMeta: cur.sealMeta } : {}),
+		...(Number.isFinite(cur.noveltyStall) ? { noveltyStall: cur.noveltyStall as number } : {}),
+		...(Number.isFinite(cur.lastNovelFacts) ? { lastNovelFacts: cur.lastNovelFacts as number } : {}),
+		...(typeof cur.semanticStall === "boolean" ? { semanticStall: cur.semanticStall } : {}),
+		...(Number.isFinite(cur.blockedCommits) ? { blockedCommits: cur.blockedCommits as number } : {}),
+		...(Number.isFinite(cur.lastBlockedCommitsDelta) ? { lastBlockedCommitsDelta: cur.lastBlockedCommitsDelta as number } : {}),
+		...(Number.isFinite(cur.lastBlockedIntentsDelta) ? { lastBlockedIntentsDelta: cur.lastBlockedIntentsDelta as number } : {}),
+		...(typeof cur.reportWritten === "boolean" ? { reportWritten: cur.reportWritten } : {}),
+		...(cur.attemptedKeys && typeof cur.attemptedKeys === "object" ? { attemptedKeys: cur.attemptedKeys } : {}),
 	};
 	st.runtime = rt;
 	if (!st.facts || typeof st.facts !== "object") st.facts = {};

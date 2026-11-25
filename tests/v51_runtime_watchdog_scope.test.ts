@@ -253,12 +253,18 @@ describe("Issue #40 (NW-20): ProcessGroupTracker 与 cleanupTrackedProcesses 级
 			},
 		);
 
-		await Bun.sleep(250);
+		const waitStart = Date.now();
+		while (tracker.list().length < 2 && Date.now() - waitStart < 3000) {
+			await Bun.sleep(40);
+		}
 		daemon.kill("SIGHUP");
 		const exitCode = await daemon.exited;
 		expect(exitCode).toBe(129);
 
-		await Bun.sleep(100);
+		const deadWait = Date.now();
+		while (isProcessAliveNonZombie(orphan.pid) && Date.now() - deadWait < 1500) {
+			await Bun.sleep(40);
+		}
 		expect(isProcessAliveNonZombie(orphan.pid)).toBe(false);
 	});
 });

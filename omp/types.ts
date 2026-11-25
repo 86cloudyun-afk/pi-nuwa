@@ -6,7 +6,7 @@
  * 供各子模块 `import type` 使用，并由 `omp/nuwa.ts` 完整 re-export 以保持 100% 向后兼容。
  */
 
-export const NUWA_VERSION = "5.0.0";
+export const NUWA_VERSION = "5.1.0";
 export const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
 export type ProfileMode = "ctf" | "pentest" | "audit" | "coding" | "ops";

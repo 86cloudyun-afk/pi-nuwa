@@ -1,5 +1,32 @@
 # Changelog
 
+## 5.1.0 — 2026-11-26
+
+实战长程自治闭环与工程化深度加固大版本（Epic #20，子议题 #21–#52 / NW-01–NW-32，共 33 个 Issues 全部闭环）：在严格保持 12 个 `nuwa_*` 工具名称 100% 不变的前提下，彻底根治实战 208 轮跑批暴露的零新事实死循环、无封盘终态、出口未注入假阴性、假阳性未复核升格、模板化回包、批派单截断、只读诊断缺失、子代理超时卡死、残留孤儿进程组、`/tmp` 易失工作区丢失与跨运行时内联脚本越界等全部痛点。
+
+### 四大工程化闭环（覆盖 #20–#52 / NW-01–NW-32）
+
+- **状态机收敛、表面分域三元组去重、免票据记账与全量只读观测（#21, #22, #25, #29, #30, #31, #34, #35, #38, #41, #43, #45, #49）**：
+  - **#21 (NW-01) & #43 (NW-23)**：引入持久化已尝试过滤器 `attempted(kind, targetKey)` 与规范化三元组去重键 `(expectedKind, normalizeTargetKey(target), hintHash)`，冷却窗内自动抑制 `blocked` 目标重派生，`nuwa_plan` / `nuwa_expand` 输出结构化 `rejectedReasons`（`duplicate_key` / `blocked_cooldown` / `inflight`），状态看板实时输出 `repeat_ratio` / `repeatRatio`。
+  - **#22 (NW-02) & #41 (NW-21)**：新增合法终态 `status="sealed_negative"`（`sealEngagement`、`shouldRecommendSeal`），`nuwa_complete(seal=true, reason, excluded_surface, coverage)` 与 `/nuwa seal` 支持硬化目标负向封盘收口；`completionRejects >= 1` 时自动生成 `buildConvergenceAdvice` 引导收敛至 `report` / `seal`。
+  - **#25 (NW-05)**：显式划分攻击面域 `surfaceDomain: "port" | "path" | "host"`（`inferSurfaceDomain`、`canDeriveCrossSurface`），隔离端口级与路径级 `blocked` 状态，跨层派生强制校验有效前置事实。
+  - **#29 (NW-09) & #31 (NW-11)**：`Intent` 自动推断并记录 `expectedKind`，`nuwa_commit` 省略 `kind` 时自动继承；导出 `commitFreeFact` 并支持 `nuwa_commit` 省略 `id` / `free_note=true` 及 `/nuwa note` 免票据直接落账。
+  - **#30 (NW-10) & #45 (NW-25)**：`Runtime` 追踪语义停滞 `noveltyStall`（`blocked=true` 提交绝不重置，仅新非 `blocked` 事实归零）；导出 `resolveReportPhaseTransition` / `finalizeReportPhase` 修复 `report` 阶段零正向漏洞时的死锁循环。
+  - **#34 (NW-14)、#35 (NW-15)、#38 (NW-18) & #49 (NW-29)**：`nuwa_status` 支持 `raw`/`offset`/`limit`/`format="text"|"json"` 不截断输出（`renderFullStatus`）及 `inspect_intent`/`query_status`/`target_key`（`/nuwa inspect`、`/nuwa query`）严格零磁盘写入只读诊断（`inspectGraph`）；UI 与状态栏呈现 `last_ok`、`blocked_ratio` 边缘受阻标记，并明确区分当前 `blockedIntents` 与累计 `blockedCommits`。
+- **派单守卫、假阳性与真实性门禁、证据落盘及跨轮结构化归档（#24, #26, #27, #28, #39, #42, #50, #51, #52）**：
+  - **#24 (NW-04)**：`evaluatePositiveEvidenceGate` / `verifyPositiveConclusion` / `buildFalsePositiveNote` 拦截仅凭 `HTTP 200` + `<64B` 微小错误壳、Soft-404 或与负向基线同哈希的误报升格，返回 `falsePositive: true` 并支持自动降级为 `note` 记账。
+  - **#26 (NW-06) & #39 (NW-19)**：`validateDeliverableRealism` 拦截 `[TARGET]`/`[BOOL_DELTA]` 占位符、未展开 `TARGET`/`HOST`/`$U` 与无状态码纯脚本回包；`buildDispatchPacket` 自动注入 `resolved_host` 与目标 URL；`validateHitEvidenceFields` 与 `agents/{fujiang,nuwa-verifier}.md` 强制五项 `curl -w` 命中证据指标。
+  - **#27 (NW-07)、#28 (NW-08) & #50 (NW-30)**：`before_subagent_spawn` 与 `task` 接入 `validateSubagentDispatch` 及 `DispatchReceiptRegistry` 拦截空任务并标记 `requeue`；`chunkBatchTasks` 对超过 `6000`B 的批派单自动分片或溢写 `.nuwa/dispatches/batch-<id>.json`；`InflightTargetRegistry` 与 `coalesceProbesByTarget` 实现跨子代理在途目标去重与同目标探针合并。
+  - **#42 (NW-22)、#51 (NW-31) & #52 (NW-32)**：`nuwa_commit` 接入 `parseAgentResult`（兼容 JSON / Markdown fenced JSON / 5 行回执）与 `saveFactEvidenceLog`（`0o600` 脱敏落盘 `.nuwa/evidence/<factId>.log` 生成 `evidence_ref`）；`nuwa_report(format="timeline")` 与 `/nuwa export` 导出 Episode 时间线（`exportEpisodeTimeline`），`writeEpisodeArchiveIndex` / `searchArchiveIndexes` 生成并检索 `.nuwa/archive/episode-<N>.{json,md}` 结构化归档。
+- **出口注入、多出口熔断池、端点分类与合规浏览器挑战门识别（#23, #32, #33, #36, #37）**：
+  - **#23 (NW-03) & #36 (NW-16)**：`injectEgressEnv` / `buildCurlProxyArgs` / `injectEgressIntoScript` 随任务强制透传出口配置，`preflightEgressCheck` 在 Gate URL 被边缘防火墙统一拦截时快速失败标记 `egress_blocked`（杜绝业务路径假阴性）；`EgressPoolManager` 统计 TTFB/403/5xx/重置率并执行自动熔断故障转移与最少负载/轮询分池。
+  - **#32 (NW-12) & #33 (NW-13)**：`classifyEndpointResponse` 精确区分 `exists_requires_auth`（401/鉴权 403/带 `Allow` 405）与 `not_found` 并记录 SHA-256 `bodyHash`/`bodyBytes`；`detectSoft404` / `sampleSoft404Baseline` 识别随机路径基线、Next.js RSC Flight `NEXT_HTTP_ERROR_FALLBACK;404` 及多语言 404 文案。
+  - **#37 (NW-17)**：`buildChromiumLaunchConfig` 支持持久化 `--user-data-dir` 与可配 `headless`/`useXvfb`/`display`；`detectChallengeGate` 确定性识别 Cloudflare Turnstile 等挑战门并立即停止盲目重试返回 `challenge_gated`，支持通过 `session-vault`（`loadHumanSessionFromVault`/`saveHumanSessionToVault`）复用人工合法会话凭据（零验证码破解/绕过代码）。
+- **孤儿进程组回收、免确认软暂停、子代理看门狗、持久化工作区与跨运行时网络守卫（#40, #44, #46, #47, #48）**：
+  - **#40 (NW-20) & #46 (NW-26)**：`ProcessGroupTracker` 与 `cleanupTrackedProcesses` 在 `nuwa_stop`、`session_shutdown` 与信号退出时按 `-pgid` 安全级联回收派生子进程组（严格校验 PID/PGID 边界防误杀）；`SubagentWatchdog` 追踪 `startedAt`/`lastReqAt`/`lastOutputAt`，超空闲（300s）或硬超时（900s）自动终止回收并释放并发槽位。
+  - **#44 (NW-24)**：`nuwa_stop` 显式暴露 `confirm="STOP"`（硬停机）与 `pause=true`（免确认即时软暂停），配合 `/nuwa pause`、`/nuwa resume` 与 `setPausedState`/`isPausedState` 实现优雅挂起与即时恢复。
+  - **#47 (NW-27) & #48 (NW-28)**：默认状态与工作区迁出易失 `/tmp`（优先 `$NUWA_STATE_DIR` / `~/.local/state/nuwa`），`verifyWorkspaceIntegrity` 持续巡检工作区与 `.git` 元数据完好性；`omp/scope.ts` 统一拦截 `python -c`、`node -e`、`bun -e`、`ruby -e`、`perl -e`、`php -r` 内联脚本越界请求，所有 `N-007` 阻断消息显式携带 `[layer=shell-guard|egress-proxy|sandbox-net]`，并为 `bin/nuwa-autonomous` 外部探活施加短超时保护；新增 `tests/gates/g5_v51.sh` 阶段门禁。
+
 ## 5.0.0 — 2026-11-25
 
 架构跃升与自主评估闭环大版本（Issues #16–#19）：全面贯通认证态攻击面自动化、零信任常驻 Sidecar 沙盒与抗 DNS 重绑定出向代理、一等 OOB 回调通道、多资产跳板拓扑与跨事实假设图推理、全流程 Profile 领域解耦、企业级 SARIF 2.1.0 / 脱敏审计证据包、守护器成本封顶与告警，以及 10 场景离线确定性评测靶场；严格维持 12 个 `nuwa_*` 工具 100% 向后兼容。
