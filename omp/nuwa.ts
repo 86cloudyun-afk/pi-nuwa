@@ -1,5 +1,5 @@
 /**
- * nuwa-omp v4.0.1 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
+ * nuwa-omp v4.1.0 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
  *
  * 子模块分工：
  *   - `./types`         共享类型契约与常量
@@ -51,13 +51,13 @@ import { createBoardComponent, createWidgetComponent } from "./ui-native";
 import type { ExecLike } from "./autoexec";
 import { checkToolScopeAndRisk, defaultScopeForTarget } from "./scope";
 import { isTrustedEvidenceEvent, probeToolchain, recordToolExecution, verifyExecutionEvidence } from "./evidence";
-import { bindSubagentSpawn, registerActiveSession, resolveLineageRoot, routeSubagentModel } from "./lineage";
+import { bindSubagentSpawn, registerActiveSession, resolveLineageRoot, resolveTaskIntentContext, routeSubagentModel } from "./lineage";
 import { distillProjectExperience, ensureBundledKb, kbLookupSafe } from "./kb";
 import { redactVaultSecrets } from "./session-vault";
-import { isVerifyVulnIntentKey } from "./verifier-gate";
+import { extractVerifyTargetFactId, isVerifyVulnIntentKey, validateVerificationCommit } from "./verifier-gate";
 import { readSandboxConfig, wrapCommandInDockerSandbox } from "./sandbox";
 
-export const VERSION = "4.0.1";
+export const VERSION = "4.1.0";
 
 export {
 	PHASE_ORDER, SCHEMA, SEEDS, addFallbackIntent, addIntent, appendIntentSpecs, applyAutoItemResult,
@@ -293,6 +293,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					allowHosts: z.array(z.string()).optional(), allowCidrs: z.array(z.string()).optional(),
 					denyHosts: z.array(z.string()).optional(), allowSubdomains: z.boolean().optional(),
 					allowPrivateNetwork: z.boolean().optional(), allowDestructive: z.boolean().optional(),
+					allowLoopback: z.boolean().optional(), oobDomains: z.array(z.string()).optional(),
 				})
 				.optional()
 				.describe("可选靶标范围与风险策略覆盖"),
@@ -359,9 +360,25 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						}
 						s.project.toolchain = probeToolchain();
 						s.project.sandboxMode = readSandboxConfig().mode;
+						const prevStart = s.runtime.projectStartedAt ?? s.runtime.startedAt ?? Date.now();
+						const prevTurns = Math.max(0, Number(s.runtime.turns ?? 0));
+						const prevTotalTurns = Math.max(Number(s.runtime.totalTurns ?? 0), prevTurns);
+						const prevTotalTokens = Number(s.runtime.totalTokens ?? 0) + Math.max(0, Number(s.runtime.tokens ?? 0));
 						Object.assign(s.runtime, {
-							startedAt: Date.now(), turns: 0, genTurns: 0, stall: 0, idle: 0, tokens: 0,
-							completionRejects: 0, lastSig: "", lastSettleAt: 0, blockStreak: 0, pressure: 0,
+							startedAt: s.runtime.startedAt || prevStart,
+							projectStartedAt: prevStart,
+							turns: prevTurns,
+							totalTurns: prevTotalTurns,
+							totalTokens: prevTotalTokens,
+							genTurns: 0,
+							stall: 0,
+							idle: 0,
+							tokens: 0,
+							completionRejects: 0,
+							lastSig: "",
+							lastSettleAt: 0,
+							blockStreak: 0,
+							pressure: 0,
 							rulesSource: checkAndLogAutoRuleSource(root, s),
 						});
 						saveState(root, s, { reason: "init" });
@@ -527,6 +544,26 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const pre = loadState(root);
 				if (!pre) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 
+				const targetIntent = pre.intents[p.id];
+				const intentKey = targetIntent?.key ?? "";
+				const isVerifyCommit = !p.blocked && isVerifyVulnIntentKey(intentKey);
+				const verifyTargetFid = isVerifyCommit ? extractVerifyTargetFactId(intentKey) : null;
+				const candidateFact = verifyTargetFid ? pre.facts[verifyTargetFid] : undefined;
+
+				if (isVerifyCommit) {
+					const vc = validateVerificationCommit({
+						intentKey,
+						kind: p.kind,
+						blocked: p.blocked,
+						worker: targetIntent?.worker,
+						candidateFact,
+					});
+					if (!vc.ok) {
+						logEvent(root, { type: "verify_commit_rejected", id: p.id, kind: p.kind, reason: vc.reason });
+						throw new Error(`双盲复验门禁拒绝: ${vc.reason ?? "复验提交不合规"}`);
+					}
+				}
+
 				let verifiedFlag: boolean | undefined;
 				if (!p.blocked && (p.kind === "vuln" || p.kind === "cred" || p.kind === "flag")) {
 					const strict = (process.env.NUWA_STRICT_EVIDENCE ?? "").trim() === "1";
@@ -538,7 +575,16 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						command: p.command,
 						output: p.output,
 						flagValue: extractedFlag,
-						strict,
+						strict: strict || isVerifyCommit,
+						...(isVerifyCommit
+							? {
+									minSeq: candidateFact?.evidenceSeq ?? 0,
+									...(candidateFact?.createdAt ? { sinceTs: candidateFact.createdAt } : {}),
+									requireSubstantive: true,
+								}
+							: p.kind === "vuln"
+								? { requireSubstantive: true }
+								: {}),
 					});
 					if (!vr.ok) {
 						logEvent(root, { type: "evidence_rejected", id: p.id, kind: p.kind, reason: vr.reason });
@@ -791,6 +837,21 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					return s;
 				});
 				logEvent(root, { type: "stop_manual", reason });
+				try {
+					const dist = distillProjectExperience(updated, { agentHome: getAgentHome(), negativeOnly: true });
+					if (dist.updated > 0) {
+						logEvent(root, {
+							type: "experience_distill",
+							negativeOnly: true,
+							techKeys: dist.techKeys,
+							updated: dist.updated,
+							positive: dist.positive,
+							negative: dist.negative,
+						});
+					}
+				} catch {
+					/* 负向经验回流异常不阻断停机 */
+				}
 				refreshUi(ctx, root, updated, true);
 				return toolText(`已停机: ${reason}`, { root });
 			} catch (e) {
@@ -910,6 +971,21 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				});
 				if (!st) return notify("state 读取失败", "error");
 				logEvent(found, { type: "stop", reason, via: "command" });
+				try {
+					const dist = distillProjectExperience(st, { agentHome: getAgentHome(), negativeOnly: true });
+					if (dist.updated > 0) {
+						logEvent(found, {
+							type: "experience_distill",
+							negativeOnly: true,
+							techKeys: dist.techKeys,
+							updated: dist.updated,
+							positive: dist.positive,
+							negative: dist.negative,
+						});
+					}
+				} catch {
+					/* 负向经验回流异常不阻断停机 */
+				}
 				refreshUi(ctx as ExtensionContext, found, st, true);
 				return notify(`已停止 ${st.project.id} · ${reason}｜/nuwa resume 继续`);
 			}
@@ -922,9 +998,25 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					s.project.status = "active";
 					s.project.stopReason = undefined;
 					s.project.toolchain = probeToolchain();
+					const prevStart = s.runtime.projectStartedAt ?? s.runtime.startedAt ?? Date.now();
+					const prevTurns = Math.max(0, Number(s.runtime.turns ?? 0));
+					const prevTotalTurns = Math.max(Number(s.runtime.totalTurns ?? 0), prevTurns);
+					const prevTotalTokens = Number(s.runtime.totalTokens ?? 0) + Math.max(0, Number(s.runtime.tokens ?? 0));
 					Object.assign(s.runtime, {
-						startedAt: Date.now(), turns: 0, genTurns: 0, stall: 0, idle: 0, tokens: 0,
-						completionRejects: 0, lastSig: "", lastSettleAt: 0, blockStreak: 0, pressure: 0,
+						startedAt: s.runtime.startedAt || prevStart,
+						projectStartedAt: prevStart,
+						turns: prevTurns,
+						totalTurns: prevTotalTurns,
+						totalTokens: prevTotalTokens,
+						genTurns: 0,
+						stall: 0,
+						idle: 0,
+						tokens: 0,
+						completionRejects: 0,
+						lastSig: "",
+						lastSettleAt: 0,
+						blockStreak: 0,
+						pressure: 0,
 					});
 					saveState(found, s, { reason: "init" });
 					return s;
@@ -1047,6 +1139,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					autoPlan(s, curCfg);
 					if (hasExec()) autoIds = claimAutoBatch(s, curCfg, root);
 					s.runtime.turns += 1;
+					s.runtime.totalTurns = Math.max(s.runtime.totalTurns ?? 0, s.runtime.turns - 1) + 1;
 					s.runtime.genTurns = (s.runtime.genTurns ?? 0) + 1;
 					s.runtime.lastSettleAt = Date.now();
 					directive = buildDirective(s, curCfg);
@@ -1128,21 +1221,27 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 							? event.name
 							: "";
 			const taskText = String(event?.task ?? event?.prompt ?? "");
-			const activeIntents = Object.values(st.intents).filter((i) => i.status === "claimed" || i.status === "open");
-			const claimedKeys = activeIntents.filter((i) => i.status === "claimed").map((i) => i.key);
-			const hasPendingVerify =
-				agentName === "nuwa-verifier" || activeIntents.some((i) => isVerifyVulnIntentKey(i.key)) || /verify-vuln:|\[双盲独立复验任务/.test(taskText);
-			const hasReflect = claimedKeys.some((k) => k.startsWith("reflect:")) || /\breflect:|战略复盘/.test(taskText);
+			const routeCtx = resolveTaskIntentContext(agentName, taskText, st.intents, st.project.phase);
 
 			const routedModel = routeSubagentModel({
 				agent: agentName,
-				phase: st.project.phase,
-				intentKeys: claimedKeys,
-				hasPendingVerify,
-				hasReflect,
+				phase: routeCtx.phase,
+				intentKeys: routeCtx.intentKey ? [routeCtx.intentKey] : [],
+				hasPendingVerify: routeCtx.isVerify,
+				hasReflect: routeCtx.isReflect,
 			});
 			if (routedModel) {
 				if (event && typeof event === "object" && !event.model) event.model = routedModel;
+				logEvent(root, {
+					type: "model_route",
+					agent: agentName || "unknown",
+					model: routedModel,
+					phase: routeCtx.phase,
+					...(routeCtx.intentId ? { intentId: routeCtx.intentId } : {}),
+					...(routeCtx.intentKey ? { intentKey: routeCtx.intentKey } : {}),
+					isVerify: routeCtx.isVerify,
+					isReflect: routeCtx.isReflect,
+				});
 				return { model: routedModel };
 			}
 		} catch {
@@ -1174,7 +1273,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const root = resolveRootWithLineage(ctx);
 			if (!root) return;
 			if (command || output) {
-				recordToolExecution(root, { tool: toolName, command, output, sessionId: sid });
+				const agentObj = ctx.agent as { name?: string; kind?: string } | undefined;
+				const agentName = agentObj?.name ?? agentObj?.kind;
+				recordToolExecution(root, { tool: toolName, command, output, sessionId: sid, agentName });
 			}
 		} catch {
 			/* 账本记录异常不阻塞主流程 */

@@ -661,6 +661,88 @@ export function resolveLineageRoot(ctx: LineageContextLike, agentHome?: string):
 	return null;
 }
 
+export interface TaskIntentRouteContext {
+	intentId?: string;
+	intentKey?: string;
+	phase?: Phase;
+	isVerify: boolean;
+	isReflect: boolean;
+}
+
+/**
+ * 按本次派单文本与子代理名称精准解析当前任务路由上下文（Issue #13）：
+ * - 优先从 taskText 提取显式意图 ID（`[女娲派单 iXXX]` 或命中 intents 的 `\bi\d{3,}\b`），
+ *   命中时依据该意图自身的 phase 与 key 判定 isVerify / isReflect；
+ * - 未命中具体意图时回落到 fallbackPhase，仅依据 agentName 与 taskText 特征判定，
+ *   绝不因盘面存在无关 open 的 verify-vuln:* 意图而误将常规侦察任务路由至复验模型。
+ */
+export function resolveTaskIntentContext(
+	agentName: string,
+	taskText: string,
+	intents: Record<string, { id: string; key: string; phase: Phase; status: string }>,
+	fallbackPhase: Phase,
+): TaskIntentRouteContext {
+	const normAgent = String(agentName ?? "").trim().toLowerCase();
+	const text = String(taskText ?? "");
+	const map = intents && typeof intents === "object" ? intents : {};
+
+	const lookupIntent = (rawId: string | undefined) => {
+		if (!rawId) return undefined;
+		const trimmed = rawId.trim();
+		if (!trimmed) return undefined;
+		if (Object.prototype.hasOwnProperty.call(map, trimmed)) {
+			return map[trimmed];
+		}
+		const lower = trimmed.toLowerCase();
+		if (Object.prototype.hasOwnProperty.call(map, lower)) {
+			return map[lower];
+		}
+		return undefined;
+	};
+
+	let matched: { id: string; key: string; phase: Phase; status: string } | undefined;
+
+	const dispatchRe = /\[女娲派单\s+(i\d+)\]/gi;
+	for (let m = dispatchRe.exec(text); m !== null; m = dispatchRe.exec(text)) {
+		const hit = lookupIntent(m[1]);
+		if (hit) {
+			matched = hit;
+			break;
+		}
+	}
+
+	if (!matched) {
+		const bareIdRe = /\b(i\d{3,})\b/gi;
+		for (let m = bareIdRe.exec(text); m !== null; m = bareIdRe.exec(text)) {
+			const hit = lookupIntent(m[1]);
+			if (hit) {
+				matched = hit;
+				break;
+			}
+		}
+	}
+
+	const textSignalsVerify = /verify-vuln:|\[双盲独立复验任务/i.test(text);
+	const textSignalsReflect = /\breflect:|战略复盘/i.test(text);
+
+	if (matched) {
+		const key = String(matched.key ?? "");
+		return {
+			intentId: matched.id,
+			intentKey: key,
+			phase: matched.phase,
+			isVerify: normAgent === "nuwa-verifier" || /(?:^|:)verify-vuln:/i.test(key) || textSignalsVerify,
+			isReflect: /^reflect:/i.test(key) || textSignalsReflect,
+		};
+	}
+
+	return {
+		phase: fallbackPhase,
+		isVerify: normAgent === "nuwa-verifier" || textSignalsVerify,
+		isReflect: textSignalsReflect,
+	};
+}
+
 function cleanModelName(value: string | undefined): string | undefined {
 	const trimmed = (value ?? "").trim();
 	return trimmed.length > 0 ? trimmed : undefined;
@@ -693,7 +775,7 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 	const isVerifyTask =
 		agentName === "nuwa-verifier" ||
 		Boolean(input.hasPendingVerify) ||
-		keys.some((k) => k.startsWith("verify-vuln:") || k.startsWith("verify:"));
+		keys.some((k) => /(?:^|:)verify-vuln:/i.test(k) || k.startsWith("verify:"));
 
 	if (isVerifyTask) {
 		return verifyModel ?? deepModel;

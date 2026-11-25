@@ -3,6 +3,7 @@
  *
  * 约束：仅使用 import type 引用 ./nuwa，保持运行时零循环依赖。
  */
+import { posix as posixPath } from "node:path";
 import type { Mode } from "./nuwa";
 
 export interface ScopePolicy {
@@ -12,6 +13,10 @@ export interface ScopePolicy {
 	allowSubdomains: boolean;
 	allowPrivateNetwork: boolean;
 	allowDestructive: boolean;
+	/** v4.1 回环地址放行策略；undefined 兼容历史策略，false 时禁止越界访问宿主机回环。 */
+	allowLoopback?: boolean;
+	/** v5.0 受控 OOB（带外回调，如 Interactsh/DNSLog）允许域名白名单。 */
+	oobDomains?: string[];
 }
 
 export interface ScopeBlockVerdict {
@@ -295,115 +300,288 @@ const NET_CLIENT_CMDS = new Set([
 	"mongosh",
 ]);
 
-/** 紧跟文件/头部/报文/配置值而非目标主机的 CLI 选项。 */
+/** 跨工具通用的长参数名：紧跟 payload / 请求头 / Cookie / 输出文件 / 配置值而非目标主机。 */
 const NON_HOST_VALUE_FLAGS = new Set([
-	"-o",
 	"--output",
-	"-D",
+	"--output-document",
+	"--output-file",
+	"--output-dir",
+	"--append-output",
+	"--directory-prefix",
 	"--dump-header",
-	"-b",
 	"--cookie",
-	"-c",
 	"--cookie-jar",
-	"-d",
+	"--load-cookies",
+	"--save-cookies",
 	"--data",
 	"--data-raw",
 	"--data-binary",
 	"--data-urlencode",
 	"--data-ascii",
-	"-F",
+	"--json",
+	"--body",
+	"--body-data",
+	"--body-file",
+	"--post-data",
+	"--post-file",
 	"--form",
-	"-H",
+	"--form-string",
 	"--header",
-	"-A",
+	"--headers",
 	"--user-agent",
-	"-e",
 	"--referer",
-	"-X",
 	"--request",
-	"-T",
+	"--method",
 	"--upload-file",
-	"-K",
 	"--config",
 	"--cacert",
 	"--capath",
-	"-CAfile",
-	"-CApath",
+	"--ca-certificate",
+	"--ca-directory",
 	"--cert",
+	"--certificate",
 	"--key",
-	"-cert",
-	"-key",
-	"-in",
-	"-out",
-	"-w",
+	"--private-key",
 	"--write-out",
-	"-m",
 	"--max-time",
 	"--connect-timeout",
-	"-oN",
-	"-oX",
-	"-oG",
-	"-oA",
-	"-oS",
-	"-iL",
+	"--timeout",
+	"--tries",
+	"--wordlist",
 	"--excludefile",
 	"--datadir",
 	"--script",
 	"--script-args",
 	"--script-args-file",
-	"-p",
 	"--ports",
-	"-g",
 	"--source-port",
 	"--interface",
-	"-of",
-	"-od",
-	"-fc",
-	"-mc",
-	"-fs",
-	"-ms",
-	"-fw",
-	"-mw",
-	"-fl",
-	"-ml",
-	"-t",
-	"-rate",
-	"-i",
-	"-l",
-	"-L",
-	"-P",
-	"--output-document",
-	"--save-headers",
-	"--post-data",
-	"--post-file",
+	"--oauth2-bearer",
+	"--auth-cred",
+	"--auth-type",
+	"--http-user",
+	"--http-password",
+	"--password",
+	"--tamper",
+	"--prefix",
+	"--suffix",
+	"--technique",
+	"--dbms",
+	"--level",
+	"--risk",
+	"--threads",
+	"--rate",
+	"--rate-limit",
+	"--templates",
+	"--tags",
+	"--severity",
 ]);
+
+interface CmdFlagSpec {
+	exact: Set<string>;
+	shortPrefixes: readonly string[];
+}
+
+function makeFlagSpec(extraExact: readonly string[], shortPrefixes: readonly string[] = []): CmdFlagSpec {
+	return {
+		exact: new Set([...NON_HOST_VALUE_FLAGS, ...extraExact]),
+		shortPrefixes,
+	};
+}
+
+const CURL_FLAG_SPEC = makeFlagSpec(
+	["-d", "-F", "-H", "-b", "-c", "-e", "-A", "-X", "-o", "-D", "-T", "-K", "-w", "-m", "-u", "--user", "-E", "-r", "-z", "-C", "-Y", "-y", "-t"],
+	["-d", "-F", "-H", "-b", "-c", "-e", "-A", "-X", "-o", "-D", "-T", "-K", "-w", "-m", "-u"],
+);
+const WGET_FLAG_SPEC = makeFlagSpec(
+	["-O", "-o", "-a", "-P", "-T", "-t", "-U", "-i", "--user"],
+	["-O", "-o", "-P", "-T", "-t", "-U"],
+);
+const FUZZ_FLAG_SPEC = makeFlagSpec(
+	[
+		"-H",
+		"-b",
+		"-c",
+		"-d",
+		"-X",
+		"-w",
+		"-o",
+		"-of",
+		"-od",
+		"-fc",
+		"-mc",
+		"-fs",
+		"-ms",
+		"-fw",
+		"-mw",
+		"-fl",
+		"-ml",
+		"-t",
+		"-rate",
+		"-p",
+		"-e",
+		"-A",
+		"-timeout",
+		"-z",
+	],
+	["-H", "-d", "-b", "-o", "-w", "-X", "-A"],
+);
+const WEB_SCAN_FLAG_SPEC = makeFlagSpec(
+	[
+		"-H",
+		"-b",
+		"-d",
+		"-X",
+		"-body",
+		"-o",
+		"-t",
+		"-templates",
+		"-tags",
+		"-severity",
+		"-etags",
+		"-rl",
+		"-rate",
+		"-rate-limit",
+		"-c",
+		"-timeout",
+		"-fc",
+		"-mc",
+		"-fs",
+		"-ms",
+		"-l",
+		"-A",
+		"-w",
+		"-p",
+		"-P",
+	],
+	["-H", "-d", "-b", "-o", "-X", "-A"],
+);
+const SQLMAP_FLAG_SPEC = makeFlagSpec(["-H", "-A", "-p", "-r", "-l", "-m", "-c", "-t"], ["-H", "-A"]);
+const NMAP_FLAG_SPEC = makeFlagSpec(
+	["-oN", "-oX", "-oG", "-oA", "-oS", "-oJ", "-iL", "-p", "-g", "-e", "-rate", "-c"],
+	["-p"],
+);
+const OPENSSL_FLAG_SPEC = makeFlagSpec(["-CAfile", "-CApath", "-cert", "-key", "-in", "-out", "-passin", "-passout"]);
+const SSH_FLAG_SPEC = makeFlagSpec(["-i", "-l", "-p", "-P", "-F", "-c", "-E"]);
+const DB_FLAG_SPEC = makeFlagSpec(["-u", "-U", "--user", "--username", "-P", "--port", "-D", "-d", "--database", "--dbname", "-a"], ["-p"]);
+const SUBDOMAIN_FLAG_SPEC = makeFlagSpec(["-o", "-oJ", "-oD", "-t", "-rl", "-config", "-pc", "-rf"]);
+const NC_FLAG_SPEC = makeFlagSpec(["-p", "-w", "-i"]);
+const PING_FLAG_SPEC = makeFlagSpec(["-c", "-i", "-w", "-W", "-I", "-s"]);
+const BRUTE_FLAG_SPEC = makeFlagSpec(["-l", "-L", "-p", "-P", "-t", "-w", "-o", "-s", "-C"]);
+const DEFAULT_NET_FLAG_SPEC = makeFlagSpec([]);
+
+function getCmdNonHostFlags(cmdName: string): CmdFlagSpec {
+	switch (cmdName) {
+		case "curl":
+			return CURL_FLAG_SPEC;
+		case "wget":
+			return WGET_FLAG_SPEC;
+		case "ffuf":
+		case "gobuster":
+		case "feroxbuster":
+		case "dirsearch":
+		case "dirb":
+		case "wfuzz":
+			return FUZZ_FLAG_SPEC;
+		case "httpx":
+		case "nuclei":
+		case "katana":
+		case "whatweb":
+		case "nikto":
+		case "wpscan":
+			return WEB_SCAN_FLAG_SPEC;
+		case "sqlmap":
+			return SQLMAP_FLAG_SPEC;
+		case "nmap":
+		case "masscan":
+			return NMAP_FLAG_SPEC;
+		case "openssl":
+			return OPENSSL_FLAG_SPEC;
+		case "ssh":
+		case "scp":
+		case "sftp":
+			return SSH_FLAG_SPEC;
+		case "mysql":
+		case "psql":
+		case "pg_isready":
+		case "redis-cli":
+		case "mongo":
+		case "mongosh":
+			return DB_FLAG_SPEC;
+		case "subfinder":
+		case "amass":
+			return SUBDOMAIN_FLAG_SPEC;
+		case "nc":
+		case "ncat":
+		case "netcat":
+			return NC_FLAG_SPEC;
+		case "ping":
+		case "ping6":
+			return PING_FLAG_SPEC;
+		case "hydra":
+		case "medusa":
+		case "ncrack":
+			return BRUTE_FLAG_SPEC;
+		default:
+			return DEFAULT_NET_FLAG_SPEC;
+	}
+}
+
+/** 必须提取连接/代理目标主机的 CLI 选项（绝不可被 payload 掩码跳过）。 */
+const PROXY_VALUE_FLAGS = new Set([
+	"-x",
+	"--proxy",
+	"--preproxy",
+	"--socks4",
+	"--socks4a",
+	"--socks5",
+	"--socks5-hostname",
+	"-proxy",
+	"-http-proxy",
+	"-replay-proxy",
+]);
+
+/** 显式承载目标 URL 的 CLI 选项（curl 的 -u 为凭据，单独排除）。 */
+const URL_VALUE_FLAGS = new Set(["--url", "-u", "-target", "--target", "--second-url", "--csrf-url"]);
+
+const SCHEME_URL_PREFIX_RE =
+	/^(?:https?|wss?|ftps?|s?ftp|ssh|ldaps?|rediss?|mysql|postgres(?:ql)?|mongodb|socks(?:4a?|5h?)?):\/\//i;
 
 interface ShellToken {
 	text: string;
 	afterRedirect: boolean;
+	start: number;
+	end: number;
 }
 
-/** 将命令行按引号感知切分为子命令 token 序列，并标记重定向目标文件。 */
+/** 将命令行按引号感知切分为子命令 token 序列，记录原文偏移并标记文件重定向目标。 */
 function splitShellCommands(src: string): ShellToken[][] {
 	const cmds: ShellToken[][] = [];
 	let curCmd: ShellToken[] = [];
 	let cur = "";
 	let hasTokenChar = false;
+	let tokStart = -1;
 	let inSingle = false;
 	let inDouble = false;
 	let afterRedirect = false;
 
-	const flushToken = () => {
+	const flushToken = (endPos: number) => {
 		if (hasTokenChar || cur.length > 0) {
-			curCmd.push({ text: cur, afterRedirect });
+			curCmd.push({
+				text: cur,
+				afterRedirect,
+				start: tokStart >= 0 ? tokStart : endPos,
+				end: endPos,
+			});
 			cur = "";
 			hasTokenChar = false;
+			tokStart = -1;
 			afterRedirect = false;
 		}
 	};
 
-	const flushCmd = () => {
-		flushToken();
+	const flushCmd = (endPos: number) => {
+		flushToken(endPos);
 		if (curCmd.length > 0) {
 			cmds.push(curCmd);
 			curCmd = [];
@@ -421,6 +599,10 @@ function splitShellCommands(src: string): ShellToken[][] {
 		if (inDouble) {
 			if (ch === '"') {
 				inDouble = false;
+			} else if (ch === "\\" && src[i + 1] === "\n") {
+				i += 1;
+			} else if (ch === "\\" && src[i + 1] === "\r" && src[i + 2] === "\n") {
+				i += 2;
 			} else if (ch === "\\" && i + 1 < src.length) {
 				cur += src[++i]!;
 			} else {
@@ -429,84 +611,203 @@ function splitShellCommands(src: string): ShellToken[][] {
 			continue;
 		}
 
+		if (ch === "\\" && src[i + 1] === "\n") {
+			i += 1;
+			continue;
+		}
+		if (ch === "\\" && src[i + 1] === "\r" && src[i + 2] === "\n") {
+			i += 2;
+			continue;
+		}
 		if (ch === "'") {
+			if (tokStart < 0) tokStart = i;
 			inSingle = true;
 			hasTokenChar = true;
 			continue;
 		}
 		if (ch === '"') {
+			if (tokStart < 0) tokStart = i;
 			inDouble = true;
 			hasTokenChar = true;
 			continue;
 		}
 		if (ch === "\\" && i + 1 < src.length) {
+			if (tokStart < 0) tokStart = i;
 			cur += src[++i]!;
 			hasTokenChar = true;
 			continue;
 		}
 		if (ch === ";" || ch === "|" || ch === "&" || ch === "\n" || ch === "(" || ch === ")") {
 			if (ch === "&" && src[i + 1] === ">") {
-				flushToken();
+				flushToken(i);
 				i += 1;
 				if (src[i + 1] === ">") i += 1;
 				afterRedirect = true;
 				continue;
 			}
-			flushCmd();
+			flushCmd(i);
 			continue;
 		}
 		if (ch === ">" || ch === "<") {
 			if (/^\d+$/.test(cur)) {
 				cur = "";
 				hasTokenChar = false;
+				tokStart = -1;
 			} else {
-				flushToken();
+				flushToken(i);
 			}
-			while (i + 1 < src.length && (src[i + 1] === ">" || src[i + 1] === "<" || src[i + 1] === "&" || /\d/.test(src[i + 1]!))) {
-				i += 1;
+			let op = ch;
+			while (i + 1 < src.length && (src[i + 1] === ">" || src[i + 1] === "<" || src[i + 1] === "&" || src[i + 1] === "|")) {
+				op += src[++i]!;
+			}
+			// 处理 2>&1 / <&0 / >&- 等文件描述符重定向，避免将后续正常参数误标为重定向目标
+			if (op.endsWith("&")) {
+				const fdStart = i + 1;
+				if (src[fdStart] === "-") {
+					i = fdStart;
+					afterRedirect = false;
+					continue;
+				}
+				if (fdStart < src.length && /\d/.test(src[fdStart]!)) {
+					while (i + 1 < src.length && /\d/.test(src[i + 1]!)) {
+						i += 1;
+					}
+					afterRedirect = false;
+					continue;
+				}
 			}
 			afterRedirect = true;
 			continue;
 		}
 		if (/\s/.test(ch)) {
-			flushToken();
+			flushToken(i);
 			continue;
 		}
+		if (tokStart < 0) tokStart = i;
 		cur += ch;
 		hasTokenChar = true;
 	}
-	flushCmd();
+	flushCmd(src.length);
 	return cmds;
+}
+
+/** 从双引号或未加引号的 shell 片段中提取可执行命令替换 $(...) / `...` 正文（跳过单引号内字面量）。 */
+function extractCommandSubstitutions(raw: string): string[] {
+	const subs: string[] = [];
+	let inSingle = false;
+	let inDouble = false;
+	for (let i = 0; i < raw.length; i++) {
+		const ch = raw[i]!;
+		if (inSingle) {
+			if (ch === "'") inSingle = false;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < raw.length) {
+			i += 1;
+			continue;
+		}
+		if (!inDouble && ch === "'") {
+			inSingle = true;
+			continue;
+		}
+		if (ch === '"') {
+			inDouble = !inDouble;
+			continue;
+		}
+		if (ch === "$" && raw[i + 1] === "(" && raw[i + 2] !== "(") {
+			let depth = 1;
+			let j = i + 2;
+			let innerSingle = false;
+			let innerDouble = false;
+			while (j < raw.length && depth > 0) {
+				const c = raw[j]!;
+				if (innerSingle) {
+					if (c === "'") innerSingle = false;
+				} else if (c === "\\" && j + 1 < raw.length) {
+					j += 1;
+				} else if (!innerDouble && c === "'") {
+					innerSingle = true;
+				} else if (c === '"') {
+					innerDouble = !innerDouble;
+				} else if (!innerDouble) {
+					if (c === "(") depth++;
+					else if (c === ")") depth--;
+				}
+				j++;
+			}
+			const body = raw.slice(i + 2, depth === 0 ? j - 1 : j).trim();
+			if (body) subs.push(body);
+			i = j - 1;
+			continue;
+		}
+		if (ch === "`") {
+			let j = i + 1;
+			while (j < raw.length) {
+				if (raw[j] === "\\" && j + 1 < raw.length) {
+					j += 2;
+					continue;
+				}
+				if (raw[j] === "`") break;
+				j++;
+			}
+			const body = raw.slice(i + 1, j).trim();
+			if (body) subs.push(body);
+			i = j;
+			continue;
+		}
+	}
+	return subs;
 }
 
 const WRAPPER_CMDS = new Set(["sudo", "env", "nohup", "nice", "stdbuf", "command", "builtin", "exec", "time"]);
 
+function findSubcommandIndex(tokens: readonly ShellToken[]): number {
+	let idx = 0;
+	while (idx < tokens.length) {
+		const t = tokens[idx]!.text;
+		if (!t || tokens[idx]!.afterRedirect) {
+			idx++;
+			continue;
+		}
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+			idx++;
+			continue;
+		}
+		const base = (t.split("/").pop() ?? t).toLowerCase();
+		if (WRAPPER_CMDS.has(base)) {
+			idx++;
+			while (idx < tokens.length && tokens[idx]!.text.startsWith("-")) idx++;
+			continue;
+		}
+		if (base === "timeout") {
+			idx += 1;
+			while (idx < tokens.length && tokens[idx]!.text.startsWith("-")) {
+				const f = tokens[idx]!.text;
+				idx++;
+				if ((f === "-k" || f === "-s" || f === "--kill-after" || f === "--signal") && idx < tokens.length) {
+					idx++;
+				}
+			}
+			if (idx < tokens.length) idx++; // 跳过 duration 参数
+			continue;
+		}
+		break;
+	}
+	return idx;
+}
+
+function nextNonRedirectIndex(tokens: readonly ShellToken[], startIdx: number): number {
+	let idx = startIdx;
+	while (idx < tokens.length && tokens[idx]!.afterRedirect) {
+		idx++;
+	}
+	return idx;
+}
+
 function extractBareDomainsFromCommands(rest: string, onCandidate: (domain: string) => void): void {
 	const subcmds = splitShellCommands(rest);
 	for (const tokens of subcmds) {
-		let idx = 0;
-		while (idx < tokens.length) {
-			const t = tokens[idx]!.text;
-			if (!t || tokens[idx]!.afterRedirect) {
-				idx++;
-				continue;
-			}
-			if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
-				idx++;
-				continue;
-			}
-			const base = (t.split("/").pop() ?? t).toLowerCase();
-			if (WRAPPER_CMDS.has(base)) {
-				idx++;
-				while (idx < tokens.length && tokens[idx]!.text.startsWith("-")) idx++;
-				continue;
-			}
-			if (base === "timeout") {
-				idx += 2;
-				continue;
-			}
-			break;
-		}
+		const idx = findSubcommandIndex(tokens);
 		if (idx >= tokens.length) continue;
 
 		const cmdName = (tokens[idx]!.text.split("/").pop() ?? tokens[idx]!.text).toLowerCase();
@@ -539,26 +840,38 @@ function extractBareDomainsFromCommands(rest: string, onCandidate: (domain: stri
 		}
 
 		if (NET_CLIENT_CMDS.has(cmdName)) {
+			const flagSpec = getCmdNonHostFlags(cmdName);
+			let afterDoubleDash = false;
 			for (let i = idx + 1; i < tokens.length; i++) {
 				const tok = tokens[i]!;
 				if (tok.afterRedirect) continue;
 				const val = tok.text;
 				if (!val) continue;
-				if (NON_HOST_VALUE_FLAGS.has(val) || (cmdName === "curl" && (val === "-u" || val === "--user"))) {
-					i += 1; // 跳过紧随其后的文件名/头部/配置值
+				if (!afterDoubleDash && val === "--") {
+					afterDoubleDash = true;
 					continue;
 				}
-				if (val.startsWith("-")) {
-					const eq = val.indexOf("=");
-					if (eq > 0) {
-						const flagPart = val.slice(0, eq);
-						if (NON_HOST_VALUE_FLAGS.has(flagPart) || (cmdName === "curl" && flagPart === "--user")) {
+				if (!afterDoubleDash) {
+					if (flagSpec.exact.has(val)) {
+						i = nextNonRedirectIndex(tokens, i + 1); // 跳过紧随其后的文件名/头部/配置值
+						continue;
+					}
+					if (val.startsWith("-")) {
+						if (val.length > 2 && !val.startsWith("--") && flagSpec.shortPrefixes.some((p) => val.startsWith(p))) {
 							continue;
 						}
-						const rhs = val.slice(eq + 1).split("/")[0]!.replace(/:\d{1,5}$/, "");
-						if (looksLikeDomain(rhs)) onCandidate(rhs);
+						const eq = val.indexOf("=");
+						if (eq > 0) {
+							const flagPart = val.slice(0, eq);
+							if (flagSpec.exact.has(flagPart)) {
+								continue;
+							}
+							const rhsRaw = val.slice(eq + 1).replace(/^[^@/]+@/, "");
+							const rhs = rhsRaw.split("/")[0]!.replace(/:\d{1,5}$/, "");
+							if (looksLikeDomain(rhs)) onCandidate(rhs);
+						}
+						continue;
 					}
-					continue;
 				}
 				if (/^(?:\.{0,2}\/|~\/|@)/.test(val) || val.includes("@")) continue;
 				const hostPart = val.split("/")[0]!.replace(/:\d{1,5}$/, "");
@@ -708,7 +1021,7 @@ function uniqClean(items: readonly string[] | undefined, allowCidr = false): str
 
 /**
  * 为指定目标与运行模式生成默认靶标范围策略。
- * 支持读取环境变量 NUWA_SCOPE_ALLOW_SUBDOMAINS / NUWA_SCOPE_ALLOW_CIDRS，overrides 显式字段优先。
+ * 支持读取环境变量 NUWA_SCOPE_ALLOW_SUBDOMAINS / NUWA_SCOPE_ALLOW_CIDRS / NUWA_SCOPE_ALLOW_LOOPBACK / NUWA_SCOPE_OOB_DOMAINS，overrides 显式字段优先。
  */
 export function defaultScopeForTarget(
 	targetUrlOrHost: string,
@@ -723,12 +1036,37 @@ export function defaultScopeForTarget(
 		.map((s) => s.trim())
 		.filter(Boolean);
 
+	const envLoopRaw = (process.env.NUWA_SCOPE_ALLOW_LOOPBACK ?? "").trim().toLowerCase();
+	const envLoopback: boolean | undefined =
+		envLoopRaw === "1" || envLoopRaw === "true"
+			? true
+			: envLoopRaw === "0" || envLoopRaw === "false"
+				? false
+				: undefined;
+
+	const envOobDomains = (process.env.NUWA_SCOPE_OOB_DOMAINS ?? "")
+		.split(/[,\s]+/)
+		.map((s) => s.trim())
+		.filter(Boolean);
+
 	const m = String(mode ?? "ctf").toLowerCase();
 	const defaultHosts = host ? [host] : m === "coding" || m === "ops" ? ["127.0.0.1", "localhost", "::1"] : [];
 
-	const allowHosts = overrides?.allowHosts !== undefined ? uniqClean(overrides.allowHosts, false) : uniqClean(defaultHosts, false);
-	const allowCidrs = overrides?.allowCidrs !== undefined ? uniqClean(overrides.allowCidrs, true) : uniqClean(envCidrs, true);
+	const allowHosts =
+		overrides?.allowHosts !== undefined ? uniqClean(overrides.allowHosts, false) : uniqClean(defaultHosts, false);
+	const allowCidrs =
+		overrides?.allowCidrs !== undefined ? uniqClean(overrides.allowCidrs, true) : uniqClean(envCidrs, true);
 	const denyHosts = uniqClean(overrides?.denyHosts, true);
+
+	const allowLoopback =
+		overrides?.allowLoopback !== undefined
+			? overrides.allowLoopback
+			: envLoopback !== undefined
+				? envLoopback
+				: !host || isLoopbackHost(host) || m === "coding" || m === "ops" || m === "ctf";
+
+	const oobDomains =
+		overrides?.oobDomains !== undefined ? uniqClean(overrides.oobDomains, false) : uniqClean(envOobDomains, false);
 
 	return {
 		allowHosts,
@@ -737,6 +1075,8 @@ export function defaultScopeForTarget(
 		allowSubdomains: overrides?.allowSubdomains ?? envSub,
 		allowPrivateNetwork: overrides?.allowPrivateNetwork ?? false,
 		allowDestructive: overrides?.allowDestructive ?? false,
+		allowLoopback,
+		oobDomains,
 	};
 }
 
@@ -762,7 +1102,7 @@ function matchesHostPattern(host: string, rawPattern: string): boolean {
 
 /**
  * 校验主机或 CIDR 是否在 ScopePolicy 允许范围内。
- * 优先级：denyHosts 黑名单 > 回环地址放行 > allowHosts（精确 / *.domain / allowSubdomains）> IPv4 CIDR > allowPrivateNetwork。
+ * 优先级：denyHosts 黑名单 > 回环策略（allowLoopback）> allowHosts（精确 / *.domain / allowSubdomains）> oobDomains > IPv4 CIDR > allowPrivateNetwork。
  */
 export function isHostInScope(host: string, scope: ScopePolicy): { ok: boolean; reason?: string } {
 	const norm = normalizeHostToken(host, true);
@@ -781,8 +1121,9 @@ export function isHostInScope(host: string, scope: ScopePolicy): { ok: boolean; 
 		}
 	}
 
-	// 2. 本地回环地址放行（未命中 denyHosts）
-	if (!norm.includes("/") && isLoopbackHost(norm)) {
+	// 2. 本地回环地址策略（未命中 denyHosts；allowLoopback === false 时仅允许 allowHosts 显式放行）
+	const isLoopback = !norm.includes("/") && isLoopbackHost(norm);
+	if (isLoopback && scope.allowLoopback !== false) {
 		return { ok: true };
 	}
 
@@ -805,6 +1146,33 @@ export function isHostInScope(host: string, scope: ScopePolicy): { ok: boolean; 
 				return { ok: true };
 			}
 		}
+	}
+
+	// 3b. 受控 OOB 回调域名白名单（精确匹配或子域名 *.oobDomain）
+	if (!targetIsIpOrCidr) {
+		for (const rawOob of scope.oobDomains ?? []) {
+			const oobNorm = normalizeHostToken(rawOob, false);
+			if (!oobNorm || oobNorm === "*" || !oobNorm.includes(".")) continue;
+			if (oobNorm.startsWith("*.")) {
+				const base = oobNorm.slice(2);
+				if (base && norm.endsWith(`.${base}`) && norm.length > base.length + 1) {
+					return { ok: true };
+				}
+			} else if (
+				parseIpv4(oobNorm) === null &&
+				!isIpv6Literal(oobNorm) &&
+				(norm === oobNorm || (norm.endsWith(`.${oobNorm}`) && norm.length > oobNorm.length + 1))
+			) {
+				return { ok: true };
+			}
+		}
+	}
+
+	if (isLoopback) {
+		return {
+			ok: false,
+			reason: `回环目标 ${norm} 被默认策略禁止 (allowLoopback=false)`,
+		};
 	}
 
 	// 4. IPv4 CIDR 掩码匹配
@@ -864,9 +1232,38 @@ function looksLikeDomain(candidate: string): boolean {
 	return false;
 }
 
+function extractUrlHostnameLoose(rawUrl: string): string | null {
+	const cleaned = rawUrl.trim().replace(/[.,;:!?]+$/, "");
+	if (!cleaned) return null;
+	try {
+		const u = new URL(cleaned);
+		return u.hostname || null;
+	} catch {
+		const m = /^[a-z0-9+.-]+:\/\/(?:[^/@\s]+@)?(\[[^\]]+\]|[^/:?#\s]+)/i.exec(cleaned);
+		return m?.[1] ?? null;
+	}
+}
+
+function extractProxyHostLoose(rawProxy: string): string | null {
+	const trimmed = rawProxy.trim();
+	if (!trimmed) return null;
+	if (SCHEME_URL_PREFIX_RE.test(trimmed)) {
+		return extractUrlHostnameLoose(trimmed);
+	}
+	const noCred = trimmed.replace(/^[^/@\s]+@/, "");
+	if (noCred.startsWith("[")) {
+		const close = noCred.indexOf("]");
+		return close > 1 ? noCred.slice(1, close) : null;
+	}
+	const hostPart = noCred.split("/")[0]?.replace(/:\d{1,5}$/, "") ?? "";
+	return hostPart || null;
+}
+
 /**
  * 从命令行文本中提取所有潜在网络目标（主机名、IPv4、IPv6、IPv4 CIDR）。
  * 覆盖：显式 URL、curl、nmap、openssl、nc、ssh、数据库客户端、/dev/tcp、Python/Node socket 连接及裸 IP/域名。
+ * 对已识别的 HTTP/网络客户端子命令按位置与选项语义解析：自动掩码 payload/header/output 参数值，
+ * 避免 SSRF 测试载荷（如 -d 'url=http://169.254.169.254/' 或 -H 'Referer: ...'）误触发 N-007。
  */
 export function extractCommandTargets(cmd: string): string[] {
 	const text = String(cmd ?? "");
@@ -887,17 +1284,141 @@ export function extractCommandTargets(cmd: string): string[] {
 		}
 	};
 
-	// 1. 提取完整 scheme://... URL，仅取其连接目标 hostname，并从剩余扫描串抹除以避免路径/query 二次干扰
-	const urlRe = /\b(?:https?|wss?|ftps?|s?ftp|ssh|ldaps?|rediss?|mysql|postgres(?:ql)?|mongodb):\/\/[^\s'"`<>|;&)]+/gi;
-	const rest = text.replace(urlRe, (fullUrl) => {
-		const cleaned = fullUrl.replace(/[.,;:!?]+$/, "");
-		try {
-			const u = new URL(cleaned);
-			addTarget(u.hostname);
-		} catch {
-			const m = /^[a-z0-9+.-]+:\/\/(\[[^\]]+\]|[^/:?#]+)/i.exec(cleaned);
-			if (m?.[1]) addTarget(m[1]);
+	// 0. 对已识别网络/HTTP 客户端子命令做 token 级位置解析：
+	//    - 掩码 payload/header/output 等非主机参数值（保留其中可执行 $(...) / `...` 命令替换）
+	//    - 优先按位置提取代理选项（-x/--proxy/--preproxy/--socks*）、URL 选项（--url/-u）与位置 URL 主机
+	const chars = text.split("");
+	const embeddedSubCmds: string[] = [];
+	const maskTokenSpan = (tok: ShellToken, scanSubCmds = true) => {
+		if (scanSubCmds && tok.end > tok.start) {
+			const rawSlice = text.slice(tok.start, tok.end);
+			for (const sub of extractCommandSubstitutions(rawSlice)) {
+				embeddedSubCmds.push(sub);
+			}
 		}
+		for (let k = tok.start; k < tok.end && k < chars.length; k++) {
+			chars[k] = " ";
+		}
+	};
+
+	const parsedSubcmds = splitShellCommands(text);
+	for (const tokens of parsedSubcmds) {
+		const cmdIdx = findSubcommandIndex(tokens);
+		if (cmdIdx >= tokens.length) continue;
+		const cmdName = (tokens[cmdIdx]!.text.split("/").pop() ?? tokens[cmdIdx]!.text).toLowerCase();
+		if (!NET_CLIENT_CMDS.has(cmdName)) continue;
+
+		const flagSpec = getCmdNonHostFlags(cmdName);
+		let afterDoubleDash = false;
+
+		for (let i = cmdIdx + 1; i < tokens.length; i++) {
+			const tok = tokens[i]!;
+			if (tok.afterRedirect) continue;
+			const val = tok.text;
+			if (!afterDoubleDash && val === "--") {
+				afterDoubleDash = true;
+				continue;
+			}
+
+			if (!afterDoubleDash) {
+				// 代理/路由选项：提取代理主机并掩码该选项与值，保持从左到右的目标顺序
+				if (PROXY_VALUE_FLAGS.has(val)) {
+					const nextIdx = nextNonRedirectIndex(tokens, i + 1);
+					if (nextIdx < tokens.length) {
+						const proxyTok = tokens[nextIdx]!;
+						const h = extractProxyHostLoose(proxyTok.text);
+						if (h) addTarget(h);
+						maskTokenSpan(tok, false);
+						maskTokenSpan(proxyTok, true);
+						i = nextIdx;
+					}
+					continue;
+				}
+				if (cmdName === "curl" && val.startsWith("-x") && val.length > 2) {
+					const h = extractProxyHostLoose(val.slice(2));
+					if (h) addTarget(h);
+					maskTokenSpan(tok, true);
+					continue;
+				}
+
+				// 非主机值选项（独立参数）：同时掩码选项与紧随其后的值
+				if (flagSpec.exact.has(val)) {
+					maskTokenSpan(tok, false);
+					const nextIdx = nextNonRedirectIndex(tokens, i + 1);
+					if (nextIdx < tokens.length) {
+						maskTokenSpan(tokens[nextIdx]!, true);
+						i = nextIdx;
+					}
+					continue;
+				}
+
+				// 显式 URL 选项（独立参数）：如 --url / ffuf -u / sqlmap -u / httpx -u / nuclei -u（不含 curl -u）
+				if (URL_VALUE_FLAGS.has(val) && !(cmdName === "curl" && val === "-u")) {
+					const nextIdx = nextNonRedirectIndex(tokens, i + 1);
+					if (nextIdx < tokens.length) {
+						const urlTok = tokens[nextIdx]!;
+						if (SCHEME_URL_PREFIX_RE.test(urlTok.text)) {
+							const h = extractUrlHostnameLoose(urlTok.text);
+							if (h) addTarget(h);
+							maskTokenSpan(tok, false);
+							maskTokenSpan(urlTok, true);
+							i = nextIdx;
+							continue;
+						}
+					}
+					continue;
+				}
+
+				if (val.startsWith("-")) {
+					// 短选项紧贴值（如 curl -d'url=...' / -H"Referer: ..." / -ehttp://... / -oout.test / -uuser:pass）
+					// 必须在 indexOf("=") 之前判断，因为紧贴的 payload 值内部常包含 '='
+					if (val.length > 2 && !val.startsWith("--") && flagSpec.shortPrefixes.some((p) => val.startsWith(p))) {
+						maskTokenSpan(tok, true);
+						continue;
+					}
+					const eq = val.indexOf("=");
+					if (eq > 0) {
+						const flagPart = val.slice(0, eq);
+						const rhs = val.slice(eq + 1);
+						if (PROXY_VALUE_FLAGS.has(flagPart)) {
+							const h = extractProxyHostLoose(rhs);
+							if (h) addTarget(h);
+							maskTokenSpan(tok, true);
+							continue;
+						}
+						if (flagSpec.exact.has(flagPart)) {
+							maskTokenSpan(tok, true);
+							continue;
+						}
+						if (URL_VALUE_FLAGS.has(flagPart) && !(cmdName === "curl" && flagPart === "-u") && SCHEME_URL_PREFIX_RE.test(rhs)) {
+							const h = extractUrlHostnameLoose(rhs);
+							if (h) addTarget(h);
+							maskTokenSpan(tok, true);
+							continue;
+						}
+						continue;
+					}
+					continue;
+				}
+			}
+
+			// 位置完整 URL 参数：只取 URL 真实连接主机并掩码整个 token（屏蔽 query 中内嵌回调 URL/IP）
+			if (SCHEME_URL_PREFIX_RE.test(val)) {
+				const h = extractUrlHostnameLoose(val);
+				if (h) addTarget(h);
+				maskTokenSpan(tok, true);
+			}
+		}
+	}
+
+	const maskedText = chars.join("");
+
+	// 1. 提取剩余文本（非 HTTP 客户端子命令、管道、内联脚本、环境变量等）中的完整 scheme://... URL
+	const urlRe =
+		/\b(?:https?|wss?|ftps?|s?ftp|ssh|ldaps?|rediss?|mysql|postgres(?:ql)?|mongodb|socks(?:4a?|5h?)?):\/\/[^\s'"`<>|;&)]+/gi;
+	const rest = maskedText.replace(urlRe, (fullUrl) => {
+		const h = extractUrlHostnameLoose(fullUrl);
+		if (h) addTarget(h);
 		return " ";
 	});
 
@@ -974,17 +1495,37 @@ export function extractCommandTargets(cmd: string): string[] {
 	// 10. 网络相关命令与脚本外部参数中的裸域名（跳过 -c/-e 内联代码正文及 -o/-D/-oN 等非主机选项值）
 	extractBareDomainsFromCommands(rest, (cand) => addTarget(cand));
 
+	// 11. 递归检查掩码值中出现的可执行命令替换（如 -d "x=$(curl http://evil.com)"），严防命令替换绕过 N-007
+	for (const sub of embeddedSubCmds) {
+		for (const t of extractCommandTargets(sub)) {
+			addTarget(t, t.includes("/"));
+		}
+	}
+
 	return found;
 }
 
 const NUWA_PROTECTED_TARGET_RE =
-	/(?:^|[\s'"`=(/\\])\.nuwa(?:[\\/](?:state\.json|journal[^/\s'"`)|;&]*|exec-ledger[^/\s'"`)|;&]*|snap(?:[\\/][^\s'"`)|;&]*)?|state\.lock|\*)|[\\/]?['"`\s;|&)]|[\\/]?$)/i;
+	/(?:^|[\s'"`=(/\\])\.nuwa(?:[\\/](?:state\.json|journal[^/\s'"`)|;&]*|exec-ledger[^/\s'"`)|;&]*|snap(?:[\\/][^\s'"`)|;&]*)?|sessions(?:[\\/][^\s'"`)|;&]*)?|state\.lock|\*)|[\\/]?['"`\s;|&)]|[\\/]?$)/i;
 
 const NUWA_PROTECTED_FILE_ONLY_RE =
-	/\.nuwa[\\/](?:state\.json|journal[^/\s'"`)|;&]*|exec-ledger[^/\s'"`)|;&]*|snap(?:[\\/][^\s'"`)|;&]*)?|state\.lock)/i;
+	/\.nuwa[\\/](?:state\.json|journal[^/\s'"`)|;&]*|exec-ledger[^/\s'"`)|;&]*|snap(?:[\\/][^\s'"`)|;&]*)?|sessions(?:[\\/][^\s'"`)|;&]*)?|state\.lock)/i;
 
 const NUWA_REDIRECT_RE =
-	/(?:>>?|>\||&>>?|tee\s+(?:-[a-zA-Z]+\s+)*)[^\n;|&]*\.nuwa[\\/](?:state\.json|journal|exec-ledger|snap|state\.lock)/i;
+	/(?:>>?|>\||&>>?|tee\s+(?:-[a-zA-Z]+\s+)*)[^\n;|&]*\.nuwa[\\/](?:state\.json|journal|exec-ledger|snap|sessions(?:[\\/][^\s'"`)|;&]*)?|state\.lock)/i;
+
+const NUWA_SESSIONS_REF_RE =
+	/(?:^|[\s'"`=(/@<\\:,{[])\.nuwa(?:[\\/]+\.)?[\\/]+sessions(?:[\\/]+[^\s'"`)|;&]*)?(?=$|[\s'"`)|;&/\\,}\]])/i;
+
+const NUWA_SESSIONS_JOIN_RE = /['"]\.nuwa['"]\s*,\s*['"]sessions['"]/i;
+
+const NUWA_VAULT_FILE_RE =
+	/(?:^|[\s'"`=(/@<\\:,{[])\.nuwa[\\/]+[^\s'"`)|;&]*vault\.json(?=$|[\s'"`)|;&/\\,}\]])/i;
+
+function hasNuwaSessionsReference(text: string): boolean {
+	if (!text.toLowerCase().includes(".nuwa")) return false;
+	return NUWA_SESSIONS_REF_RE.test(text) || NUWA_SESSIONS_JOIN_RE.test(text) || NUWA_VAULT_FILE_RE.test(text);
+}
 
 const NUWA_FILE_MUTATE_CMD_RE =
 	/(?:^|[;&|()\s`])(?:sudo\s+)?(?:rm|unlink|shred|mv|cp|install|ln|truncate|dd|chmod|chown|touch)\b/i;
@@ -996,11 +1537,20 @@ const NUWA_SCRIPT_WRITE_RE =
 	/\b(?:writeFileSync|writeFile|appendFileSync|appendFile|unlinkSync|unlink|rmSync|rmdirSync|renameSync|copyFileSync|truncateSync|openSync|Bun\.write|write_text|write_bytes|rmtree|os\.remove|os\.unlink|os\.rename|os\.replace|shutil\.(?:move|copy|copy2|copyfile|rmtree)|json\.dump|open\s*\([^)]*,\s*['"][wa+x])/i;
 
 /**
- * 检查命令是否试图篡改 .nuwa/ 下的权威状态（state.json、journal、snap、state.lock 或整个 .nuwa 目录）。
+ * 检查命令是否试图篡改 .nuwa/ 下的权威状态（state.json、journal、snap、state.lock 或整个 .nuwa 目录），
+ * 或读取/外带/篡改 .nuwa/sessions/vault.json 会话保险箱明文凭据。
  */
 export function checkNuwaDirTamper(cmd: string): ScopeBlockVerdict | null {
 	const text = String(cmd ?? "");
-	if (!text.includes(".nuwa")) return null;
+	if (!text.toLowerCase().includes(".nuwa")) return null;
+
+	// 会话保险箱明文凭据保护：严禁任何命令读取、外带或篡改 .nuwa/sessions/ 与 .nuwa/sessions/vault.json
+	if (hasNuwaSessionsReference(text)) {
+		return {
+			block: true,
+			reason: "nuwa N-003: 禁止读取或篡改 .nuwa/sessions/vault.json 会话保险箱明文凭据",
+		};
+	}
 
 	if (NUWA_REDIRECT_RE.test(text)) {
 		return {
@@ -1026,7 +1576,7 @@ export function checkNuwaDirTamper(cmd: string): ScopeBlockVerdict | null {
 	// 按子命令段拆分检查 rm / mv / cp / truncate / dd 等文件修改指令
 	const segments = text.split(/[;&|\n]+/);
 	for (const seg of segments) {
-		if (!seg.includes(".nuwa")) continue;
+		if (!seg.toLowerCase().includes(".nuwa")) continue;
 		if (NUWA_INPLACE_EDIT_RE.test(seg) && NUWA_PROTECTED_TARGET_RE.test(seg)) {
 			return {
 				block: true,
@@ -1241,6 +1791,29 @@ export function checkToolScopeAndRisk(
 					: typeof params.url === "string"
 						? params.url.trim()
 						: "";
+		if ((name === "read" || name === "read_file" || !/^https?:\/\//i.test(rawPath)) && rawPath) {
+			const slashPath = rawPath.replace(/\\/g, "/");
+			let decodedPath = slashPath;
+			try {
+				decodedPath = decodeURIComponent(slashPath);
+			} catch {
+				// 忽略非法百分号序列，按原始规范路径校验
+			}
+			const normSlash = posixPath.normalize(slashPath);
+			const normDecoded = posixPath.normalize(decodedPath);
+			const sessionsPathRe = /(?:^|\/)\.nuwa\/sessions(?:\/|$)/i;
+			if (
+				sessionsPathRe.test(slashPath) ||
+				sessionsPathRe.test(normSlash) ||
+				sessionsPathRe.test(decodedPath) ||
+				sessionsPathRe.test(normDecoded)
+			) {
+				return {
+					block: true,
+					reason: "nuwa N-003: 禁止通过 read 工具读取 .nuwa/sessions/vault.json 明文凭据",
+				};
+			}
+		}
 		if (/^https?:\/\//i.test(rawPath)) {
 			const host = parseHostnameFromUrlStrict(rawPath);
 			if (!host) {
@@ -1269,6 +1842,10 @@ export function checkToolScopeAndRisk(
 			};
 		}
 
+		// coding 模式允许访问本地开发回环地址（仍严格服从 denyHosts 黑名单）
+		const browserScope: ScopePolicy =
+			normMode === "coding" && scope.allowLoopback === false ? { ...scope, allowLoopback: true } : scope;
+
 		const rawUrl = typeof params.url === "string" ? params.url.trim() : "";
 		if (rawUrl && rawUrl.toLowerCase() !== "about:blank") {
 			if (/^file:\/\//i.test(rawUrl)) {
@@ -1286,7 +1863,7 @@ export function checkToolScopeAndRisk(
 						reason: `nuwa N-007: browser URL 非法或无法解析主机 (${rawUrl})`,
 					};
 				}
-				const res = isHostInScope(host, scope);
+				const res = isHostInScope(host, browserScope);
 				if (!res.ok) {
 					return {
 						block: true,
@@ -1301,7 +1878,7 @@ export function checkToolScopeAndRisk(
 			} else {
 				const host = parseTargetHost(rawUrl);
 				if (host) {
-					const res = isHostInScope(host, scope);
+					const res = isHostInScope(host, browserScope);
 					if (!res.ok) {
 						return {
 							block: true,
@@ -1323,7 +1900,7 @@ export function checkToolScopeAndRisk(
 				: [];
 
 		for (const rawDomain of domainList) {
-			if (rawDomain === "*" && !(scope.allowHosts ?? []).includes("*")) {
+			if (rawDomain === "*" && !(browserScope.allowHosts ?? []).includes("*")) {
 				return {
 					block: true,
 					reason: "nuwa N-007: browser allowed_domains 禁止配置全局通配符 *",
@@ -1332,7 +1909,7 @@ export function checkToolScopeAndRisk(
 			const candHost = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawDomain)
 				? (parseHostnameFromUrlStrict(rawDomain) ?? rawDomain)
 				: rawDomain;
-			const res = isHostInScope(candHost, scope);
+			const res = isHostInScope(candHost, browserScope);
 			if (!res.ok) {
 				return {
 					block: true,
@@ -1371,6 +1948,12 @@ export function checkToolScopeAndRisk(
 
 		const tamper = checkNuwaDirTamper(code);
 		if (tamper) return tamper;
+		if (hasNuwaSessionsReference(code)) {
+			return {
+				block: true,
+				reason: "nuwa N-003: 禁止读取或篡改 .nuwa/sessions/vault.json 会话保险箱明文凭据",
+			};
+		}
 
 		// 将模板插值替换为占位标识，既避免 '}' 截断 URL，又能拦截 https://${x}.evil.org 外带并放行纯变量主机
 		const normalizedCode = code

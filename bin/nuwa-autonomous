@@ -55,6 +55,8 @@ const REQUIRED_NUWA_TOOLS = [
 
 const CORE_EXT_MODULES = [
 	"types.ts",
+	"storage.ts",
+	"graph.ts",
 	"ui.ts",
 	"ui-native.ts",
 	"autoexec.ts",
@@ -63,6 +65,12 @@ const CORE_EXT_MODULES = [
 	"profiles.ts",
 	"reincarnate.ts",
 ];
+
+const SPLIT_CORE_MODULES = new Set(["storage.ts", "graph.ts"]);
+const DEFAULT_GEN_TIMEOUT_MINUTES = 45;
+const DEFAULT_IDLE_TIMEOUT_MINUTES = 0;
+const WATCHDOG_SIGKILL_GRACE_MS = 1500;
+const MAX_SET_TIMEOUT_MS = 2_147_483_647;
 
 const V4_EXT_MODULES = [
 	"lineage.ts",
@@ -104,6 +112,8 @@ const HELP_TEXT = `女娲 v4.0 外层无头守护器与环境自检工具 (nuwa-
   --root <dir>                 项目根目录（默认: 当前工作目录）
   --max-generations <n>        最大会话世代数（默认: 20）
   --max-hours <h>              最大连续运行时长（小时，默认: 12）
+  --gen-timeout-minutes <m>    单代子进程硬超时上限（分钟，默认: 45；可用 NUWA_GEN_TIMEOUT_MS 毫秒覆盖）
+  --idle-timeout-minutes <m>   空闲看门狗超时（分钟，默认: 0=关闭；可用 NUWA_DAEMON_IDLE_MS 毫秒覆盖）
   --reincarnate-tokens <n>     单代触发换血的上下文 token 阈值（默认: 140000）
   --reincarnate-turns <n>      单代触发换血的轮次阈值（默认: 30）
   --allow-subdomains           放行目标主域的子域名（NUWA_SCOPE_ALLOW_SUBDOMAINS=1）
@@ -126,6 +136,8 @@ const HELP_TEXT = `女娲 v4.0 外层无头守护器与环境自检工具 (nuwa-
 环境变量:
   NUWA_DAEMON_BACKOFF_MS       异常重试基础退避毫秒数（默认: 2000，测试可设小值）
   NUWA_DAEMON_MAX_ERRORS       连续异常退出最大重试次数（默认: 5）
+  NUWA_GEN_TIMEOUT_MS          单代子进程超时覆盖值（毫秒，优先于 --gen-timeout-minutes）
+  NUWA_DAEMON_IDLE_MS          空闲看门狗超时覆盖值（毫秒，0=关闭，优先于 --idle-timeout-minutes）
   PI_AGENT_HOME                指定 omp/pi agent 目录（默认自动探测 ~/.omp/agent 或 ~/.pi/agent）
 `;
 
@@ -155,9 +167,23 @@ function logErr(msg) {
 }
 
 function parsePositiveNumber(name, raw, integerOnly = false) {
+	if (String(raw ?? "").trim() === "") {
+		throw new Error(`参数 ${name} 必须为正${integerOnly ? "整" : ""}数，实际收到: ${raw}`);
+	}
 	const n = Number(raw);
 	if (!Number.isFinite(n) || n <= 0 || (integerOnly && !Number.isInteger(n))) {
 		throw new Error(`参数 ${name} 必须为正${integerOnly ? "整" : ""}数，实际收到: ${raw}`);
+	}
+	return n;
+}
+
+function parseNonNegativeNumber(name, raw, integerOnly = false) {
+	if (String(raw ?? "").trim() === "") {
+		throw new Error(`参数 ${name} 必须为非负${integerOnly ? "整" : ""}数，实际收到: ${raw}`);
+	}
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0 || (integerOnly && !Number.isInteger(n))) {
+		throw new Error(`参数 ${name} 必须为非负${integerOnly ? "整" : ""}数，实际收到: ${raw}`);
 	}
 	return n;
 }
@@ -171,6 +197,8 @@ function parseArgs(argv) {
 		root: process.cwd(),
 		maxGenerations: 20,
 		maxHours: 12,
+		genTimeoutMinutes: DEFAULT_GEN_TIMEOUT_MINUTES,
+		idleTimeoutMinutes: DEFAULT_IDLE_TIMEOUT_MINUTES,
 		reincarnateTokens: 140000,
 		reincarnateTurns: 30,
 		allowSubdomains: false,
@@ -226,6 +254,12 @@ function parseArgs(argv) {
 				break;
 			case "--max-hours":
 				opts.maxHours = parsePositiveNumber(flag, take(), false);
+				break;
+			case "--gen-timeout-minutes":
+				opts.genTimeoutMinutes = parsePositiveNumber(flag, take(), false);
+				break;
+			case "--idle-timeout-minutes":
+				opts.idleTimeoutMinutes = parseNonNegativeNumber(flag, take(), false);
 				break;
 			case "--reincarnate-tokens":
 				opts.reincarnateTokens = parsePositiveNumber(flag, take(), true);
@@ -452,12 +486,22 @@ function checkExtensionInstallation(agentHome) {
 		}
 	}
 
+	const referencesSplitModules =
+		/from\s+["']\.\/(?:storage|graph)(?:\.ts)?["']/.test(indexSrc) ||
+		/require\s*\(\s*["']\.\/(?:storage|graph)(?:\.ts)?["']\s*\)/.test(indexSrc);
+	const hasAnySplitFile = existsSync(join(extDir, "storage.ts")) || existsSync(join(extDir, "graph.ts"));
+	const isLegacyMonolith =
+		!referencesSplitModules &&
+		!hasAnySplitFile &&
+		typeof version === "string" &&
+		(version === "4.0.0" || /^3\./.test(version));
+
 	const coreModulesFound = [];
 	const coreModulesMissing = [];
 	for (const mod of CORE_EXT_MODULES) {
 		if (existsSync(join(extDir, mod))) {
 			coreModulesFound.push(mod);
-		} else {
+		} else if (!isLegacyMonolith || !SPLIT_CORE_MODULES.has(mod)) {
 			coreModulesMissing.push(mod);
 		}
 	}
@@ -865,7 +909,7 @@ function runDoctor(argv) {
 		`${badge(ompCheck)} omp: ${ompCheck.ok ? `${ompCheck.version ?? "ok"} (${ompCheck.path})` : ompCheck.reason}`,
 		`${badge(extensionCheck)} 扩展与工具: ${
 			extensionCheck.ok
-				? `v${extensionCheck.version ?? "?"} · 工具 ${extensionCheck.toolsCount}/${extensionCheck.toolsRequired} · 核心模块 ${extensionCheck.coreModulesFound.length}/${CORE_EXT_MODULES.length} · v4模块 ${extensionCheck.v4ModulesFound.length}/${V4_EXT_MODULES.length}`
+				? `v${extensionCheck.version ?? "?"} · 工具 ${extensionCheck.toolsCount}/${extensionCheck.toolsRequired} · 核心模块 ${extensionCheck.coreModulesFound.length}/${extensionCheck.coreModulesFound.length + extensionCheck.coreModulesMissing.length} · v4模块 ${extensionCheck.v4ModulesFound.length}/${V4_EXT_MODULES.length}`
 				: extensionCheck.reason
 		}`,
 		`${badge(kbCheck)} 知识库 KB: ${
@@ -1068,6 +1112,8 @@ function persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal
 			root: opts.root,
 			maxGenerations: opts.maxGenerations,
 			maxHours: opts.maxHours,
+			genTimeoutMinutes: opts.genTimeoutMinutes,
+			idleTimeoutMinutes: opts.idleTimeoutMinutes,
 			reincarnateTokens: opts.reincarnateTokens,
 			reincarnateTurns: opts.reincarnateTurns,
 			allowSubdomains: opts.allowSubdomains,
@@ -1088,6 +1134,157 @@ function persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal
 
 function shellQuotePreview(arg) {
 	return `'${String(arg).replace(/'/g, `'\\''`)}'`;
+}
+
+function formatDurationMs(ms) {
+	if (ms < 1000) return `${Math.round(ms)}ms`;
+	if (ms < 60_000) return `${Number((ms / 1000).toFixed(2))}s`;
+	return `${Number((ms / 60_000).toFixed(2))}min`;
+}
+
+function fileActivityPart(filePath) {
+	try {
+		const st = statSync(filePath);
+		return `${st.mtimeMs}:${st.size}:${st.ino}`;
+	} catch {
+		return "missing";
+	}
+}
+
+function readActivitySignature(root) {
+	const nuwaDir = join(root, ".nuwa");
+	return `${fileActivityPart(join(nuwaDir, "journal.jsonl"))}|${fileActivityPart(join(nuwaDir, "state.json"))}`;
+}
+
+async function awaitChildWithWatchdog(child, params) {
+	const {
+		root,
+		gen,
+		hardDeadlineMs,
+		deadlineIsMaxHours,
+		genTimeoutMs,
+		idleTimeoutMs,
+		maxHours,
+		startedAt,
+		maxDurationMs,
+		isShuttingDown,
+	} = params;
+
+	let settled = false;
+	let killing = false;
+	let timedOut = false;
+	let timeoutKind = "";
+	let timeoutReason = "";
+	let hardTimer = null;
+	let idleTimer = null;
+	let sigkillTimer = null;
+
+	const clearAllTimers = () => {
+		if (hardTimer !== null) {
+			clearTimeout(hardTimer);
+			hardTimer = null;
+		}
+		if (idleTimer !== null) {
+			clearInterval(idleTimer);
+			idleTimer = null;
+		}
+		if (sigkillTimer !== null) {
+			clearTimeout(sigkillTimer);
+			sigkillTimer = null;
+		}
+	};
+
+	const triggerWatchdog = (kind, reason) => {
+		if (settled || killing || isShuttingDown()) return;
+		killing = true;
+		timedOut = true;
+		timeoutKind = kind;
+		timeoutReason = reason;
+		if (hardTimer !== null) {
+			clearTimeout(hardTimer);
+			hardTimer = null;
+		}
+		if (idleTimer !== null) {
+			clearInterval(idleTimer);
+			idleTimer = null;
+		}
+		logErr(reason);
+		try {
+			child.kill("SIGTERM");
+		} catch {
+			/* 子进程可能已退出 */
+		}
+		sigkillTimer = setTimeout(() => {
+			if (settled) return;
+			logErr(`第 ${gen} 代子进程在 SIGTERM 后 ${WATCHDOG_SIGKILL_GRACE_MS}ms 仍未退出，发送 SIGKILL 强制终止。`);
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				/* ignore */
+			}
+		}, WATCHDOG_SIGKILL_GRACE_MS);
+	};
+
+	// 分片调度硬截止定时器，避免超大毫秒数触发 32-bit setTimeout 溢出
+	const deadlineAt = Date.now() + Math.max(1, hardDeadlineMs);
+	const armHardTimer = () => {
+		if (settled || killing || isShuttingDown()) return;
+		const remain = deadlineAt - Date.now();
+		if (remain <= 0) {
+			const hitMaxHours = deadlineIsMaxHours || Date.now() - startedAt >= maxDurationMs;
+			if (hitMaxHours) {
+				triggerWatchdog(
+					"hard_max_hours",
+					`第 ${gen} 代触发总时长硬上限 (maxHours=${maxHours}h)，发送 SIGTERM 终止子进程...`,
+				);
+			} else {
+				triggerWatchdog(
+					"hard_gen",
+					`第 ${gen} 代触发单代超时看门狗 (genTimeout=${formatDurationMs(genTimeoutMs)})，发送 SIGTERM 终止子进程...`,
+				);
+			}
+			return;
+		}
+		hardTimer = setTimeout(armHardTimer, Math.min(remain, MAX_SET_TIMEOUT_MS));
+	};
+	armHardTimer();
+
+	if (idleTimeoutMs > 0) {
+		let lastSig = readActivitySignature(root);
+		let lastActivityAt = Date.now();
+		const pollMs = Math.max(25, Math.min(5000, Math.floor(idleTimeoutMs / 4)));
+		idleTimer = setInterval(() => {
+			if (settled || killing || isShuttingDown()) return;
+			const curSig = readActivitySignature(root);
+			if (curSig !== lastSig) {
+				lastSig = curSig;
+				lastActivityAt = Date.now();
+				return;
+			}
+			if (Date.now() - lastActivityAt >= idleTimeoutMs) {
+				triggerWatchdog(
+					"idle",
+					`第 ${gen} 代触发空闲看门狗：.nuwa/journal.jsonl 与 .nuwa/state.json 连续 ${formatDurationMs(idleTimeoutMs)} 未更新，判定挂起并发送 SIGTERM...`,
+				);
+			}
+		}, pollMs);
+	}
+
+	try {
+		const rawExitCode = await child.exited;
+		settled = true;
+		clearAllTimers();
+		return {
+			exitCode: timedOut ? 124 : rawExitCode,
+			timedOut,
+			timeoutKind,
+			timeoutReason,
+		};
+	} catch (err) {
+		settled = true;
+		clearAllTimers();
+		throw err;
+	}
 }
 
 async function main() {
@@ -1135,6 +1332,8 @@ async function main() {
 			goal: effectiveGoal,
 			maxGenerations: opts.maxGenerations,
 			maxHours: opts.maxHours,
+			genTimeoutMinutes: opts.genTimeoutMinutes,
+			idleTimeoutMinutes: opts.idleTimeoutMinutes,
 			reincarnateTokens: opts.reincarnateTokens,
 			reincarnateTurns: opts.reincarnateTurns,
 			allowSubdomains: opts.allowSubdomains,
@@ -1183,6 +1382,20 @@ async function main() {
 	const rawMaxErr = Number(process.env.NUWA_DAEMON_MAX_ERRORS ?? 5);
 	const maxConsecutiveErrors = Number.isFinite(rawMaxErr) && rawMaxErr >= 1 ? Math.floor(rawMaxErr) : 5;
 
+	const rawGenTimeoutEnv = (process.env.NUWA_GEN_TIMEOUT_MS ?? "").trim();
+	const parsedGenTimeoutEnv = rawGenTimeoutEnv ? Number(rawGenTimeoutEnv) : NaN;
+	const genTimeoutMs =
+		Number.isFinite(parsedGenTimeoutEnv) && parsedGenTimeoutEnv > 0
+			? parsedGenTimeoutEnv
+			: opts.genTimeoutMinutes * 60_000;
+
+	const rawIdleTimeoutEnv = (process.env.NUWA_DAEMON_IDLE_MS ?? "").trim();
+	const parsedIdleTimeoutEnv = rawIdleTimeoutEnv ? Number(rawIdleTimeoutEnv) : NaN;
+	const idleTimeoutMs =
+		Number.isFinite(parsedIdleTimeoutEnv) && parsedIdleTimeoutEnv >= 0
+			? parsedIdleTimeoutEnv
+			: opts.idleTimeoutMinutes * 60_000;
+
 	const startedAt = Date.now();
 	const maxDurationMs = opts.maxHours * 3600_000;
 	let activeChild = null;
@@ -1216,6 +1429,11 @@ async function main() {
 			process.exit(2);
 		}
 
+		const remainingMaxHoursMs = maxDurationMs - (Date.now() - startedAt);
+		if (remainingMaxHoursMs <= 0) break;
+		const hardDeadlineMs = Math.max(1, Math.min(genTimeoutMs, remainingMaxHoursMs));
+		const deadlineIsMaxHours = remainingMaxHoursMs <= genTimeoutMs;
+
 		const prompt = buildPrompt(opts, preState, gen);
 		const ompArgs = buildOmpArgs(opts, prompt);
 		const childEnv = buildChildEnv(opts, gen);
@@ -1225,6 +1443,8 @@ async function main() {
 		);
 
 		let exitCode = 1;
+		let timedOut = false;
+		let timeoutKind = "";
 		try {
 			activeChild = Bun.spawn([opts.ompBin, ...ompArgs], {
 				cwd: opts.root,
@@ -1233,7 +1453,21 @@ async function main() {
 				stdout: "inherit",
 				stderr: "inherit",
 			});
-			exitCode = await activeChild.exited;
+			const watchRes = await awaitChildWithWatchdog(activeChild, {
+				root: opts.root,
+				gen,
+				hardDeadlineMs,
+				deadlineIsMaxHours,
+				genTimeoutMs,
+				idleTimeoutMs,
+				maxHours: opts.maxHours,
+				startedAt,
+				maxDurationMs,
+				isShuttingDown: () => shuttingDown,
+			});
+			exitCode = watchRes.exitCode;
+			timedOut = watchRes.timedOut;
+			timeoutKind = watchRes.timeoutKind;
 		} catch (err) {
 			logErr(`启动 ${opts.ompBin} 失败: ${err instanceof Error ? err.message : String(err)}`);
 			exitCode = 127;
@@ -1242,6 +1476,11 @@ async function main() {
 		}
 
 		if (shuttingDown) return;
+
+		if (timedOut && (timeoutKind === "hard_max_hours" || Date.now() - startedAt >= maxDurationMs)) {
+			logErr(`已达到最大运行时长上限 (${opts.maxHours}h)，超时终止第 ${gen} 代 (exit=124)。`);
+			process.exit(1);
+		}
 
 		const postState = readDiskState(opts.root);
 		if (postState?.project?.status === "completed") {
@@ -1263,8 +1502,11 @@ async function main() {
 			const remainMs = maxDurationMs - (Date.now() - startedAt);
 			if (remainMs <= 0) break;
 			const actualDelay = Math.min(delayMs, remainMs);
+			const statusLabel = timedOut
+				? `超时终止 (${timeoutKind === "idle" ? "空闲看门狗" : "单代超时"}, exit=124)`
+				: `异常退出 (exit=${exitCode})`;
 			log(
-				`第 ${gen} 代子进程异常退出 (exit=${exitCode})，${actualDelay}ms 后按磁盘状态退避重试（连续错误 ${consecutiveErrors}/${maxConsecutiveErrors}）...`,
+				`第 ${gen} 代子进程${statusLabel}，${actualDelay}ms 后按磁盘状态退避重试（连续错误 ${consecutiveErrors}/${maxConsecutiveErrors}）...`,
 			);
 			if (actualDelay > 0) {
 				await Bun.sleep(actualDelay);

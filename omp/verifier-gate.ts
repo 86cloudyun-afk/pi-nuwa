@@ -266,3 +266,103 @@ export function filterConfirmedProofs(
 	}
 	return out;
 }
+
+export interface VerifyCommitValidationInput {
+	intentKey: string;
+	kind?: string;
+	blocked?: boolean;
+	worker?: string;
+	candidateFact?: VerifiableFact;
+	hasFreshExecution?: boolean;
+	executedByVerifier?: boolean;
+	requireVerifierWorker?: boolean;
+}
+
+export interface VerifyCommitValidationResult {
+	ok: boolean;
+	reason?: string;
+}
+
+export interface FactVerifyPartition {
+	confirmed: VerifiableFact[];
+	candidate: VerifiableFact[];
+	rejected: VerifiableFact[];
+}
+
+/**
+ * 校验双盲复验提交（verify-vuln:*）的硬性门禁条件，防止绕过升格：
+ * - 非 verify-vuln:* 意图或 blocked=true（驳回）直接放行；
+ * - 复验确认必须使用 kind="vuln"（禁止用默认 note 绕过执行账本复验）；
+ * - 要求存在晚于候选创建水位的新增独立工具执行记录（hasFreshExecution !== false）；
+ * - 若启用 requireVerifierWorker 且已记录 worker，则必须由独立审查代理 nuwa-verifier 认领执行。
+ */
+export function validateVerificationCommit(
+	input: VerifyCommitValidationInput,
+): VerifyCommitValidationResult {
+	if (!input || !isVerifyVulnIntentKey(input.intentKey) || input.blocked === true) {
+		return { ok: true };
+	}
+
+	const normKind = String(input.kind ?? "").trim().toLowerCase();
+	if (normKind !== "vuln") {
+		return {
+			ok: false,
+			reason: '双盲复验确认必须使用 kind="vuln" 并通过执行证据账本核验，禁止用默认 note 绕过升格',
+		};
+	}
+
+	if (input.hasFreshExecution === false) {
+		return {
+			ok: false,
+			reason: "双盲复验缺少晚于候选创建时间的独立工具执行记录，禁止复用历史输出直接升格",
+		};
+	}
+
+	const worker = String(input.worker ?? "").trim();
+	if (input.requireVerifierWorker && worker && worker !== "nuwa-verifier") {
+		return {
+			ok: false,
+			reason: "双盲复验须由独立审查代理 nuwa-verifier 认领执行",
+		};
+	}
+
+	return { ok: true };
+}
+
+/**
+ * 按 verifyStage 将事实划分为 confirmed / candidate / rejected 三组（可选按 FactKind 过滤）：
+ * - verifyStage === "rejected" -> rejected
+ * - verifyStage === "candidate" -> candidate
+ * - verifyStage === "confirmed" 或 undefined -> confirmed
+ */
+export function partitionFactsByVerifyStage(
+	facts: Iterable<VerifiableFact> | Record<string, VerifiableFact>,
+	kindFilter?: FactKind,
+): FactVerifyPartition {
+	const confirmed: VerifiableFact[] = [];
+	const candidate: VerifiableFact[] = [];
+	const rejected: VerifiableFact[] = [];
+	if (!facts) {
+		return { confirmed, candidate, rejected };
+	}
+
+	const list: VerifiableFact[] =
+		Symbol.iterator in Object(facts)
+			? [...(facts as Iterable<VerifiableFact>)]
+			: Object.values(facts as Record<string, VerifiableFact>);
+
+	for (const fact of list) {
+		if (!fact) continue;
+		if (kindFilter !== undefined && fact.kind !== kindFilter) continue;
+		if (fact.verifyStage === "rejected") {
+			rejected.push(fact);
+		} else if (fact.verifyStage === "candidate") {
+			candidate.push(fact);
+		} else {
+			confirmed.push(fact);
+		}
+	}
+
+	return { confirmed, candidate, rejected };
+}
+

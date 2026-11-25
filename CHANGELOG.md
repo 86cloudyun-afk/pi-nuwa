@@ -1,5 +1,27 @@
 # Changelog
 
+## 4.1.0 — 2026-11-25
+
+安全闭环加固与运行时可靠性升级版本（Issues #11–#15）：封堵双盲复验与执行账本绕过面、消除自进化记忆跨技术栈误污染、修复动态模型路由串台、补齐跨世代累积记账与无头守护单代卡死看门狗，并显著提升 Scope 护栏（N-007）的载荷识别精度。
+
+### 核心加固与修复
+
+- **双盲复验闸门与执行账本加固（Issue #11）**：
+  - `omp/verifier-gate.ts` 新增 `validateVerificationCommit` 与 `partitionFactsByVerifyStage`：`verify-vuln:<fid>` 非 blocked 提交强制要求 `kind="vuln"`，禁止以默认 `kind="note"` 绕过执行账本核验直接升格；候选漏洞落盘记录当前账本序列号水位 `evidenceSeq`，复验提交须核验严格晚于该水位的实质性新增执行记录。
+  - `omp/evidence.ts` 新增单调递增 `seq`、`agentName` 归属、`getLatestLedgerSeq`、`isLowEntropyGenericLine` 与专属锁文件 `.nuwa/exec-ledger.lock`（消除多子代理并发写竞态），落盘前自动执行 `redactVaultSecrets` 脱敏并以 `0o600` 原子写入；`verifyExecutionEvidence` 拦截仅含 `HTTP/1.1 200 OK`、`Content-Type` 等通用低熵响应头的伪造放行。
+  - `omp/scope.ts` 与 `omp/graph.ts` 封堵经由 `bash`（`cat`/`jq`/`grep`/`python3`/`node`/`curl -d @` 等）、`read`/`read_file`、`eval` 与写工具对 `.nuwa/sessions/vault.json` 的读取与篡改（N-003）。
+  - `reportMarkdown` 按 `verifyStage` 分层输出「漏洞（已确认）」「待复验候选漏洞（Candidate）」「已驳回误报（Rejected）」，结论仅统计已确认实锤漏洞。
+- **自进化经验蒸馏防污染与失败回流（Issue #12）**：
+  - `omp/kb.ts` 将被双盲驳回的 `rejected` 漏洞记为 `negative` 避坑经验并跳过未复验 `candidate`；新增 `resolveIntentTechKeys` 按意图键与关联事实精准归因技术栈（彻底消除项目级笛卡尔积污染）；`computeExperiencePriorityBoost` 引入 90 天半衰期时间衰减；`nuwa_stop` / `/nuwa stop` 触发 `negativeOnly: true` 失败避坑蒸馏。
+- **动态模型路由串台修复（Issue #13）**：
+  - `omp/lineage.ts` 新增 `resolveTaskIntentContext`，优先从派单正文 `[女娲派单 iNNN]` 解析当前任务对应的具体意图与阶段；`before_subagent_spawn` 不再因队列中存在任意 `open` 态 `verify-vuln` 意图而误将所有常规 `fujiang` 子代理路由至 `verifyModel`，并在 `journal.jsonl` 记录 `model_route` 轨迹。
+- **无头守护器与跨世代记账加固（Issue #14）**：
+  - `omp/types.ts` / `omp/storage.ts` / `omp/reincarnate.ts` / `omp/nuwa.ts` 持久化 `projectStartedAt`、`totalTurns`、`totalTokens`，`nuwa_init(resume=true)`、`/nuwa resume` 与跨代换血不再清零项目累计轮次与起始时间。
+  - `bin/nuwa-autonomous` 同步 `CORE_EXT_MODULES` 补齐 `storage.ts` 与 `graph.ts` 校验，新增 `--gen-timeout-minutes`（默认 45 分钟 / `NUWA_GEN_TIMEOUT_MS`）与 `--idle-timeout-minutes`（`NUWA_DAEMON_IDLE_MS`）子进程看门狗（`SIGTERM` → `SIGKILL` 兜底并受总 `maxHours` 剩余时长封顶）。
+- **Scope 护栏（N-007）精度优化与回环策略收紧（Issue #15）**：
+  - `omp/scope.ts` 升级为按命令形态区分连接目标与请求载荷：忽略 `-d`/`--data`/`--json`/`-H`/`-F`/`-b`/`-e`/`-A` 等载荷与头中的 SSRF 测试 URL，同时严格捕获 `-x`/`--proxy`/`--resolve`/`--connect-to` 及 `$()` 命令替换中的真实外连目标。
+  - 新增 `ScopePolicy.allowLoopback`（远程 `pentest`/`audit` 默认 `false`，`ctf`/`coding`/`ops` 或本机靶标默认 `true`，支持 `NUWA_SCOPE_ALLOW_LOOPBACK` 与 `/nuwa scope loopback on|off`）与 `ScopePolicy.oobDomains`（支持 `NUWA_SCOPE_OOB_DOMAINS` 与 `/nuwa scope +oob/-oob`）。
+
 ## 4.0.1 — 2026-11-25
 
 热修复与部署门禁加固版本：彻底根治 SQLite WAL 模式在冷启动/缺失伴生文件时只读打开失败缺陷，全面隔离单测环境变量杜绝污染宿主机知识库，并强化 `install.sh` 一键安装与 `doctor` 体检门禁。

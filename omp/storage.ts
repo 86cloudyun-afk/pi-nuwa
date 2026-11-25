@@ -593,11 +593,25 @@ export function normalizeState(st: NuwaState): NuwaState {
 		saveCount: Number.isFinite(cur.saveCount) ? (cur.saveCount as number) : 0,
 		stateBytes: Number.isFinite(cur.stateBytes) ? (cur.stateBytes as number) : undefined,
 		rulesSource: typeof cur.rulesSource === "string" ? cur.rulesSource : undefined,
+		projectStartedAt: Number.isFinite(cur.projectStartedAt)
+			? (cur.projectStartedAt as number)
+			: Number.isFinite(cur.startedAt)
+				? (cur.startedAt as number)
+				: Date.now(),
+		totalTurns: Number.isFinite(cur.totalTurns)
+			? Math.max(cur.totalTurns as number, Number.isFinite(cur.turns) ? (cur.turns as number) : 0)
+			: Number.isFinite(cur.turns)
+				? (cur.turns as number)
+				: 0,
+		totalTokens: Number.isFinite(cur.totalTokens) ? (cur.totalTokens as number) : 0,
+		totalCostUsd: Number.isFinite(cur.totalCostUsd) ? (cur.totalCostUsd as number) : 0,
 	};
 	st.runtime = rt;
 	if (!st.facts || typeof st.facts !== "object") st.facts = {};
 	if (!st.intents || typeof st.intents !== "object") st.intents = {};
 	if (!st.seq) st.seq = { fact: 0, intent: 0 };
+	if (st.assets !== undefined && (typeof st.assets !== "object" || st.assets === null)) st.assets = {};
+	if (st.hypotheses !== undefined && (typeof st.hypotheses !== "object" || st.hypotheses === null)) st.hypotheses = {};
 	return st;
 }
 
@@ -836,6 +850,7 @@ export function createInitialState(
 			: mode === "ops"
 				? `完成 ${t.url} 的运维排障与巡检并验证恢复`
 				: `对 ${t.url} 做完整渗透评估并取得 flag`;
+	const nowMs = Date.now();
 	return {
 		schema: SCHEMA,
 		version: NUWA_VERSION,
@@ -860,14 +875,18 @@ export function createInitialState(
 		intents: {},
 		seq: { fact: 0, intent: 0 },
 		runtime: {
-			startedAt: Date.now(),
+			startedAt: nowMs,
+			projectStartedAt: nowMs,
 			turns: 0,
+			totalTurns: 0,
 			stall: 0,
 			idle: 0,
 			blockStreak: 0,
 			toolCalls: 0,
 			lastToolCalls: 0,
 			tokens: 0,
+			totalTokens: 0,
+			totalCostUsd: 0,
 			lastSig: "",
 			lastDirective: "",
 			completionRejects: 0,

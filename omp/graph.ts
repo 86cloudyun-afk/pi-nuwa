@@ -45,7 +45,7 @@ import {
 } from "./storage";
 import { prepareNextGeneration, readReincarnatePolicy, shouldReincarnate } from "./reincarnate";
 import { checkNuwaDirTamper, checkScopeAndRisk, defaultScopeForTarget, isHostInScope } from "./scope";
-import { adaptPacketForToolchain, probeToolchain, recordToolExecution } from "./evidence";
+import { adaptPacketForToolchain, getLatestLedgerSeq, probeToolchain, recordToolExecution } from "./evidence";
 import { buildReflectIntentSpec, deriveKbIntents, getProfile } from "./profiles";
 import {
 	canonicalAutoKey,
@@ -79,10 +79,13 @@ import {
 } from "./session-vault";
 import {
 	buildDoubleBlindVerifyIntentSpec,
+	extractVerifyTargetFactId,
 	filterConfirmedProofs,
 	isVerifyVulnIntentKey,
+	partitionFactsByVerifyStage,
 	resolveVerificationOutcome,
 	shouldStageAsCandidate,
+	validateVerificationCommit,
 } from "./verifier-gate";
 import { probeDockerAvailable, readSandboxConfig, wrapCommandInDockerSandbox } from "./sandbox";
 
@@ -1595,7 +1598,8 @@ export function statusBoard(st: NuwaState, root?: string): string {
 	const p = st.project;
 	const rt = st.runtime;
 	const kinds = countsByKind(st);
-	const mins = Math.floor((Date.now() - rt.startedAt) / 60000);
+	const projectStart = rt.projectStartedAt ?? rt.startedAt;
+	const mins = Math.floor((Date.now() - projectStart) / 60000);
 	const cfg = readCfg();
 	const rows = phaseStats(st);
 	const head = `+${"-".repeat(8)}+${"-".repeat(7)}+${"-".repeat(7)}+${"-".repeat(7)}+${"-".repeat(9)}+${"-".repeat(7)}+`;
@@ -1641,9 +1645,13 @@ export function statusBoard(st: NuwaState, root?: string): string {
 	} catch {
 		kbReady = "missing";
 	}
+	const totalTurns = Math.max(rt.totalTurns ?? 0, rt.turns);
+	const totalTokens = (rt.totalTokens ?? 0) + rt.tokens;
+	const turnsDisp = totalTurns > rt.turns ? `${rt.turns}(total=${totalTurns})` : `${rt.turns}`;
+	const tokensDisp = (rt.totalTokens ?? 0) > 0 ? `${rt.tokens}(total=${totalTokens})` : `${rt.tokens}`;
 	const budgetLine = cfg.infinite
-		? `budget: ∞ 永动 · gen=${gen} · turns=${rt.turns} · ${mins}min · tokens=${rt.tokens} · stall=${rt.stall} idle=${rt.idle} · pressure=${Math.round(pressure * 100)}% · ep=${p.episode ?? 1} expand=${rt.expansions ?? 0}`
-		: `budget: 预算受限 · gen=${gen} · turns=${rt.turns}/${cfg.maxTurns} · ${mins}/${cfg.maxMinutes}min · tokens=${rt.tokens}/${cfg.maxTokens} · stall=${rt.stall}/${cfg.maxStall} idle=${rt.idle}/${cfg.maxIdle}`;
+		? `budget: ∞ 永动 · gen=${gen} · turns=${turnsDisp} · ${mins}min · tokens=${tokensDisp} · stall=${rt.stall} idle=${rt.idle} · pressure=${Math.round(pressure * 100)}% · ep=${p.episode ?? 1} expand=${rt.expansions ?? 0}`
+		: `budget: 预算受限 · gen=${gen} · turns=${turnsDisp}/${cfg.maxTurns} · ${mins}/${cfg.maxMinutes}min · tokens=${tokensDisp}/${cfg.maxTokens} · stall=${rt.stall}/${cfg.maxStall} idle=${rt.idle}/${cfg.maxIdle}`;
 	return [
 		`女娲 v${VERSION} · ${p.url} · ${p.mode} · ${p.status}`,
 		`phase=${p.phase} · facts=${Object.keys(st.facts).length} (${kindLine || "无"}) · cand=${candCount} · roles=${roleCount} · kb=${kbReady} · state=${stateKb}KB · rules=${rulesSource} · net-retry=${netRetry}`,
@@ -1659,11 +1667,43 @@ export function reportMarkdown(st: NuwaState): string {
 	const facts = Object.values(st.facts).sort((a, b) => a.id.localeCompare(b.id));
 	const intents = Object.values(st.intents).sort((a, b) => a.id.localeCompare(b.id));
 	const flags = facts.filter((f) => f.kind === "flag");
-	const vulns = facts.filter((f) => f.kind === "vuln");
+	const vulnPart = partitionFactsByVerifyStage(facts, "vuln");
+	const confirmedVulns = vulnPart.confirmed;
+	const candidateVulns = vulnPart.candidate;
+	const rejectedVulns = vulnPart.rejected;
 	const queue = intents.filter((i) => i.status === "open" || i.status === "claimed");
 	const chain = intents
 		.filter((i) => i.status === "done" && i.to)
 		.map((i) => `| ${i.id} | ${i.phase} | ${cell(i.title, 80)} | ${i.to} | ${st.facts[i.to as string]?.kind ?? "?"} | ${cell(st.facts[i.to as string]?.command, 90)} |`);
+
+	const conclusionLine = flags.length
+		? `取得 flag ${flags.length} 个：${flags.map((f) => f.detail.replace(/^值:\s*/, "")).join(" / ")}`
+		: confirmedVulns.length
+			? `未取得 flag；确认漏洞 ${confirmedVulns.length} 条${candidateVulns.length ? `（另有待复验候选 ${candidateVulns.length} 条）` : ""}${rejectedVulns.length ? `（已驳回误报 ${rejectedVulns.length} 条）` : ""}，最高危害见下表。`
+			: candidateVulns.length
+				? `未取得可验收证据（当前仅有待复验候选漏洞 ${candidateVulns.length} 条，尚未通过双盲复验确认）。`
+				: `未取得可验收证据。`;
+
+	const extraVulnSections: string[] = [];
+	if (candidateVulns.length > 0) {
+		extraVulnSections.push(
+			``,
+			`## 待复验候选漏洞（Candidate）`,
+			`| fact | 标题 | 证据 | 命令 |`,
+			`|---|---|---|---|`,
+			...candidateVulns.map((f) => `| ${f.id} | ${cell(f.title, 80)} | ${cell(f.output, 120)} | ${cell(f.command, 100)} |`),
+		);
+	}
+	if (rejectedVulns.length > 0) {
+		extraVulnSections.push(
+			``,
+			`## 已驳回误报（Rejected）`,
+			`| fact | 标题 | 驳回说明 |`,
+			`|---|---|---|`,
+			...rejectedVulns.map((f) => `| ${f.id} | ${cell(f.title, 80)} | ${cell(f.verifyNote ?? f.detail, 140)} |`),
+		);
+	}
+
 	return [
 		`# 渗透报告 — ${p.host}:${p.port}`,
 		``,
@@ -1673,11 +1713,7 @@ export function reportMarkdown(st: NuwaState): string {
 		`- 目标描述: ${p.goal}`,
 		``,
 		`## 结论`,
-		flags.length
-			? `取得 flag ${flags.length} 个：${flags.map((f) => f.detail.replace(/^值:\s*/, "")).join(" / ")}`
-			: vulns.length
-				? `未取得 flag；确认漏洞 ${vulns.length} 条，最高危害见下表。`
-				: `未取得可验收证据。`,
+		conclusionLine,
 		``,
 		`## 攻击链`,
 		`| intent | 阶段 | 动作 | fact | 类型 | 命令 |`,
@@ -1690,9 +1726,10 @@ export function reportMarkdown(st: NuwaState): string {
 			: "无",
 		``,
 		`## 漏洞`,
-		vulns.length
-			? [`| fact | 标题 | 证据 | 命令 |`, `|---|---|---|---|`, ...vulns.map((f) => `| ${f.id} | ${cell(f.title, 80)} | ${cell(f.output, 120)} | ${cell(f.command, 100)} |`)].join("\n")
+		confirmedVulns.length
+			? [`| fact | 标题 | 证据 | 命令 |`, `|---|---|---|---|`, ...confirmedVulns.map((f) => `| ${f.id} | ${cell(f.title, 80)} | ${cell(f.output, 120)} | ${cell(f.command, 100)} |`)].join("\n")
 			: "无",
+		...extraVulnSections,
 		``,
 		`## 资产与服务`,
 		facts.filter((f) => ["target", "asset", "service", "endpoint", "cred", "loot"].includes(f.kind)).length
@@ -1798,8 +1835,8 @@ const SCANNER_RE =
 	/\b(nmap|masscan|ffuf|gobuster|feroxbuster|dirsearch|dirb|wpscan|nuclei|nikto|sqlmap|commix|whatweb|subfinder|amass|assetfinder|httpx|katana|gospider|hakrawler|dalfox|wfuzz|arjun|hydra|medusa|ncrack|john|hashcat)\b/;
 const CLI_RE = /(^|[\s;&|()'"`])(?:[^\s;&|()'"`]*\/)?(?:bin\/nuwa|nuwa\/cli\.py)(?=\s|$)/;
 const CLI_SUB_RE = /(^|[\s;&|()'"`])nuwa\s+(?:dispatch|commit|complete|flag|status|plan|run|kb|report|soak|night)\b/;
-const PROTECTED_RE = /(^|[\\/])\.nuwa[\\/](state\.json|journal[^\\/]*\.jsonl|state\.lock|exec-ledger\.jsonl|snap(?:[\\/]|$))/;
-const REDIRECT_RE = /(>>?|tee\s+(?:-a\s+)?)\s*[^\s;|&]*\.nuwa[\\/](state\.json|journal[^\\/]*\.jsonl|exec-ledger\.jsonl|state\.lock)/;
+const PROTECTED_RE = /(^|[\\/])\.nuwa[\\/](state\.json|journal[^\\/]*\.jsonl|state\.lock|exec-ledger\.jsonl|exec-ledger\.lock|sessions(?:[\\/]|$)|snap(?:[\\/]|$))/;
+const REDIRECT_RE = /(>>?|tee\s+(?:-a\s+)?)\s*[^\s;|&]*\.nuwa[\\/](state\.json|journal[^\\/]*\.jsonl|exec-ledger\.jsonl|exec-ledger\.lock|state\.lock|sessions(?:[\\/][^\s;|&]*)?)/;
 
 export function checkBashPolicy(
 	cmd: string,
@@ -2049,6 +2086,8 @@ export function formatScopeSummary(scope: ScopePolicy): string {
 		`- denyHosts: ${scope.denyHosts.join(", ") || "(无)"}`,
 		`- allowSubdomains: ${scope.allowSubdomains}`,
 		`- allowPrivateNetwork: ${scope.allowPrivateNetwork}`,
+		`- allowLoopback: ${scope.allowLoopback ?? true}`,
+		`- oobDomains: ${(scope.oobDomains ?? []).join(", ") || "(无)"}`,
 		`- allowDestructive: ${scope.allowDestructive}`,
 	].join("\n");
 }
@@ -2353,6 +2392,21 @@ export function executeCommitWithGates(
 		const targetIntent = s.intents[p.id];
 		const intentKey = targetIntent?.key ?? "";
 
+		if (!p.blocked && isVerifyVulnIntentKey(intentKey)) {
+			const verifyTargetFid = extractVerifyTargetFactId(intentKey);
+			const candidateFact = verifyTargetFid ? s.facts[verifyTargetFid] : undefined;
+			const vc = validateVerificationCommit({
+				intentKey,
+				kind: p.kind,
+				blocked: p.blocked,
+				worker: targetIntent?.worker,
+				candidateFact,
+			});
+			if (!vc.ok) {
+				throw new Error(`双盲复验门禁拒绝: ${vc.reason ?? "复验提交不合规"}`);
+			}
+		}
+
 		if (!p.blocked && p.kind === "cred") {
 			const roleEntry = ingestCredFactToVault(root, {
 				kind: "cred",
@@ -2413,6 +2467,7 @@ export function executeCommitWithGates(
 			}
 		} else if (stageCand && r.fact) {
 			r.fact.verifyStage = "candidate";
+			r.fact.evidenceSeq = getLatestLedgerSeq(root);
 			verifyStageOut = "candidate";
 			const vSpec = buildDoubleBlindVerifyIntentSpec(s, r.fact);
 			if (vSpec) {
@@ -2514,7 +2569,7 @@ export function executeScopeCommand(found: string | null, subArg: string): { msg
 		if (!st) return { msg: "state 读取失败", level: "error" };
 		const sc = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
 		return {
-			msg: `${formatScopeSummary(sc)}\n用法: /nuwa scope +host <h> | -host <h> | +cidr <c> | +deny <h> | subdomains on|off | destructive on|off | reset`,
+			msg: `${formatScopeSummary(sc)}\n用法: /nuwa scope +host <h> | -host <h> | +cidr <c> | +deny <h> | +oob <d> | -oob <d> | loopback on|off | subdomains on|off | destructive on|off | reset`,
 			level: "info",
 		};
 	}
@@ -2534,6 +2589,15 @@ export function executeScopeCommand(found: string | null, subArg: string): { msg
 		else if (op === "+deny" && v) {
 			if (!sc.denyHosts.includes(v)) sc.denyHosts.push(v);
 		} else if (op === "-deny" && v) sc.denyHosts = sc.denyHosts.filter((d) => d !== v);
+		else if (op === "+oob" && v) {
+			const normOob = v.toLowerCase().replace(/^\*\./, "").replace(/\.$/, "");
+			const list = sc.oobDomains ?? [];
+			if (normOob && !list.includes(normOob)) list.push(normOob);
+			sc.oobDomains = list;
+		} else if (op === "-oob" && v) {
+			const normOob = v.toLowerCase().replace(/^\*\./, "").replace(/\.$/, "");
+			sc.oobDomains = (sc.oobDomains ?? []).filter((d) => d.toLowerCase() !== normOob);
+		} else if (op === "loopback") sc.allowLoopback = ["on", "1", "true"].includes(v.toLowerCase());
 		else if (op === "subdomains") sc.allowSubdomains = ["on", "1", "true"].includes(v.toLowerCase());
 		else if (op === "destructive") sc.allowDestructive = ["on", "1", "true"].includes(v.toLowerCase());
 		else return undefined;
@@ -2545,7 +2609,7 @@ export function executeScopeCommand(found: string | null, subArg: string): { msg
 	if (updated === null) return { msg: "state 读取失败", level: "error" };
 	if (updated === undefined) {
 		return {
-			msg: "未知 scope 指令。用法: /nuwa scope [+host <h>|-host <h>|+cidr <c>|+deny <h>|subdomains on|off|destructive on|off|reset]",
+			msg: "未知 scope 指令。用法: /nuwa scope [+host <h>|-host <h>|+cidr <c>|+deny <h>|+oob <d>|-oob <d>|loopback on|off|subdomains on|off|destructive on|off|reset]",
 			level: "error",
 		};
 	}
@@ -2735,6 +2799,7 @@ export function settleSessionStopState(opts: {
 		const s = loadState(opts.root);
 		if (!s || s.project.status !== "active") return s;
 		s.runtime.turns += 1;
+		s.runtime.totalTurns = Math.max(s.runtime.totalTurns ?? 0, s.runtime.turns - 1) + 1;
 		s.runtime.genTurns = (s.runtime.genTurns ?? 0) + 1;
 		s.runtime.lastSettleAt = Date.now();
 		if (Number.isFinite(opts.tokens) && opts.tokens > s.runtime.tokens) s.runtime.tokens = opts.tokens;

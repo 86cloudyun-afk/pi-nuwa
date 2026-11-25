@@ -283,12 +283,13 @@ SMOKE_OUT="$(
     const extDir = process.env.EXT_DIR!;
     const realKbOut = process.env.REAL_KB_OUT!;
     const escaped = extDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const transpiler = new Bun.Transpiler({ loader: "ts" });
     Bun.plugin({
       name: "nuwa-install-async-smoke",
       setup(build) {
         build.onLoad({ filter: new RegExp(`^${escaped}/.*\\.ts$`) }, async (args) => {
           const text = await Bun.file(args.path).text();
-          return { contents: text, loader: "ts" };
+          return { contents: transpiler.transformSync(text), loader: "js" };
         });
       },
     });

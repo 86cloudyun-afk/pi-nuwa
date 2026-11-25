@@ -616,13 +616,15 @@ describe("自进化经验脱敏蒸馏与 UCB1 跨项目提权", () => {
 		expect(distillRes.techKeys).toEqual(["nginx", "spring", "shiro"]);
 		expect(distillRes.positive).toBe(4);
 		expect(distillRes.negative).toBe(1);
-		expect(distillRes.updated).toBe(15); // 3 techKeys * 5 canonical intents
+		expect(distillRes.updated).toBe(9); // v4.1 精准来源归因（消除 3x5=15 笛卡尔积误污染）
 
-		// 直接扫描 SQLite experience 全表，确认 0 敏感信息入库
+		// 直接扫描 SQLite experience 全表，确认 0 敏感信息入库且无跨技术栈误污染
 		const db = new Database(dbPath, { readonly: true });
 		try {
 			const rows = db.query("SELECT * FROM experience").all() as Array<Record<string, any>>;
-			expect(rows.length).toBe(15);
+			expect(rows.length).toBe(9);
+			expect(rows.find((r) => r.tech_key === "nginx" && r.intent_key === "vuln:component")).toBeUndefined();
+			expect(rows.find((r) => r.tech_key === "shiro" && r.intent_key === "surface:uploads")).toBeUndefined();
 			const dumped = JSON.stringify(rows);
 
 			const forbiddenSecrets = [

@@ -57,7 +57,10 @@ export interface KbLookupOptions extends KbCommonOptions {
 	includeExperience?: boolean;
 }
 
-export interface DistillOptions extends KbCommonOptions {}
+export interface DistillOptions extends KbCommonOptions {
+	/** 仅蒸馏负向避坑经验（适用于人工停止或超时未完成项目，防止正向成功计数虚高）。 */
+	negativeOnly?: boolean;
+}
 
 export interface DistillResult {
 	ok: boolean;
@@ -74,6 +77,8 @@ export interface BoostOptions {
 	agentHome?: string;
 	autoInit?: boolean;
 	seedDir?: string;
+	/** 可选的当前时间戳（毫秒），默认取 Date.now()，便于时间衰减计算与测试。 */
+	nowMs?: number;
 }
 
 export interface ExperienceRecord {
@@ -1391,6 +1396,145 @@ function mergeExperienceNote(existing: string, incoming: string, maxLen = 220): 
 
 const POSITIVE_PROOF_KINDS = new Set<FactKind>(["vuln", "flag", "loot", "cred", "service", "endpoint", "asset"]);
 const NEGATIVE_NOTE_RE = /(未发现|无异常|不适用|版本不匹配|无此功能|未开启|不存在|not\s+found|no\s+vuln)/i;
+const PROXY_WRAPPER_TECHS = new Set<string>(["nginx", "apache", "openresty", "caddy", "iis"]);
+const MS_PER_DAY = 86_400_000;
+const EXPERIENCE_DECAY_HALF_LIFE_DAYS = 90;
+
+function normalizeMetaTech(rawTech: unknown): string | null {
+	const raw = String(rawTech ?? "").trim();
+	if (!raw) return null;
+	const matched = TECH_PATTERNS.find((p) => p.re.test(raw));
+	if (matched) return matched.name;
+	const clean = raw.toLowerCase().replace(/[^a-z0-9_-]/g, "");
+	if (clean.length >= 2 && clean.length <= 24) return clean;
+	return null;
+}
+
+function extractTechsFromText(text: string, extraTechs: readonly string[] = []): string[] {
+	const src = String(text ?? "");
+	if (!src.trim()) return [];
+	const seen = new Set<string>();
+	const out: string[] = [];
+	const push = (t: string) => {
+		const norm = t.trim().toLowerCase();
+		if (!norm || norm === "generic" || seen.has(norm)) return;
+		seen.add(norm);
+		out.push(norm);
+	};
+	for (const { name, re } of TECH_PATTERNS) {
+		if (re.test(src)) push(name);
+	}
+	for (const extra of extraTechs) {
+		const norm = String(extra ?? "").trim().toLowerCase();
+		if (!norm || norm === "generic" || seen.has(norm)) continue;
+		const re = new RegExp(`\\b${escapeRegexLiteral(norm)}\\b`, "i");
+		if (re.test(src)) push(norm);
+	}
+	return out;
+}
+
+function extractTechsFromFacts(
+	facts: readonly Fact[],
+	extraTechs: readonly string[],
+	includeOutput: boolean,
+): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	const push = (t: string | null) => {
+		if (!t) return;
+		const norm = t.trim().toLowerCase();
+		if (!norm || norm === "generic" || seen.has(norm)) return;
+		seen.add(norm);
+		out.push(norm);
+	};
+
+	for (const fact of facts) {
+		// 跳过 flag / cred 事实文本，避免 flag 字符串或泄露的下游连接串污染技术栈归因
+		if (fact.kind === "flag" || fact.kind === "cred") continue;
+		if (Array.isArray(fact.meta?.tech)) {
+			for (const rawTech of fact.meta.tech) {
+				push(normalizeMetaTech(rawTech));
+			}
+		}
+		const primaryBlob = [fact.title ?? "", fact.detail ?? ""].join("\n");
+		for (const t of extractTechsFromText(primaryBlob, extraTechs)) push(t);
+		if (includeOutput) {
+			const secondaryBlob = [fact.output ?? "", fact.meta?.server ?? ""].join("\n");
+			for (const t of extractTechsFromText(secondaryBlob, extraTechs)) push(t);
+		}
+	}
+	return out;
+}
+
+function preferAppLayerTechs(techs: readonly string[]): string[] {
+	const unique: string[] = [];
+	const seen = new Set<string>();
+	for (const t of techs) {
+		const norm = String(t ?? "").trim().toLowerCase();
+		if (!norm || norm === "generic" || seen.has(norm)) continue;
+		seen.add(norm);
+		unique.push(norm);
+	}
+	if (unique.length === 0) return [];
+	const appLayer = unique.filter((t) => !PROXY_WRAPPER_TECHS.has(t));
+	return appLayer.length > 0 ? appLayer : unique;
+}
+
+/**
+ * 为单条意图解析精确归因的技术栈，避免多组件项目产生跨组件笛卡尔积污染：
+ * 1. 优先从 `intent.key` 直接提取显式技术标识（如 `kb:f002:spring` → `spring`）；
+ * 2. 其次从 `intent.title` 与本意图直接产出的 `linkedFacts`（优先 `meta.tech`/标题/详情，未命中再看 `output`/`server`）提取；
+ * 3. 若仍未命中，回溯 `intent.from` 引用的前提事实（混合前提存在应用层组件时过滤纯反向代理外壳）；
+ * 4. 均未命中（如无 `from` 的通用种子意图）时，过滤 `projectTechKeys` 中的纯反向代理外壳层（若存在应用层组件），否则回退 `projectTechKeys` 或 `["generic"]`。
+ */
+export function resolveIntentTechKeys(
+	intent: Intent,
+	linkedFacts: readonly Fact[],
+	st: NuwaState,
+	projectTechKeys: readonly string[],
+): string[] {
+	const knownProjectTechs = projectTechKeys
+		.map((t) => String(t ?? "").trim().toLowerCase())
+		.filter((t) => Boolean(t) && t !== "generic");
+
+	// Step 1a: 直接从 intent.key 提取显式技术关键词（如 kb:f002:spring / ep:f003:/actuator/env）
+	const keyTechs = extractTechsFromText(String(intent.key ?? ""), knownProjectTechs);
+	if (keyTechs.length > 0) return keyTechs;
+
+	// Step 1b: 从 intent.title 与 linkedFacts 的结构化字段（meta.tech / title / detail）提取
+	const directTechs: string[] = [];
+	const pushDirect = (list: readonly string[]) => {
+		for (const t of list) {
+			if (!directTechs.includes(t)) directTechs.push(t);
+		}
+	};
+	pushDirect(extractTechsFromText(String(intent.title ?? ""), knownProjectTechs));
+	pushDirect(extractTechsFromFacts(linkedFacts, knownProjectTechs, false));
+	if (directTechs.length > 0) return directTechs;
+
+	// 若结构化字段未命中，再检查 linkedFacts 的回显与 Server 头（output / meta.server）
+	const outputTechs = extractTechsFromFacts(linkedFacts, knownProjectTechs, true);
+	if (outputTechs.length > 0) return outputTechs;
+
+	// Step 1c: 回溯 intent.from 引用的前提事实
+	const fromIds = Array.isArray(intent.from) ? intent.from : [];
+	if (fromIds.length > 0 && st.facts) {
+		const fromFacts: Fact[] = [];
+		for (const fid of fromIds) {
+			const f = st.facts[fid];
+			if (f) fromFacts.push(f);
+		}
+		const fromPrimary = extractTechsFromFacts(fromFacts, knownProjectTechs, false);
+		const fromAll = fromPrimary.length > 0 ? fromPrimary : extractTechsFromFacts(fromFacts, knownProjectTechs, true);
+		if (fromAll.length > 0) {
+			return preferAppLayerTechs(fromAll);
+		}
+	}
+
+	// Step 3: 通用种子意图无直接/前提技术绑定时，存在应用层组件则过滤纯反向代理外壳层
+	const fallback = preferAppLayerTechs(knownProjectTechs);
+	return fallback.length > 0 ? fallback : ["generic"];
+}
 
 function classifyIntentOutcome(
 	intent: Intent,
@@ -1401,6 +1545,7 @@ function classifyIntentOutcome(
 		return { outcome: "skip", helpful: "", pitfall: "" };
 	}
 
+	const canonicalKey = canonicalizeExperienceIntentKey(intent.key);
 	const nonBlockedFacts = linkedFacts.filter((f) => f.kind !== "blocked");
 	const blockedFacts = linkedFacts.filter((f) => f.kind === "blocked");
 
@@ -1411,7 +1556,19 @@ function classifyIntentOutcome(
 		(intent.status !== "done" && intent.attempts >= 3 && nonBlockedFacts.length === 0)
 	) {
 		const rawReason = intent.note || blockedFacts[0]?.title || intent.title || "路径受阻或条件不满足";
-		const pitfall = sanitizeExperienceText(`${intent.phase}/${canonicalizeExperienceIntentKey(intent.key)}: ${rawReason}`, st, 160);
+		const pitfall = sanitizeExperienceText(`${intent.phase}/${canonicalKey}: ${rawReason}`, st, 160);
+		return { outcome: "negative", helpful: "", pitfall };
+	}
+
+	// 误报抗污染：双盲复验已驳回（verifyStage === "rejected"）的漏洞事实直接归类为负向避坑教训
+	const rejectedVuln = nonBlockedFacts.find((f) => f.kind === "vuln" && f.verifyStage === "rejected");
+	if (rejectedVuln) {
+		const rawRejectReason = rejectedVuln.verifyNote || rejectedVuln.title || "双盲复验未通过";
+		const pitfall = sanitizeExperienceText(
+			`${intent.phase}/${canonicalKey}: 双盲复验驳回误报 (${rawRejectReason})`,
+			st,
+			160,
+		);
 		return { outcome: "negative", helpful: "", pitfall };
 	}
 
@@ -1419,10 +1576,15 @@ function classifyIntentOutcome(
 		return { outcome: "skip", helpful: "", pitfall: "" };
 	}
 
-	// 正向经验：必须存在实质性有效发现事实
+	// 严禁未通过双盲复验的 candidate 或已驳回的 rejected 事实充当正向证明，防止虚增 success_count
+	const confirmedNonBlocked = nonBlockedFacts.filter(
+		(f) => f.verifyStage !== "candidate" && f.verifyStage !== "rejected",
+	);
+
+	// 正向经验：必须存在实质性有效且已确认的发现事实
 	const strongFact =
-		nonBlockedFacts.find((f) => f.kind === "vuln" || f.kind === "flag" || f.kind === "loot" || f.kind === "cred") ??
-		nonBlockedFacts.find((f) => POSITIVE_PROOF_KINDS.has(f.kind));
+		confirmedNonBlocked.find((f) => f.kind === "vuln" || f.kind === "flag" || f.kind === "loot" || f.kind === "cred") ??
+		confirmedNonBlocked.find((f) => POSITIVE_PROOF_KINDS.has(f.kind));
 
 	if (strongFact) {
 		// 对 flag/cred 事实严禁引用其具体 title/detail 内容，仅保留抽象意图标题与事实类型
@@ -1436,9 +1598,9 @@ function classifyIntentOutcome(
 	}
 
 	// 仅产出 note 且明确表示未发现/不适用时视为中性或轻微负向（若明确不适用/无发现则跳过不污染正经验）
-	const noteFact = nonBlockedFacts.find((f) => f.kind === "note");
+	const noteFact = confirmedNonBlocked.find((f) => f.kind === "note");
 	if (noteFact && NEGATIVE_NOTE_RE.test(`${noteFact.title} ${noteFact.detail}`)) {
-		const pitfall = sanitizeExperienceText(`${canonicalizeExperienceIntentKey(intent.key)}: 实测无异常/版本条件不匹配`, st, 140);
+		const pitfall = sanitizeExperienceText(`${canonicalKey}: 实测无异常/版本条件不匹配`, st, 140);
 		return { outcome: "negative", helpful: "", pitfall };
 	}
 
@@ -1449,6 +1611,9 @@ function classifyIntentOutcome(
  * 蒸馏项目终态经验并脱敏回写至 SQLite `experience` 表。
  *
  * - 自动识别项目技术栈（覆盖 36 个核心组件；未命中时回落为 `generic`）；
+ * - 按单意图精确归因至直接关联技术栈（消除跨组件笛卡尔积污染）；
+ * - 拒绝未复验候选漏洞（`verifyStage="candidate"`）膨胀正向计数，并将复验驳回误报（`verifyStage="rejected"`）沉淀为负向教训；
+ * - 支持 `negativeOnly` 模式（中止/超时项目仅沉淀负向避坑教训）；
  * - 剥离全部目标 URL、IP、端口、凭据与 Flag，确保脱敏文本不含具体靶标信息；
  * - 按 `(tech_key, intent_key)` 增量累加 `success_count` / `fail_count`。
  */
@@ -1462,6 +1627,7 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 
 	const detectedTechs = extractStateTechStack(st);
 	const techKeys = detectedTechs.length > 0 ? detectedTechs : ["generic"];
+	const negativeOnly = opts?.negativeOnly === true;
 
 	// 预先建立 intentId -> Fact[] 与 fact.key -> Fact[] 映射
 	const factsByIntent = new Map<string, Fact[]>();
@@ -1517,7 +1683,7 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 		}
 
 		const verdict = classifyIntentOutcome(intent, linked, st);
-		if (verdict.outcome === "skip") {
+		if (verdict.outcome === "skip" || (negativeOnly && verdict.outcome === "positive")) {
 			skipped += 1;
 			continue;
 		}
@@ -1525,7 +1691,8 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 		else negative += 1;
 
 		const canonicalKey = canonicalizeExperienceIntentKey(intent.key);
-		for (const techKey of techKeys) {
+		const intentTechKeys = resolveIntentTechKeys(intent, linked, st, techKeys);
+		for (const techKey of intentTechKeys) {
 			const mapKey = `${techKey}::${canonicalKey}`;
 			const cur = agg.get(mapKey) ?? {
 				techKey,
@@ -1625,10 +1792,18 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 // UCB1 跨项目意图优先级提权 / 避坑降权引擎（输出严格限定于 [-8, +15]）
 // ============================================================================
 
+function computeExperienceAgeDecay(updatedAt: string | undefined, nowMs: number): number {
+	const ts = updatedAt ? Date.parse(updatedAt) : Number.NaN;
+	if (!Number.isFinite(ts)) return 1;
+	const ageDays = Math.max(0, (nowMs - ts) / MS_PER_DAY);
+	return Math.pow(0.5, ageDays / EXPERIENCE_DECAY_HALF_LIFE_DAYS);
+}
+
 /**
  * 基于历史自进化经验表执行 UCB1（Upper Confidence Bound）计算，返回 `[-8, +15]` 闭区间优先级偏移。
  *
  * - 冷启动（库不存在或该技术栈尚无历史经验）返回 `0`；
+ * - 按 90 天半衰期对每条历史记录执行温和时间衰减（`0.5^(ageDays/90)`），防止陈旧样本长期锁死探索；
  * - 同技术栈下历史高胜率路径获得显著正提权（最高 `+15`）；
  * - 历史反复失败/受阻路径获得负降权（最低 `-8`）；
  * - 该技术栈已有先验但当前路径尚未尝试时，按 UCB1 探索项给予温和正激励（`+1..+3`）。
@@ -1663,42 +1838,58 @@ export function computeExperiencePriorityBoost(
 		if (!hasTable(db, "experience")) return 0;
 
 		const placeholders = techs.map(() => "?").join(",");
-		const totalRow = db
+		const rows = db
 			.query(
-				`SELECT COALESCE(SUM(success_count + fail_count), 0) AS total_n
+				`SELECT intent_key, success_count, fail_count, updated_at
 				 FROM experience
 				 WHERE tech_key IN (${placeholders})`,
 			)
-			.get(...techs) as { total_n?: number } | null;
+			.all(...techs) as Array<{
+			intent_key?: string;
+			success_count?: number;
+			fail_count?: number;
+			updated_at?: string;
+		}>;
 
-		const totalN = Number(totalRow?.total_n ?? 0);
-		if (totalN <= 0) return 0;
+		const nowMs = opts?.nowMs ?? Date.now();
+		let totalN = 0;
+		let s = 0;
+		let f = 0;
 
-		const armRow = db
-			.query(
-				`SELECT COALESCE(SUM(success_count), 0) AS s, COALESCE(SUM(fail_count), 0) AS f
-				 FROM experience
-				 WHERE tech_key IN (${placeholders}) AND intent_key = ?`,
-			)
-			.get(...techs, intentKey) as { s?: number; f?: number } | null;
-
-		const s = Number(armRow?.s ?? 0);
-		const f = Number(armRow?.f ?? 0);
-		const n = s + f;
-
-		// 同一技术栈已有其他路径经验，但本意图尚未探索 -> 温和 UCB1 探索激励 [+1, +3]
-		if (n <= 0) {
-			const exploreOnly = Math.round(Math.sqrt(Math.log(totalN + 1)));
-			return Math.max(1, Math.min(3, exploreOnly));
+		for (const row of rows) {
+			const rowS = Math.max(0, Number(row.success_count ?? 0));
+			const rowF = Math.max(0, Number(row.fail_count ?? 0));
+			if (rowS <= 0 && rowF <= 0) continue;
+			const decay = computeExperienceAgeDecay(row.updated_at, nowMs);
+			const decayedS = rowS * decay;
+			const decayedF = rowF * decay;
+			totalN += decayedS + decayedF;
+			if (row.intent_key === intentKey) {
+				s += decayedS;
+				f += decayedF;
+			}
 		}
 
-		// Beta(0.5, 0.5) 平滑胜率 + UCB1 置信上界探索项
+		const EPS = 1e-9;
+		if (totalN <= EPS) return 0;
+
+		const n = s + f;
+
+		const untriedBoost = Math.max(1, Math.min(3, Math.round(Math.sqrt(Math.log(totalN + 1)))));
+
+		// 同一技术栈已有其他路径经验，但本意图尚未探索 -> 温和 UCB1 探索激励 [+1, +3]
+		if (n <= EPS) {
+			return untriedBoost;
+		}
+
+		// Beta(0.5, 0.5) 平滑胜率 + UCB1 置信上界探索项（衰减后有效样本 n < 1 时向未探索基线平滑收敛，避免 1/n 发散）
 		const smoothedMean = (s + 0.5) / (n + 1);
-		const exploreTerm = 0.18 * Math.sqrt(Math.log(Math.max(totalN, n) + 1) / n);
+		const exploreTerm = 0.18 * Math.sqrt(Math.log(Math.max(totalN, n) + 1) / Math.max(1, n));
 		const ucbScore = smoothedMean + exploreTerm;
 		const delta = ucbScore - 0.5;
 
-		const rawBoost = delta >= 0 ? Math.round(delta * 26) : Math.round(delta * 18);
+		const ucbBoost = delta >= 0 ? Math.round(delta * 26) : Math.round(delta * 18);
+		const rawBoost = n < 1 ? Math.round(untriedBoost * (1 - n) + ucbBoost * n) : ucbBoost;
 		return Math.max(-8, Math.min(15, rawBoost));
 	} catch {
 		return 0;

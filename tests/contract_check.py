@@ -243,12 +243,13 @@ const agentHome = mkdtempSync(join(tmpdir(), "nuwa-contract-home-"));
 process.env.PI_AGENT_HOME = agentHome;
 const ompDir = process.env.NUWA_OMP_DIR!;
 const escaped = ompDir.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+const transpiler = new Bun.Transpiler({ loader: "ts" });
 Bun.plugin({
   name: "nuwa-contract-async-ext",
   setup(build) {
     build.onLoad({ filter: new RegExp(`^${escaped}/.*\\\\.ts$`) }, async (args) => {
       const text = await Bun.file(args.path).text();
-      return { contents: text, loader: "ts" };
+      return { contents: transpiler.transformSync(text), loader: "js" };
     });
   },
 });

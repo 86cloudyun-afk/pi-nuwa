@@ -1,28 +1,35 @@
 /**
  * 执行账本证据复验（升级 3）与本地工具链探针（升级 5）。
  *
- * 约束：仅使用 import type 引用 ./nuwa，严禁运行时 import ./nuwa。
+ * 约束：仅使用 import type 引用 ./types，严禁运行时 import ./nuwa。
  */
 import { createHash } from "node:crypto";
 import {
 	accessSync,
+	chmodSync,
+	closeSync,
 	constants,
 	existsSync,
 	mkdirSync,
+	openSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
-import type { FactKind } from "./nuwa";
+import { redactVaultSecrets } from "./session-vault";
+import type { FactKind } from "./types";
 
 export interface ExecRecordInput {
 	tool: string;
 	command?: string;
 	output: string;
 	sessionId?: string;
+	agentName?: string;
 }
 
 export interface VerifyEvidenceInput {
@@ -32,12 +39,17 @@ export interface VerifyEvidenceInput {
 	output?: string;
 	flagValue?: string;
 	strict?: boolean;
+	minSeq?: number;
+	sinceTs?: string;
+	requireSubstantive?: boolean;
 }
 
 export interface VerifyEvidenceResult {
 	ok: boolean;
 	verified: boolean;
 	reason?: string;
+	matchedSeq?: number;
+	matchedAgent?: string;
 }
 
 export interface ToolchainCaps {
@@ -47,10 +59,12 @@ export interface ToolchainCaps {
 }
 
 export interface ExecLedgerEntry {
+	seq: number;
 	ts: string;
 	tool: string;
 	command?: string;
 	sessionId?: string;
+	agentName?: string;
 	sha1: string;
 	normSha1: string;
 	bytes: number;
@@ -58,6 +72,7 @@ export interface ExecLedgerEntry {
 }
 
 const LEDGER_MAX_ENTRIES = 200;
+const LEDGER_LOCK_TIMEOUT_MS = 3000;
 const SNIPPET_HEAD = 4096;
 const SNIPPET_TAIL = 2048;
 
@@ -128,6 +143,13 @@ const UNTRUSTED_ORCHESTRATION_TOOLS = new Set<string>([
 	"google_search",
 ]);
 
+const LOW_ENTROPY_HTTP_STATUS_RE = /^HTTP\/\d(?:\.\d)?\s+\d{3}(?:\s+[A-Za-z0-9 _-]+)?$/i;
+const LOW_ENTROPY_HTTP_HEADER_RE =
+	/^(?:Content-Type|Content-Length|Connection|Date|Server|Cache-Control|Transfer-Encoding|Accept-Ranges|Vary|Keep-Alive|Expires|Pragma|X-Frame-Options|X-Content-Type-Options|Strict-Transport-Security|Referrer-Policy|Content-Encoding|ETag|Last-Modified|Age|Host|User-Agent|Accept|Accept-Encoding|Accept-Language)\s*:/i;
+const LOW_ENTROPY_BOILERPLATE_RE =
+	/^(?:\d{3}\s+(?:OK|Found|Moved Permanently|Not Found|Forbidden|Unauthorized|Bad Request|Internal Server Error|Service Unavailable|No Content)|<html>|<\/html>|<head>|<\/head>|<body>|<\/body>|<!doctype\s+html>|\{\s*\}|\[\s*\]|true|false|ok|success|error|failed|denied)$/i;
+const PUNCTUATION_ONLY_RE = /^[\s{}[\](),:;="'`~@#$%^&*+\-_/\\|<>?!.]+$/;
+
 function isNuwaTmpArtifactPath(rawPath: string): boolean {
 	const trimmed = rawPath.trim();
 	if (!trimmed) return false;
@@ -173,11 +195,28 @@ export function isTrustedEvidenceEvent(
 	return TRUSTED_TOOL_SET.has(name);
 }
 
+/**
+ * 判断单行文本是否属于低信息熵的通用 HTTP 状态行、常规响应头或占位模板行。
+ * 安全相关响应头（如 Set-Cookie / Authorization / Location / X-Debug-* / Access-Control-*）不视为通用行。
+ */
+export function isLowEntropyGenericLine(line: string): boolean {
+	const trimmed = String(line ?? "").trim();
+	if (!trimmed || trimmed.length < 3) return true;
+	if (PUNCTUATION_ONLY_RE.test(trimmed)) return true;
+	const cleaned = trimmed.replace(/^[<>]\s+/, "");
+	if (LOW_ENTROPY_HTTP_STATUS_RE.test(cleaned)) return true;
+	if (LOW_ENTROPY_HTTP_HEADER_RE.test(cleaned)) return true;
+	if (LOW_ENTROPY_BOILERPLATE_RE.test(cleaned)) return true;
+	return false;
+}
+
 interface MemoryLedgerRecord extends ExecLedgerEntry {
 	rawOutput?: string;
 }
 
 const memoryRing = new Map<string, MemoryLedgerRecord[]>();
+const heldLedgerLocks = new Set<string>();
+const SLEEP_VIEW = new Int32Array(new SharedArrayBuffer(4));
 let atomicLedgerSeq = 0;
 
 function sha1Hex(text: string): string {
@@ -188,11 +227,166 @@ function ledgerFilePath(root: string): string {
 	return join(resolve(root), ".nuwa", "exec-ledger.jsonl");
 }
 
+function ledgerLockPath(root: string): string {
+	return join(resolve(root), ".nuwa", "exec-ledger.lock");
+}
+
 function buildSnippet(output: string): string {
 	if (output.length <= SNIPPET_HEAD + SNIPPET_TAIL) {
 		return output;
 	}
 	return `${output.slice(0, SNIPPET_HEAD)}\n...[truncated]...\n${output.slice(-SNIPPET_TAIL)}`;
+}
+
+function safeRedact(text: string, normRoot: string): string {
+	if (!text) return text;
+	try {
+		return redactVaultSecrets(text, normRoot);
+	} catch {
+		return text;
+	}
+}
+
+function entrySeq(entry: Partial<ExecLedgerEntry> | undefined): number {
+	return typeof entry?.seq === "number" && Number.isFinite(entry.seq) && entry.seq > 0
+		? Math.floor(entry.seq)
+		: 0;
+}
+
+function maxSeqOf(entries: readonly Partial<ExecLedgerEntry>[]): number {
+	let max = 0;
+	for (const e of entries) {
+		const s = entrySeq(e);
+		if (s > max) max = s;
+	}
+	return max;
+}
+
+function sleepSync(ms: number): void {
+	if (ms <= 0) return;
+	Atomics.wait(SLEEP_VIEW, 0, 0, ms);
+}
+
+function pidAlive(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException)?.code === "EPERM";
+	}
+}
+
+function procStartTime(pid: number): string | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return null;
+		const fields = stat.slice(close + 2).split(" ");
+		return fields[19] ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function readLockHolder(lockFile: string): { pid?: number; ts?: number; start?: string | null } | null {
+	try {
+		const raw = readFileSync(lockFile, "utf8").trim();
+		if (!raw) return null;
+		const parsed = JSON.parse(raw) as { pid?: number; ts?: number; start?: string | null };
+		return parsed && typeof parsed === "object" ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
+function withLedgerLock<T>(normRoot: string, fn: () => T, timeoutMs = LEDGER_LOCK_TIMEOUT_MS): T {
+	const p = ledgerLockPath(normRoot);
+	mkdirSync(dirname(p), { recursive: true });
+	if (heldLedgerLocks.has(p)) {
+		return fn();
+	}
+
+	const deadline = Date.now() + timeoutMs;
+	let backoff = 4;
+
+	for (;;) {
+		let fd = -1;
+		try {
+			fd = openSync(p, "wx", 0o600);
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException)?.code;
+			if (code !== "EEXIST") throw err;
+
+			const held = readLockHolder(p);
+			if (held) {
+				const heldPid = typeof held.pid === "number" ? held.pid : 0;
+				const heldStart = typeof held.start === "string" ? held.start : null;
+				const sameProcess =
+					heldPid > 0 && pidAlive(heldPid) && (!heldStart || heldStart === procStartTime(heldPid));
+				if (sameProcess) {
+					if (Date.now() >= deadline) {
+						throw new Error(`exec-ledger locked by pid ${heldPid}`);
+					}
+					sleepSync(backoff);
+					backoff = Math.min(backoff * 2, 64);
+					continue;
+				}
+			} else {
+				// 刚创建尚未写完 JSON 的极短窗口内暂缓抢占，避免误删并发写者的活锁
+				let recentlyCreated = false;
+				try {
+					recentlyCreated = Date.now() - statSync(p).mtimeMs < 250;
+				} catch {
+					recentlyCreated = false;
+				}
+				if (recentlyCreated && Date.now() < deadline) {
+					sleepSync(backoff);
+					backoff = Math.min(backoff * 2, 32);
+					continue;
+				}
+			}
+
+			try {
+				unlinkSync(p);
+			} catch {
+				/* 已被其他写者回收 */
+			}
+			continue;
+		}
+
+		try {
+			writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now(), start: procStartTime(process.pid) }));
+			closeSync(fd);
+			fd = -1;
+		} catch (writeErr) {
+			if (fd >= 0) {
+				try {
+					closeSync(fd);
+				} catch {
+					/* ignore */
+				}
+			}
+			try {
+				unlinkSync(p);
+			} catch {
+				/* ignore */
+			}
+			throw writeErr;
+		}
+
+		heldLedgerLocks.add(p);
+		try {
+			return fn();
+		} finally {
+			heldLedgerLocks.delete(p);
+			try {
+				unlinkSync(p);
+			} catch {
+				/* 已被回收 */
+			}
+		}
+	}
 }
 
 function readDiskLedger(root: string): ExecLedgerEntry[] {
@@ -205,9 +399,22 @@ function readDiskLedger(root: string): ExecLedgerEntry[] {
 			const trimmed = line.trim();
 			if (!trimmed) continue;
 			try {
-				const parsed = JSON.parse(trimmed) as ExecLedgerEntry;
+				const parsed = JSON.parse(trimmed) as Partial<ExecLedgerEntry>;
 				if (parsed && typeof parsed.sha1 === "string" && typeof parsed.snippet === "string") {
-					out.push(parsed);
+					out.push({
+						seq: entrySeq(parsed),
+						ts: typeof parsed.ts === "string" ? parsed.ts : "",
+						tool: typeof parsed.tool === "string" ? parsed.tool : "",
+						...(typeof parsed.command === "string" ? { command: parsed.command } : {}),
+						...(typeof parsed.sessionId === "string" ? { sessionId: parsed.sessionId } : {}),
+						...(typeof parsed.agentName === "string" && parsed.agentName.trim()
+							? { agentName: parsed.agentName.trim() }
+							: {}),
+						sha1: parsed.sha1,
+						normSha1: typeof parsed.normSha1 === "string" ? parsed.normSha1 : parsed.sha1,
+						bytes: typeof parsed.bytes === "number" && Number.isFinite(parsed.bytes) ? parsed.bytes : 0,
+						snippet: parsed.snippet,
+					});
 				}
 			} catch {
 				/* 忽略损坏单行 */
@@ -221,14 +428,17 @@ function readDiskLedger(root: string): ExecLedgerEntry[] {
 
 function writeDiskLedger(root: string, entries: readonly ExecLedgerEntry[]): void {
 	const p = ledgerFilePath(root);
+	let tmp = "";
 	try {
 		mkdirSync(dirname(p), { recursive: true });
 		const tail = entries.slice(-LEDGER_MAX_ENTRIES).map((e) => {
 			const diskEntry: ExecLedgerEntry = {
+				seq: entrySeq(e),
 				ts: e.ts,
 				tool: e.tool,
 				...(e.command !== undefined ? { command: e.command } : {}),
 				...(e.sessionId !== undefined ? { sessionId: e.sessionId } : {}),
+				...(e.agentName !== undefined ? { agentName: e.agentName } : {}),
 				sha1: e.sha1,
 				normSha1: e.normSha1,
 				bytes: e.bytes,
@@ -237,16 +447,45 @@ function writeDiskLedger(root: string, entries: readonly ExecLedgerEntry[]): voi
 			return JSON.stringify(diskEntry);
 		});
 		const body = tail.length ? `${tail.join("\n")}\n` : "";
-		const tmp = `${p}.tmp-${process.pid}-${Date.now()}-${atomicLedgerSeq++}`;
-		writeFileSync(tmp, body, "utf8");
+		tmp = `${p}.tmp-${process.pid}-${Date.now()}-${atomicLedgerSeq++}`;
+		writeFileSync(tmp, body, { encoding: "utf8", mode: 0o600 });
+		try {
+			chmodSync(tmp, 0o600);
+		} catch {
+			/* 忽略非 POSIX 权限异常 */
+		}
 		renameSync(tmp, p);
+		tmp = "";
+		try {
+			chmodSync(p, 0o600);
+		} catch {
+			/* 忽略非 POSIX 权限异常 */
+		}
 	} catch {
+		if (tmp) {
+			try {
+				unlinkSync(tmp);
+			} catch {
+				/* ignore */
+			}
+		}
 		/* 写盘失败不打断主流程，内存缓冲仍保留 */
 	}
 }
 
 /**
- * 记录一次真实工具执行结果：同步更新进程内环形缓冲与 <root>/.nuwa/exec-ledger.jsonl（滚动保留最近 200 条摘要与 SHA1）。
+ * 获取指定项目根目录在内存环形缓冲与磁盘执行账本中的最高单调序列号（无记录时返回 0）。
+ */
+export function getLatestLedgerSeq(root: string): number {
+	const normRoot = resolve(root || process.cwd());
+	const memMax = maxSeqOf(memoryRing.get(normRoot) ?? []);
+	const diskMax = maxSeqOf(readDiskLedger(normRoot));
+	return Math.max(memMax, diskMax);
+}
+
+/**
+ * 记录一次真实工具执行结果：在专属文件锁保护下同步更新进程内环形缓冲与 <root>/.nuwa/exec-ledger.jsonl
+ * （单调递增 seq、自动脱敏会话保险箱凭据、0o600 落盘并滚动保留最近 200 条摘要与 SHA1）。
  * 防御性拒绝 task / eval / todo / think / ask / nuwa_* 等非执行编排工具，防止子代理幻觉文本污染账本。
  */
 export function recordToolExecution(root: string, rec: ExecRecordInput): void {
@@ -263,28 +502,48 @@ export function recordToolExecution(root: string, rec: ExecRecordInput): void {
 
 	const normRoot = resolve(root || process.cwd());
 	const rawOutput = String(rec.output ?? "");
-	const entry: MemoryLedgerRecord = {
+	const redactedCommand = rec.command ? safeRedact(String(rec.command), normRoot).slice(0, 1000) : undefined;
+	const redactedOutput = safeRedact(rawOutput, normRoot);
+	const cleanAgent = rec.agentName ? String(rec.agentName).trim() : "";
+
+	const buildEntry = (seq: number): MemoryLedgerRecord => ({
+		seq,
 		ts: new Date().toISOString(),
 		tool: rawTool,
-		...(rec.command ? { command: String(rec.command).slice(0, 1000) } : {}),
+		...(redactedCommand ? { command: redactedCommand } : {}),
 		...(rec.sessionId ? { sessionId: String(rec.sessionId) } : {}),
+		...(cleanAgent ? { agentName: cleanAgent } : {}),
 		sha1: sha1Hex(rawOutput),
 		normSha1: sha1Hex(rawOutput.trim()),
 		bytes: Buffer.byteLength(rawOutput, "utf8"),
-		snippet: buildSnippet(rawOutput),
+		snippet: buildSnippet(redactedOutput),
 		rawOutput: rawOutput.length <= 65_536 ? rawOutput : undefined,
+	});
+
+	const pushMemory = (entry: MemoryLedgerRecord): void => {
+		const mem = memoryRing.get(normRoot) ?? [];
+		mem.push(entry);
+		if (mem.length > LEDGER_MAX_ENTRIES) {
+			mem.splice(0, mem.length - LEDGER_MAX_ENTRIES);
+		}
+		memoryRing.set(normRoot, mem);
 	};
 
-	const mem = memoryRing.get(normRoot) ?? [];
-	mem.push(entry);
-	if (mem.length > LEDGER_MAX_ENTRIES) {
-		mem.splice(0, mem.length - LEDGER_MAX_ENTRIES);
+	try {
+		withLedgerLock(normRoot, () => {
+			const mem = memoryRing.get(normRoot) ?? [];
+			const diskExisting = readDiskLedger(normRoot);
+			const nextSeq = Math.max(maxSeqOf(mem), maxSeqOf(diskExisting)) + 1;
+			const entry = buildEntry(nextSeq);
+			diskExisting.push(entry);
+			writeDiskLedger(normRoot, diskExisting);
+			pushMemory(entry);
+		});
+	} catch {
+		const mem = memoryRing.get(normRoot) ?? [];
+		const nextSeq = maxSeqOf(mem) + 1;
+		pushMemory(buildEntry(nextSeq));
 	}
-	memoryRing.set(normRoot, mem);
-
-	const diskExisting = readDiskLedger(normRoot);
-	diskExisting.push(entry);
-	writeDiskLedger(normRoot, diskExisting);
 }
 
 /**
@@ -339,18 +598,58 @@ function collectArtifactTexts(projectId: string): string[] {
 	return texts;
 }
 
-function extractKeyLines(output: string): string[] {
-	const lines = output
+function cleanOutputLines(output: string): string[] {
+	return output
 		.replace(/\r/g, "")
 		.split("\n")
 		.map((l) => l.trim())
 		.filter((l) => l.length > 0 && !/^(?:\.\.\.|---.*---|todo|tbd|n\/a|none|null|-+)$/i.test(l));
+}
+
+function extractKeyLines(output: string): string[] {
+	const lines = cleanOutputLines(output);
 	const strong = lines.filter((l) => l.length >= 6);
 	return strong.length > 0 ? strong.slice(0, 20) : lines.filter((l) => l.length >= 3).slice(0, 20);
 }
 
+function extractSubstantiveLines(output: string): string[] {
+	const lines = cleanOutputLines(output).filter((l) => !isLowEntropyGenericLine(l));
+	const strong = lines.filter((l) => l.length >= 6);
+	return strong.length > 0 ? strong.slice(0, 20) : lines.filter((l) => l.length >= 3).slice(0, 20);
+}
+
+interface CorpusRecord {
+	seq?: number;
+	agentName?: string;
+	sha1?: string;
+	normSha1?: string;
+	texts: string[];
+}
+
+function makeVerifiedResult(rec?: CorpusRecord): VerifyEvidenceResult {
+	const res: VerifyEvidenceResult = { ok: true, verified: true };
+	if (rec?.seq !== undefined && rec.seq > 0) {
+		Object.defineProperty(res, "matchedSeq", {
+			value: rec.seq,
+			enumerable: false,
+			configurable: true,
+			writable: true,
+		});
+	}
+	if (rec?.agentName) {
+		Object.defineProperty(res, "matchedAgent", {
+			value: rec.agentName,
+			enumerable: false,
+			configurable: true,
+			writable: true,
+		});
+	}
+	return res;
+}
+
 /**
  * 复验提交的证据（output / flagValue）是否真实出现在近期执行账本或 /tmp/nuwa/<projectId>/ 产物文件中。
+ * 支持 minSeq / sinceTs 增量新鲜度校验、防低信息熵通用 HTTP 头绕过以及命中 seq/agentName 回传。
  */
 export function verifyExecutionEvidence(root: string, input: VerifyEvidenceInput): VerifyEvidenceResult {
 	const envMode = (process.env.NUWA_STRICT_EVIDENCE ?? "").trim();
@@ -359,61 +658,224 @@ export function verifyExecutionEvidence(root: string, input: VerifyEvidenceInput
 	}
 
 	const normRoot = resolve(root || process.cwd());
-	const memRecords = memoryRing.get(normRoot) ?? [];
-	const diskRecords = readDiskLedger(normRoot);
-	const artifacts = collectArtifactTexts(input.projectId);
+	const allMemRecords = memoryRing.get(normRoot) ?? [];
+	const allDiskRecords = readDiskLedger(normRoot);
+	const hasAnyHist = allMemRecords.length > 0 || allDiskRecords.length > 0;
 
-	const corpusTexts: string[] = [];
-	const shaSet = new Set<string>();
+	const hasMinSeq = typeof input.minSeq === "number" && Number.isFinite(input.minSeq);
+	const minSeqVal = hasMinSeq ? Math.floor(input.minSeq!) : undefined;
+	const parsedSinceTs = input.sinceTs ? Date.parse(input.sinceTs) : Number.NaN;
+	const hasSinceTs = Number.isFinite(parsedSinceTs);
 
-	for (const r of memRecords) {
-		shaSet.add(r.sha1);
-		shaSet.add(r.normSha1);
-		corpusTexts.push(r.rawOutput ?? r.snippet);
-	}
+	const matchesBounds = (r: ExecLedgerEntry): boolean => {
+		if (hasMinSeq && entrySeq(r) <= minSeqVal!) return false;
+		if (hasSinceTs) {
+			const rTs = Date.parse(r.ts);
+			if (!Number.isFinite(rTs) || rTs < parsedSinceTs - 1) return false;
+		}
+		return true;
+	};
+
+	const memRecords = allMemRecords.filter(matchesBounds);
+	const diskRecords = allDiskRecords.filter(matchesBounds);
+
+	// 合并内存与磁盘账本（按 seq 去重并保留最新顺序，内存 rawOutput 仅用于内存中复验绝不落盘）
+	const bySeq = new Map<number, CorpusRecord>();
+	const legacyRecords: CorpusRecord[] = [];
+
+	const addLedgerRecord = (r: MemoryLedgerRecord | ExecLedgerEntry, rawOutput?: string) => {
+		const seq = entrySeq(r);
+		const texts: string[] = [];
+		if (rawOutput) texts.push(rawOutput);
+		if (r.snippet && !texts.includes(r.snippet)) texts.push(r.snippet);
+
+		if (seq > 0) {
+			const prev = bySeq.get(seq);
+			if (prev) {
+				for (const t of texts) {
+					if (!prev.texts.includes(t)) prev.texts.unshift(t);
+				}
+				if (!prev.agentName && r.agentName) prev.agentName = r.agentName;
+				if (!prev.sha1 && r.sha1) prev.sha1 = r.sha1;
+				if (!prev.normSha1 && r.normSha1) prev.normSha1 = r.normSha1;
+			} else {
+				bySeq.set(seq, {
+					seq,
+					agentName: r.agentName,
+					sha1: r.sha1,
+					normSha1: r.normSha1,
+					texts,
+				});
+			}
+		} else {
+			legacyRecords.push({
+				agentName: r.agentName,
+				sha1: r.sha1,
+				normSha1: r.normSha1,
+				texts,
+			});
+		}
+	};
+
 	for (const r of diskRecords) {
-		shaSet.add(r.sha1);
-		shaSet.add(r.normSha1);
-		corpusTexts.push(r.snippet);
+		addLedgerRecord(r);
 	}
-	for (const t of artifacts) {
-		corpusTexts.push(t);
+	for (const r of memRecords) {
+		addLedgerRecord(r, r.rawOutput);
 	}
+
+	const corpusRecords: CorpusRecord[] = [
+		...[...bySeq.values()].sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0)),
+		...legacyRecords.reverse(),
+	];
+
+	// 当指定了 minSeq 或 sinceTs 时仅检索严格更新的账本记录，跳过无序列水印的 /tmp/nuwa/ 产物兜底
+	if (!hasMinSeq && !hasSinceTs) {
+		const artifacts = collectArtifactTexts(input.projectId);
+		for (const t of artifacts) {
+			corpusRecords.push({ texts: [t] });
+		}
+	}
+
+	const normKind = String(input.kind ?? "").trim().toLowerCase();
+	const strictActive = Boolean(input.strict) || envMode === "1";
+	const requireSubstantive = Boolean(input.requireSubstantive);
+	const substantiveMode = requireSubstantive || normKind === "vuln" || normKind === "cred";
 
 	const rawOut = String(input.output ?? "");
 	const trimmedOut = rawOut.trim();
+	const redactedRawOut = safeRedact(rawOut, normRoot);
+	const redactedTrimmedOut = redactedRawOut.trim();
+
 	const explicitFlag = String(input.flagValue ?? "").trim();
 	const inferredFlag =
-		!explicitFlag && input.kind === "flag" ? (rawOut.match(/flag\{[^}\s]{2,}\}/i)?.[0] ?? "") : "";
+		!explicitFlag && normKind === "flag" ? (rawOut.match(/flag\{[^}\s]{2,}\}/i)?.[0] ?? "") : "";
 	const targetFlag = explicitFlag || inferredFlag;
-	const isFlagCheck = Boolean(targetFlag) || input.kind === "flag";
+	const isFlagCheck = Boolean(targetFlag) || normKind === "flag";
 
-	let verified = false;
+	if (hasMinSeq && corpusRecords.length === 0) {
+		return {
+			ok: false,
+			verified: false,
+			reason: `证据复验未通过: 未找到序列号大于 ${minSeqVal} 的新增真实工具执行记录`,
+		};
+	}
+
+	if (hasSinceTs && corpusRecords.length === 0) {
+		return {
+			ok: false,
+			verified: false,
+			reason: `证据复验未通过: 未找到晚于 ${input.sinceTs} 的新增真实工具执行记录`,
+		};
+	}
+
+	let matchedRecord: CorpusRecord | undefined;
 
 	if (targetFlag) {
-		verified = corpusTexts.some((chunk) => chunk.includes(targetFlag));
+		matchedRecord = corpusRecords.find((rec) => rec.texts.some((chunk) => chunk.includes(targetFlag)));
 	} else if (trimmedOut.length > 0) {
-		if (shaSet.has(sha1Hex(rawOut)) || shaSet.has(sha1Hex(trimmedOut))) {
-			verified = true;
-		} else if (trimmedOut.length >= 4 && corpusTexts.some((chunk) => chunk.includes(trimmedOut))) {
-			verified = true;
+		if (substantiveMode) {
+			const substantiveLines = extractSubstantiveLines(rawOut);
+			const redactedSubstantiveLines =
+				redactedRawOut !== rawOut
+					? extractSubstantiveLines(redactedRawOut).filter((l) => !/^[\s*]+$/.test(l))
+					: [];
+
+			if (substantiveLines.length === 0) {
+				if (
+					requireSubstantive ||
+					normKind === "vuln" ||
+					(normKind === "cred" && (strictActive || hasAnyHist || hasMinSeq || hasSinceTs))
+				) {
+					return {
+						ok: false,
+						verified: false,
+						reason: `证据复验未通过: ${input.kind} 仅含通用HTTP状态/响应头，缺少实质性差异或特征证据行`,
+					};
+				}
+			} else {
+				const rawSha1 = sha1Hex(rawOut);
+				const trimmedSha1 = sha1Hex(trimmedOut);
+				matchedRecord = corpusRecords.find(
+					(rec) =>
+						rec.sha1 === rawSha1 ||
+						rec.normSha1 === rawSha1 ||
+						rec.sha1 === trimmedSha1 ||
+						rec.normSha1 === trimmedSha1,
+				);
+
+				if (!matchedRecord && trimmedOut.length >= 4) {
+					matchedRecord = corpusRecords.find((rec) => rec.texts.some((chunk) => chunk.includes(trimmedOut)));
+				}
+
+				if (
+					!matchedRecord &&
+					redactedTrimmedOut !== trimmedOut &&
+					redactedTrimmedOut.length >= 4 &&
+					!/^[\s*]+$/.test(redactedTrimmedOut)
+				) {
+					matchedRecord = corpusRecords.find((rec) =>
+						rec.texts.some((chunk) => chunk.includes(redactedTrimmedOut)),
+					);
+				}
+
+				if (!matchedRecord) {
+					matchedRecord = corpusRecords.find((rec) =>
+						substantiveLines.some((line) => rec.texts.some((chunk) => chunk.includes(line))),
+					);
+				}
+
+				if (!matchedRecord && redactedSubstantiveLines.length > 0) {
+					matchedRecord = corpusRecords.find((rec) =>
+						redactedSubstantiveLines.some((line) => rec.texts.some((chunk) => chunk.includes(line))),
+					);
+				}
+			}
 		} else {
-			const keyLines = extractKeyLines(rawOut);
-			if (keyLines.length > 0) {
-				verified = keyLines.some((line) => corpusTexts.some((chunk) => chunk.includes(line)));
+			const rawSha1 = sha1Hex(rawOut);
+			const trimmedSha1 = sha1Hex(trimmedOut);
+			matchedRecord = corpusRecords.find(
+				(rec) =>
+					rec.sha1 === rawSha1 ||
+					rec.normSha1 === rawSha1 ||
+					rec.sha1 === trimmedSha1 ||
+					rec.normSha1 === trimmedSha1,
+			);
+			if (!matchedRecord && trimmedOut.length >= 4) {
+				matchedRecord = corpusRecords.find((rec) => rec.texts.some((chunk) => chunk.includes(trimmedOut)));
+			}
+			if (!matchedRecord) {
+				const keyLines = extractKeyLines(rawOut);
+				if (keyLines.length > 0) {
+					matchedRecord = corpusRecords.find((rec) =>
+						keyLines.some((line) => rec.texts.some((chunk) => chunk.includes(line))),
+					);
+				}
 			}
 		}
 	}
 
-	if (verified) {
-		return { ok: true, verified: true };
+	if (matchedRecord) {
+		return makeVerifiedResult(matchedRecord);
 	}
 
-	const hasHist = memRecords.length > 0 || diskRecords.length > 0;
-	const strictActive = Boolean(input.strict) || envMode === "1";
-	const normKind = String(input.kind ?? "").trim().toLowerCase();
+	if (hasMinSeq) {
+		return {
+			ok: false,
+			verified: false,
+			reason: `证据复验未通过: 未在序列号大于 ${minSeqVal} 的新增真实执行账本中命中 ${input.kind} 关键证据`,
+		};
+	}
 
-	if (isFlagCheck && (strictActive || hasHist)) {
+	if (hasSinceTs) {
+		return {
+			ok: false,
+			verified: false,
+			reason: `证据复验未通过: 未在晚于 ${input.sinceTs} 的新增真实执行账本中命中 ${input.kind} 关键证据`,
+		};
+	}
+
+	if (isFlagCheck && (strictActive || hasAnyHist)) {
 		return {
 			ok: false,
 			verified: false,
@@ -421,7 +883,7 @@ export function verifyExecutionEvidence(root: string, input: VerifyEvidenceInput
 		};
 	}
 
-	if ((normKind === "vuln" || normKind === "cred") && (strictActive || hasHist)) {
+	if ((normKind === "vuln" || normKind === "cred") && (strictActive || hasAnyHist)) {
 		return {
 			ok: false,
 			verified: false,
@@ -429,7 +891,7 @@ export function verifyExecutionEvidence(root: string, input: VerifyEvidenceInput
 		};
 	}
 
-	if (strictActive) {
+	if (strictActive || requireSubstantive) {
 		return {
 			ok: false,
 			verified: false,
@@ -440,7 +902,7 @@ export function verifyExecutionEvidence(root: string, input: VerifyEvidenceInput
 	return {
 		ok: true,
 		verified: false,
-		reason: hasHist ? "未在近期账本摘要中完全匹配关键行（非严格模式软放行）" : "尚无工具执行账本记录",
+		reason: hasAnyHist ? "未在近期账本摘要中完全匹配关键行（非严格模式软放行）" : "尚无工具执行账本记录",
 	};
 }
 

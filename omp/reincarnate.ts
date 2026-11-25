@@ -79,10 +79,23 @@ export function buildHandoffSummary(st: NuwaState, reason?: string): string {
 	const gen = rt.generation ?? 1;
 	const ep = p.episode ?? 1;
 
+	const rawTotalTurns = Number(rt.totalTurns ?? 0);
+	const rawTurns = Number(rt.turns ?? 0);
+	const totalTurns = Math.max(
+		Number.isFinite(rawTotalTurns) ? Math.max(0, rawTotalTurns) : 0,
+		Number.isFinite(rawTurns) ? Math.max(0, rawTurns) : 0,
+	);
+	const rawTotalTokens = Number(rt.totalTokens ?? 0);
+	const rawTokens = Number(rt.tokens ?? 0);
+	const totalTokens = Math.max(
+		Number.isFinite(rawTotalTokens) ? Math.max(0, rawTotalTokens) : 0,
+		Number.isFinite(rawTokens) ? Math.max(0, rawTokens) : 0,
+	);
+
 	const headerLines = [
 		`[女娲世代交接 G${gen}->G${gen + 1}]`,
 		`目标: ${p.url} (${p.mode}) — ${oneLine(p.goal, 120)}`,
-		`进度: phase=${p.phase} episode=E${ep} totalTurns=${rt.turns ?? 0}${reason ? ` trigger=${oneLine(reason, 60)}` : ""}`,
+		`进度: phase=${p.phase} episode=E${ep} totalTurns=${totalTurns}${totalTokens > 0 ? ` totalTokens=${totalTokens}` : ""}${reason ? ` trigger=${oneLine(reason, 60)}` : ""}`,
 	];
 
 	// 1. 关键事实（按价值权重 + 最新排序，去噪保留核心发现）
@@ -141,11 +154,28 @@ export function buildHandoffSummary(st: NuwaState, reason?: string): string {
 	return raw.slice(0, MAX_SUMMARY_CHARS - suffix.length) + suffix;
 }
 
-/** 执行世代交接状态变更：递增 generation、写入 handoffSummary、归零 genTurns/tokens、重置 lastSig。 */
+/** 执行世代交接状态变更：保全跨世代累计账目、递增 generation、写入 handoffSummary、归零 genTurns/tokens、重置 lastSig。 */
 export function prepareNextGeneration(
 	st: NuwaState,
 	reason?: string,
 ): { generation: number; summary: string } {
+	const prevTotalTokens = Number(st.runtime.totalTokens ?? 0);
+	const curTokens = Number(st.runtime.tokens ?? 0);
+	const prevTotalTurns = Number(st.runtime.totalTurns ?? 0);
+	const curTurns = Number(st.runtime.turns ?? 0);
+
+	st.runtime.projectStartedAt =
+		typeof st.runtime.projectStartedAt === "number" && Number.isFinite(st.runtime.projectStartedAt)
+			? st.runtime.projectStartedAt
+			: st.runtime.startedAt;
+	st.runtime.totalTokens =
+		(Number.isFinite(prevTotalTokens) ? Math.max(0, prevTotalTokens) : 0) +
+		(Number.isFinite(curTokens) ? Math.max(0, curTokens) : 0);
+	st.runtime.totalTurns = Math.max(
+		Number.isFinite(prevTotalTurns) ? Math.max(0, prevTotalTurns) : 0,
+		Number.isFinite(curTurns) ? Math.max(0, curTurns) : 0,
+	);
+
 	const summary = buildHandoffSummary(st, reason);
 	const nextGen = (st.runtime.generation ?? 1) + 1;
 	st.runtime.generation = nextGen;
