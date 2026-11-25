@@ -1,16 +1,17 @@
 /**
- * 女娲 v3.0 世代轮转（Reincarnation）模块。
+ * 女娲 v5.x 世代轮转（Reincarnation）与阶段收口协同模块。
  *
- * 在外层无头守护器（`NUWA_HEADLESS_DAEMON=1`）托管下，当单代会话 token 或轮次达到阈值时，
- * 精炼 1500 字以内的交接摘要（Handoff Summary），重置本代计数器并优雅放行 `session_stop`，
- * 由外层守护进程以全新上下文拉起下一代会话继续推进。
+ * 在外层无头守护器（`NUWA_HEADLESS_DAEMON=1`）托管下，当单代会话 token、轮次或语义停滞（noveltyStall）
+ * 达到阈值时，精炼 1500 字以内的交接摘要（Handoff Summary），重置本代计数器并优雅放行 `session_stop`；
+ * 同时为 `report` 阶段提供无新事实/零漏洞下的干净完结、转世推进或 `sealed_negative` 收口状态转移判定（#30, #45）。
  */
-import type { Fact, NuwaState, ReincarnatePolicy } from "./types";
+import type { Fact, FactKind, Mode, NuwaState, ReincarnatePolicy } from "./types";
 
 export type { ReincarnatePolicy } from "./types";
 
 const DEFAULT_REINCARNATE_TOKENS = 140_000;
 const DEFAULT_REINCARNATE_TURNS = 30;
+const DEFAULT_NOVELTY_STALL_THRESHOLD = 8;
 const MAX_SUMMARY_CHARS = 1500;
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {
@@ -26,22 +27,131 @@ function oneLine(text: string | undefined, max = 100): string {
 		.slice(0, max);
 }
 
+function proofKindsForMode(mode: Mode): FactKind[] {
+	if (mode === "ctf") return ["flag"];
+	if (mode === "audit") return ["vuln", "loot"];
+	if (mode === "pentest") return ["vuln", "loot", "flag"];
+	return ["vuln", "loot", "flag", "note"];
+}
+
+function hasConfirmedPositiveProof(st: NuwaState): boolean {
+	const allowed = proofKindsForMode(st.project?.mode ?? "ctf");
+	return Object.values(st.facts ?? {}).some(
+		(f) => allowed.includes(f.kind) && f.verifyStage !== "candidate" && f.verifyStage !== "rejected",
+	);
+}
+
+function hasSettledReportArtifact(st: NuwaState, explicitReportWritten?: boolean): boolean {
+	if (explicitReportWritten || st.runtime?.reportWritten) return true;
+	const reportIntents = Object.values(st.intents ?? {}).filter((i) => i.phase === "report");
+	if (reportIntents.length === 0) return false;
+	const hasLive = reportIntents.some((i) => i.status === "open" || i.status === "claimed");
+	const hasDoneOrBlocked = reportIntents.some((i) => i.status === "done" || i.status === "blocked");
+	return !hasLive && hasDoneOrBlocked;
+}
+
+export interface ReportPhaseTransition {
+	action: "complete" | "seal_negative" | "advance_episode" | "wait_live" | "seed_report" | "noop";
+	reason: string;
+	canAdvanceEpisode: boolean;
+}
+
+/**
+ * 判定 report 阶段的干净出口转移（#45）：
+ * 即使 vuln/exploit/post 成功数为 0，只要报告已写或无新事实达标（noveltyStall >= threshold / completionRejects >= 1），
+ * 立即给出 complete / seal_negative / advance_episode 干净出口，不再反复重展已死事实。
+ */
+export function resolveReportPhaseTransition(
+	st: NuwaState,
+	opts?: {
+		reportWritten?: boolean;
+		noveltyThreshold?: number;
+		maxEpisodes?: number;
+	},
+): ReportPhaseTransition {
+	if (st.project?.phase !== "report") {
+		return { action: "noop", reason: `phase=${st.project?.phase ?? "unknown"}`, canAdvanceEpisode: false };
+	}
+
+	const reportIntents = Object.values(st.intents ?? {}).filter((i) => i.phase === "report");
+	const liveReport = reportIntents.filter((i) => i.status === "open" || i.status === "claimed");
+	const reportReady = hasSettledReportArtifact(st, opts?.reportWritten);
+
+	if (hasConfirmedPositiveProof(st) && (reportReady || liveReport.length === 0)) {
+		return { action: "complete", reason: "confirmed_proof_ready_in_report", canAdvanceEpisode: false };
+	}
+
+	if (liveReport.length > 0 && !opts?.reportWritten && !st.runtime?.reportWritten) {
+		return { action: "wait_live", reason: `report_live(${liveReport.length})`, canAdvanceEpisode: false };
+	}
+
+	if (reportIntents.length === 0 && !reportReady) {
+		return { action: "seed_report", reason: "report_unseeded", canAdvanceEpisode: false };
+	}
+
+	const threshold = opts?.noveltyThreshold ?? DEFAULT_NOVELTY_STALL_THRESHOLD;
+	const noveltyStall = Number(st.runtime?.noveltyStall ?? 0);
+	const rejects = Number(st.runtime?.completionRejects ?? 0);
+	const ep = Number(st.project?.episode ?? 1);
+	const maxEpisodes = opts?.maxEpisodes ?? 0;
+	const episodeCapReached = maxEpisodes > 0 && ep >= maxEpisodes;
+
+	if (
+		noveltyStall >= threshold ||
+		rejects >= 1 ||
+		Boolean(opts?.reportWritten || st.runtime?.reportWritten)
+	) {
+		return {
+			action: "seal_negative",
+			reason:
+				rejects >= 1
+					? `report_converged_after_rejects(${rejects})`
+					: noveltyStall >= threshold
+						? `report_novelty_stall(${noveltyStall}>=${threshold})`
+						: "report_written_zero_positive_proof",
+			canAdvanceEpisode: false,
+		};
+	}
+
+	if (episodeCapReached) {
+		return {
+			action: "noop",
+			reason: `report_episode_capped(${ep}/${maxEpisodes})`,
+			canAdvanceEpisode: false,
+		};
+	}
+
+	return {
+		action: "advance_episode",
+		reason: `report_settled_next_episode(E${ep + 1})`,
+		canAdvanceEpisode: true,
+	};
+}
+
 /** 读取世代轮转策略：默认 140000 tokens / 30 turns，仅在 NUWA_HEADLESS_DAEMON=1 时启用。 */
 export function readReincarnatePolicy(): ReincarnatePolicy {
-	return {
+	const base: ReincarnatePolicy = {
 		maxTokens: parsePositiveInt(process.env.NUWA_REINCARNATE_TOKENS, DEFAULT_REINCARNATE_TOKENS),
 		maxTurns: parsePositiveInt(process.env.NUWA_REINCARNATE_TURNS, DEFAULT_REINCARNATE_TURNS),
 		headless: (process.env.NUWA_HEADLESS_DAEMON ?? "").trim() === "1",
 	};
+	const rawNovelty = process.env.NUWA_NOVELTY_STALL_THRESHOLD;
+	if (rawNovelty !== undefined && rawNovelty.trim() !== "") {
+		base.noveltyStallThreshold = parsePositiveInt(rawNovelty, DEFAULT_NOVELTY_STALL_THRESHOLD);
+	}
+	return base;
 }
 
-/** 判断当前状态是否需要触发会话世代轮转。 */
+/** 判断当前状态是否需要触发会话世代轮转（兼容 #30 语义停滞升级与 #45 report 阶段收口推进）。 */
 export function shouldReincarnate(
 	st: NuwaState,
 	policy: ReincarnatePolicy,
 ): { needed: boolean; reason?: string } {
 	if (!policy.headless) return { needed: false };
 	if (st.project?.status !== "active") return { needed: false };
+	if (st.runtime?.status === "completed" || st.runtime?.status === "sealed_negative") {
+		return { needed: false };
+	}
 
 	const tokens = Number(st.runtime?.tokens ?? 0);
 	if (policy.maxTokens > 0 && tokens >= policy.maxTokens) {
@@ -54,6 +164,27 @@ export function shouldReincarnate(
 			: Number(st.runtime?.turns ?? 0);
 	if (policy.maxTurns > 0 && genTurns >= policy.maxTurns) {
 		return { needed: true, reason: `max_gen_turns(${genTurns}>=${policy.maxTurns})` };
+	}
+
+	const stallThreshold =
+		policy.noveltyStallThreshold ??
+		parsePositiveInt(process.env.NUWA_NOVELTY_STALL_THRESHOLD, DEFAULT_NOVELTY_STALL_THRESHOLD);
+	const noveltyStall = Number(st.runtime?.noveltyStall ?? 0);
+	if (stallThreshold > 0 && noveltyStall >= stallThreshold) {
+		if (st.project.phase === "report") {
+			return {
+				needed: true,
+				reason: `report_seal_convergence(novelty_stall=${noveltyStall}>=${stallThreshold})`,
+			};
+		}
+		return { needed: true, reason: `novelty_stall(${noveltyStall}>=${stallThreshold})` };
+	}
+
+	if (st.project.phase === "report" && genTurns >= 2) {
+		const reportTrans = resolveReportPhaseTransition(st, { noveltyThreshold: stallThreshold });
+		if (reportTrans.action === "seal_negative" || reportTrans.action === "complete") {
+			return { needed: true, reason: `report_phase_exit(${reportTrans.reason})` };
+		}
 	}
 
 	return { needed: false };
@@ -91,11 +222,13 @@ export function buildHandoffSummary(st: NuwaState, reason?: string): string {
 		Number.isFinite(rawTotalTokens) ? Math.max(0, rawTotalTokens) : 0,
 		Number.isFinite(rawTokens) ? Math.max(0, rawTokens) : 0,
 	);
+	const noveltyStall = Number(rt.noveltyStall ?? 0);
+	const rejects = Number(rt.completionRejects ?? 0);
 
 	const headerLines = [
 		`[女娲世代交接 G${gen}->G${gen + 1}]`,
 		`目标: ${p.url} (${p.mode}) — ${oneLine(p.goal, 120)}`,
-		`进度: phase=${p.phase} episode=E${ep} totalTurns=${totalTurns}${totalTokens > 0 ? ` totalTokens=${totalTokens}` : ""}${reason ? ` trigger=${oneLine(reason, 60)}` : ""}`,
+		`进度: phase=${p.phase} episode=E${ep} totalTurns=${totalTurns}${totalTokens > 0 ? ` totalTokens=${totalTokens}` : ""}${noveltyStall > 0 ? ` noveltyStall=${noveltyStall}` : ""}${rejects > 0 ? ` rejects=${rejects}` : ""}${reason ? ` trigger=${oneLine(reason, 60)}` : ""}`,
 	];
 
 	// 1. 关键事实（按价值权重 + 最新排序，去噪保留核心发现）
@@ -133,20 +266,34 @@ export function buildHandoffSummary(st: NuwaState, reason?: string): string {
 			]
 		: [];
 
-	// 3. 高优待办意图（供下一代立即接力）
+	// 3. 高优待办意图或 report/seal 收口指引（供下一代立即接力，避免重展死事实）
 	const openIntents = Object.values(st.intents ?? {})
 		.filter((i) => i.status === "open" || i.status === "claimed")
 		.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id))
 		.slice(0, 6);
 
-	const todoLines = openIntents.length
-		? [
-				`优先待办(open/claimed):`,
-				...openIntents.map(
-					(i) => `- ${i.id}[${i.phase}|P${i.priority}] ${oneLine(i.title, 55)}${i.status === "claimed" ? " (待续)" : ""}`,
-				),
-			]
-		: [`优先待办: 当前队列待 nuwa_expand() 派生新面`];
+	let todoLines: string[];
+	if (openIntents.length) {
+		todoLines = [
+			`优先待办(open/claimed):`,
+			...openIntents.map(
+				(i) => `- ${i.id}[${i.phase}|P${i.priority}] ${oneLine(i.title, 55)}${i.status === "claimed" ? " (待续)" : ""}`,
+			),
+		];
+	} else if (p.phase === "report" || rejects >= 1 || noveltyStall >= DEFAULT_NOVELTY_STALL_THRESHOLD) {
+		const trans = p.phase === "report" ? resolveReportPhaseTransition(st) : null;
+		if (trans?.action === "complete") {
+			todoLines = [`优先待办: report 阶段证据已备齐，请生成报告并调用 nuwa_complete 收口`];
+		} else if (trans?.action === "seal_negative" || rejects >= 1 || noveltyStall >= DEFAULT_NOVELTY_STALL_THRESHOLD) {
+			todoLines = [
+				`优先待办: 已触发收敛/停滞条件（禁止重展已死事实），请整理排除面生成报告并执行 sealEngagement(sealed_negative) 合法封盘`,
+			];
+		} else {
+			todoLines = [`优先待办: report 阶段收尾，完成报告整理后按新线索推进下一轮`];
+		}
+	} else {
+		todoLines = [`优先待办: 当前队列待 nuwa_expand() 派生新面`];
+	}
 
 	const raw = [...headerLines, ...factLines, ...blockedLines, ...todoLines].join("\n");
 	if (raw.length <= MAX_SUMMARY_CHARS) return raw;

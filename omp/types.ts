@@ -1,8 +1,8 @@
 /**
- * 女娲 v4.0 共享类型定义。
+ * 女娲 v5.x 共享类型定义。
  *
  * 汇总核心状态机、范围护栏、证据账本、多领域 Profile、会话保险箱、
- * 双盲复验闸门、零信任沙盒与世代轮转的公共类型，
+ * 双盲复验闸门、零信任沙盒、封盘终态、表面分域去重与世代轮转的公共类型，
  * 供各子模块 `import type` 使用，并由 `omp/nuwa.ts` 完整 re-export 以保持 100% 向后兼容。
  */
 
@@ -27,6 +27,41 @@ export type FactKind =
 export type Phase = (typeof PHASE_ORDER)[number];
 export type IntentStatus = "open" | "claimed" | "done" | "blocked";
 export type VerifyStage = "candidate" | "confirmed" | "rejected";
+
+/** v5.1 攻击面显式分域（#25）：端口级、路径级与主机级互不污染 blocked 状态。 */
+export type SurfaceDomain = "port" | "path" | "host";
+
+/** v5.1 项目与运行态生命周期终态（#22）：sealed_negative 与 completed 并列为合法终态。 */
+export type ProjectStatus = "active" | "completed" | "stopped" | "sealed_negative";
+export type RuntimeStatus = "active" | "completed" | "sealed_negative";
+
+/** v5.1 负向封盘元数据（#22）。 */
+export interface SealMeta {
+	reason: string;
+	excludedSurface: string[];
+	coverage: Record<string, unknown>;
+	sealedAt: string;
+}
+
+/** v5.1 规划/展图去重拒绝原因枚举与条目（#43）。 */
+export type PlanRejectReason = "duplicate_key" | "blocked_cooldown" | "inflight";
+
+export interface RejectedIntentEntry {
+	title: string;
+	targetKey: string;
+	reason: PlanRejectReason;
+}
+
+/** v5.1 已尝试过滤器持久化记录项（#21, #45）：防止 compactIntents 后已死目标重派生。 */
+export interface AttemptedEntry {
+	key: string;
+	expectedKind: FactKind;
+	targetKey: string;
+	surfaceDomain: SurfaceDomain;
+	status: "done" | "blocked";
+	at: string;
+	from: string[];
+}
 
 export interface AutoFactMeta {
 	ports?: number[];
@@ -96,6 +131,8 @@ export interface ReincarnatePolicy {
 	maxTokens: number;
 	maxTurns: number;
 	headless: boolean;
+	/** v5.1 可选语义停滞换代阈值（默认 8，#30）。 */
+	noveltyStallThreshold?: number;
 }
 
 export interface ProfileSpec {
@@ -128,6 +165,13 @@ export interface Fact {
 	evidenceSeq?: number;
 	/** v5.0 关联的多资产节点 ID。 */
 	assetId?: string;
+	/** v5.1 关联规范化目标键与表面分域（#21, #25）。 */
+	targetKey?: string;
+	surfaceDomain?: SurfaceDomain;
+	/** v5.1 原始响应/证据落盘文件相对路径指针（#42）。 */
+	evidenceRef?: string;
+	/** v5.1 子代理结构化回包解析结果（#51）。 */
+	agentResult?: Record<string, unknown>;
 }
 
 export interface Intent {
@@ -156,6 +200,15 @@ export interface Intent {
 	authRole?: string;
 	/** v5.0 当依赖前提事实被证伪时的自动剪枝/失效原因。 */
 	invalidatedReason?: string;
+	/** v5.1 规划/派生/认领时自动推断或显式记录的期望事实类型（#29）。 */
+	expectedKind?: FactKind;
+	/** v5.1 显式表面分域（#25）：port / path / host。 */
+	surfaceDomain?: SurfaceDomain;
+	/** v5.1 规范化目标键（#21, #43）。 */
+	targetKey?: string;
+	/** v5.1 规范化三元组去重键 (expectedKind, targetKey, hintHash)（#43）。 */
+	dedupKey?: string;
+	hintHash?: string;
 }
 
 /** v5.0 多资产与跳板可达拓扑节点。 */
@@ -197,13 +250,15 @@ export interface Project {
 	scheme: string;
 	goal: string;
 	mode: Mode;
-	status: "active" | "completed" | "stopped";
+	status: ProjectStatus;
 	phase: Phase;
 	createdAt: string;
 	updatedAt: string;
 	completedAt?: string;
 	completedFrom?: string[];
 	stopReason?: string;
+	/** v5.1 负向封盘元数据（#22）。 */
+	sealMeta?: SealMeta;
 	/** 扩张轮次：report 全终态后 +1 并回到 recon；目标未达就永不封顶。 */
 	episode?: number;
 	/** 首次创建/接管的 omp 会话；共享 cwd 下用它拒绝跨会话接管。 */
@@ -266,6 +321,26 @@ export interface Runtime {
 	totalTokens?: number;
 	/** v5.0 跨世代估算累计成本（USD）。 */
 	totalCostUsd?: number;
+	/** v5.1 运行时终态（#22）：active | completed | sealed_negative。 */
+	status?: RuntimeStatus;
+	/** v5.1 负向封盘元数据（#22）。 */
+	sealMeta?: SealMeta;
+	/** v5.1 连续 0 新非 blocked 事实的轮数（提交 blocked=true 绝不重置，#30）。 */
+	noveltyStall?: number;
+	/** v5.1 上一轮结算时的有效（非 blocked）事实数水位（#30）。 */
+	lastNovelFacts?: number;
+	/** v5.1 是否已达语义停滞升级阈值（#30）。 */
+	semanticStall?: boolean;
+	/** v5.1 历史累计 blocked=true 提交总次数（不受 compactIntents 回收影响，#49）。 */
+	blockedCommits?: number;
+	/** v5.1 最近一次 blockedCommits 增量（供快照与状态栏展示，#49）。 */
+	lastBlockedCommitsDelta?: number;
+	/** v5.1 最近一次 blockedIntents 增量（#49）。 */
+	lastBlockedIntentsDelta?: number;
+	/** v5.1 标记当前轮次/项目已生成评估报告（#45）。 */
+	reportWritten?: boolean;
+	/** v5.1 跨压缩保留的已尝试 (kind, surfaceDomain, targetKey) 登记表（#21, #45）。 */
+	attemptedKeys?: Record<string, AttemptedEntry>;
 }
 
 export interface NuwaState {
@@ -284,7 +359,7 @@ export interface NuwaState {
 
 export interface Cfg {
 	loop: boolean;
-	/** 无限推进：预算只降档不停机；唯一停机条件是目标完成或人工 stop。 */
+	/** 无限推进：预算只降档不停机；唯一停机条件是目标完成、负向封盘或人工 stop。 */
 	infinite: boolean;
 	maxTurns: number;
 	maxStall: number;
@@ -318,6 +393,12 @@ export interface Cfg {
 	autoBudgetMs?: number;
 	/** 自动批并发度（默认 1）。 */
 	autoConcurrency?: number;
+	/** v5.1 语义停滞阈值（默认 8，#22/#30）。 */
+	noveltyStallThreshold?: number;
+	/** v5.1 跨世代成本上限（USD，0 或未设不限，#22）。 */
+	maxCostUsd?: number;
+	/** v5.1 blocked targetKey 冷却窗口毫秒数（默认 300_000，#43）。 */
+	blockedCooldownMs?: number;
 }
 
 export interface Seed {
@@ -325,6 +406,8 @@ export interface Seed {
 	title: string;
 	detail: string;
 	priority?: number;
+	expectedKind?: FactKind;
+	surfaceDomain?: SurfaceDomain;
 }
 
 export interface FrontierItem {
@@ -336,6 +419,7 @@ export interface FrontierItem {
 export interface ExpansionResult {
 	added: string[];
 	rules: string[];
+	rejectedReasons: RejectedIntentEntry[];
 }
 
 export interface AutoPlanResult {
@@ -343,10 +427,12 @@ export interface AutoPlanResult {
 	reason: string;
 	phase?: Phase;
 	episode?: number;
+	rejectedReasons: RejectedIntentEntry[];
 }
 
 export interface CommitInput {
-	id: string;
+	/** 意图 ID；省略或传 freeNote=true 时直通免票据落账（#31）。 */
+	id?: string;
 	kind?: FactKind;
 	title?: string;
 	detail?: string;
@@ -357,6 +443,14 @@ export interface CommitInput {
 	meta?: AutoFactMeta;
 	verified?: boolean;
 	verifyStage?: VerifyStage;
+	/** v5.1 免票据直记开关（#31）。 */
+	freeNote?: boolean;
+	/** v5.1 显式强制覆盖重复抑制（#21）。 */
+	force?: boolean;
+	/** v5.1 原始响应/日志证据文件相对路径引用（#42）。 */
+	evidenceRef?: string;
+	/** v5.1 子代理结构化回包对象（#51）。 */
+	agentResult?: Record<string, unknown>;
 }
 
 export interface PolicyVerdict {

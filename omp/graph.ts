@@ -3,11 +3,12 @@
  *
  * 约束：严禁运行时 `import "./nuwa"`，保持纯单向模块依赖。
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
 	NUWA_VERSION,
 	PHASE_ORDER,
+	type AttemptedEntry,
 	type AutoFactMeta,
 	type AutoPlanResult,
 	type Cfg,
@@ -21,9 +22,14 @@ import {
 	type Mode,
 	type NuwaState,
 	type Phase,
+	type PlanRejectReason,
 	type PolicyVerdict,
+	type RejectedIntentEntry,
+	type Runtime,
 	type ScopePolicy,
+	type SealMeta,
 	type Seed,
+	type SurfaceDomain,
 	type VerifyStage,
 } from "./types";
 import {
@@ -43,7 +49,15 @@ import {
 	sha,
 	withLock,
 } from "./storage";
-import { prepareNextGeneration, readReincarnatePolicy, shouldReincarnate } from "./reincarnate";
+import {
+	prepareNextGeneration,
+	readReincarnatePolicy,
+	resolveReportPhaseTransition,
+	shouldReincarnate,
+	type ReportPhaseTransition,
+} from "./reincarnate";
+import { extractProbeHealth, renderFullStatus, type FullStatusOptions } from "./ui";
+export { renderFullStatus, resolveReportPhaseTransition, type FullStatusOptions, type ReportPhaseTransition };
 import { checkNuwaDirTamper, checkScopeAndRisk, defaultScopeForTarget, isHostInScope } from "./scope";
 import { adaptPacketForToolchain, getLatestLedgerSeq, probeToolchain, recordToolExecution } from "./evidence";
 import {
@@ -137,11 +151,1090 @@ export function newState(
 	ownerSessionId = "",
 	scopeOverrides?: Partial<ScopePolicy>,
 ): NuwaState {
-	return createInitialState(target, goal, mode, cfg, ownerSessionId, scopeOverrides);
+	const st = createInitialState(target, goal, mode, cfg, ownerSessionId, scopeOverrides);
+	st.runtime.status = "active";
+	st.runtime.noveltyStall = 0;
+	st.runtime.lastNovelFacts = 0;
+	st.runtime.semanticStall = false;
+	st.runtime.blockedCommits = 0;
+	st.runtime.lastBlockedCommitsDelta = 0;
+	st.runtime.lastBlockedIntentsDelta = 0;
+	st.runtime.attemptedKeys = {};
+	return st;
 }
 
 export function kbLookup(query: string, kind: KbLookupKind, limit = 5): string {
 	return kbLookupSafe(query, kind, limit, { agentHome: getAgentHome() });
+}
+
+// ============================================================================
+// v5.1 表面分域、规范化三元组去重、已尝试过滤器、封盘终态、免票据落账与只读诊断
+// ============================================================================
+
+const DEFAULT_NOVELTY_THRESHOLD = 8;
+const DEFAULT_BLOCKED_COOLDOWN_MS = 300_000;
+
+function readEnvCooldownMs(cfg?: Partial<Cfg>): number {
+	if (typeof cfg?.blockedCooldownMs === "number" && Number.isFinite(cfg.blockedCooldownMs) && cfg.blockedCooldownMs >= 0) {
+		return cfg.blockedCooldownMs;
+	}
+	const raw = process.env.NUWA_BLOCKED_COOLDOWN_MS;
+	if (raw !== undefined && raw.trim() !== "") {
+		const n = Number(raw);
+		if (Number.isFinite(n) && n >= 0) return n;
+	}
+	return DEFAULT_BLOCKED_COOLDOWN_MS;
+}
+
+function readNoveltyThreshold(cfg?: Partial<Cfg>): number {
+	if (
+		typeof cfg?.noveltyStallThreshold === "number" &&
+		Number.isFinite(cfg.noveltyStallThreshold) &&
+		cfg.noveltyStallThreshold >= 1
+	) {
+		return Math.floor(cfg.noveltyStallThreshold);
+	}
+	const raw = process.env.NUWA_NOVELTY_STALL_THRESHOLD;
+	if (raw !== undefined && raw.trim() !== "") {
+		const n = Number(raw);
+		if (Number.isFinite(n) && n >= 1) return Math.floor(n);
+	}
+	return DEFAULT_NOVELTY_THRESHOLD;
+}
+
+/** 规范化目标键（#21, #43）：统一处理路径尾斜杠/查询串排序、host:port/tcp 与 URL 默认端口。 */
+export function normalizeTargetKey(raw: string, defaultHost?: string): string {
+	const trimmed = (raw ?? "").trim();
+	if (!trimmed) return defaultHost ? defaultHost.toLowerCase() : "/";
+
+	const prefixMatch = /^(port|path|host):(.*)$/i.exec(trimmed);
+	const explicitDomain = prefixMatch ? (prefixMatch[1]!.toLowerCase() as SurfaceDomain) : undefined;
+	const body = (prefixMatch ? prefixMatch[2]! : trimmed).trim();
+	if (!body) return defaultHost ? defaultHost.toLowerCase() : "/";
+
+	const normPathAndQuery = (rawPath: string): string => {
+		const hashIdx = rawPath.indexOf("#");
+		const noHash = hashIdx >= 0 ? rawPath.slice(0, hashIdx) : rawPath;
+		const qIdx = noHash.indexOf("?");
+		const pathOnly = (qIdx >= 0 ? noHash.slice(0, qIdx) : noHash).replace(/\/{2,}/g, "/");
+		const cleanPath = pathOnly.length > 1 ? pathOnly.replace(/\/+$/, "") : pathOnly || "/";
+		if (qIdx < 0) return cleanPath;
+		const params = new URLSearchParams(noHash.slice(qIdx + 1));
+		params.sort();
+		const qs = params.toString();
+		return qs ? `${cleanPath}?${qs}` : cleanPath;
+	};
+
+	if (body.startsWith("/") || explicitDomain === "path") {
+		const ensured = body.startsWith("/") ? body : `/${body}`;
+		return normPathAndQuery(ensured);
+	}
+
+	const portMatch = /^(?:([a-zA-Z0-9.-]+):)?(\d{1,5})(?:\/(?:tcp|udp))?$/i.exec(body);
+	if (portMatch) {
+		const hostPart = (portMatch[1] || defaultHost || "").toLowerCase();
+		return hostPart ? `${hostPart}:${portMatch[2]}` : `port:${portMatch[2]}`;
+	}
+
+	if (/^https?:\/\//i.test(body)) {
+		try {
+			const u = new URL(body);
+			const host = u.hostname.toLowerCase();
+			const isDefaultPort =
+				!u.port ||
+				(u.protocol === "http:" && u.port === "80") ||
+				(u.protocol === "https:" && u.port === "443");
+			const portSuffix = isDefaultPort ? "" : `:${u.port}`;
+			const pq = normPathAndQuery(`${u.pathname}${u.search}`);
+			if (pq !== "/" || body.endsWith("/") && explicitDomain === "path") {
+				if (pq !== "/") {
+					if (defaultHost && host === defaultHost.toLowerCase() && isDefaultPort) {
+						return pq;
+					}
+					return `${host}${portSuffix}${pq}`;
+				}
+			}
+			return `${host}${portSuffix}`;
+		} catch {
+			return body.toLowerCase();
+		}
+	}
+
+	const slashIdx = body.indexOf("/");
+	if (slashIdx > 0 && !/^\d+\/(?:tcp|udp)$/i.test(body)) {
+		const hostPart = body.slice(0, slashIdx).toLowerCase().replace(/:(?:80|443)$/, "");
+		const pq = normPathAndQuery(body.slice(slashIdx));
+		if (defaultHost && hostPart === defaultHost.toLowerCase()) {
+			return pq;
+		}
+		return `${hostPart}${pq}`;
+	}
+
+	return body.toLowerCase().replace(/\/+$/, "");
+}
+
+/** 显式推断目标键所属的攻击面分域（#25）："port" | "path" | "host"。 */
+export function inferSurfaceDomain(targetKey: string): SurfaceDomain {
+	const raw = (targetKey ?? "").trim();
+	if (!raw) return "host";
+	if (/^port:/i.test(raw)) return "port";
+	if (/^path:/i.test(raw)) return "path";
+	if (/^host:/i.test(raw)) return "host";
+
+	if (raw.startsWith("/")) return "path";
+
+	if (/^https?:\/\//i.test(raw)) {
+		try {
+			const u = new URL(raw);
+			if ((u.pathname && u.pathname !== "/") || u.search) return "path";
+			if (u.port) return "port";
+			return "host";
+		} catch {
+			/* fallthrough */
+		}
+	}
+
+	if (/^(?:[a-zA-Z0-9.-]+:)?\d{1,5}(?:\/(?:tcp|udp))?$/i.test(raw)) {
+		return "port";
+	}
+
+	if (raw.includes("/") && !/^\d{1,5}\/(?:tcp|udp)$/i.test(raw)) {
+		return "path";
+	}
+
+	return "host";
+}
+
+/** 跨层派生校验（#25）：从某一 surfaceDomain 派生另一 surfaceDomain 时，必须携带有效非证伪的显式前置事实。 */
+export function canDeriveCrossSurface(
+	st: NuwaState,
+	fromDomain: SurfaceDomain | undefined,
+	toDomain: SurfaceDomain | undefined,
+	fromFactIds: string[],
+): boolean {
+	if (!fromDomain || !toDomain || fromDomain === toDomain) return true;
+	const validFacts = (fromFactIds ?? [])
+		.map((fid) => st.facts[fid])
+		.filter((f): f is Fact => Boolean(f) && f.kind !== "blocked" && f.verifyStage !== "rejected");
+	if (validFacts.length === 0) return false;
+	// 端口层 -> 路径层：必须有证明 HTTP/Web 端点或服务可达的事实，纯关闭端口或无关事实不可跨层派生路径
+	if (fromDomain === "port" && toDomain === "path") {
+		return validFacts.some((f) => {
+			if (f.kind === "endpoint" || f.kind === "cred" || f.kind === "vuln" || f.kind === "loot") return true;
+			if (f.kind === "service") {
+				const blob = `${f.title} ${f.detail} ${f.output ?? ""} ${f.meta?.server ?? ""}`;
+				return (
+					(typeof f.meta?.status === "number" && f.meta.status > 0) ||
+					(f.meta?.paths?.length ?? 0) > 0 ||
+					/\b(?:http|https|html|nginx|apache|caddy|iis|express|nextjs|tomcat|jetty|werkzeug|uvicorn|gunicorn|200|301|302|401|403|404|405)\b/i.test(blob)
+				);
+			}
+			return false;
+		});
+	}
+	// 路径层 -> 端口层：必须有显式发现新主机资产或端口服务的事实（禁止路径 403 后无依据回头重扫死端口）
+	if (fromDomain === "path" && toDomain === "port") {
+		return validFacts.some((f) => f.kind === "asset" || f.kind === "service" || f.kind === "cred" || f.kind === "vuln");
+	}
+	return true;
+}
+
+/** 自动推断意图的期望事实类型 expectedKind（#29, #43：优先显式声明、证据契约、结构化规则键与阶段语义，避免泛化标题词污染三元组）。 */
+export function inferExpectedKind(spec: {
+	key?: string;
+	phase?: Phase;
+	title?: string;
+	detail?: string;
+	expectedKind?: FactKind;
+}): FactKind {
+	if (spec.expectedKind) return spec.expectedKind;
+	const detail = spec.detail ?? "";
+	const m = /证据\s*[:：]\s*kind\s*=\s*(target|asset|service|endpoint|cred|vuln|flag|loot|note)\b/i.exec(detail);
+	if (m) return m[1]!.toLowerCase() as FactKind;
+
+	const canonKey = (spec.key ?? "").replace(/^e\d+:/i, "").toLowerCase();
+	if (canonKey.startsWith("svc:") || canonKey.endsWith(":http") || canonKey.endsWith(":ports")) return "service";
+	if (canonKey.startsWith("san:")) return "asset";
+	if (canonKey.startsWith("enum:")) return "service";
+	if (canonKey.startsWith("ep:") || canonKey.startsWith("exp:") || canonKey.startsWith("verify-vuln:")) return "vuln";
+	if (canonKey.startsWith("reuse:") || canonKey.endsWith(":creds")) return "cred";
+	if (canonKey.startsWith("pivot:") || canonKey.endsWith(":loot")) return "loot";
+	if (canonKey.endsWith(":flag")) return "flag";
+	if (canonKey.startsWith("loot:") || canonKey.startsWith("reflect:") || canonKey.startsWith("report:")) return "note";
+	if (canonKey.startsWith("surface:") || canonKey.endsWith(":dirs") || canonKey.endsWith(":tlsjs")) return "endpoint";
+
+	if (spec.phase) {
+		switch (spec.phase) {
+			case "recon":
+				return "service";
+			case "surface":
+				return "endpoint";
+			case "vuln":
+			case "exploit":
+				return "vuln";
+			case "post":
+				return "loot";
+			case "report":
+				return "note";
+		}
+	}
+
+	const title = (spec.title ?? "").toLowerCase();
+	if (/\bflag\b/.test(title)) return "flag";
+	if (/(sql\s*注入|sqli|xss|ssti|ssrf|rce|命令注入|路径穿越|lfi|越权|idor|绕过|漏洞|cve-|审计)/i.test(title)) return "vuln";
+	if (/(凭据|口令|token|cookie|cred)/i.test(title)) return "cred";
+	if (/(端口|nmap|服务枚举|服务深挖|存活)/i.test(title)) return "service";
+	if (/(路由|目录|接口|api|endpoint|爬取|参数)/i.test(title)) return "endpoint";
+	if (/(子域|虚拟主机|san|资产)/i.test(title)) return "asset";
+
+	return "note";
+}
+
+/** 从意图 key / title / detail 中提取目标标识并规范化（#21, #25, #43）。 */
+export function extractIntentTargetKey(
+	spec: { key?: string; title?: string; detail?: string; targetKey?: string; phase?: Phase },
+	defaultHost = "",
+): string {
+	if (spec.targetKey && spec.targetKey.trim()) {
+		return normalizeTargetKey(spec.targetKey, defaultHost);
+	}
+	const rawKey = (spec.key ?? "").replace(/^e\d+:/i, "");
+	if (rawKey.startsWith("svc:")) {
+		const port = rawKey.split(":")[2];
+		if (port) return normalizeTargetKey(`${defaultHost || "port"}:${port}`, defaultHost);
+	}
+	if (rawKey.startsWith("ep:")) {
+		const parts = rawKey.split(":");
+		if (parts.length >= 3) return normalizeTargetKey(parts.slice(2).join(":"), defaultHost);
+	}
+	if (rawKey.startsWith("san:")) {
+		const dom = rawKey.split(":").slice(2).join(":");
+		if (dom) return normalizeTargetKey(dom, defaultHost);
+	}
+
+	const blob = `${spec.title ?? ""}\n${spec.detail ?? ""}`;
+	const urlHit = blob.match(/https?:\/\/[^\s"'`）)，。；;、<>]+/i)?.[0];
+	if (urlHit) {
+		return normalizeTargetKey(urlHit.replace(/[.,;:!?]+$/, ""), defaultHost);
+	}
+	const hostPortHit = blob.match(/\b([a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?:\d{1,5})\b/)?.[1];
+	if (hostPortHit) {
+		return normalizeTargetKey(hostPortHit, defaultHost);
+	}
+	const portProtoHit = blob.match(/\b(\d{1,5}\/(?:tcp|udp))\b/i)?.[1];
+	if (portProtoHit) {
+		return normalizeTargetKey(portProtoHit, defaultHost);
+	}
+	const pathHit = (spec.title ?? "").match(/(?:^|[\s"'(:])(\/[A-Za-z0-9._~:/?=&%-]{1,120})/)?.[1]
+		?? (spec.detail ?? "").match(/(?:^|[\s"'(:])(\/[A-Za-z0-9._~:/?=&%-]{1,120})/)?.[1];
+	if (pathHit && !pathHit.startsWith("//") && !pathHit.startsWith("/tmp/") && !pathHit.startsWith("/usr/") && !pathHit.startsWith("/etc/") && !pathHit.startsWith("/var/")) {
+		return normalizeTargetKey(pathHit, defaultHost);
+	}
+	if (rawKey && !rawKey.startsWith("custom:")) {
+		return `seed:${rawKey}`;
+	}
+	return defaultHost ? defaultHost.toLowerCase() : "/";
+}
+
+function normalizeHintForHash(rawHint: string): string {
+	return rawHint
+		.replace(/\bf\d{3,}\b/g, "<fact>")
+		.replace(/\bi\d{3,}\b/g, "<intent>")
+		.replace(/https?:\/\/[^\s"'`]+/gi, "<url>")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+}
+
+/**
+ * 构建规划/展图的规范化三元组去重键 (expectedKind, normalizeTargetKey(target), hintHash)（#43）。
+ */
+export function buildIntentDedupKey(
+	spec: {
+		expectedKind?: FactKind;
+		targetKey?: string;
+		target?: string;
+		hint?: string;
+		detail?: string;
+		title?: string;
+		phase?: Phase;
+		key?: string;
+		surfaceDomain?: SurfaceDomain;
+	},
+	defaultHost = "",
+): {
+	dedupKey: string;
+	expectedKind: FactKind;
+	targetKey: string;
+	surfaceDomain: SurfaceDomain;
+	hintHash: string;
+} {
+	const expectedKind = inferExpectedKind(spec);
+	const targetKey = spec.target
+		? normalizeTargetKey(spec.target, defaultHost)
+		: extractIntentTargetKey(spec, defaultHost);
+	const surfaceDomain = spec.surfaceDomain ?? inferSurfaceDomain(targetKey.startsWith("seed:") ? (defaultHost || "/") : targetKey);
+
+	// 对内置结构化规则（如 svc:<fid>:<port> / ep:<fid>:<path> / san:<fid>:<dom>）使用稳定的动作族标识，消除 <fid> 噪声
+	const rawKey = (spec.key ?? "").replace(/^e\d+:/i, "");
+	let semanticHintSource: string;
+	if (spec.hint !== undefined && spec.hint.trim() !== "") {
+		semanticHintSource = normalizeHintForHash(spec.hint);
+	} else if (/^(?:svc|ep|san):/.test(rawKey)) {
+		semanticHintSource = rawKey.split(":")[0]!;
+	} else if (spec.detail && spec.detail.trim() !== "") {
+		semanticHintSource = normalizeHintForHash(spec.detail);
+	} else {
+		semanticHintSource = normalizeHintForHash(spec.title ?? rawKey);
+	}
+
+	const hintHash = sha(semanticHintSource || "default", 10);
+	const dedupKey = `${expectedKind}|${targetKey}|${hintHash}`;
+	return { dedupKey, expectedKind, targetKey, surfaceDomain, hintHash };
+}
+
+function attemptRegistryKey(expectedKind: string, surfaceDomain: SurfaceDomain, targetKey: string): string {
+	return `${expectedKind}|${surfaceDomain}|${targetKey}`;
+}
+
+function recordAttemptedIntent(st: NuwaState, intent: Intent, status: "done" | "blocked"): void {
+	const host = st.project?.host ?? "";
+	const expectedKind = intent.expectedKind ?? inferExpectedKind(intent);
+	const targetKey = intent.targetKey ? normalizeTargetKey(intent.targetKey, host) : extractIntentTargetKey(intent, host);
+	const surfaceDomain = intent.surfaceDomain ?? inferSurfaceDomain(targetKey.startsWith("seed:") ? (host || "/") : targetKey);
+	const regKey = attemptRegistryKey(expectedKind, surfaceDomain, targetKey);
+	if (!st.runtime.attemptedKeys) st.runtime.attemptedKeys = {};
+	const prev = st.runtime.attemptedKeys[regKey];
+	const mergedFrom = [...new Set([...(prev?.from ?? []), ...(intent.from ?? [])])];
+	st.runtime.attemptedKeys[regKey] = {
+		key: regKey,
+		expectedKind,
+		targetKey,
+		surfaceDomain,
+		status,
+		at: intent.doneAt ?? nowIso(),
+		from: mergedFrom,
+	};
+}
+
+function hasUnlockingPrerequisiteFacts(
+	st: NuwaState,
+	lastAttemptAt: string,
+	recordedFrom: string[],
+	candidateFrom: string[],
+	strictAutoDerive = false,
+): boolean {
+	const recordedSet = new Set(recordedFrom);
+	const lastTs = Date.parse(lastAttemptAt);
+
+	// 检查显式传入的 candidateFrom 中是否包含上次尝试时尚未关联的有效新前置事实
+	for (const fid of candidateFrom) {
+		const f = st.facts[fid];
+		if (!f || f.kind === "blocked" || f.verifyStage === "rejected") continue;
+		if (!recordedSet.has(fid)) {
+			if (!strictAutoDerive) {
+				return true;
+			}
+			// 自动派生（deriveFromFacts）场景：同质的 service/endpoint 重复发现不算新解锁条件，只有 cred/vuln/loot 等高阶新前置才解锁重测
+			if (f.kind === "cred" || f.kind === "vuln" || f.kind === "loot") {
+				return true;
+			}
+		}
+	}
+
+	// 全局检查：若在上次结案时间之后新增了有效凭据（cred），允许重测曾被 401/403 阻断的目标
+	if (Number.isFinite(lastTs)) {
+		for (const f of Object.values(st.facts)) {
+			if (f.kind === "cred" && f.verifyStage !== "rejected") {
+				const fTs = Date.parse(f.createdAt);
+				if (Number.isFinite(fTs) && fTs > lastTs && !recordedSet.has(f.id)) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/**
+ * 已尝试过滤器 attempted(st, kind, targetKey, opts)（#21, #25）：
+ * 覆盖 done 与 blocked 状态，严格按 surfaceDomain 隔离（端口 blocked 不污染路径），
+ * 同键未传 force=true 且无新前置事实时返回 true 抑制重派生。
+ */
+export function attempted(
+	st: NuwaState,
+	kind: FactKind | string,
+	targetKey: string,
+	opts?: {
+		force?: boolean;
+		from?: string[];
+		surfaceDomain?: SurfaceDomain;
+		strictAutoDerive?: boolean;
+	},
+): boolean {
+	if (opts?.force === true) return false;
+	const host = st.project?.host ?? "";
+	const normTarget = normalizeTargetKey(targetKey, host);
+	const domain = opts?.surfaceDomain ?? inferSurfaceDomain(normTarget.startsWith("seed:") ? (host || "/") : normTarget);
+	const regKey = attemptRegistryKey(kind, domain, normTarget);
+
+	const regHit = st.runtime?.attemptedKeys?.[regKey];
+	const matchingIntents = Object.values(st.intents ?? {}).filter((it) => {
+		if (it.status !== "done" && it.status !== "blocked") return false;
+		const itKind = it.expectedKind ?? inferExpectedKind(it);
+		if (itKind !== kind) return false;
+		const itTarget = it.targetKey ? normalizeTargetKey(it.targetKey, host) : extractIntentTargetKey(it, host);
+		if (itTarget !== normTarget) return false;
+		const itDomain = it.surfaceDomain ?? inferSurfaceDomain(itTarget.startsWith("seed:") ? (host || "/") : itTarget);
+		return itDomain === domain;
+	});
+
+	if (!regHit && matchingIntents.length === 0) return false;
+
+	const recordedFrom = new Set<string>(regHit?.from ?? []);
+	let latestAt = regHit?.at ?? "";
+	for (const it of matchingIntents) {
+		for (const fid of it.from ?? []) recordedFrom.add(fid);
+		const at = it.doneAt ?? it.createdAt;
+		if (!latestAt || at > latestAt) latestAt = at;
+	}
+
+	if (
+		hasUnlockingPrerequisiteFacts(
+			st,
+			latestAt,
+			[...recordedFrom],
+			opts?.from ?? [],
+			Boolean(opts?.strictAutoDerive),
+		)
+	) {
+		return false;
+	}
+
+	return true;
+}
+
+export const hasAttempted = attempted;
+
+/** 检查目标键是否处于 blocked 冷却窗口内（#43, #25：按 surfaceDomain 隔离，端口不污染路径）。 */
+export function isTargetInBlockedCooldown(
+	st: NuwaState,
+	targetKey: string,
+	opts?: {
+		surfaceDomain?: SurfaceDomain;
+		cooldownMs?: number;
+		now?: number;
+		force?: boolean;
+		from?: string[];
+		strictAutoDerive?: boolean;
+	},
+): boolean {
+	if (opts?.force === true) return false;
+	const cooldownMs = opts?.cooldownMs ?? readEnvCooldownMs();
+	if (cooldownMs <= 0) return false;
+	const now = opts?.now ?? Date.now();
+	const host = st.project?.host ?? "";
+	const normTarget = normalizeTargetKey(targetKey, host);
+	if (normTarget.startsWith("seed:")) return false;
+	const domain = opts?.surfaceDomain ?? inferSurfaceDomain(normTarget);
+
+	const blockedMatches = Object.values(st.intents ?? {}).filter((it) => {
+		if (it.status !== "blocked") return false;
+		const itTarget = it.targetKey ? normalizeTargetKey(it.targetKey, host) : extractIntentTargetKey(it, host);
+		if (itTarget !== normTarget) return false;
+		const itDomain = it.surfaceDomain ?? inferSurfaceDomain(itTarget);
+		if (itDomain !== domain) return false;
+		const blockedTs = Date.parse(it.doneAt ?? it.createdAt);
+		return !Number.isFinite(blockedTs) || now - blockedTs < cooldownMs;
+	});
+
+	let regMatch: AttemptedEntry | undefined;
+	for (const entry of Object.values(st.runtime?.attemptedKeys ?? {})) {
+		if (entry.status !== "blocked") continue;
+		if (entry.surfaceDomain !== domain || normalizeTargetKey(entry.targetKey, host) !== normTarget) continue;
+		const ts = Date.parse(entry.at);
+		if (!Number.isFinite(ts) || now - ts < cooldownMs) {
+			regMatch = entry;
+			break;
+		}
+	}
+
+	if (blockedMatches.length === 0 && !regMatch) return false;
+
+	const recordedFrom = new Set<string>(regMatch?.from ?? []);
+	let latestAt = regMatch?.at ?? "";
+	for (const it of blockedMatches) {
+		for (const fid of it.from ?? []) recordedFrom.add(fid);
+		const at = it.doneAt ?? it.createdAt;
+		if (!latestAt || at > latestAt) latestAt = at;
+	}
+
+	if (
+		hasUnlockingPrerequisiteFacts(
+			st,
+			latestAt,
+			[...recordedFrom],
+			opts?.from ?? [],
+			Boolean(opts?.strictAutoDerive),
+		)
+	) {
+		return false;
+	}
+
+	return true;
+}
+
+/** 计算重复尝试比率 repeatRatio = 1 - distinct/total（#21）。 */
+export function computeRepeatRatio(st: NuwaState): { total: number; distinct: number; repeatRatio: number } {
+	const host = st.project?.host ?? "";
+	const intents = Object.values(st.intents ?? {});
+	const sigs = intents.map((it) => {
+		const k = it.expectedKind ?? inferExpectedKind(it);
+		const t = it.targetKey ? normalizeTargetKey(it.targetKey, host) : extractIntentTargetKey(it, host);
+		return `${k}|${t}`;
+	});
+	const seen = new Set(sigs);
+	for (const entry of Object.values(st.runtime?.attemptedKeys ?? {})) {
+		const sig = `${entry.expectedKind}|${normalizeTargetKey(entry.targetKey, host)}`;
+		if (!seen.has(sig)) {
+			sigs.push(sig);
+			seen.add(sig);
+		}
+	}
+	const total = Math.max(intents.length, sigs.length);
+	if (total === 0) return { total: 0, distinct: 0, repeatRatio: 0 };
+	const distinct = seen.size;
+	return {
+		total,
+		distinct,
+		repeatRatio: Math.max(0, Math.min(1, Number((1 - distinct / total).toFixed(4)))),
+	};
+}
+
+export interface SealEngagementInput {
+	reason: string;
+	excludedSurface?: string[];
+	coverage?: Record<string, unknown>;
+}
+
+export interface SealEngagementResult {
+	ok: boolean;
+	status: "sealed_negative";
+	sealMeta: SealMeta;
+	state: NuwaState;
+}
+
+function buildDefaultSealCoverage(st: NuwaState, extra?: Record<string, unknown>): Record<string, unknown> {
+	const intents = Object.values(st.intents ?? {});
+	const facts = Object.values(st.facts ?? {});
+	return {
+		turns: Math.max(st.runtime?.totalTurns ?? 0, st.runtime?.turns ?? 0),
+		episodes: st.project.episode ?? 1,
+		totalFacts: facts.length,
+		totalIntents: intents.length,
+		doneIntents: intents.filter((i) => i.status === "done").length,
+		blockedIntents: intents.filter((i) => i.status === "blocked").length,
+		blockedCommits: st.runtime?.blockedCommits ?? 0,
+		noveltyStall: st.runtime?.noveltyStall ?? 0,
+		...(extra ?? {}),
+	};
+}
+
+function applySealToState(st: NuwaState, input: SealEngagementInput): SealMeta {
+	const reason = (input.reason ?? "").trim();
+	if (!reason) throw new Error("sealEngagement 需要非空 reason 说明封盘依据");
+	const sealedAt = nowIso();
+	const excludedSurface = Array.isArray(input.excludedSurface)
+		? [...new Set(input.excludedSurface.map((s) => String(s).trim()).filter(Boolean))]
+		: Object.values(st.intents ?? {})
+				.filter((i) => i.status === "done" || i.status === "blocked")
+				.map((i) => i.targetKey || i.key)
+				.slice(0, 50);
+	const coverage = buildDefaultSealCoverage(st, input.coverage);
+	const sealMeta: SealMeta = {
+		reason,
+		excludedSurface,
+		coverage,
+		sealedAt,
+	};
+	st.project.status = "sealed_negative";
+	st.project.completedAt = sealedAt;
+	st.project.stopReason = reason;
+	st.project.sealMeta = sealMeta;
+	st.runtime.status = "sealed_negative";
+	st.runtime.sealMeta = sealMeta;
+	return sealMeta;
+}
+
+/**
+ * 负向封盘（#22）：将硬化无漏洞/不可突破目标合法收口为 status="sealed_negative"，
+ * 与 completed（夺旗/实锤漏洞）并列为合法终态。支持传入 root 目录路径（带锁持久化）或 NuwaState 对象。
+ */
+export function sealEngagement(
+	rootOrState: string | NuwaState,
+	input: SealEngagementInput,
+): SealEngagementResult {
+	if (typeof rootOrState !== "string") {
+		const sealMeta = applySealToState(rootOrState, input);
+		releaseAutoBatchRemaining(rootOrState);
+		return { ok: true, status: "sealed_negative", sealMeta, state: rootOrState };
+	}
+	const normRoot = resolve(rootOrState);
+	let outMeta!: SealMeta;
+	const state = withLock(normRoot, () => {
+		const s = loadState(normRoot);
+		if (!s) throw new Error("未找到有效 .nuwa/state.json；先 nuwa_init");
+		releaseAutoBatchRemaining(s);
+		outMeta = applySealToState(s, input);
+		saveState(normRoot, s, { forceSnapshot: true, reason: "seal" });
+		logEvent(normRoot, {
+			type: "seal",
+			reason: outMeta.reason,
+			excludedSurface: outMeta.excludedSurface,
+			sealedAt: outMeta.sealedAt,
+		});
+		return s;
+	});
+	return { ok: true, status: "sealed_negative", sealMeta: outMeta, state };
+}
+
+export interface SealRecommendation {
+	recommend: boolean;
+	shouldSeal: boolean;
+	reason?: string;
+	reasons: string[];
+}
+
+/**
+ * 自动封盘判定函数 shouldRecommendSeal(rt, cfg)（#22, #30）：
+ * 当轮次达上限、成本/Token 超限或 noveltyStall >= threshold 时建议封盘。
+ */
+export function shouldRecommendSeal(
+	rtOrState: Runtime | NuwaState,
+	cfg?: Partial<Cfg> & { maxCostUsd?: number; noveltyStallThreshold?: number },
+): SealRecommendation {
+	const rt: Runtime =
+		"runtime" in rtOrState && rtOrState.runtime ? rtOrState.runtime : (rtOrState as Runtime);
+	const effectiveCfg = { ...readCfg(), ...(cfg ?? {}) };
+	const reasons: string[] = [];
+
+	const turns = Math.max(Number(rt.totalTurns ?? 0), Number(rt.turns ?? 0));
+	if (effectiveCfg.maxTurns > 0 && turns >= effectiveCfg.maxTurns) {
+		reasons.push(`max_turns(${turns}>=${effectiveCfg.maxTurns})`);
+	}
+
+	const maxCostUsd =
+		typeof effectiveCfg.maxCostUsd === "number" && Number.isFinite(effectiveCfg.maxCostUsd)
+			? effectiveCfg.maxCostUsd
+			: Number(process.env.NUWA_MAX_COST_USD ?? 0) || 0;
+	const curCost = Number(rt.totalCostUsd ?? 0);
+	if (maxCostUsd > 0 && curCost >= maxCostUsd) {
+		reasons.push(`max_cost_usd(${curCost.toFixed(4)}>=${maxCostUsd})`);
+	}
+
+	const tokens = Math.max(Number(rt.totalTokens ?? 0) + Number(rt.tokens ?? 0), Number(rt.tokens ?? 0));
+	if (effectiveCfg.maxTokens > 0 && tokens >= effectiveCfg.maxTokens) {
+		reasons.push(`max_tokens(${tokens}>=${effectiveCfg.maxTokens})`);
+	}
+
+	const threshold = readNoveltyThreshold(effectiveCfg);
+	const noveltyStall = Number(rt.noveltyStall ?? 0);
+	if (noveltyStall >= threshold) {
+		reasons.push(`novelty_stall(${noveltyStall}>=${threshold})`);
+	}
+
+	const recommend = reasons.length > 0;
+	return {
+		recommend,
+		shouldSeal: recommend,
+		...(reasons[0] ? { reason: reasons[0] } : {}),
+		reasons,
+	};
+}
+
+export interface ConvergenceAdvice {
+	active: boolean;
+	rejects: number;
+	recommendedAction: "continue" | "verify_candidates" | "report_and_seal";
+	targetPhase?: Phase;
+	forbidBlindRerun: boolean;
+	message: string;
+}
+
+/**
+ * 当 rt.completionRejects >= 1 时生成策略收敛建议（#41）：
+ * 引导转向 report / seal 收口（或仅完成既有 candidate 复验），禁止原样重跑空转循环。
+ */
+export function buildConvergenceAdvice(
+	stOrRt: NuwaState | Runtime,
+	cfg?: Partial<Cfg>,
+): ConvergenceAdvice {
+	const isFullState = "project" in stOrRt && "runtime" in stOrRt;
+	const rt: Runtime = isFullState ? (stOrRt as NuwaState).runtime : (stOrRt as Runtime);
+	const rejects = Number(rt.completionRejects ?? 0);
+	if (rejects < 1) {
+		return {
+			active: false,
+			rejects: 0,
+			recommendedAction: "continue",
+			forbidBlindRerun: false,
+			message: "",
+		};
+	}
+
+	const candidateIds = isFullState
+		? Object.values((stOrRt as NuwaState).facts ?? {})
+				.filter((f) => f.verifyStage === "candidate")
+				.map((f) => f.id)
+		: [];
+
+	if (candidateIds.length > 0) {
+		return {
+			active: true,
+			rejects,
+			recommendedAction: "verify_candidates",
+			forbidBlindRerun: true,
+			message: `策略收敛（completionRejects=${rejects}）：禁止原样重跑已探明攻击面；请先完成候选事实 [${candidateIds.join(", ")}] 的双盲独立复验，若驳回则立即转入 report 阶段并调用 sealEngagement 封盘收口。`,
+		};
+	}
+
+	const sealRec = shouldRecommendSeal(rt, cfg);
+	return {
+		active: true,
+		rejects,
+		recommendedAction: "report_and_seal",
+		targetPhase: "report",
+		forbidBlindRerun: true,
+		message: `策略收敛（completionRejects=${rejects}${sealRec.recommend ? `, ${sealRec.reasons.join(",")}` : ""}）：当前无已确认正向漏洞/Flag，严禁原样重跑空转循环；请转向 phase=report 汇总已排除攻击面并执行 sealEngagement(status="sealed_negative") 合法收口。`,
+	};
+}
+
+export const getCompletionRejectAdvice = buildConvergenceAdvice;
+
+function countNovelFacts(st: NuwaState): number {
+	return Object.values(st.facts ?? {}).filter((f) => f.kind !== "blocked").length;
+}
+
+/**
+ * 推进单轮语义停滞计数器 noveltyStall（#30）：
+ * 比较当前非 blocked 事实数与上一轮水位；无新增则 +1（达阈值触发 semanticStall 升级信号），有新增则归零。
+ */
+export function tickNoveltyStall(
+	st: NuwaState,
+	cfg?: Partial<Cfg>,
+): { noveltyStall: number; escalated: boolean; threshold: number } {
+	const threshold = readNoveltyThreshold(cfg);
+	const curNovel = countNovelFacts(st);
+	const prevNovel = typeof st.runtime.lastNovelFacts === "number" && st.runtime.lastNovelFacts >= 0
+		? st.runtime.lastNovelFacts
+		: 0;
+
+	if (curNovel > prevNovel) {
+		st.runtime.noveltyStall = 0;
+		st.runtime.semanticStall = false;
+		st.runtime.lastNovelFacts = curNovel;
+		return { noveltyStall: 0, escalated: false, threshold };
+	}
+
+	st.runtime.lastNovelFacts = curNovel;
+	st.runtime.noveltyStall = (st.runtime.noveltyStall ?? 0) + 1;
+	const escalated = st.runtime.noveltyStall >= threshold;
+	st.runtime.semanticStall = escalated;
+	return { noveltyStall: st.runtime.noveltyStall, escalated, threshold };
+}
+
+export interface FreeFactInput {
+	kind?: FactKind;
+	title: string;
+	detail?: string;
+	command?: string;
+	output?: string;
+	meta?: AutoFactMeta;
+	verified?: boolean;
+	verifyStage?: VerifyStage;
+	evidenceRef?: string;
+	agentResult?: Record<string, unknown>;
+}
+
+/**
+ * 无票据直记函数 commitFreeFact(root, input)（#31）：
+ * 不占用、不依赖任何 open/claimed Intent，确保 open=0 时仍可随时落账关键确证事实。
+ * 支持传入 root 工作区路径（自动加锁落盘）或内存 NuwaState 对象。
+ */
+export function commitFreeFact(
+	rootOrState: string | NuwaState,
+	input: FreeFactInput,
+): { fact: Fact; duplicate: boolean; state: NuwaState } {
+	if (typeof rootOrState !== "string") {
+		const r = commitIntent(rootOrState, {
+			...input,
+			freeNote: true,
+		});
+		return { fact: r.fact!, duplicate: Boolean(r.duplicate), state: rootOrState };
+	}
+	const normRoot = resolve(rootOrState);
+	let outFact!: Fact;
+	let outDup = false;
+	const state = withLock(normRoot, () => {
+		const s = loadState(normRoot);
+		if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
+		const kind: FactKind = input.kind ?? "note";
+		const shouldRedact = kind !== "flag";
+		const safeTitle = shouldRedact ? redactVaultSecrets(input.title ?? "", normRoot) : (input.title ?? "");
+		const safeDetail = shouldRedact ? redactVaultSecrets(input.detail ?? "", normRoot) : (input.detail ?? "");
+		const safeCommand = shouldRedact && input.command !== undefined ? redactVaultSecrets(input.command, normRoot) : input.command;
+		const safeOutput = shouldRedact && input.output !== undefined ? redactVaultSecrets(input.output, normRoot) : input.output;
+		const r = commitIntent(s, {
+			freeNote: true,
+			kind,
+			title: safeTitle,
+			detail: safeDetail,
+			command: safeCommand,
+			output: safeOutput,
+			meta: input.meta,
+			verified: input.verified,
+			verifyStage: input.verifyStage,
+			evidenceRef: input.evidenceRef,
+			agentResult: input.agentResult,
+		});
+		outFact = r.fact!;
+		outDup = Boolean(r.duplicate);
+		saveState(normRoot, s, kind === "flag" ? { reason: "flag" } : undefined);
+		logEvent(normRoot, {
+			type: "commit_free",
+			fact: outFact.id,
+			kind: outFact.kind,
+			duplicate: outDup,
+		});
+		return s;
+	});
+	return { fact: outFact, duplicate: outDup, state };
+}
+
+export interface InspectGraphQuery {
+	intentId?: string;
+	status?: IntentStatus;
+	targetKey?: string;
+	phase?: Phase;
+	surfaceDomain?: SurfaceDomain;
+	limit?: number;
+}
+
+export interface InspectedIntentDetail extends Intent {
+	resolvedTargetKey: string;
+	resolvedSurfaceDomain: SurfaceDomain;
+	resolvedExpectedKind: FactKind;
+	fromFacts: Fact[];
+	toFact?: Fact;
+}
+
+export interface InspectGraphResult {
+	ok: boolean;
+	project?: {
+		id: string;
+		url: string;
+		status: string;
+		phase: Phase;
+		episode: number;
+	};
+	matchedCount: number;
+	intents: InspectedIntentDetail[];
+	relatedFacts: Fact[];
+	summary: {
+		totalIntents: number;
+		totalFacts: number;
+		blockedIntents: number;
+		blockedCommits: number;
+		noveltyStall: number;
+		repeatRatio: number;
+	};
+}
+
+/**
+ * 纯只读图诊断函数 inspectGraph(root, query)（#35）：
+ * 严格零磁盘写入——仅调用 existsSync/readFileSync 读取 .nuwa/state.json，绝不建锁、不写日志、不改任何文件或 mtime。
+ */
+export function inspectGraph(
+	rootOrState: string | NuwaState,
+	query: InspectGraphQuery = {},
+): InspectGraphResult {
+	let st: NuwaState | null = null;
+	if (typeof rootOrState === "string") {
+		const sp = join(resolve(rootOrState), ".nuwa", "state.json");
+		if (!existsSync(sp)) {
+			return {
+				ok: false,
+				matchedCount: 0,
+				intents: [],
+				relatedFacts: [],
+				summary: {
+					totalIntents: 0,
+					totalFacts: 0,
+					blockedIntents: 0,
+					blockedCommits: 0,
+					noveltyStall: 0,
+					repeatRatio: 0,
+				},
+			};
+		}
+		st = JSON.parse(readFileSync(sp, "utf8")) as NuwaState;
+	} else {
+		st = rootOrState;
+	}
+
+	const host = st.project?.host ?? "";
+	const allIntents = Object.values(st.intents ?? {}).sort((a, b) => a.id.localeCompare(b.id));
+	const allFacts = st.facts ?? {};
+	const normQueryTarget =
+		query.targetKey !== undefined && query.targetKey.trim() !== ""
+			? normalizeTargetKey(query.targetKey, host)
+			: undefined;
+	const rawQueryTarget = query.targetKey?.trim().toLowerCase();
+
+	const enriched: InspectedIntentDetail[] = allIntents.map((it) => {
+		const resolvedTargetKey = it.targetKey
+			? normalizeTargetKey(it.targetKey, host)
+			: extractIntentTargetKey(it, host);
+		const resolvedSurfaceDomain =
+			it.surfaceDomain ?? inferSurfaceDomain(resolvedTargetKey.startsWith("seed:") ? (host || "/") : resolvedTargetKey);
+		const resolvedExpectedKind = it.expectedKind ?? inferExpectedKind(it);
+		return {
+			...it,
+			resolvedTargetKey,
+			resolvedSurfaceDomain,
+			resolvedExpectedKind,
+			fromFacts: (it.from ?? []).map((fid) => allFacts[fid]).filter((f): f is Fact => Boolean(f)),
+			...(it.to && allFacts[it.to] ? { toFact: allFacts[it.to] } : {}),
+		};
+	});
+
+	const filtered = enriched.filter((it) => {
+		if (query.intentId && it.id !== query.intentId) return false;
+		if (query.status && it.status !== query.status) return false;
+		if (query.phase && it.phase !== query.phase) return false;
+		if (query.surfaceDomain && it.resolvedSurfaceDomain !== query.surfaceDomain) return false;
+		if (normQueryTarget !== undefined) {
+			const exactMatch = it.resolvedTargetKey === normQueryTarget;
+			const subMatch = rawQueryTarget
+				? it.resolvedTargetKey.toLowerCase().includes(rawQueryTarget) ||
+					it.key.toLowerCase().includes(rawQueryTarget) ||
+					it.title.toLowerCase().includes(rawQueryTarget)
+				: false;
+			if (!exactMatch && !subMatch) return false;
+		}
+		return true;
+	});
+
+	const limit = query.limit !== undefined ? Math.max(1, Math.floor(query.limit)) : 100;
+	const page = filtered.slice(0, limit);
+	const relatedFactMap = new Map<string, Fact>();
+	for (const it of page) {
+		for (const f of it.fromFacts) relatedFactMap.set(f.id, f);
+		if (it.toFact) relatedFactMap.set(it.toFact.id, it.toFact);
+	}
+
+	const blockedIntents = allIntents.filter((i) => i.status === "blocked").length;
+	const blockedCommits =
+		typeof st.runtime?.blockedCommits === "number" ? st.runtime.blockedCommits : blockedIntents;
+	const rep = computeRepeatRatio(st);
+
+	return {
+		ok: true,
+		project: {
+			id: st.project.id,
+			url: st.project.url,
+			status: st.runtime?.status === "sealed_negative" ? "sealed_negative" : st.project.status,
+			phase: st.project.phase,
+			episode: st.project.episode ?? 1,
+		},
+		matchedCount: filtered.length,
+		intents: page,
+		relatedFacts: [...relatedFactMap.values()],
+		summary: {
+			totalIntents: allIntents.length,
+			totalFacts: Object.keys(allFacts).length,
+			blockedIntents,
+			blockedCommits,
+			noveltyStall: st.runtime?.noveltyStall ?? 0,
+			repeatRatio: rep.repeatRatio,
+		},
+	};
+}
+
+/**
+ * 执行 report 阶段收口转移（#45）：
+ * 当处于 report 阶段且报告已写或无新事实达标（即使 vuln/exploit/post === 0）时，
+ * 提供干净的 complete / sealed_negative / advance_episode 收口或推进，不再反复重展已死事实。
+ */
+export function finalizeReportPhase(
+	st: NuwaState,
+	cfg?: Partial<Cfg>,
+	opts?: {
+		root?: string;
+		reportWritten?: boolean;
+		autoSeal?: boolean;
+		sealReason?: string;
+	},
+): {
+	transition: ReportPhaseTransition;
+	completed?: boolean;
+	sealed?: SealMeta;
+	advancedEpisode?: number;
+	added: string[];
+} {
+	const effectiveCfg = { ...readCfg(), ...(cfg ?? {}) };
+	let diskReportWritten = Boolean(opts?.reportWritten || st.runtime?.reportWritten);
+	if (!diskReportWritten && opts?.root) {
+		const nuwaDir = join(resolve(opts.root), ".nuwa");
+		diskReportWritten =
+			existsSync(join(nuwaDir, "REPORT.md")) ||
+			existsSync(join(nuwaDir, "REPORT.json")) ||
+			existsSync(join(nuwaDir, "REPORT.sarif.json"));
+	}
+	if (diskReportWritten) {
+		st.runtime.reportWritten = true;
+	}
+
+	const transition = resolveReportPhaseTransition(st, {
+		reportWritten: diskReportWritten,
+		noveltyThreshold: readNoveltyThreshold(effectiveCfg),
+		maxEpisodes: effectiveCfg.maxEpisodes,
+	});
+
+	if (transition.action === "complete") {
+		const comp = completeProject(st, undefined, "report 阶段确认证据闭环");
+		if (comp.ok) {
+			return { transition, completed: true, added: [] };
+		}
+	}
+
+	if (transition.action === "seal_negative") {
+		if (opts?.autoSeal !== false) {
+			const sealMeta = applySealToState(st, {
+				reason: opts?.sealReason ?? `report 阶段无正向漏洞收口 (${transition.reason})`,
+			});
+			return { transition, sealed: sealMeta, added: [] };
+		}
+		return { transition, added: [] };
+	}
+
+	if (transition.action === "advance_episode") {
+		const nextEp = (st.project.episode ?? 1) + 1;
+		st.project.episode = nextEp;
+		st.project.phase = "recon";
+		st.runtime.reportWritten = false;
+		const added = seedEpisode(st, nextEp);
+		st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
+		st.runtime.lastExpandAt = Date.now();
+		return { transition, advancedEpisode: nextEp, added };
+	}
+
+	if (transition.action === "seed_report") {
+		const added = seedPhase(st, "report");
+		return { transition, added };
+	}
+
+	return { transition, added: [] };
 }
 
 // ============================================================================
@@ -607,6 +1700,17 @@ export function seedPhase(st: NuwaState, phase: Phase): string[] {
 	for (const s of seeds) {
 		const key = `${phase}:${s.key}`;
 		if (existing.has(key)) continue;
+		const built = buildIntentDedupKey(
+			{
+				key,
+				phase,
+				title: s.title,
+				detail: s.detail,
+				expectedKind: s.expectedKind,
+				surfaceDomain: s.surfaceDomain,
+			},
+			st.project.host,
+		);
 		const id = nextIntentId(st);
 		st.intents[id] = {
 			id,
@@ -619,15 +1723,153 @@ export function seedPhase(st: NuwaState, phase: Phase): string[] {
 			priority: s.priority ?? 50,
 			attempts: 0,
 			createdAt: nowIso(),
+			expectedKind: built.expectedKind,
+			targetKey: built.targetKey,
+			surfaceDomain: built.surfaceDomain,
+			dedupKey: built.dedupKey,
+			hintHash: built.hintHash,
 		};
 		added.push(id);
 	}
 	return added;
 }
 
+export interface AddIntentInput {
+	title: string;
+	detail?: string;
+	hint?: string;
+	target?: string;
+	targetKey?: string;
+	expectedKind?: FactKind;
+	surfaceDomain?: SurfaceDomain;
+	phase?: Phase;
+	from?: string[];
+	priority?: number;
+	force?: boolean;
+}
+
+function checkCandidateRejection(
+	st: NuwaState,
+	built: {
+		dedupKey: string;
+		expectedKind: FactKind;
+		targetKey: string;
+		surfaceDomain: SurfaceDomain;
+		hintHash: string;
+	},
+	rawKey: string,
+	from: string[],
+	opts?: {
+		force?: boolean;
+		cooldownMs?: number;
+		strictAutoDerive?: boolean;
+		bypassTargetSuppress?: boolean;
+	},
+): PlanRejectReason | null {
+	const host = st.project?.host ?? "";
+	const intents = Object.values(st.intents ?? {});
+
+	if (opts?.bypassTargetSuppress) {
+		if (intents.some((i) => i.key === rawKey)) {
+			const hit = intents.find((i) => i.key === rawKey)!;
+			return hit.status === "claimed" ? "inflight" : "duplicate_key";
+		}
+		return null;
+	}
+
+	if (opts?.force === true) {
+		// force=true 时仅拦仍在 claimed 执行中的完全同键任务，允许重排已尝试/冷却中目标
+		if (intents.some((i) => i.status === "claimed" && (i.key === rawKey || i.dedupKey === built.dedupKey))) {
+			return "inflight";
+		}
+		return null;
+	}
+
+	// 1. 在途检查（claimed 同三元组或非种子同域同目标同期望类型）
+	const isSeedTarget = built.targetKey.startsWith("seed:");
+	for (const it of intents) {
+		if (it.status !== "claimed") continue;
+		if (it.key === rawKey || (it.dedupKey && it.dedupKey === built.dedupKey)) {
+			return "inflight";
+		}
+		if (!isSeedTarget) {
+			const itTarget = it.targetKey ? normalizeTargetKey(it.targetKey, host) : extractIntentTargetKey(it, host);
+			const itDomain = it.surfaceDomain ?? inferSurfaceDomain(itTarget);
+			const itKind = it.expectedKind ?? inferExpectedKind(it);
+			if (itDomain === built.surfaceDomain && itTarget === built.targetKey && itKind === built.expectedKind) {
+				return "inflight";
+			}
+		}
+	}
+
+	// 2. 冷却窗内 blocked targetKey 抑制（#43, #25 按 surfaceDomain 隔离）
+	if (
+		!isSeedTarget &&
+		isTargetInBlockedCooldown(st, built.targetKey, {
+			surfaceDomain: built.surfaceDomain,
+			cooldownMs: opts?.cooldownMs,
+			force: opts?.force,
+			from,
+			strictAutoDerive: opts?.strictAutoDerive,
+		})
+	) {
+		return "blocked_cooldown";
+	}
+
+	// 3. 规范化三元组去重键与已尝试过滤器（#21, #43）
+	for (const it of intents) {
+		if (it.key === rawKey) return "duplicate_key";
+		const itDedup =
+			it.dedupKey ??
+			buildIntentDedupKey(
+				{
+					key: it.key,
+					phase: it.phase,
+					title: it.title,
+					detail: it.detail,
+					expectedKind: it.expectedKind,
+					targetKey: it.targetKey,
+					surfaceDomain: it.surfaceDomain,
+				},
+				host,
+			).dedupKey;
+		if (itDedup === built.dedupKey) {
+			if (
+				(it.status === "done" || it.status === "blocked") &&
+				hasUnlockingPrerequisiteFacts(st, it.doneAt ?? it.createdAt, it.from ?? [], from, Boolean(opts?.strictAutoDerive))
+			) {
+				continue;
+			}
+			return "duplicate_key";
+		}
+	}
+
+	if (
+		!isSeedTarget &&
+		attempted(st, built.expectedKind, built.targetKey, {
+			force: opts?.force,
+			from,
+			surfaceDomain: built.surfaceDomain,
+			strictAutoDerive: opts?.strictAutoDerive,
+		})
+	) {
+		// 若提供了显式不同的非空 hint（新攻击向量/新测试面）且不在冷却窗内，放行新向量（#43）
+		const sameVectorAttempted = Object.values(st.intents ?? {}).some((it) => {
+			if (it.status !== "done" && it.status !== "blocked") return false;
+			const b = buildIntentDedupKey(it, host);
+			return b.dedupKey === built.dedupKey;
+		});
+		if (sameVectorAttempted || opts?.strictAutoDerive) {
+			return "duplicate_key";
+		}
+	}
+
+	return null;
+}
+
 export function addIntent(
 	st: NuwaState,
-	input: { title: string; detail?: string; phase?: Phase; from?: string[]; priority?: number },
+	input: AddIntentInput,
 ): Intent {
 	const title = (input.title ?? "").trim();
 	if (!title) throw new Error("intent.title 为空");
@@ -636,11 +1878,24 @@ export function addIntent(
 		if (!st.facts[f]) throw new Error(`依赖事实不存在: ${f}`);
 	}
 	const phase = input.phase ?? st.project.phase;
+	const built = buildIntentDedupKey(
+		{
+			phase,
+			title,
+			detail: input.detail,
+			hint: input.hint,
+			target: input.target,
+			targetKey: input.targetKey,
+			expectedKind: input.expectedKind,
+			surfaceDomain: input.surfaceDomain,
+		},
+		st.project.host,
+	);
 	const id = nextIntentId(st);
 	const intent: Intent = {
 		id,
 		phase,
-		key: `custom:${sha(`${title}|${phase}`)}`,
+		key: `custom:${sha(built.dedupKey)}`,
 		title: normOneLine(title, 120),
 		detail: input.detail ?? "",
 		from,
@@ -648,9 +1903,157 @@ export function addIntent(
 		priority: Number.isFinite(input.priority) ? Number(input.priority) : 50,
 		attempts: 0,
 		createdAt: nowIso(),
+		expectedKind: built.expectedKind,
+		targetKey: built.targetKey,
+		surfaceDomain: built.surfaceDomain,
+		dedupKey: built.dedupKey,
+		hintHash: built.hintHash,
 	};
 	st.intents[id] = intent;
 	return intent;
+}
+
+export interface PlanIntentsResult {
+	added: string[];
+	phase: Phase;
+	rejectedReasons: RejectedIntentEntry[];
+}
+
+/**
+ * 批量规划意图（#43, #21, #25, #29）：
+ * 使用规范化三元组 (expectedKind, normalizeTargetKey(target), hintHash) 去重，
+ * 自动抑制在途 inflight 与冷却窗内的 blocked targetKey，并返回结构化 rejectedReasons。
+ */
+export function planIntents(
+	st: NuwaState,
+	input: {
+		phase?: Phase;
+		intents?: AddIntentInput[];
+		force?: boolean;
+		cooldownMs?: number;
+	},
+	cfg?: Partial<Cfg>,
+): PlanIntentsResult {
+	const added: string[] = [];
+	const rejectedReasons: RejectedIntentEntry[] = [];
+	const cooldownMs = input.cooldownMs ?? readEnvCooldownMs(cfg);
+
+	if (input.phase) {
+		if (phaseIndex(input.phase) > phaseIndex(st.project.phase)) {
+			st.project.phase = input.phase;
+		}
+		const seeds = seedsForProject(st, input.phase);
+		for (const s of seeds) {
+			const key = `${input.phase}:${s.key}`;
+			const built = buildIntentDedupKey(
+				{
+					key,
+					phase: input.phase,
+					title: s.title,
+					detail: s.detail,
+					expectedKind: s.expectedKind,
+					surfaceDomain: s.surfaceDomain,
+				},
+				st.project.host,
+			);
+			const rej = checkCandidateRejection(st, built, key, [], {
+				force: input.force,
+				cooldownMs,
+			});
+			if (rej) {
+				rejectedReasons.push({ title: s.title, targetKey: built.targetKey, reason: rej });
+				continue;
+			}
+			const id = nextIntentId(st);
+			st.intents[id] = {
+				id,
+				phase: input.phase,
+				key,
+				title: s.title,
+				detail: s.detail,
+				from: [],
+				status: "open",
+				priority: s.priority ?? 50,
+				attempts: 0,
+				createdAt: nowIso(),
+				expectedKind: built.expectedKind,
+				targetKey: built.targetKey,
+				surfaceDomain: built.surfaceDomain,
+				dedupKey: built.dedupKey,
+				hintHash: built.hintHash,
+			};
+			added.push(id);
+		}
+	}
+
+	for (const item of input.intents ?? []) {
+		const title = (item.title ?? "").trim();
+		if (!title) throw new Error("intent.title 为空");
+		const from = item.from ?? [];
+		for (const fid of from) {
+			if (!st.facts[fid]) throw new Error(`依赖事实不存在: ${fid}`);
+		}
+		const phase = item.phase ?? input.phase ?? st.project.phase;
+		const force = item.force ?? input.force ?? false;
+		const built = buildIntentDedupKey(
+			{
+				phase,
+				title,
+				detail: item.detail,
+				hint: item.hint,
+				target: item.target,
+				targetKey: item.targetKey,
+				expectedKind: item.expectedKind,
+				surfaceDomain: item.surfaceDomain,
+			},
+			st.project.host,
+		);
+		const rawKey = `custom:${sha(built.dedupKey)}`;
+
+		// 若显式带了前置事实且存在跨层关系，校验跨层前置有效性（#25）
+		if (from.length > 0 && item.surfaceDomain) {
+			const parentDomains = from
+				.map((fid) => st.facts[fid]?.surfaceDomain)
+				.filter((d): d is SurfaceDomain => Boolean(d));
+			if (parentDomains.length > 0 && !parentDomains.includes(built.surfaceDomain)) {
+				if (!canDeriveCrossSurface(st, parentDomains[0], built.surfaceDomain, from)) {
+					rejectedReasons.push({ title, targetKey: built.targetKey, reason: "blocked_cooldown" });
+					continue;
+				}
+			}
+		}
+
+		const rej = checkCandidateRejection(st, built, rawKey, from, {
+			force,
+			cooldownMs,
+			strictAutoDerive: false,
+		});
+		if (rej) {
+			rejectedReasons.push({ title, targetKey: built.targetKey, reason: rej });
+			continue;
+		}
+		const id = nextIntentId(st);
+		st.intents[id] = {
+			id,
+			phase,
+			key: rawKey,
+			title: normOneLine(title, 120),
+			detail: item.detail ?? "",
+			from,
+			status: "open",
+			priority: Number.isFinite(item.priority) ? Number(item.priority) : 50,
+			attempts: 0,
+			createdAt: nowIso(),
+			expectedKind: built.expectedKind,
+			targetKey: built.targetKey,
+			surfaceDomain: built.surfaceDomain,
+			dedupKey: built.dedupKey,
+			hintHash: built.hintHash,
+		};
+		added.push(id);
+	}
+
+	return { added, phase: st.project.phase, rejectedReasons };
 }
 
 export function frontierList(st: NuwaState, limit = 20, claimTtl = 900): FrontierItem[] {
@@ -726,13 +2129,14 @@ const INTENT_SOFT_CAP = 800;
 const BLOCKED_KEEP = 120;
 const NOTE_KEEP = 200;
 
-/** 回收过量 blocked 意图，防止无限推进把 state 撑爆；done 与高价值 facts 一律保留。 */
+/** 回收过量 blocked 意图，防止无限推进把 state 撑爆；清理前先写入 attemptedKeys 防止死事实重派生（#21, #45）。 */
 export function compactIntents(st: NuwaState, keep = BLOCKED_KEEP): number {
 	const blocked = Object.values(st.intents)
 		.filter((i) => i.status === "blocked")
 		.sort((a, b) => (a.doneAt ?? a.createdAt).localeCompare(b.doneAt ?? b.createdAt));
 	let removed = 0;
 	for (const it of blocked.slice(0, Math.max(0, blocked.length - keep))) {
+		recordAttemptedIntent(st, it, "blocked");
 		delete st.intents[it.id];
 		removed += 1;
 	}
@@ -808,16 +2212,51 @@ export function appendIntentSpecs(
 		hypothesisId?: string;
 		assetId?: string;
 		authRole?: string;
+		expectedKind?: FactKind;
+		surfaceDomain?: SurfaceDomain;
+		targetKey?: string;
+		hint?: string;
 	}>,
 	cap = INTENT_SOFT_CAP,
+	opts?: {
+		rejectedOut?: RejectedIntentEntry[];
+		force?: boolean;
+		cooldownMs?: number;
+		strictAutoDerive?: boolean;
+	},
 ): string[] {
-	const existing = new Set(Object.values(st.intents).map((i) => i.key));
 	const added: string[] = [];
 	for (const spec of specs) {
-		if (existing.has(spec.key)) continue;
 		if (Object.keys(st.intents).length >= cap) break;
 		const validFrom = (spec.from ?? []).filter((fid) => Boolean(st.facts[fid]));
-		existing.add(spec.key);
+		const bypassTargetSuppress = /^(?:verify-vuln:|waf-bypass:|post-auth:|session:refresh:|reflect:)/.test(spec.key);
+		const built = buildIntentDedupKey(
+			{
+				key: spec.key,
+				phase: spec.phase,
+				title: spec.title,
+				detail: spec.detail,
+				hint: spec.hint,
+				expectedKind: spec.expectedKind,
+				surfaceDomain: spec.surfaceDomain,
+				targetKey: spec.targetKey,
+			},
+			st.project.host,
+		);
+		const rej = checkCandidateRejection(st, built, spec.key, validFrom, {
+			force: opts?.force,
+			cooldownMs: opts?.cooldownMs,
+			strictAutoDerive: opts?.strictAutoDerive ?? true,
+			bypassTargetSuppress,
+		});
+		if (rej) {
+			opts?.rejectedOut?.push({
+				title: spec.title,
+				targetKey: built.targetKey,
+				reason: rej,
+			});
+			continue;
+		}
 		const id = nextIntentId(st);
 		st.intents[id] = {
 			id,
@@ -830,6 +2269,11 @@ export function appendIntentSpecs(
 			priority: spec.priority,
 			attempts: 0,
 			createdAt: nowIso(),
+			expectedKind: built.expectedKind,
+			targetKey: built.targetKey,
+			surfaceDomain: built.surfaceDomain,
+			dedupKey: built.dedupKey,
+			hintHash: built.hintHash,
 			...(spec.hypothesisId ? { hypothesisId: spec.hypothesisId } : {}),
 			...(spec.assetId ? { assetId: spec.assetId } : {}),
 			...(spec.authRole ? { authRole: spec.authRole } : {}),
@@ -842,18 +2286,22 @@ export function appendIntentSpecs(
 /**
  * 从已有事实派生下一层意图：优先消费结构化 f.meta（ports/paths/san），并兼容文本扫描。
  * 非网络安全模式（coding / ops / 本地白盒 audit）全量交由领域 Profile 插件派生，绝不混入扫描器命令；
- * 安全评估模式在常规事实派生后追加跨事实假设图推理（synthesizeCrossFactHypotheses）。
+ * 安全评估模式结合规范化三元组去重、surfaceDomain 隔离、blocked 冷却窗与 attempted 过滤器返回 rejectedReasons（#21, #25, #43）。
  */
-export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): ExpansionResult {
+export function deriveFromFacts(
+	st: NuwaState,
+	cap = INTENT_SOFT_CAP,
+	opts?: { force?: boolean; cooldownMs?: number },
+): ExpansionResult {
 	try {
 		syncAssetsFromFacts(st);
 	} catch {
 		/* 资产拓扑同步异常不阻塞主派生 */
 	}
 
-	const existing = new Set(Object.values(st.intents).map((i) => i.key));
 	const added: string[] = [];
 	const rules: string[] = [];
+	const rejectedReasons: RejectedIntentEntry[] = [];
 	const push = (
 		key: string,
 		phase: Phase,
@@ -861,11 +2309,44 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 		detail: string,
 		priority: number,
 		from: string[],
-		extra?: { hypothesisId?: string; assetId?: string; authRole?: string },
+		extra?: {
+			hypothesisId?: string;
+			assetId?: string;
+			authRole?: string;
+			expectedKind?: FactKind;
+			surfaceDomain?: SurfaceDomain;
+			sourceDomain?: SurfaceDomain;
+			targetKey?: string;
+			hint?: string;
+		},
 	) => {
-		if (existing.has(key)) return;
 		if (Object.keys(st.intents).length >= cap) return;
-		existing.add(key);
+		const built = buildIntentDedupKey(
+			{
+				key,
+				phase,
+				title,
+				detail,
+				hint: extra?.hint,
+				expectedKind: extra?.expectedKind,
+				surfaceDomain: extra?.surfaceDomain,
+				targetKey: extra?.targetKey,
+			},
+			st.project.host,
+		);
+		if (extra?.sourceDomain && !canDeriveCrossSurface(st, extra.sourceDomain, built.surfaceDomain, from)) {
+			rejectedReasons.push({ title, targetKey: built.targetKey, reason: "blocked_cooldown" });
+			return;
+		}
+		const rej = checkCandidateRejection(st, built, key, from, {
+			force: opts?.force,
+			cooldownMs: opts?.cooldownMs,
+			strictAutoDerive: true,
+		});
+		if (rej) {
+			rejectedReasons.push({ title, targetKey: built.targetKey, reason: rej });
+			return;
+		}
 		const id = nextIntentId(st);
 		st.intents[id] = {
 			id,
@@ -878,6 +2359,11 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 			priority,
 			attempts: 0,
 			createdAt: nowIso(),
+			expectedKind: built.expectedKind,
+			targetKey: built.targetKey,
+			surfaceDomain: built.surfaceDomain,
+			dedupKey: built.dedupKey,
+			hintHash: built.hintHash,
 			...(extra?.hypothesisId ? { hypothesisId: extra.hypothesisId } : {}),
 			...(extra?.assetId ? { assetId: extra.assetId } : {}),
 			...(extra?.authRole ? { authRole: extra.authRole } : {}),
@@ -891,7 +2377,7 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 		for (const sp of profSpecs) {
 			push(sp.key, sp.phase, sp.title, sp.detail, sp.priority, sp.from);
 		}
-		return { added, rules };
+		return { added, rules, rejectedReasons };
 	}
 
 	const projScope =
@@ -916,6 +2402,12 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 						`目标: 对 ${st.project.host}:${port} 做服务级枚举与版本核对。\n命令:\n  nmap -sV -Pn -p ${port} --version-all ${st.project.host}\n  curl -k -sS -D - --max-time 10 http://${st.project.host}:${port}/ | head -30\n  printf '' | openssl s_client -connect ${st.project.host}:${port} -servername ${st.project.host} 2>/dev/null | head -20\n证据: kind=service；detail 写 service/version/banner。\n换路: 非 HTTP → nc/openssl 探 banner；全滤 → 记录 blocked 并换端口。`,
 						70,
 						[f.id],
+						{
+							expectedKind: "service",
+							surfaceDomain: "port",
+							targetKey: `${st.project.host}:${port}`,
+							hint: "svc",
+						},
 					);
 				}
 
@@ -937,6 +2429,13 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 						`目标: 证书 SAN 发现 Scope 内新域名 ${domain}，执行存活与服务指纹核查。\n命令:\n  curl -k -sS -D - --max-time 10 'https://${domain}/' | head -30\n  curl -k -sS -D - --max-time 10 'http://${domain}/' | head -30\n证据: kind=asset 或 service；记录状态码、标题与指纹。`,
 						74,
 						[f.id],
+						{
+							expectedKind: "asset",
+							surfaceDomain: "host",
+							sourceDomain: f.surfaceDomain,
+							targetKey: domain,
+							hint: "san",
+						},
 					);
 				}
 
@@ -954,6 +2453,11 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 						`目标: 提取 ${st.project.url} 的单页应用前端路由与同源 JS Bundle API 契约（GET/POST/GraphQL 端点与键名）。\n说明: 自动批与 /nuwa spa 会优先执行受控只读浏览器/静态 Bundle 感知，也可结合同源脚本清单核查后端真实接口，避免将 SPA HTML 兜底页误判为敏感文件。`,
 						84,
 						[f.id],
+						{
+							expectedKind: "endpoint",
+							surfaceDomain: "path",
+							sourceDomain: "port",
+						},
 					);
 				}
 
@@ -966,6 +2470,11 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 							`目标: 基于本机已就绪工具链执行 ${enrich.key} 受控非破坏性表面核查。`,
 							82,
 							[f.id],
+							{
+								expectedKind: enrich.key === "recon:katana" ? "endpoint" : "vuln",
+								surfaceDomain: "path",
+								sourceDomain: "port",
+							},
 						);
 					}
 				}
@@ -988,6 +2497,12 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 							`目标: 对 ${st.project.url}${p} 做参数、方法、认证、越权四类检查。\n命令:\n  curl -k -sS -i --max-time 10 '${st.project.url}${p}'\n  curl -k -sS -i -X OPTIONS --max-time 10 '${st.project.url}${p}'\n  curl -k -sS -i -X POST -H 'Content-Type: application/json' -d '{}' --max-time 10 '${st.project.url}${p}'\n证据: kind=vuln 或 endpoint；无问题则 commit(kind=note) 写清已测面。\n换路: 403 → 加 X-Forwarded-For / 换方法 / 路径规范化。`,
 							68,
 							[f.id],
+							{
+								expectedKind: "vuln",
+								surfaceDomain: "path",
+								targetKey: p,
+								hint: "ep",
+							},
 						);
 					}
 				} else {
@@ -1008,6 +2523,12 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 								`目标: 对 ${st.project.url}${p} 做参数、方法、认证、越权四类检查。\n命令:\n  curl -k -sS -i --max-time 10 '${st.project.url}${p}'\n  curl -k -sS -i -X OPTIONS --max-time 10 '${st.project.url}${p}'\n  curl -k -sS -i -X POST -H 'Content-Type: application/json' -d '{}' --max-time 10 '${st.project.url}${p}'\n证据: kind=vuln 或 endpoint；无问题则 commit(kind=note) 写清已测面。\n换路: 403 → 加 X-Forwarded-For / 换方法 / 路径规范化。`,
 								68,
 								[f.id],
+								{
+									expectedKind: "vuln",
+									surfaceDomain: "path",
+									targetKey: p,
+									hint: "ep",
+								},
 							);
 						}
 					} else {
@@ -1019,6 +2540,12 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 							`目标: 对 ${st.project.url}${path} 做参数、方法、认证、越权四类检查。\n命令:\n  curl -k -sS -i --max-time 10 '${st.project.url}${path}'\n  curl -k -sS -i -X OPTIONS --max-time 10 '${st.project.url}${path}'\n  curl -k -sS -i -X POST -H 'Content-Type: application/json' -d '{}' --max-time 10 '${st.project.url}${path}'\n证据: kind=vuln 或 endpoint；无问题则 commit(kind=note) 写清已测面。\n换路: 403 → 加 X-Forwarded-For / 换方法 / 路径规范化。`,
 							68,
 							[f.id],
+							{
+								expectedKind: "vuln",
+								surfaceDomain: "path",
+								targetKey: path,
+								hint: "ep",
+							},
 						);
 					}
 				}
@@ -1035,6 +2562,7 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 					`目标: 把已确认漏洞 ${f.id} 推到可复现的利用结果（读敏感数据 / 命令执行 / 越权访问）。\n已知证据:\n  命令: ${normOneLine(f.command, 200)}\n  回显: ${normOneLine(f.output, 300)}\n要求: 给出可重复的最小利用命令与回显；拿到 flag 立即 nuwa_flag。\n换路: 被 WAF 拦 → 编码/分块/换 payload；仍失败 → commit(blocked) 写清拦截特征。`,
 					92,
 					[f.id],
+					{ expectedKind: "vuln", hint: `exp:${f.id}` },
 				);
 				push(
 					`pivot:${f.id}`,
@@ -1043,6 +2571,7 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 					`目标: 评估 ${f.id} 能否作为横向跳板。\n命令:\n  id; hostname; ip a; cat /etc/hosts 2>/dev/null\n  ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null\n证据: kind=loot 或 asset；detail 写内网网段、可达主机、可用凭据。\n换路: 无命令执行 → commit(blocked, note="仅数据面漏洞")。`,
 					55,
 					[f.id],
+					{ expectedKind: "loot", hint: `pivot:${f.id}` },
 				);
 				break;
 			}
@@ -1054,6 +2583,7 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 					`目标: 用凭据 ${f.id} 撞已发现的服务（SSH/MySQL/Redis/管理面/后台）。\n命令:\n  hydra -L users.txt -P pass.txt -f ${st.project.host} ssh\n  curl -k -sS -i -u '<user>:<pass>' ${st.project.url}/admin\n证据: kind=loot 或 cred；成功必须给登录后页面/命令回显。\n换路: 锁定风险 → 每服务最多 3 次，换下一服务。`,
 					78,
 					[f.id],
+					{ expectedKind: "loot", hint: `reuse:${f.id}` },
 				);
 				break;
 			}
@@ -1065,6 +2595,7 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 					`目标: 对新资产 ${f.id} 做端口与服务枚举。\n命令:\n  nmap -sT -sV -Pn -T4 --top-ports 1000 ${normOneLine(f.detail, 120) || st.project.host}\n证据: kind=service，每端口一条。`,
 					72,
 					[f.id],
+					{ expectedKind: "service", surfaceDomain: "host", hint: `enum:${f.id}` },
 				);
 				break;
 			}
@@ -1076,6 +2607,7 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 					`目标: 复盘 ${f.id} 的利用价值与可复用性（凭据/密钥/配置/源码）。\n输出: 报告攻击链段落 + 是否需要横向；有价值则派生新意图。`,
 					45,
 					[f.id],
+					{ expectedKind: "note", hint: `loot:${f.id}` },
 				);
 				break;
 			}
@@ -1096,7 +2628,7 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 		/* 假设图推理异常不阻塞主派生 */
 	}
 
-	return { added, rules };
+	return { added, rules, rejectedReasons };
 }
 
 /** 第 N 轮扩张：完整重播六阶段种子，key 带轮次前缀，优先级随轮次衰减。 */
@@ -1108,6 +2640,18 @@ export function seedEpisode(st: NuwaState, episode: number): string[] {
 		for (const s of seedsForProject(st, phase)) {
 			const key = `e${episode}:${phase}:${s.key}`;
 			if (existing.has(key)) continue;
+			const built = buildIntentDedupKey(
+				{
+					key,
+					phase,
+					title: `[E${episode}] ${s.title}`,
+					detail: s.detail,
+					expectedKind: s.expectedKind,
+					surfaceDomain: s.surfaceDomain,
+					hint: `e${episode}:${phase}:${s.key}`,
+				},
+				st.project.host,
+			);
 			const id = nextIntentId(st);
 			st.intents[id] = {
 				id,
@@ -1120,6 +2664,11 @@ export function seedEpisode(st: NuwaState, episode: number): string[] {
 				priority: Math.max(20, (s.priority ?? 50) - decay),
 				attempts: 0,
 				createdAt: nowIso(),
+				expectedKind: built.expectedKind,
+				targetKey: built.targetKey,
+				surfaceDomain: built.surfaceDomain,
+				dedupKey: built.dedupKey,
+				hintHash: built.hintHash,
 			};
 			added.push(id);
 		}
@@ -1171,20 +2720,24 @@ export function releaseStaleClaims(st: NuwaState, claimTtl: number): string[] {
 }
 
 /**
- * Issue #4 二维空转闸：
- * - 无工具活动且 facts 不涨 → 计 emptyRounds（达 emptyLimit 收口）；
- * - 有工具活动且 facts 不涨 → 计 suspectRounds（达 suspectLimit=5 才收口，给长耗时深挖留足窗口）；
- * - 有新 fact → emptyRounds 与 suspectRounds 同时归零。
+ * Issue #4 二维空转闸 + Issue #30 语义停滞计数器 noveltyStall：
+ * - 无工具活动且有效非 blocked 事实不涨 → 计 emptyRounds（达 emptyLimit 收口）；
+ * - 有工具活动且有效非 blocked 事实不涨 → 计 suspectRounds（达 suspectLimit=5 才收口）；
+ * - 同步推进 noveltyStall（blocked=true 提交绝不重置，仅产出新非 blocked Fact 时归零）。
  */
 export function applyEmptyGuard(st: NuwaState, cfg: Cfg, hadToolActivity = false): string[] {
-	const factsNow = Object.keys(st.facts).length;
+	const factsNow = countNovelFacts(st);
 	const suspectLimit = cfg.suspectLimit ?? 5;
+	tickNoveltyStall(st, cfg);
 
-	if (factsNow !== (st.runtime.lastFacts ?? -1)) {
+	if (factsNow !== (st.runtime.lastFacts ?? -1) && factsNow > Math.max(0, st.runtime.lastFacts ?? -1)) {
 		st.runtime.emptyRounds = 0;
 		st.runtime.suspectRounds = 0;
 		st.runtime.lastFacts = factsNow;
 		return [];
+	}
+	if (st.runtime.lastFacts === undefined || st.runtime.lastFacts < 0) {
+		st.runtime.lastFacts = factsNow;
 	}
 
 	let shouldClose = false;
@@ -1210,6 +2763,7 @@ export function applyEmptyGuard(st: NuwaState, cfg: Cfg, hadToolActivity = false
 		it.status = "blocked";
 		it.note = noteReason;
 		it.doneAt = nowIso();
+		recordAttemptedIntent(st, it, "blocked");
 	}
 	st.runtime.emptyRounds = 0;
 	st.runtime.suspectRounds = 0;
@@ -1256,6 +2810,11 @@ export function claimAutoBatch(st: NuwaState, cfg: Cfg, root?: string): string[]
 }
 
 export function autoPlan(st: NuwaState, cfg: Cfg): AutoPlanResult {
+	const rejectedReasons: RejectedIntentEntry[] = [];
+	if (st.project.status === "sealed_negative" || st.runtime.status === "sealed_negative") {
+		return { added: [], reason: "sealed", phase: st.project.phase, rejectedReasons };
+	}
+
 	compactIntents(st);
 	compactFacts(st);
 	releaseStaleClaims(st, cfg.claimTtl);
@@ -1265,9 +2824,11 @@ export function autoPlan(st: NuwaState, cfg: Cfg): AutoPlanResult {
 			it.status = "blocked";
 			it.note = `尝试上限 ${cfg.maxAttempts}: 未产出，换路`;
 			it.doneAt = nowIso();
+			recordAttemptedIntent(st, it, "blocked");
 		}
 	}
 
+	const cooldownMs = readEnvCooldownMs(cfg);
 	const curPhaseIntents = Object.values(st.intents).filter((i) => i.phase === st.project.phase);
 	const curPhaseLive = curPhaseIntents.filter((i) => i.status === "open" || i.status === "claimed");
 	const curPhaseSettled = curPhaseIntents.length - curPhaseLive.length;
@@ -1278,35 +2839,68 @@ export function autoPlan(st: NuwaState, cfg: Cfg): AutoPlanResult {
 		const trigger = (st.runtime.stall ?? 0) >= 3 ? `stall=${st.runtime.stall}` : `phase-closing:${st.project.phase}`;
 		const reflectSpec = buildReflectIntentSpec(st, trigger);
 		if (reflectSpec) {
-			const reflectAdded = appendIntentSpecs(st, [reflectSpec]);
+			const reflectAdded = appendIntentSpecs(st, [reflectSpec], INTENT_SOFT_CAP, { rejectedOut: rejectedReasons, cooldownMs });
 			if (reflectAdded.length) {
 				st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
 				st.runtime.lastExpandAt = Date.now();
-				return { added: reflectAdded, reason: "reflect", phase: st.project.phase };
+				return { added: reflectAdded, reason: "reflect", phase: st.project.phase, rejectedReasons };
 			}
 		}
 	}
 
 	const live = Object.values(st.intents).filter((i) => i.status === "open" || i.status === "claimed");
-	if (live.length) return { added: [], reason: "frontier-live" };
+	if (live.length) return { added: [], reason: "frontier-live", rejectedReasons };
 
 	const seeded = seedPhase(st, st.project.phase);
-	if (seeded.length) return { added: seeded, reason: "seed-current", phase: st.project.phase };
+	if (seeded.length) return { added: seeded, reason: "seed-current", phase: st.project.phase, rejectedReasons };
 
-	const derived = deriveFromFacts(st);
-	const kbSpecs = deriveKbIntents(st, (q, k, lim) => kbLookup(q, k, lim));
-	const kbAdded = appendIntentSpecs(st, kbSpecs);
-	const allDerived = [...derived.added, ...kbAdded];
-	if (allDerived.length) {
-		st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
-		st.runtime.lastExpandAt = Date.now();
-		return { added: allDerived, reason: "derive", phase: st.project.phase };
+	// #45 修复 report 阶段死锁：在 report 阶段已完成种子收尾后，禁止重展旧阶段已死事实；
+	// 若报告已写或满足收敛/停滞条件（即使 vuln/exploit/post === 0），直接给出干净阶段收口信号。
+	if (st.project.phase === "report") {
+		const reportTrans = resolveReportPhaseTransition(st, {
+			reportWritten: st.runtime.reportWritten,
+			noveltyThreshold: readNoveltyThreshold(cfg),
+			maxEpisodes: cfg.maxEpisodes,
+		});
+		if (reportTrans.action === "complete") {
+			return { added: [], reason: "report-ready-complete", phase: "report", rejectedReasons };
+		}
+		if (reportTrans.action === "seal_negative") {
+			return { added: [], reason: "report-seal-ready", phase: "report", rejectedReasons };
+		}
+	} else {
+		const derived = deriveFromFacts(st, INTENT_SOFT_CAP, { cooldownMs });
+		rejectedReasons.push(...derived.rejectedReasons);
+		const kbSpecs = deriveKbIntents(st, (q, k, lim) => kbLookup(q, k, lim));
+		const kbAdded = appendIntentSpecs(st, kbSpecs, INTENT_SOFT_CAP, { rejectedOut: rejectedReasons, cooldownMs });
+		const allDerived = [...derived.added, ...kbAdded];
+		if (allDerived.length) {
+			st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
+			st.runtime.lastExpandAt = Date.now();
+			return { added: allDerived, reason: "derive", phase: st.project.phase, rejectedReasons };
+		}
+	}
+
+	// #41 策略收敛：completionRejects >= 1 且无活跃候选时，引导收敛至 report / seal，禁止原样重播 Episode 空转循环
+	const conv = buildConvergenceAdvice(st, cfg);
+	if (conv.active && conv.forbidBlindRerun) {
+		if (st.project.phase !== "report") {
+			st.project.phase = "report";
+			const repAdded = seedPhase(st, "report");
+			return {
+				added: repAdded,
+				reason: repAdded.length ? "converge-to-report" : "report-seal-ready",
+				phase: "report",
+				rejectedReasons,
+			};
+		}
+		return { added: [], reason: "report-seal-ready", phase: "report", rejectedReasons };
 	}
 
 	for (let guard = 0; guard < PHASE_ORDER.length; guard++) {
 		const adv = maybeAdvance(st);
 		if (!adv.advanced) break;
-		if (adv.added.length) return { added: adv.added, reason: "advance", phase: adv.phase };
+		if (adv.added.length) return { added: adv.added, reason: "advance", phase: adv.phase, rejectedReasons };
 	}
 
 	const curIdx = phaseIndex(st.project.phase);
@@ -1316,16 +2910,19 @@ export function autoPlan(st: NuwaState, cfg: Cfg): AutoPlanResult {
 		if (cfg.maxEpisodes === 0 || ep <= cfg.maxEpisodes) {
 			st.project.episode = ep;
 			st.project.phase = "recon";
+			st.runtime.reportWritten = false;
 			const added = seedEpisode(st, ep);
 			st.runtime.expansions = (st.runtime.expansions ?? 0) + 1;
 			st.runtime.lastExpandAt = Date.now();
-			return { added, reason: "episode", phase: "recon", episode: ep };
+			return { added, reason: "episode", phase: "recon", episode: ep, rejectedReasons };
 		}
 	}
 
 	const fb = addFallbackIntent(st);
-	return { added: fb ? [fb] : [], reason: fb ? "fallback" : "exhausted", phase: st.project.phase };
+	return { added: fb ? [fb] : [], reason: fb ? "fallback" : "exhausted", phase: st.project.phase, rejectedReasons };
 }
+
+export const expandGraph = autoPlan;
 
 export function claimIntent(
 	st: NuwaState,
@@ -1352,6 +2949,17 @@ export function claimIntent(
 	intent.claimedAt = nowIso();
 	intent.nextRunAt = undefined;
 	intent.attempts += 1;
+	if (!intent.expectedKind) {
+		intent.expectedKind = inferExpectedKind(intent);
+	}
+	if (!intent.targetKey) {
+		intent.targetKey = extractIntentTargetKey(intent, st.project.host);
+	}
+	if (!intent.surfaceDomain) {
+		intent.surfaceDomain = inferSurfaceDomain(
+			intent.targetKey.startsWith("seed:") ? (st.project.host || "/") : intent.targetKey,
+		);
+	}
 	const ctxFacts = Object.values(st.facts)
 		.filter((f) => f.kind !== "note" && f.kind !== "blocked")
 		.slice(-16)
@@ -1414,7 +3022,7 @@ export function claimIntent(
 	let packet = [
 		`[女娲派单 ${intent.id}] ${intent.phase} · ${intent.title}`,
 		`目标: ${st.project.url}`,
-		`项目: ${st.project.id}  模式: ${st.project.mode}  第 ${intent.attempts} 次尝试`,
+		`项目: ${st.project.id}  模式: ${st.project.mode}  第 ${intent.attempts} 次尝试  期望类型: ${intent.expectedKind ?? "note"}`,
 		`时限: 600s；超时用 nuwa_commit(blocked:true, note:"超时：<原因>") 收口。`,
 		``,
 		`已知事实:`,
@@ -1458,13 +3066,138 @@ export function evidenceProblem(kind: FactKind, command?: string, output?: strin
 	return null;
 }
 
+export interface CommitIntentResult {
+	fact?: Fact;
+	intent: Intent;
+	duplicate?: boolean;
+	freeFact?: boolean;
+	advanced?: { phase: Phase; added: string[] };
+	blockedIntents: number;
+	blockedCommits: number;
+	blockedIntentsDelta: number;
+	blockedCommitsDelta: number;
+}
+
 export function commitIntent(
 	st: NuwaState,
 	input: CommitInput,
-): { fact?: Fact; intent: Intent; duplicate?: boolean; advanced?: { phase: Phase; added: string[] } } {
-	const intent = st.intents[input.id];
-	if (!intent) throw new Error(`intent 不存在: ${input.id}`);
-	if (intent.status === "done") throw new Error(`intent ${input.id} 已完成`);
+): CommitIntentResult {
+	const prevBlockedIntents = Object.values(st.intents).filter((i) => i.status === "blocked").length;
+	const prevBlockedCommits = st.runtime.blockedCommits ?? 0;
+	const rawId = (input.id ?? "").trim();
+	const isFree = !rawId || input.freeNote === true;
+
+	// #31 免票据直通模式：省略 id 或传 freeNote=true 时，不占用、不依赖任何 open/claimed Intent
+	if (isFree) {
+		const syntheticIntent: Intent =
+			rawId && st.intents[rawId]
+				? st.intents[rawId]!
+				: {
+						id: "free",
+						phase: st.project.phase,
+						key: "free:note",
+						title: normOneLine(input.title || "free-fact", 120),
+						detail: input.detail ?? "",
+						from: [],
+						status: input.blocked ? "blocked" : "done",
+						priority: 50,
+						attempts: 1,
+						createdAt: nowIso(),
+						doneAt: nowIso(),
+						expectedKind: input.kind ?? "note",
+					};
+
+		if (input.blocked) {
+			const note = (input.note ?? "").trim();
+			if (note.length < 4) throw new Error("blocked 必须写 note（>=4 字），说明卡点");
+			const nextBlockedCommits = prevBlockedCommits + 1;
+			st.runtime.blockedCommits = nextBlockedCommits;
+			st.runtime.lastBlockedCommitsDelta = 1;
+			st.runtime.lastBlockedIntentsDelta = 0;
+			// #30 提交 blocked=true 时绝对不重置 noveltyStall
+			st.runtime.noveltyStall = st.runtime.noveltyStall ?? 0;
+			return {
+				intent: syntheticIntent,
+				freeFact: true,
+				blockedIntents: prevBlockedIntents,
+				blockedCommits: nextBlockedCommits,
+				blockedIntentsDelta: 0,
+				blockedCommitsDelta: 1,
+			};
+		}
+
+		const kind: FactKind = input.kind ?? "note";
+		const problem = evidenceProblem(kind, input.command, input.output);
+		if (problem) throw new Error(`证据不足: ${problem}`);
+		if (kind === "flag") {
+			const m = `${input.title ?? ""} ${input.detail ?? ""}`.match(/flag\{[^}\s]{2,}\}/i);
+			if (m && !(input.output ?? "").includes(m[0])) {
+				throw new Error(`flag 证据不匹配: output 必须包含 ${m[0]}`);
+			}
+		}
+		const title = (input.title ?? "").trim();
+		if (!title) throw new Error("fact.title 为空");
+		const key = sha(`${st.project.id}|free|${kind}|${normOneLine(title, 80)}`);
+		const existing = Object.values(st.facts).find((f) => f.key === key);
+		st.runtime.lastBlockedCommitsDelta = 0;
+		st.runtime.lastBlockedIntentsDelta = 0;
+		if (existing) {
+			if (input.meta && !existing.meta) existing.meta = input.meta;
+			if (input.verified !== undefined) existing.verified = input.verified;
+			if (input.verifyStage !== undefined && !existing.verifyStage) existing.verifyStage = input.verifyStage;
+			if (input.evidenceRef && !existing.evidenceRef) existing.evidenceRef = input.evidenceRef;
+			if (input.agentResult && !existing.agentResult) existing.agentResult = input.agentResult;
+			return {
+				fact: existing,
+				intent: syntheticIntent,
+				duplicate: true,
+				freeFact: true,
+				blockedIntents: prevBlockedIntents,
+				blockedCommits: prevBlockedCommits,
+				blockedIntentsDelta: 0,
+				blockedCommitsDelta: 0,
+			};
+		}
+		const targetKey = extractIntentTargetKey({ title, detail: input.detail }, st.project.host);
+		const surfaceDomain = inferSurfaceDomain(targetKey.startsWith("seed:") ? (st.project.host || "/") : targetKey);
+		const fid = nextFactId(st);
+		const fact: Fact = {
+			id: fid,
+			kind,
+			title: normOneLine(title, 120),
+			detail: input.detail ?? "",
+			command: input.command,
+			output: input.output,
+			key,
+			createdAt: nowIso(),
+			targetKey,
+			surfaceDomain,
+			...(input.meta ? { meta: input.meta } : {}),
+			...(input.verified !== undefined ? { verified: input.verified } : {}),
+			...(input.verifyStage !== undefined ? { verifyStage: input.verifyStage } : {}),
+			...(input.evidenceRef ? { evidenceRef: input.evidenceRef } : {}),
+			...(input.agentResult ? { agentResult: input.agentResult } : {}),
+		};
+		st.facts[fid] = fact;
+		if (kind !== "blocked") {
+			st.runtime.noveltyStall = 0;
+			st.runtime.semanticStall = false;
+		}
+		return {
+			fact,
+			intent: syntheticIntent,
+			duplicate: false,
+			freeFact: true,
+			blockedIntents: prevBlockedIntents,
+			blockedCommits: prevBlockedCommits,
+			blockedIntentsDelta: 0,
+			blockedCommitsDelta: 0,
+		};
+	}
+
+	const intent = st.intents[rawId];
+	if (!intent) throw new Error(`intent 不存在: ${rawId}`);
+	if (intent.status === "done") throw new Error(`intent ${rawId} 已完成`);
 
 	if (input.blocked) {
 		const note = (input.note ?? "").trim();
@@ -1472,11 +3205,28 @@ export function commitIntent(
 		intent.status = "blocked";
 		intent.note = note;
 		intent.doneAt = nowIso();
+		recordAttemptedIntent(st, intent, "blocked");
+		const nextBlockedCommits = prevBlockedCommits + 1;
+		st.runtime.blockedCommits = nextBlockedCommits;
+		// #30 提交 blocked=true 时绝对不重置 noveltyStall
+		st.runtime.noveltyStall = st.runtime.noveltyStall ?? 0;
 		const adv = maybeAdvance(st);
-		return { intent, advanced: adv.advanced ? { phase: adv.phase, added: adv.added } : undefined };
+		const curBlockedIntents = Object.values(st.intents).filter((i) => i.status === "blocked").length;
+		const blockedIntentsDelta = curBlockedIntents - prevBlockedIntents;
+		st.runtime.lastBlockedIntentsDelta = blockedIntentsDelta;
+		st.runtime.lastBlockedCommitsDelta = 1;
+		return {
+			intent,
+			advanced: adv.advanced ? { phase: adv.phase, added: adv.added } : undefined,
+			blockedIntents: curBlockedIntents,
+			blockedCommits: nextBlockedCommits,
+			blockedIntentsDelta,
+			blockedCommitsDelta: 1,
+		};
 	}
 
-	const kind: FactKind = input.kind ?? "note";
+	// #29 省略 input.kind 时自动继承 intent.expectedKind（兜底 "note"）
+	const kind: FactKind = input.kind ?? intent.expectedKind ?? "note";
 	const problem = evidenceProblem(kind, input.command, input.output);
 	if (problem) throw new Error(`证据不足: ${problem}`);
 	if (kind === "flag") {
@@ -1493,11 +3243,29 @@ export function commitIntent(
 		if (input.meta && !existing.meta) existing.meta = input.meta;
 		if (input.verified !== undefined) existing.verified = input.verified;
 		if (input.verifyStage !== undefined && !existing.verifyStage) existing.verifyStage = input.verifyStage;
+		if (input.evidenceRef && !existing.evidenceRef) existing.evidenceRef = input.evidenceRef;
+		if (input.agentResult && !existing.agentResult) existing.agentResult = input.agentResult;
 		intent.status = "done";
 		intent.to = existing.id;
 		intent.doneAt = intent.doneAt ?? nowIso();
-		return { fact: existing, intent, duplicate: true };
+		recordAttemptedIntent(st, intent, "done");
+		const curBlockedIntents = Object.values(st.intents).filter((i) => i.status === "blocked").length;
+		const blockedIntentsDelta = curBlockedIntents - prevBlockedIntents;
+		st.runtime.lastBlockedIntentsDelta = blockedIntentsDelta;
+		st.runtime.lastBlockedCommitsDelta = 0;
+		return {
+			fact: existing,
+			intent,
+			duplicate: true,
+			blockedIntents: curBlockedIntents,
+			blockedCommits: prevBlockedCommits,
+			blockedIntentsDelta,
+			blockedCommitsDelta: 0,
+		};
 	}
+	const targetKey = intent.targetKey ?? extractIntentTargetKey(intent, st.project.host);
+	const surfaceDomain =
+		intent.surfaceDomain ?? inferSurfaceDomain(targetKey.startsWith("seed:") ? (st.project.host || "/") : targetKey);
 	const id = nextFactId(st);
 	const fact: Fact = {
 		id,
@@ -1509,16 +3277,38 @@ export function commitIntent(
 		intent: intent.id,
 		key,
 		createdAt: nowIso(),
+		targetKey,
+		surfaceDomain,
 		...(input.meta ? { meta: input.meta } : {}),
 		...(input.verified !== undefined ? { verified: input.verified } : {}),
 		...(input.verifyStage !== undefined ? { verifyStage: input.verifyStage } : {}),
+		...(input.evidenceRef ? { evidenceRef: input.evidenceRef } : {}),
+		...(input.agentResult ? { agentResult: input.agentResult } : {}),
 	};
 	st.facts[id] = fact;
 	intent.status = "done";
 	intent.to = id;
 	intent.doneAt = nowIso();
+	recordAttemptedIntent(st, intent, "done");
+	if (kind !== "blocked") {
+		st.runtime.noveltyStall = 0;
+		st.runtime.semanticStall = false;
+	}
 	const adv = maybeAdvance(st);
-	return { fact, intent, duplicate: false, advanced: adv.advanced ? { phase: adv.phase, added: adv.added } : undefined };
+	const curBlockedIntents = Object.values(st.intents).filter((i) => i.status === "blocked").length;
+	const blockedIntentsDelta = curBlockedIntents - prevBlockedIntents;
+	st.runtime.lastBlockedIntentsDelta = blockedIntentsDelta;
+	st.runtime.lastBlockedCommitsDelta = 0;
+	return {
+		fact,
+		intent,
+		duplicate: false,
+		advanced: adv.advanced ? { phase: adv.phase, added: adv.added } : undefined,
+		blockedIntents: curBlockedIntents,
+		blockedCommits: prevBlockedCommits,
+		blockedIntentsDelta,
+		blockedCommitsDelta: 0,
+	};
 }
 
 export function recordFlag(
@@ -1556,6 +3346,8 @@ export function recordFlag(
 		...(verified !== undefined ? { verified } : {}),
 	};
 	st.facts[id] = fact;
+	st.runtime.noveltyStall = 0;
+	st.runtime.semanticStall = false;
 	return { fact };
 }
 
@@ -1563,15 +3355,17 @@ export function completeProject(
 	st: NuwaState,
 	from?: string[],
 	note?: string,
-): { ok: boolean; reason?: string; from: string[] } {
+): { ok: boolean; reason?: string; from: string[]; convergence?: ConvergenceAdvice } {
 	const allowedKinds = proofKinds(st.project.mode);
 	const rawProofs = Object.values(st.facts).filter((f) => allowedKinds.includes(f.kind));
 	if (!rawProofs.length) {
 		st.runtime.completionRejects += 1;
+		const conv = buildConvergenceAdvice(st);
 		return {
 			ok: false,
-			reason: `没有任何 ${allowedKinds.join("/")} 事实；先拿到并 nuwa_flag / nuwa_commit 入账`,
+			reason: `没有任何 ${allowedKinds.join("/")} 事实；先拿到并 nuwa_flag / nuwa_commit 入账（若已穷尽攻击面请转向 report / sealEngagement 封盘）`,
 			from: [],
+			convergence: conv,
 		};
 	}
 	const confirmedProofs = filterConfirmedProofs(st.facts, allowedKinds);
@@ -1581,11 +3375,12 @@ export function completeProject(
 		const rejIds = rawProofs.filter((f) => f.verifyStage === "rejected").map((f) => f.id);
 		const hint = candIds.length
 			? `候选漏洞 ${candIds.join(",")} 尚处于 verifyStage=candidate 待复验状态；请先执行 verify-vuln 独立双盲复验升格为 confirmed`
-			: `候选事实 ${rejIds.join(",")} 已被双盲复验驳回 (rejected)，不可作为完成依据`;
+			: `候选事实 ${rejIds.join(",")} 已被双盲复验驳回 (rejected)，不可作为完成依据；请转向 report / sealEngagement 封盘收口`;
 		return {
 			ok: false,
 			reason: hint,
 			from: [],
+			convergence: buildConvergenceAdvice(st),
 		};
 	}
 	const ids = from?.length ? from : confirmedProofs.map((f) => f.id);
@@ -1604,9 +3399,11 @@ export function completeProject(
 				? `引用事实尚未通过双盲复验（candidate/rejected 不可收口），请先完成 verify-vuln 独立复验`
 				: `引用里没有有效的 ${allowedKinds.join("/")} 实锤事实`,
 			from: ids,
+			convergence: buildConvergenceAdvice(st),
 		};
 	}
 	st.project.status = "completed";
+	st.runtime.status = "completed";
 	st.project.completedAt = nowIso();
 	st.project.completedFrom = ids;
 	if (note) st.project.stopReason = note;
@@ -1622,7 +3419,8 @@ export function sigOf(st: NuwaState): string {
 	const facts = Object.keys(st.facts).length;
 	const flags = Object.values(st.facts).filter((f) => f.kind === "flag").length;
 	const last = Object.keys(st.facts).sort().at(-1) ?? "-";
-	return `${st.project.status}|${st.project.phase}|${open}|${claimed}|${done}|${blocked}|${facts}|${flags}|${last}`;
+	const status = st.runtime?.status === "sealed_negative" ? "sealed_negative" : st.project.status;
+	return `${status}|${st.project.phase}|${open}|${claimed}|${done}|${blocked}|${facts}|${flags}|${last}`;
 }
 
 /** 预算压力 0..1.5：只用于降档与提示，不产生停机。 */
@@ -1640,12 +3438,13 @@ export function budgetPressure(st: NuwaState, cfg: Cfg): number {
 }
 
 /**
- * 停机判定。
- * 2.2.0 起唯一停机条件：目标完成（completed）或人工 stop。
- * infinite 模式下预算永不产生停机；NUWA_INFINITE=0 时保留旧预算闸做兼容。
+ * 停机判定（#22）：
+ * 合法终态包括目标完成（completed）、负向封盘（sealed_negative）以及人工 stop。
+ * infinite 模式下预算永不产生强制停机（改由 shouldRecommendSeal 建议封盘）；NUWA_INFINITE=0 时保留旧预算闸做兼容。
  */
 export function stopReason(st: NuwaState, cfg: Cfg): string | null {
-	if (st.project.status === "completed") return "completed";
+	if (st.project.status === "completed" || st.runtime?.status === "completed") return "completed";
+	if (st.project.status === "sealed_negative" || st.runtime?.status === "sealed_negative") return "sealed_negative";
 	if (st.project.status === "stopped") return st.project.stopReason ?? "stopped";
 	if (cfg.infinite) return null;
 	const rt = st.runtime;
@@ -1738,20 +3537,41 @@ export function statusBoard(st: NuwaState, root?: string): string {
 	const turnsDisp = totalTurns > rt.turns ? `${rt.turns}(total=${totalTurns})` : `${rt.turns}`;
 	const tokensDisp = (rt.totalTokens ?? 0) > 0 ? `${rt.tokens}(total=${totalTokens})` : `${rt.tokens}`;
 	const assetCount = Object.keys(st.assets ?? {}).length;
-	const hypCount = Object.values(st.hypotheses ?? {}).filter((h) => h.status === "open" || h.status === "active").length;
-	const extraMetaParts: string[] = [];
+	const hypCount = Object.values(st.hypotheses ?? {}).filter((h) => h.status === "open" || (h as { status: string }).status === "active").length;
+	const rep = computeRepeatRatio(st);
+	const probe = extractProbeHealth(st);
+	const blockedIntents = Object.values(st.intents).filter((i) => i.status === "blocked").length;
+	const blockedCommits = rt.blockedCommits ?? blockedIntents;
+	const noveltyStall = rt.noveltyStall ?? 0;
+	const effectiveStatus = rt.status === "sealed_negative" ? "sealed_negative" : p.status;
+	const conv = buildConvergenceAdvice(st, cfg);
+	const sealRec = shouldRecommendSeal(st, cfg);
+
+	const extraMetaParts: string[] = [
+		`repeatRatio=${rep.repeatRatio.toFixed(2)}`,
+		`last_ok=${probe.lastOk}`,
+		`blocked_ratio=${Math.round(probe.blockedRatio * 100)}%`,
+		`blockedIntents=${blockedIntents}`,
+		`blockedCommits=${blockedCommits}`,
+	];
+	if (probe.edgeBlocked) extraMetaParts.push("stage=边缘受阻");
 	if (assetCount > 1) extraMetaParts.push(`assets=${assetCount}`);
 	if (hypCount > 0) extraMetaParts.push(`hyp=${hypCount}`);
 	if (p.sandboxMode && p.sandboxMode !== "none") extraMetaParts.push(`sandbox=${p.sandboxMode}`);
 	const extraMeta = extraMetaParts.length ? ` · ${extraMetaParts.join(" · ")}` : "";
 	const budgetLine = cfg.infinite
-		? `budget: ∞ 永动 · gen=${gen} · turns=${turnsDisp} · ${mins}min · tokens=${tokensDisp} · stall=${rt.stall} idle=${rt.idle} · pressure=${Math.round(pressure * 100)}% · ep=${p.episode ?? 1} expand=${rt.expansions ?? 0}`
-		: `budget: 预算受限 · gen=${gen} · turns=${turnsDisp}/${cfg.maxTurns} · ${mins}/${cfg.maxMinutes}min · tokens=${tokensDisp}/${cfg.maxTokens} · stall=${rt.stall}/${cfg.maxStall} idle=${rt.idle}/${cfg.maxIdle}`;
+		? `budget: ∞ 永动 · gen=${gen} · turns=${turnsDisp} · ${mins}min · tokens=${tokensDisp} · stall=${rt.stall} noveltyStall=${noveltyStall} idle=${rt.idle} · pressure=${Math.round(pressure * 100)}% · ep=${p.episode ?? 1} expand=${rt.expansions ?? 0}`
+		: `budget: 预算受限 · gen=${gen} · turns=${turnsDisp}/${cfg.maxTurns} · ${mins}/${cfg.maxMinutes}min · tokens=${tokensDisp}/${cfg.maxTokens} · stall=${rt.stall}/${cfg.maxStall} noveltyStall=${noveltyStall} idle=${rt.idle}/${cfg.maxIdle}`;
+	const rejectNotes: string[] = [];
+	if (conv.active) rejectNotes.push(`收敛:${conv.recommendedAction}`);
+	if (sealRec.recommend && effectiveStatus === "active") rejectNotes.push(`建议封盘:${sealRec.reasons.join(",")}`);
+	if (rt.sealMeta) rejectNotes.push(`封盘原因:${rt.sealMeta.reason}`);
+	const rejectSuffix = rejectNotes.length ? ` (${rejectNotes.join(" | ")})` : "";
 	return [
-		`女娲 v${VERSION} · ${p.url} · ${p.mode} · ${p.status}`,
+		`女娲 v${VERSION} · ${p.url} · ${p.mode} · ${effectiveStatus}`,
 		`phase=${p.phase} · facts=${Object.keys(st.facts).length} (${kindLine || "无"}) · cand=${candCount} · roles=${roleCount} · kb=${kbReady} · state=${stateKb}KB · rules=${rulesSource} · net-retry=${netRetry}${extraMeta}`,
 		budgetLine,
-		`rejects=${rt.completionRejects} · 目标: ${p.goal}`,
+		`rejects=${rt.completionRejects}${rejectSuffix} · 目标: ${p.goal}`,
 		table,
 		`frontier: ${frontier}${autoBatch ? ` · auto: ${autoBatch}` : ""}`,
 	].join("\n");
@@ -1778,13 +3598,17 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 	const mins = Math.floor((Date.now() - rt.startedAt) / 60000);
 	const flags = Object.values(st.facts).filter((f) => f.kind === "flag").length;
 	const ep = p.episode ?? 1;
-	const head = `[女娲 v${VERSION} · 永动续跑 第 ${rt.turns} 轮 · E${ep}] status=${p.status} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked} facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}min stall=${rt.stall} idle=${rt.idle} pressure=${Math.round(pressure * 100)}% expand=${rt.expansions ?? 0}`;
+	const noveltyStall = rt.noveltyStall ?? 0;
+	const threshold = readNoveltyThreshold(cfg);
+	const conv = buildConvergenceAdvice(st, cfg);
+	const sealRec = shouldRecommendSeal(st, cfg);
+	const head = `[女娲 v${VERSION} · 永动续跑 第 ${rt.turns} 轮 · E${ep}] status=${p.status} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked}(commits=${rt.blockedCommits ?? counts.blocked}) facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}min stall=${rt.stall} noveltyStall=${noveltyStall} idle=${rt.idle} pressure=${Math.round(pressure * 100)}% expand=${rt.expansions ?? 0}`;
 	const goal = `目标: ${p.url} (${p.mode}) — ${p.goal}`;
 	const hard = [
 		`本轮硬性动作（必须发生，禁止只输出说明文字）:`,
 		`- 至少 1 次 task 批量派单，或至少 1 次 nuwa_commit；`,
 		`- 目标未完成前，禁止输出“收工/已完成/本轮结束/等待指示”；`,
-		`- 只有 nuwa_complete 返回 ok=true 才会解除续跑；其他任何理由都不停。`,
+		`- 只有 nuwa_complete 返回 ok=true（或满足封盘条件执行 sealEngagement 进入 sealed_negative）才会解除续跑；其他任何理由都不停。`,
 	].join("\n");
 
 	const freshAll = claimedFresh(st, cfg.claimTtl);
@@ -1832,8 +3656,14 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 
 	const escalate = [
 		rt.stall >= 3 ? `⚠ 连续 ${rt.stall} 轮无有效推进：换目标面，不要重复同一条命令；对卡住的 intent 写 blocked 并给 note。` : "",
+		noveltyStall >= threshold
+			? `⚠ 语义停滞升级（noveltyStall=${noveltyStall}>=${threshold}）：连续 ${noveltyStall} 轮零新非 blocked 事实；严禁在已排除死面原地重试，请切换全新攻击面或转入 report / sealEngagement 封盘。`
+			: "",
 		rt.idle >= 2 ? `⚠ 连续 ${rt.idle} 轮没调工具：立刻 task 派单或 nuwa_status，不要再输出说明文字。` : "",
-		rt.completionRejects > 0 ? `⚠ 完成已被拒 ${rt.completionRejects} 次：没有 flag/vuln/loot 就不要调 nuwa_complete。` : "",
+		conv.active ? `⚠ ${conv.message}` : "",
+		sealRec.recommend
+			? `⚠ 自动封盘建议触发（${sealRec.reasons.join(", ")}）：若所有可达攻击面均已排除且无正向突破，请整理覆盖面报告并执行封盘（sealed_negative）。`
+			: "",
 		pressure >= 0.9 ? `⚠ 预算压力 ${Math.round(pressure * 100)}%：并行降档到 ${batchSize}，推进不减速；禁止以预算为由收工。` : "",
 	]
 		.filter(Boolean)
@@ -2404,14 +4234,17 @@ export function isCompliantSandboxDockerCommand(cmd: string, projectId: string):
 export function executeCommitWithGates(
 	root: string,
 	p: {
-		id: string;
-		kind: FactKind;
+		id?: string;
+		kind?: FactKind;
 		title?: string;
 		detail?: string;
 		command?: string;
 		output?: string;
 		blocked?: boolean;
 		note?: string;
+		freeNote?: boolean;
+		evidenceRef?: string;
+		agentResult?: Record<string, unknown>;
 	},
 	verifiedFlag?: boolean,
 ): {
@@ -2420,24 +4253,35 @@ export function executeCommitWithGates(
 	verifyStageOut?: VerifyStage;
 	verifyIntentId?: string;
 	ingestedRole?: string;
+	blockedIntents: number;
+	blockedCommits: number;
+	blockedIntentsDelta: number;
+	blockedCommitsDelta: number;
 } {
 	let text = "";
 	let verifyStageOut: VerifyStage | undefined;
 	let verifyIntentId: string | undefined;
 	let ingestedRole: string | undefined;
+	let blockedIntents = 0;
+	let blockedCommits = 0;
+	let blockedIntentsDelta = 0;
+	let blockedCommitsDelta = 0;
 
 	const state = withLock(root, () => {
 		const s = loadState(root);
 		if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
-		const targetIntent = s.intents[p.id];
+		const rawId = (p.id ?? "").trim();
+		const isFree = !rawId || p.freeNote === true;
+		const targetIntent = !isFree ? s.intents[rawId] : undefined;
 		const intentKey = targetIntent?.key ?? "";
+		const effectiveKind: FactKind = p.kind ?? targetIntent?.expectedKind ?? "note";
 
-		if (!p.blocked && isVerifyVulnIntentKey(intentKey)) {
+		if (!isFree && !p.blocked && isVerifyVulnIntentKey(intentKey)) {
 			const verifyTargetFid = extractVerifyTargetFactId(intentKey);
 			const candidateFact = verifyTargetFid ? s.facts[verifyTargetFid] : undefined;
 			const vc = validateVerificationCommit({
 				intentKey,
-				kind: p.kind,
+				kind: effectiveKind,
 				blocked: p.blocked,
 				worker: targetIntent?.worker,
 				candidateFact,
@@ -2447,7 +4291,7 @@ export function executeCommitWithGates(
 			}
 		}
 
-		if (!p.blocked && p.kind === "cred") {
+		if (!p.blocked && effectiveKind === "cred") {
 			const roleEntry = ingestCredFactToVault(root, {
 				kind: "cred",
 				title: p.title ?? "",
@@ -2457,26 +4301,28 @@ export function executeCommitWithGates(
 			if (roleEntry) {
 				ingestedRole = roleEntry.role;
 				s.project.activeRoles = Object.keys(loadSessionVault(root).roles).sort();
-				logEvent(root, { type: "vault_ingest", role: roleEntry.role, fromIntent: p.id });
+				logEvent(root, { type: "vault_ingest", role: roleEntry.role, fromIntent: rawId || "free" });
 			}
 		}
 
-		const shouldRedact = p.kind !== "flag";
+		const shouldRedact = effectiveKind !== "flag";
 		const safeTitle = shouldRedact ? redactVaultSecrets(p.title ?? "", root) : (p.title ?? "");
 		const safeDetail = shouldRedact ? redactVaultSecrets(p.detail ?? "", root) : (p.detail ?? "");
 		const safeCommand = shouldRedact && p.command !== undefined ? redactVaultSecrets(p.command, root) : p.command;
 		const safeOutput = shouldRedact && p.output !== undefined ? redactVaultSecrets(p.output, root) : p.output;
 		const safeNote = shouldRedact && p.note !== undefined ? redactVaultSecrets(p.note, root) : p.note;
 
-		const stageCand = !p.blocked && shouldStageAsCandidate({ kind: p.kind, intentKey, isAuto: targetIntent?.worker === "auto" });
+		const stageCand =
+			!p.blocked && shouldStageAsCandidate({ kind: effectiveKind, intentKey, isAuto: targetIntent?.worker === "auto" });
 		const initialVerifyStage: VerifyStage | undefined = stageCand
 			? "candidate"
-			: !p.blocked && isVerifyVulnIntentKey(intentKey) && p.kind === "vuln"
+			: !p.blocked && isVerifyVulnIntentKey(intentKey) && effectiveKind === "vuln"
 				? "confirmed"
 				: undefined;
 
 		const r = commitIntent(s, {
-			id: p.id,
+			id: rawId || undefined,
+			freeNote: isFree,
 			kind: p.kind,
 			title: safeTitle,
 			detail: safeDetail,
@@ -2486,7 +4332,13 @@ export function executeCommitWithGates(
 			note: safeNote,
 			verified: stageCand ? false : verifiedFlag,
 			...(initialVerifyStage ? { verifyStage: initialVerifyStage } : {}),
+			...(p.evidenceRef ? { evidenceRef: p.evidenceRef } : {}),
+			...(p.agentResult ? { agentResult: p.agentResult } : {}),
 		});
+		blockedIntents = r.blockedIntents;
+		blockedCommits = r.blockedCommits;
+		blockedIntentsDelta = r.blockedIntentsDelta;
+		blockedCommitsDelta = r.blockedCommitsDelta;
 
 		const extraLines: string[] = [];
 		if (ingestedRole) {
@@ -2513,11 +4365,11 @@ export function executeCommitWithGates(
 			}
 		}
 
-		if (isVerifyVulnIntentKey(intentKey)) {
+		if (!isFree && isVerifyVulnIntentKey(intentKey)) {
 			const outcome = resolveVerificationOutcome(s, intentKey, Boolean(p.blocked), p.blocked ? safeNote : safeDetail || safeTitle);
 			if (outcome.matched && outcome.stage) {
 				verifyStageOut = outcome.stage;
-				logEvent(root, { type: "verify_vuln", targetFact: outcome.factId, stage: outcome.stage, byIntent: p.id });
+				logEvent(root, { type: "verify_vuln", targetFact: outcome.factId, stage: outcome.stage, byIntent: rawId });
 				if (outcome.stage === "confirmed") {
 					const d = deriveFromFacts(s);
 					extraLines.push(
@@ -2567,29 +4419,41 @@ export function executeCommitWithGates(
 			}
 		}
 
-		saveState(root, s, p.kind === "flag" && !p.blocked ? { reason: "flag" } : undefined);
+		saveState(root, s, effectiveKind === "flag" && !p.blocked ? { reason: "flag" } : undefined);
 		logEvent(root, {
-			type: p.blocked ? "blocked" : "commit",
-			id: p.id,
+			type: p.blocked ? "blocked" : isFree ? "commit_free" : "commit",
+			id: rawId || "free",
 			fact: r.fact?.id,
-			kind: p.kind,
+			kind: r.fact?.kind ?? effectiveKind,
 			verified: r.fact?.verified ?? verifiedFlag,
 			...(verifyStageOut ? { verifyStage: verifyStageOut } : {}),
 			duplicate: r.duplicate ?? false,
 		});
 		if (p.blocked) {
-			text = `已收口 ${p.id}: blocked — ${safeNote ?? ""}\nphase=${s.project.phase}`;
+			text = `已收口 ${rawId || "free"}: blocked — ${safeNote ?? ""}\nblockedIntents=${blockedIntents}(+${blockedIntentsDelta}) blockedCommits=${blockedCommits}(+${blockedCommitsDelta})\nphase=${s.project.phase}`;
 		} else if (r.duplicate) {
-			text = `幂等命中: ${p.id} → ${r.fact?.id}（未重复入账）`;
+			text = `幂等命中: ${rawId || "free"} → ${r.fact?.id}（未重复入账）`;
+		} else if (isFree) {
+			text = `已免票据入账 ${r.fact?.id} [${r.fact?.kind}] ${r.fact?.title}\nphase=${s.project.phase}`;
 		} else {
-			text = `已入账 ${r.fact?.id} [${r.fact?.kind}] ${r.fact?.title} ← ${p.id}\nphase=${s.project.phase}`;
+			text = `已入账 ${r.fact?.id} [${r.fact?.kind}] ${r.fact?.title} ← ${rawId}\nphase=${s.project.phase}`;
 		}
 		if (extraLines.length > 0) text += `\n${extraLines.join("\n")}`;
 		if (r.advanced) text += `\n阶段推进: ${r.advanced.phase}（新增 ${r.advanced.added.length} 条: ${r.advanced.added.join(" ")}）`;
 		return s;
 	});
 
-	return { state, text, verifyStageOut, verifyIntentId, ingestedRole };
+	return {
+		state,
+		text,
+		verifyStageOut,
+		verifyIntentId,
+		ingestedRole,
+		blockedIntents,
+		blockedCommits,
+		blockedIntentsDelta,
+		blockedCommitsDelta,
+	};
 }
 
 export function executeSessionCommand(found: string | null, subArg: string): { msg: string; level: "info" | "error" } {
@@ -2912,7 +4776,12 @@ export function settleSessionStopState(opts: {
 
 	const state = withLock(opts.root, () => {
 		const s = loadState(opts.root);
-		if (!s || s.project.status !== "active") return s;
+		if (!s || s.project.status !== "active" || s.runtime.status === "sealed_negative" || s.runtime.status === "completed") {
+			if (s && (s.project.status === "sealed_negative" || s.runtime.status === "sealed_negative")) {
+				stoppedWhy = "sealed_negative";
+			}
+			return s;
+		}
 		s.runtime.turns += 1;
 		s.runtime.totalTurns = Math.max(s.runtime.totalTurns ?? 0, s.runtime.turns - 1) + 1;
 		s.runtime.genTurns = (s.runtime.genTurns ?? 0) + 1;
