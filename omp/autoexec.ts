@@ -5,10 +5,42 @@
  *
  * 约束：仅使用 import type 引用 ./nuwa，严禁运行时 import ./nuwa。
  */
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Cfg, NuwaState, Phase, ToolchainCaps } from "./nuwa";
+import {
+	buildCurlProxyArgs,
+	EgressPoolManager,
+	injectEgressEnv,
+	maskEgressUrl,
+	normalizeTaskEgressUrl,
+	resolveConfiguredEgressUrl,
+	type EgressCircuitState,
+	type EgressEndpointConfig,
+	type EgressHealthSnapshot,
+	type EgressLease,
+	type EgressObservation,
+	type EgressPoolOptions,
+	type InjectEgressEnvOptions,
+} from "./sandbox";
+
+export {
+	buildCurlProxyArgs,
+	EgressPoolManager,
+	injectEgressEnv,
+	maskEgressUrl,
+	normalizeTaskEgressUrl,
+	resolveConfiguredEgressUrl,
+	type EgressCircuitState,
+	type EgressEndpointConfig,
+	type EgressHealthSnapshot,
+	type EgressLease,
+	type EgressObservation,
+	type EgressPoolOptions,
+	type InjectEgressEnvOptions,
+};
 
 export interface ExecLikeResult {
 	stdout: string;
@@ -33,6 +65,10 @@ export interface AutoFactMeta {
 	status?: number;
 	san?: string[];
 	waf?: string;
+	bodyHash?: string;
+	bodyBytes?: number;
+	endpointClassifications?: Record<string, EndpointClassification>;
+	requiresAuthPaths?: string[];
 }
 
 export interface AutoFact {
@@ -53,12 +89,31 @@ export interface AutoRule {
 }
 
 export type AutoParserName = "http" | "ports" | "dirs" | "tls" | "probe" | "katana" | "nuclei";
-export type AutoErrorKind = "network" | "blocked_by_waf" | "empty";
+export type AutoErrorKind = "network" | "blocked_by_waf" | "empty" | "egress_blocked";
+
+export type EndpointClassification =
+	| "exists"
+	| "exists_requires_auth"
+	| "not_found"
+	| "soft_404"
+	| "egress_blocked"
+	| "redirect"
+	| "server_error"
+	| "unknown";
+
+export type HeaderBagLike =
+	| Record<string, string | string[] | undefined>
+	| Headers
+	| { get(name: string): string | null };
 
 export interface Soft404Sample {
 	code: number;
 	size: number;
 	titleSig: string;
+	path?: string;
+	bodyHash?: string;
+	templateHash?: string;
+	redirectLocation?: string;
 }
 
 export interface Soft404Baseline {
@@ -72,16 +127,157 @@ export interface Soft404Baseline {
 	size?: number;
 	/** 首个非空 200/30x 兜底样本的归一化 HTML title 签名。 */
 	titleSig?: string;
+	/** 首个兜底样本的精确响应体 SHA-256 哈希。 */
+	bodyHash?: string;
+	/** 首个兜底样本的归一化模板 SHA-256 指纹。 */
+	templateHash?: string;
 }
 
 export interface Soft404Candidate {
 	path?: string;
+	url?: string;
 	code: number;
+	status?: number;
 	size?: number;
+	bodyBytes?: number;
 	/** 未提供（undefined）表示采集源未提取 title；空串或 "-" 表示已检查响应且无 HTML title。 */
 	titleSig?: string;
 	body?: string;
 	snippet?: string;
+	headers?: HeaderBagLike;
+	contentType?: string;
+}
+
+export interface DetectSoft404Input {
+	url?: string;
+	path?: string;
+	status?: number;
+	code?: number;
+	body?: string | Buffer | Uint8Array;
+	snippet?: string;
+	size?: number;
+	bodyBytes?: number;
+	titleSig?: string;
+	headers?: HeaderBagLike;
+	contentType?: string;
+}
+
+export interface Soft404BaselineInput extends Partial<Soft404Baseline> {
+	status?: number;
+	body?: string | Buffer | Uint8Array;
+	bodyBytes?: number;
+	probes?: Array<{
+		path?: string;
+		status: number;
+		size?: number;
+		bodyBytes?: number;
+		body?: string | Buffer | Uint8Array;
+		bodyHash?: string;
+		templateHash?: string;
+		titleSig?: string;
+		redirectLocation?: string;
+	}>;
+}
+
+export interface Soft404DetectionResult {
+	isSoft404: boolean;
+	confidence: "high" | "medium" | "none";
+	reasons: string[];
+	matchedRule?:
+		| "rsc_error_fallback"
+		| "multilingual_404_copy"
+		| "baseline_hash_match"
+		| "baseline_template_match"
+		| "baseline_size_title_match"
+		| "baseline_redirect_match";
+	bodyBytes: number;
+	bodyHash: string;
+	templateHash: string;
+}
+
+export interface EndpointResponseInput {
+	url?: string;
+	path?: string;
+	method?: string;
+	status: number;
+	headers?: HeaderBagLike;
+	body?: string | Buffer | Uint8Array;
+	contentType?: string;
+	bodyBytes?: number;
+}
+
+export interface EndpointBaseline404 extends Soft404BaselineInput {
+	soft404Baseline?: Soft404Baseline;
+}
+
+export interface EndpointResponseClassification {
+	classification: EndpointClassification;
+	exists: boolean;
+	requiresAuth: boolean;
+	status: number;
+	bodyHash: string;
+	bodyBytes: number;
+	templateHash: string;
+	allowMethods?: string[];
+	waf?: string;
+	reason: string;
+	meta: {
+		status: number;
+		bodyHash: string;
+		bodyBytes: number;
+		templateHash: string;
+		classification: EndpointClassification;
+		requiresAuth: boolean;
+		allow?: string[];
+		waf?: string;
+	};
+}
+
+export interface PreflightFetchResponse {
+	ok: boolean;
+	status: number;
+	text(): Promise<string>;
+	headers?: { get(name: string): string | null };
+}
+
+export type PreflightFetchLike = (
+	url: string,
+	init?: {
+		method?: string;
+		headers?: Record<string, string>;
+		signal?: AbortSignal;
+		redirect?: "manual" | "follow" | "error";
+	},
+) => Promise<PreflightFetchResponse>;
+
+export interface PreflightEgressOptions {
+	gateUrl: string;
+	egressUrl?: string;
+	expectedStatuses?: readonly number[];
+	timeoutMs?: number;
+	exec?: ExecLike;
+	cwd?: string;
+	fetchFn?: PreflightFetchLike;
+	headers?: Record<string, string>;
+	signal?: AbortSignal;
+	egressPool?: EgressPoolManager;
+	egressId?: string;
+}
+
+export interface PreflightEgressResult {
+	ok: boolean;
+	status: "ok" | "egress_blocked" | "network_error";
+	errorKind?: "egress_blocked" | "network";
+	gateUrl: string;
+	egressUrl?: string;
+	httpStatus?: number;
+	bodyBytes?: number;
+	bodyHash?: string;
+	ttfbMs?: number;
+	waf?: string;
+	cfRay?: string;
+	remoteIp?: string;
+	reason: string;
 }
 
 export interface AutoFailureClassification {
@@ -99,6 +295,9 @@ export interface AutoRunResult {
 	errorKind?: AutoErrorKind;
 	retryAfterMs?: number;
 	waf?: string;
+	egressId?: string;
+	egressUrl?: string;
+	preflight?: PreflightEgressResult;
 }
 
 export interface LoadedAutoRules {
@@ -124,6 +323,11 @@ export interface AutoBatchOptions {
 	signal?: AbortSignal;
 	agentHome?: string;
 	authHeaderFile?: string;
+	egressUrl?: string;
+	egressPool?: EgressPoolManager;
+	gateUrl?: string;
+	preflightExpectedStatuses?: readonly number[];
+	preflightFetchFn?: PreflightFetchLike;
 	getState?: () => NuwaState | null;
 	onResult?: (item: AutoBatchItemResult) => void | Promise<void>;
 	onBudgetSkip?: (remainingIds: string[], reason: BudgetSkipReason) => void | Promise<void>;
@@ -435,32 +639,829 @@ function parseSoft404RowString(rawRow: string): Soft404Candidate | null {
 	return null;
 }
 
+const RSC_ERROR_FALLBACK_RE =
+	/NEXT_HTTP_ERROR_FALLBACK\\?;404|"digest"\s*:\s*"NEXT_NOT_FOUND"|NEXT_NOT_FOUND|__next_error__|notFound":\s*true/i;
+
+const NEXT_DATA_404_RE =
+	/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>[\s\S]*?(?:"page"\s*:\s*"\/(?:404|_error)"[\s\S]*?"statusCode"\s*:\s*404|"statusCode"\s*:\s*404[\s\S]*?"page"\s*:\s*"\/(?:404|_error)")/i;
+
+const MULTILINGUAL_404_PATTERNS: ReadonlyArray<{ label: string; re: RegExp }> = [
+	{ label: "zh-Hant:找不到此頁面", re: /找不到此頁面|找不到該頁面|此頁面不存在|頁面不存在|找不到網頁|查無此頁/i },
+	{ label: "zh-Hans:页面不存在", re: /页面不存在|找不到该页面|找不到此页面|您访问的页面不存在|未找到页面|网页无法找到|该页面已失效/i },
+	{
+		label: "en:Page Not Found",
+		re: /\b(?:404\s*[-–—:|]?\s*(?:page\s*)?not\s+found|page\s+not\s+found|this\s+page\s+could\s+not\s+be\s+found|the\s+requested\s+(?:url|page|resource)\s+was\s+not\s+found|we\s+couldn['’]?t\s+find\s+(?:that|this|the)\s+page|error\s*404|cannot\s+get\s+\/)\b/i,
+	},
+	{ label: "ja:ページが見つかりません", re: /ページが見つかりません|お探しのページは見つかりませんでした/i },
+	{ label: "ko:페이지를 찾을 수 없습니다", re: /페이지를\s*찾을\s*수\s*없습니다/i },
+	{ label: "eu:404-copy", re: /\b(?:página\s+no\s+encontrada|seite\s+nicht\s+gefunden|page\s+introuvable)\b/i },
+];
+
+const BUSINESS_AUTH_403_RE =
+	/\b(?:unauthori[sz]ed|unauthenticated|permission\s+denied|insufficient\s+(?:permissions?|privileges?|scope)|invalid\s+token|token\s+(?:expired|invalid|missing|required)|jwt\s+(?:expired|invalid|missing)|auth(?:entication|orization)?\s+(?:required|failed|missing)|login\s+required|sign\s*in\s+required|role\s+required|admin\s+only|forbidden\s+resource|not\s+allowed\s+to\s+access)\b|无权限|权限不足|未授权|未登录|需要登录|请先登录|鉴权失败|令牌无效|令牌已过期/i;
+
+const EDGE_BLOCK_403_RE =
+	/\b(?:attention\s+required!?\s*\|\s*cloudflare|sorry,\s*you\s+have\s+been\s+blocked|just\s+a\s+moment\.\.\.|cf-error-details|cf-turnstile|challenge-platform|cloudflare\s+ray\s+id|enable\s+javascript\s+and\s+cookies\s+to\s+continue|why\s+have\s+i\s+been\s+blocked|access\s+denied\s+you\s+don['’]?t\s+have\s+permission\s+to\s+access\s+"[^"]+"\s+on\s+this\s+server|reference\s*#\d+\.\w+|request\s+blocked\s+by\s+(?:waf|cloudflare|cloudfront|akamai|imperva)|incapsula\s+incident\s+id|datadome)\b/i;
+
+const LOGIN_LOCATION_RE = /\/(?:login|signin|sign-in|auth|oauth|sso|passport)(?:[/?#]|$)/i;
+
+function readHeaderCaseInsensitive(headers: HeaderBagLike | undefined, name: string): string {
+	if (!headers) return "";
+	const target = name.toLowerCase();
+	if (typeof (headers as { get?: unknown }).get === "function") {
+		return String((headers as { get(k: string): string | null }).get(name) ?? "").trim();
+	}
+	const rec = headers as Record<string, string | string[] | undefined>;
+	for (const [k, v] of Object.entries(rec)) {
+		if (k.toLowerCase() !== target || v === undefined) continue;
+		return Array.isArray(v) ? v.join(", ").trim() : String(v).trim();
+	}
+	return "";
+}
+
+function serializeHeadersForInspection(headers: HeaderBagLike | undefined): string {
+	if (!headers) return "";
+	const lines: string[] = [];
+	if (typeof Headers !== "undefined" && headers instanceof Headers) {
+		headers.forEach((v, k) => lines.push(`${k}: ${v}`));
+		return lines.join("\n");
+	}
+	if (typeof (headers as { get?: unknown }).get === "function") {
+		for (const key of [
+			"server",
+			"content-type",
+			"location",
+			"allow",
+			"www-authenticate",
+			"cf-ray",
+			"cf-mitigated",
+			"x-nextjs-matched-path",
+			"x-amzn-waf-action",
+			"x-datadome",
+			"x-sucuri-id",
+			"x-iinfo",
+			"x-powered-by",
+		]) {
+			const val = (headers as { get(k: string): string | null }).get(key);
+			if (val) lines.push(`${key}: ${val}`);
+		}
+		return lines.join("\n");
+	}
+	for (const [k, v] of Object.entries(headers as Record<string, string | string[] | undefined>)) {
+		if (v === undefined) continue;
+		lines.push(`${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
+	}
+	return lines.join("\n");
+}
+
+function bodyToBufferAndText(body?: string | Buffer | Uint8Array): { buf: Buffer; text: string } {
+	if (body === undefined || body === null) {
+		return { buf: Buffer.alloc(0), text: "" };
+	}
+	if (Buffer.isBuffer(body)) {
+		return { buf: body, text: body.toString("utf8") };
+	}
+	if (body instanceof Uint8Array) {
+		const buf = Buffer.from(body);
+		return { buf, text: buf.toString("utf8") };
+	}
+	const text = String(body);
+	return { buf: Buffer.from(text, "utf8"), text };
+}
+
+/** 计算响应体的精确 SHA-256 哈希与字节数。 */
+export function computeBodyHash(body?: string | Buffer | Uint8Array): { bodyHash: string; bodyBytes: number } {
+	const { buf } = bodyToBufferAndText(body);
+	return {
+		bodyHash: createHash("sha256").update(buf).digest("hex"),
+		bodyBytes: buf.byteLength,
+	};
+}
+
+/**
+ * 计算响应体的归一化模板 SHA-256 指纹：
+ * 剥离 nonce、UUID、ISO 时间戳、请求路径回显、长十六进制哈希与多余空白，
+ * 使包含动态参数或路径回显的软 404 页面仍能稳定聚合到同一模板指纹。
+ */
+export function computeTemplateFingerprint(body: string | Buffer | Uint8Array | undefined, pathHint?: string): string {
+	let text = bodyToBufferAndText(body).text;
+	if (!text) {
+		return createHash("sha256").update("").digest("hex");
+	}
+	if (pathHint && pathHint.length > 1) {
+		const cleanPath = pathHint.split(/[?#]/)[0] ?? "";
+		if (cleanPath && cleanPath !== "/") {
+			text = text.split(cleanPath).join("<PATH>");
+			try {
+				const enc = encodeURIComponent(cleanPath);
+				if (enc !== cleanPath) text = text.split(enc).join("<PATH>");
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+	const normalized = text
+		.replace(/\bnonce=["'][^"']+["']/gi, 'nonce="<NONCE>"')
+		.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<UUID>")
+		.replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/g, "<TS>")
+		.replace(/"(?:requestId|traceId|rayId|timestamp|nonce|csrfToken|buildId)"\s*:\s*"[^"]*"/gi, '"$1":"<DYN>"')
+		.replace(/\b[0-9a-f]{24,64}\b/gi, "<HEX>")
+		.replace(/\b\d{10,16}\b/g, "<NUM>")
+		.replace(/\s+/g, " ")
+		.trim()
+		.toLowerCase();
+	return createHash("sha256").update(normalized, "utf8").digest("hex");
+}
+
+function isJsonBusinessDataPayload(text: string, contentType: string): boolean {
+	const trimmed = text.trim();
+	if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
+	const looksJson = /json/i.test(contentType) || trimmed.startsWith("{") || trimmed.startsWith("[");
+	if (!looksJson) return false;
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		if (Array.isArray(parsed)) return parsed.length > 0;
+		if (parsed && typeof parsed === "object") {
+			const rec = parsed as Record<string, unknown>;
+			if (rec.statusCode === 404 || rec.status === 404 || rec.code === 404) return false;
+			if (typeof rec.error === "string" && /not\s*found/i.test(rec.error) && Object.keys(rec).length <= 3) {
+				return false;
+			}
+			if (Array.isArray(rec.data) || (rec.data && typeof rec.data === "object")) return true;
+			if (typeof rec.openapi === "string" || typeof rec.swagger === "string") return true;
+			const keys = Object.keys(rec);
+			if (keys.length >= 2 && !keys.every((k) => /^(?:error|message|msg|code|status|statusCode|path|timestamp)$/i.test(k))) {
+				return true;
+			}
+		}
+	} catch {
+		return false;
+	}
+	return false;
+}
+
+function normalizeBaselineSamples(baseline?: Soft404BaselineInput | null): Soft404Sample[] {
+	if (!baseline) return [];
+	const out: Soft404Sample[] = [];
+	if (Array.isArray(baseline.samples)) {
+		for (const s of baseline.samples) {
+			if (Number.isFinite(s.code) && Number.isFinite(s.size)) {
+				out.push({ ...s, titleSig: normalizeTitleSig(s.titleSig) });
+			}
+		}
+	}
+	if (Array.isArray(baseline.probes)) {
+		for (const p of baseline.probes) {
+			const { buf, text } = bodyToBufferAndText(p.body);
+			const size =
+				typeof p.size === "number" && Number.isFinite(p.size)
+					? p.size
+					: typeof p.bodyBytes === "number" && Number.isFinite(p.bodyBytes)
+						? p.bodyBytes
+						: buf.byteLength;
+			const bodyHash = p.bodyHash ?? (p.body !== undefined ? computeBodyHash(buf).bodyHash : undefined);
+			const templateHash =
+				p.templateHash ?? (p.body !== undefined ? computeTemplateFingerprint(text, p.path) : undefined);
+			const titleSig = p.titleSig !== undefined ? normalizeTitleSig(p.titleSig) : normalizeTitleSig(titleOf(text));
+			out.push({
+				code: p.status,
+				size,
+				titleSig,
+				...(p.path ? { path: p.path } : {}),
+				...(bodyHash ? { bodyHash } : {}),
+				...(templateHash ? { templateHash } : {}),
+				...(p.redirectLocation ? { redirectLocation: p.redirectLocation } : {}),
+			});
+		}
+	}
+	if (out.length === 0) {
+		const hasSingle =
+			baseline.body !== undefined ||
+			baseline.bodyHash !== undefined ||
+			baseline.templateHash !== undefined ||
+			typeof baseline.size === "number" ||
+			typeof baseline.bodyBytes === "number";
+		if (hasSingle) {
+			const { buf, text } = bodyToBufferAndText(baseline.body);
+			const size =
+				typeof baseline.size === "number" && Number.isFinite(baseline.size)
+					? baseline.size
+					: typeof baseline.bodyBytes === "number" && Number.isFinite(baseline.bodyBytes)
+						? baseline.bodyBytes
+						: buf.byteLength;
+			const bodyHash = baseline.bodyHash ?? (baseline.body !== undefined ? computeBodyHash(buf).bodyHash : undefined);
+			const templateHash =
+				baseline.templateHash ?? (baseline.body !== undefined ? computeTemplateFingerprint(text) : undefined);
+			const titleSig =
+				baseline.titleSig !== undefined ? normalizeTitleSig(baseline.titleSig) : normalizeTitleSig(titleOf(text));
+			const codes =
+				Array.isArray(baseline.codes) && baseline.codes.length > 0
+					? baseline.codes
+					: [typeof baseline.status === "number" ? baseline.status : 200];
+			for (const code of codes) {
+				out.push({
+					code,
+					size,
+					titleSig,
+					...(bodyHash ? { bodyHash } : {}),
+					...(templateHash ? { templateHash } : {}),
+				});
+			}
+		}
+	}
+	return out;
+}
+
+/**
+ * 增强型软 404 检测（#33 / NW-13）：
+ * 1. Next.js RSC Flight 流 `NEXT_HTTP_ERROR_FALLBACK;404` / `NEXT_NOT_FOUND` / `x-nextjs-matched-path: /_not-found`；
+ * 2. 多语言 404 文案（如 `找不到此頁面`、`页面不存在`、`Page Not Found`、`ページが見つかりません` 等）；
+ * 3. 随机不存在路径预采样基线比对（精确 bodyHash、归一化模板 templateHash、体积容差 + titleSig 与重定向目标一致性）。
+ */
+export function detectSoft404(
+	res: DetectSoft404Input,
+	baseline?: Soft404BaselineInput | null,
+): Soft404DetectionResult {
+	const status = Number(res.status ?? res.code ?? 0);
+	const rawBodyInput = res.body !== undefined ? res.body : res.snippet;
+	const { buf, text } = bodyToBufferAndText(rawBodyInput);
+	const computed = computeBodyHash(buf);
+	const bodyBytes =
+		rawBodyInput !== undefined
+			? computed.bodyBytes
+			: typeof res.bodyBytes === "number" && Number.isFinite(res.bodyBytes)
+				? res.bodyBytes
+				: typeof res.size === "number" && Number.isFinite(res.size)
+					? res.size
+					: 0;
+	const bodyHash = computed.bodyHash;
+	const templateHash = computeTemplateFingerprint(text, res.path);
+	const contentType = res.contentType ?? readHeaderCaseInsensitive(res.headers, "content-type");
+	const nextMatchedPath = readHeaderCaseInsensitive(res.headers, "x-nextjs-matched-path");
+	const locationHeader = readHeaderCaseInsensitive(res.headers, "location");
+	const reasons: string[] = [];
+
+	// 非 200/30x 状态码不是“假 200/30x 软 404”（真实 404 由 classifyEndpointResponse 归为 not_found）
+	if (!Number.isFinite(status) || !isSoft404Status(status)) {
+		return {
+			isSoft404: false,
+			confidence: "none",
+			reasons,
+			bodyBytes,
+			bodyHash,
+			templateHash,
+		};
+	}
+
+	// 1. Next.js RSC Flight 流与框架级 404 特征（最高置信度，无需基线即可判定）
+	if (nextMatchedPath && /^\/(?:_not-found|404)(?:\/|$)/i.test(nextMatchedPath)) {
+		reasons.push(`x-nextjs-matched-path=${nextMatchedPath}`);
+	}
+	if (text && (RSC_ERROR_FALLBACK_RE.test(text) || NEXT_DATA_404_RE.test(text))) {
+		const hit = /NEXT_HTTP_ERROR_FALLBACK\\?;404/i.test(text)
+			? "NEXT_HTTP_ERROR_FALLBACK;404"
+			: /NEXT_NOT_FOUND/i.test(text)
+				? "NEXT_NOT_FOUND"
+				: "__NEXT_DATA__ 404";
+		reasons.push(`Next.js/RSC 404 特征 (${hit})`);
+	}
+	if (reasons.length > 0) {
+		return {
+			isSoft404: true,
+			confidence: "high",
+			reasons,
+			matchedRule: "rsc_error_fallback",
+			bodyBytes,
+			bodyHash,
+			templateHash,
+		};
+	}
+
+	const extractedTitle = res.titleSig !== undefined ? normalizeTitleSig(res.titleSig) : normalizeTitleSig(titleOf(text));
+	const isRealJsonBusiness = text ? isJsonBusinessDataPayload(text, contentType) : false;
+
+	// 2. 多语言 404 文案特征（防 JSON 业务载荷误杀）
+	if (!isRealJsonBusiness) {
+		const inspectTarget = text || extractedTitle;
+		if (inspectTarget) {
+			for (const pat of MULTILINGUAL_404_PATTERNS) {
+				if (pat.re.test(inspectTarget)) {
+					reasons.push(`命中多语言软 404 文案 (${pat.label})`);
+					return {
+						isSoft404: true,
+						confidence: "high",
+						reasons,
+						matchedRule: "multilingual_404_copy",
+						bodyBytes,
+						bodyHash,
+						templateHash,
+					};
+				}
+			}
+		}
+	}
+
+	// 3. 预采样基线比对（仅在基线含 200/30x 兜底样本或显式提供基线样本时执行）
+	const samples = normalizeBaselineSamples(baseline).filter((s) => isSoft404Status(s.code));
+	if (samples.length === 0) {
+		return {
+			isSoft404: false,
+			confidence: "none",
+			reasons,
+			bodyBytes,
+			bodyHash,
+			templateHash,
+		};
+	}
+
+	const hasTitleEvidence = res.titleSig !== undefined || rawBodyInput !== undefined;
+
+	for (const sample of samples) {
+		if (status !== sample.code) continue;
+
+		// 3a. 精确 bodyHash 一致（必须具有实际正文）
+		if (rawBodyInput !== undefined && sample.bodyHash && sample.bodyHash === bodyHash && bodyBytes > 0) {
+			reasons.push(`响应体 SHA-256 与 404 基线完全一致 (${bodyHash.slice(0, 12)})`);
+			return {
+				isSoft404: true,
+				confidence: "high",
+				reasons,
+				matchedRule: "baseline_hash_match",
+				bodyBytes,
+				bodyHash,
+				templateHash,
+			};
+		}
+
+		// 3b. 归一化模板指纹一致 + 宽松体积容差
+		if (rawBodyInput !== undefined && sample.templateHash && sample.templateHash === templateHash && bodyBytes > 0) {
+			const tol = Math.max(128, sample.size * 0.25);
+			if (sample.size === 0 || Math.abs(bodyBytes - sample.size) <= tol) {
+				reasons.push(`响应模板指纹与 404 基线一致 (${templateHash.slice(0, 12)}, ${bodyBytes}B vs ${sample.size}B)`);
+				return {
+					isSoft404: true,
+					confidence: "high",
+					reasons,
+					matchedRule: "baseline_template_match",
+					bodyBytes,
+					bodyHash,
+					templateHash,
+				};
+			}
+		}
+
+		// 3c. 重定向 30x 跳转到与基线相同的兜底目标
+		if (status >= 300 && status < 400 && sample.redirectLocation && locationHeader) {
+			if (sample.redirectLocation.toLowerCase() === locationHeader.toLowerCase()) {
+				reasons.push(`30x 重定向目标与 404 基线一致 (${locationHeader})`);
+				return {
+					isSoft404: true,
+					confidence: "high",
+					reasons,
+					matchedRule: "baseline_redirect_match",
+					bodyBytes,
+					bodyHash,
+					templateHash,
+				};
+			}
+		}
+
+		// 3d. 体积容差（±max(48, 10%)）+ HTML title 签名一致（与原有 isSoft404Hit 完全兼容）
+		const sampleTitle = normalizeTitleSig(sample.titleSig);
+		if (hasTitleEvidence && extractedTitle !== sampleTitle) {
+			continue;
+		}
+		if (bodyBytes > 0 || typeof res.size === "number" || typeof res.bodyBytes === "number") {
+			const effectiveSize =
+				typeof res.size === "number" && Number.isFinite(res.size)
+					? res.size
+					: typeof res.bodyBytes === "number" && Number.isFinite(res.bodyBytes)
+						? res.bodyBytes
+						: bodyBytes;
+			const tolerance = Math.max(48, sample.size * 0.1);
+			if (Math.abs(effectiveSize - sample.size) <= tolerance) {
+				reasons.push(`状态码 ${status}、体积 ${effectiveSize}B≈${sample.size}B 且标题签名一致`);
+				return {
+					isSoft404: true,
+					confidence: "medium",
+					reasons,
+					matchedRule: "baseline_size_title_match",
+					bodyBytes: effectiveSize,
+					bodyHash,
+					templateHash,
+				};
+			}
+		} else if (text && sampleTitle !== "" && extractedTitle === sampleTitle && HTML_SIGNATURE_RE.test(text)) {
+			reasons.push(`HTML 标题签名与 404 基线一致 (${sampleTitle})`);
+			return {
+				isSoft404: true,
+				confidence: "medium",
+				reasons,
+				matchedRule: "baseline_size_title_match",
+				bodyBytes,
+				bodyHash,
+				templateHash,
+			};
+		}
+	}
+
+	return {
+		isSoft404: false,
+		confidence: "none",
+		reasons,
+		bodyBytes,
+		bodyHash,
+		templateHash,
+	};
+}
+
+/**
+ * 对随机不存在路径执行预采样，构建包含精确 bodyHash、模板指纹 templateHash、体积与标题的 Soft-404 基线（#33）。
+ */
+export async function sampleSoft404Baseline(
+	origin: string,
+	fetchFn?: PreflightFetchLike,
+	opts?: {
+		paths?: readonly string[];
+		headers?: Record<string, string>;
+		timeoutMs?: number;
+		signal?: AbortSignal;
+	},
+): Promise<Soft404Baseline> {
+	const base = String(origin ?? "").replace(/\/+$/, "");
+	const randHex = () => randomBytes(6).toString("hex");
+	const paths =
+		opts?.paths && opts.paths.length > 0
+			? [...opts.paths]
+			: [`/__nuwa_soft404_${randHex()}`, `/__nuwa_soft404_${randHex()}.html`];
+
+	const fetcher: PreflightFetchLike =
+		fetchFn ??
+		(async (u, init) => {
+			const r = await fetch(u, {
+				method: init?.method ?? "GET",
+				headers: init?.headers,
+				signal: init?.signal,
+				redirect: init?.redirect ?? "manual",
+			});
+			return { ok: r.ok, status: r.status, text: () => r.text(), headers: r.headers };
+		});
+
+	const timeoutMs = Math.max(500, Math.min(30_000, opts?.timeoutMs ?? 6_000));
+	const samples: Soft404Sample[] = [];
+	const codes: number[] = [];
+
+	for (const p of paths) {
+		if (opts?.signal?.aborted) break;
+		const normPath = p.startsWith("/") ? p : `/${p}`;
+		const controller = new AbortController();
+		const onAbort = () => controller.abort();
+		opts?.signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		try {
+			const resp = await fetcher(`${base}${normPath}`, {
+				method: "GET",
+				headers: opts?.headers,
+				signal: controller.signal,
+				redirect: "manual",
+			});
+			const bodyText = await resp.text();
+			const { bodyHash, bodyBytes } = computeBodyHash(bodyText);
+			const templateHash = computeTemplateFingerprint(bodyText, normPath);
+			const titleSig = normalizeTitleSig(titleOf(bodyText));
+			const redirectLocation = resp.headers?.get("location")?.trim() || undefined;
+			samples.push({
+				path: normPath,
+				code: resp.status,
+				size: bodyBytes,
+				titleSig,
+				bodyHash,
+				templateHash,
+				...(redirectLocation ? { redirectLocation } : {}),
+			});
+			if (isSoft404Status(resp.status) && !codes.includes(resp.status)) {
+				codes.push(resp.status);
+			}
+		} catch {
+			/* 单次采样失败不影响另一条随机基线 */
+		} finally {
+			clearTimeout(timer);
+			opts?.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+
+	const activeSamples = samples.filter((s) => isSoft404Status(s.code));
+	if (activeSamples.length === 0) {
+		return { active: false, samples, codes: [] };
+	}
+	const first = activeSamples[0]!;
+	const firstTitle = activeSamples.find((s) => s.titleSig !== "")?.titleSig ?? "";
+	return {
+		active: true,
+		samples,
+		codes,
+		size: first.size,
+		titleSig: firstTitle,
+		...(first.bodyHash ? { bodyHash: first.bodyHash } : {}),
+		...(first.templateHash ? { templateHash: first.templateHash } : {}),
+	};
+}
+
+/**
+ * 端点响应分类器（#32 / NW-12）：
+ * - 明确区分 `exists_requires_auth`（401、带业务鉴权语义的 403、带 Allow 头的 405、跳登录页的 30x）
+ *   与 `not_found`（404/410 或与 404 基线同指纹响应）、`soft_404`（200/30x 软 404）及 `egress_blocked`（边缘 WAF 阻断）；
+ * - 强制计算并填入响应体 SHA-256 哈希与精确字节数至结果与 `meta`。
+ */
+export function classifyEndpointResponse(
+	res: EndpointResponseInput,
+	baseline404?: EndpointBaseline404 | null,
+): EndpointResponseClassification {
+	const status = Number(res.status ?? 0);
+	const { buf, text } = bodyToBufferAndText(res.body);
+	const computed = computeBodyHash(buf);
+	const bodyBytes =
+		res.body !== undefined
+			? computed.bodyBytes
+			: typeof res.bodyBytes === "number" && Number.isFinite(res.bodyBytes)
+				? res.bodyBytes
+				: 0;
+	const bodyHash = computed.bodyHash;
+	const templateHash = computeTemplateFingerprint(text, res.path);
+
+	const headerText = serializeHeadersForInspection(res.headers);
+	const contentType = res.contentType ?? readHeaderCaseInsensitive(res.headers, "content-type");
+	const allowHeader = readHeaderCaseInsensitive(res.headers, "allow");
+	const wwwAuthHeader = readHeaderCaseInsensitive(res.headers, "www-authenticate");
+	const locationHeader = readHeaderCaseInsensitive(res.headers, "location");
+	const cfMitigated = readHeaderCaseInsensitive(res.headers, "cf-mitigated");
+
+	const allowMethods = allowHeader
+		? allowHeader
+				.split(",")
+				.map((m) => m.trim().toUpperCase())
+				.filter((m) => /^[A-Z]+$/.test(m))
+		: undefined;
+	const hasAllowMethods = Boolean(allowMethods && allowMethods.length > 0);
+	const waf = detectWafName(headerText, text, Number.isFinite(status) ? status : undefined);
+
+	const build = (
+		classification: EndpointClassification,
+		exists: boolean,
+		requiresAuth: boolean,
+		reason: string,
+		extraWaf?: string,
+	): EndpointResponseClassification => {
+		const finalWaf = extraWaf ?? (classification === "egress_blocked" ? waf : undefined);
+		return {
+			classification,
+			exists,
+			requiresAuth,
+			status,
+			bodyHash,
+			bodyBytes,
+			templateHash,
+			...(hasAllowMethods ? { allowMethods } : {}),
+			...(finalWaf ? { waf: finalWaf } : {}),
+			reason,
+			meta: {
+				status,
+				bodyHash,
+				bodyBytes,
+				templateHash,
+				classification,
+				requiresAuth,
+				...(hasAllowMethods ? { allow: allowMethods } : {}),
+				...(finalWaf ? { waf: finalWaf } : {}),
+			},
+		};
+	};
+
+	// 与 404 基线比对精确哈希或模板指纹（覆盖任意状态码伪装同页 404，如 404/6586B）
+	const baselineSamples = normalizeBaselineSamples(baseline404?.soft404Baseline ?? baseline404);
+	const matches404BaselineFingerprint = (): boolean => {
+		if (res.body === undefined || baselineSamples.length === 0) return false;
+		for (const s of baselineSamples) {
+			if (s.bodyHash && s.bodyHash === bodyHash && bodyBytes > 0) return true;
+			if (s.templateHash && s.templateHash === templateHash && bodyBytes > 0) {
+				const tol = Math.max(128, s.size * 0.25);
+				if (s.size === 0 || Math.abs(bodyBytes - s.size) <= tol) return true;
+			}
+		}
+		return false;
+	};
+
+	// 1. 明确 404 / 410：绝不混算为需要认证的端点
+	if (status === 404 || status === 410) {
+		return build("not_found", false, false, `HTTP ${status} 端点不存在 (${bodyBytes}B, sha256=${bodyHash.slice(0, 12)})`);
+	}
+
+	// 2. 明确 401：端点存在且要求鉴权
+	if (status === 401) {
+		return build(
+			"exists_requires_auth",
+			true,
+			true,
+			`HTTP 401 端点存在但需认证${wwwAuthHeader ? ` (${wwwAuthHeader})` : ""}`,
+		);
+	}
+
+	// 3. 明确 405：带 Allow 头说明路由已注册存在（需换方法或鉴权）；否则若与 404 基线同指纹则判 not_found
+	if (status === 405) {
+		if (hasAllowMethods) {
+			return build(
+				"exists_requires_auth",
+				true,
+				true,
+				`HTTP 405 路由存在 (Allow: ${allowMethods!.join(", ")})`,
+			);
+		}
+		if (matches404BaselineFingerprint()) {
+			return build("not_found", false, false, "HTTP 405 且响应体与 404 基线同指纹，判定不存在");
+		}
+		return build("exists", true, false, "HTTP 405 Method Not Allowed（未提供 Allow 头）");
+	}
+
+	// 4. 403：严格区分 边缘 WAF/Cloudflare 阻断 vs 业务鉴权语义 vs 与 404 基线同指纹
+	if (status === 403) {
+		const isChallengeHeader = /challenge/i.test(cfMitigated);
+		const isHtmlBody = looksLikeHtml(text) || /text\/html/i.test(contentType);
+		const isJsonBody = /application\/json|\+json/i.test(contentType) || (/^\s*\{[\s\S]*\}\s*$/.test(text) && !isHtmlBody);
+		const hasEdgeBlockCopy = EDGE_BLOCK_403_RE.test(`${headerText}\n${text}`);
+		const hasBusinessAuthSemantics =
+			Boolean(wwwAuthHeader) ||
+			BUSINESS_AUTH_403_RE.test(text) ||
+			(isJsonBody && /"(?:error|message|msg|code|detail|reason)"\s*:/i.test(text) && !hasEdgeBlockCopy);
+
+		if (isChallengeHeader || (hasEdgeBlockCopy && !isJsonBody)) {
+			return build(
+				"egress_blocked",
+				false,
+				false,
+				`HTTP 403 边缘防火墙/WAF 拦截 (${waf ?? "edge-waf"})`,
+				waf ?? "edge-waf",
+			);
+		}
+		if (hasBusinessAuthSemantics) {
+			return build(
+				"exists_requires_auth",
+				true,
+				true,
+				`HTTP 403 命中业务鉴权拒绝语义 (${bodyBytes}B, sha256=${bodyHash.slice(0, 12)})`,
+			);
+		}
+		if (matches404BaselineFingerprint()) {
+			return build("not_found", false, false, "HTTP 403 且与 404 基线同指纹，判定不存在");
+		}
+		if (waf && isHtmlBody) {
+			return build("egress_blocked", false, false, `HTTP 403 HTML 命中 WAF 拦截特征 (${waf})`, waf);
+		}
+		return build("exists_requires_auth", true, true, `HTTP 403 访问受限（疑似鉴权边界，${bodyBytes}B）`);
+	}
+
+	// 5. 406 / 429 / 503 边缘拦截或挑战门
+	if (status === 406 || status === 429 || status === 503) {
+		if (/challenge/i.test(cfMitigated) || waf || EDGE_BLOCK_403_RE.test(`${headerText}\n${text}`)) {
+			return build(
+				"egress_blocked",
+				false,
+				false,
+				`HTTP ${status} 触发边缘拦截/限流 (${waf ?? "rate-limit"})`,
+				waf ?? (status === 429 ? "rate-limit" : "edge-waf"),
+			);
+		}
+		if (status >= 500) {
+			return build("server_error", false, false, `HTTP ${status} 服务端错误`);
+		}
+	}
+
+	// 6. 2xx 响应：检查挑战门与软 404
+	if (status >= 200 && status < 300) {
+		if (/challenge/i.test(cfMitigated) || EDGE_BLOCK_403_RE.test(text)) {
+			return build(
+				"egress_blocked",
+				false,
+				false,
+				`HTTP ${status} 返回人机挑战/边缘阻断页`,
+				waf ?? "cloudflare",
+			);
+		}
+		const soft = detectSoft404(
+			{
+				url: res.url,
+				path: res.path,
+				status,
+				body: res.body,
+				bodyBytes,
+				headers: res.headers,
+				contentType,
+			},
+			baseline404?.soft404Baseline ?? baseline404,
+		);
+		if (soft.isSoft404) {
+			return build(
+				"soft_404",
+				false,
+				false,
+				`HTTP ${status} 命中软 404: ${soft.reasons.join("; ")}`,
+			);
+		}
+		if (matches404BaselineFingerprint()) {
+			return build("not_found", false, false, `HTTP ${status} 响应体与 404 基线同指纹，判定不存在`);
+		}
+		return build("exists", true, false, `HTTP ${status} 有效端点 (${bodyBytes}B, sha256=${bodyHash.slice(0, 12)})`);
+	}
+
+	// 7. 3xx 重定向：登录跳转判 exists_requires_auth，软 404 重定向判 soft_404
+	if (status >= 300 && status < 400) {
+		if (locationHeader && LOGIN_LOCATION_RE.test(locationHeader)) {
+			return build("exists_requires_auth", true, true, `HTTP ${status} 重定向至登录认证页 (${locationHeader})`);
+		}
+		const soft = detectSoft404(
+			{
+				url: res.url,
+				path: res.path,
+				status,
+				body: res.body,
+				bodyBytes,
+				headers: res.headers,
+				contentType,
+			},
+			baseline404?.soft404Baseline ?? baseline404,
+		);
+		if (soft.isSoft404) {
+			return build("soft_404", false, false, `HTTP ${status} 重定向命中软 404 基线`);
+		}
+		return build("redirect", true, false, `HTTP ${status} 重定向${locationHeader ? ` -> ${locationHeader}` : ""}`);
+	}
+
+	// 8. 其余 4xx 且与 404 基线同指纹 -> not_found；5xx -> server_error
+	if (status >= 400 && status < 500 && matches404BaselineFingerprint()) {
+		return build("not_found", false, false, `HTTP ${status} 与 404 基线同指纹`);
+	}
+	if (status >= 500 && status < 600) {
+		return build("server_error", false, false, `HTTP ${status} 服务端错误`);
+	}
+
+	return build("unknown", false, false, `HTTP ${status} 未归类响应`);
+}
+
 /**
  * 判断单条探测结果是否命中 Soft-404 兜底基线：
- * 依据状态码一致 + 体积容差（±max(48, 10%)）+ HTML title 签名一致判定。
+ * 依据 Next.js RSC Flight 特征、多语言 404 文案、精确/模板指纹及状态码 + 体积容差（±max(48, 10%)）+ HTML title 签名一致判定。
  */
 export function isSoft404Hit(
 	row: string | Soft404Candidate,
 	baseline: Soft404Baseline | null | undefined,
 ): boolean {
-	if (!baseline || !baseline.active) return false;
-
 	const cand = typeof row === "string" ? parseSoft404RowString(row) : row;
-	if (!cand || !Number.isFinite(cand.code) || !isSoft404Status(cand.code)) return false;
+	if (!cand) return false;
+	const code = Number(cand.status ?? cand.code);
+	if (!Number.isFinite(code) || !isSoft404Status(code)) return false;
+
+	const rawBody = cand.body ?? cand.snippet;
+	// 即使无有效基线，明确的 Next.js RSC 404 特征或多语言 404 页面文案也立即拦截
+	if (rawBody !== undefined) {
+		const res = detectSoft404(
+			{
+				url: cand.url,
+				path: cand.path,
+				status: code,
+				body: rawBody,
+				size: cand.size,
+				bodyBytes: cand.bodyBytes,
+				titleSig: cand.titleSig,
+				headers: cand.headers,
+				contentType: cand.contentType,
+			},
+			baseline && baseline.active ? baseline : null,
+		);
+		if (res.isSoft404) return true;
+	}
+
+	if (!baseline || !baseline.active) {
+		// 若仅提取到明确的 404 多语言标题（无正文场景，如 dirsRule 行）也过滤
+		if (cand.titleSig) {
+			const normTitle = normalizeTitleSig(cand.titleSig);
+			if (normTitle && MULTILINGUAL_404_PATTERNS.some((p) => p.re.test(normTitle))) {
+				return true;
+			}
+		}
+		return false;
+	}
 
 	let activeSamples = (baseline.samples ?? []).filter((s) => isSoft404Status(s.code));
 	if (activeSamples.length === 0 && Array.isArray(baseline.codes) && typeof baseline.size === "number") {
 		activeSamples = baseline.codes
 			.filter((c) => isSoft404Status(c))
-			.map((code) => ({
-				code,
+			.map((sampleCode) => ({
+				code: sampleCode,
 				size: baseline.size!,
 				titleSig: normalizeTitleSig(baseline.titleSig),
 			}));
 	}
 	if (activeSamples.length === 0) return false;
 
-	const rawBody = cand.body ?? cand.snippet;
 	const hasTitleEvidence = cand.titleSig !== undefined || rawBody !== undefined;
 	const candTitle =
 		cand.titleSig !== undefined
@@ -470,16 +1471,17 @@ export function isSoft404Hit(
 				: "";
 
 	for (const sample of activeSamples) {
-		if (cand.code !== sample.code) continue;
+		if (code !== sample.code) continue;
 
 		const sampleTitle = normalizeTitleSig(sample.titleSig);
 		if (hasTitleEvidence && candTitle !== sampleTitle) {
 			continue;
 		}
 
-		if (typeof cand.size === "number" && Number.isFinite(cand.size)) {
+		const candSize = cand.size ?? cand.bodyBytes;
+		if (typeof candSize === "number" && Number.isFinite(candSize)) {
 			const tolerance = Math.max(48, sample.size * 0.1);
-			if (Math.abs(cand.size - sample.size) <= tolerance) {
+			if (Math.abs(candSize - sample.size) <= tolerance) {
 				return true;
 			}
 			continue;
@@ -1699,6 +2701,7 @@ const SAFE_AUTH_HEADER_FILE_RE = /^\/tmp\/nuwa\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}
 
 /**
  * 在不暴露任何明文凭据的前提下，为自动侦察脚本注入零明文角色头文件包装器（`curl -H @"$NUWA_AUTH_HEADER_FILE"`）。
+ * 同时兼容已注入的 `$NUWA_EGRESS`（自动附加 `-x "$NUWA_EGRESS"`）。
  * 仅接受位于 `/tmp/nuwa/<projectId>/sessions/<role>.headers` 的合法路径。
  */
 export function injectAuthHeaderFileIntoScript(script: string, authHeaderFile?: string): string {
@@ -1710,8 +2713,12 @@ export function injectAuthHeaderFileIntoScript(script: string, authHeaderFile?: 
 		`NUWA_AUTH_HEADER_FILE=${shellQuote(raw)}`,
 		`export NUWA_AUTH_HEADER_FILE`,
 		`curl() {`,
-		`  if [ -r "$NUWA_AUTH_HEADER_FILE" ]; then`,
+		`  if [ -n "$NUWA_EGRESS" ] && [ -r "$NUWA_AUTH_HEADER_FILE" ]; then`,
+		`    command curl -x "$NUWA_EGRESS" -H @"$NUWA_AUTH_HEADER_FILE" "$@"`,
+		`  elif [ -r "$NUWA_AUTH_HEADER_FILE" ]; then`,
 		`    command curl -H @"$NUWA_AUTH_HEADER_FILE" "$@"`,
+		`  elif [ -n "$NUWA_EGRESS" ]; then`,
+		`    command curl -x "$NUWA_EGRESS" "$@"`,
 		`  else`,
 		`    command curl "$@"`,
 		`  fi`,
@@ -1720,14 +2727,373 @@ export function injectAuthHeaderFileIntoScript(script: string, authHeaderFile?: 
 	return `${prelude}\n${script}`;
 }
 
-/** 执行单条自动意图：跑脚本 → 解析，无产出时附带失败三分类信息。入账由调用方在锁内完成。 */
+/**
+ * 将已验证的任务出口代理注入 Shell 探测脚本（#23）：
+ * 同时导出 `NUWA_EGRESS`/`EGRESS`/`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 及其小写形式，
+ * 并通过 `curl()` 包装器强制透传 `-x "$NUWA_EGRESS"`（同时兼容 `authHeaderFile`）。
+ */
+export function injectEgressIntoScript(script: string, egressUrl?: string, authHeaderFile?: string): string {
+	const normEgress = egressUrl !== undefined && String(egressUrl).trim() !== ""
+		? normalizeTaskEgressUrl(egressUrl)
+		: undefined;
+	if (egressUrl !== undefined && String(egressUrl).trim() !== "" && !normEgress) {
+		throw new Error(`非法出口代理地址，拒绝注入脚本: ${JSON.stringify(egressUrl)}`);
+	}
+
+	const rawAuth = String(authHeaderFile ?? "").trim();
+	const validAuth = rawAuth && !rawAuth.includes("..") && SAFE_AUTH_HEADER_FILE_RE.test(rawAuth) ? rawAuth : undefined;
+
+	if (!normEgress && !validAuth) {
+		return script;
+	}
+	if (!normEgress && validAuth) {
+		return injectAuthHeaderFileIntoScript(script, validAuth);
+	}
+
+	const quotedEgress = shellQuote(normEgress!);
+	const lines: string[] = [
+		`NUWA_EGRESS=${quotedEgress}`,
+		`EGRESS=${quotedEgress}`,
+		`HTTP_PROXY=${quotedEgress}`,
+		`HTTPS_PROXY=${quotedEgress}`,
+		`ALL_PROXY=${quotedEgress}`,
+		`http_proxy=${quotedEgress}`,
+		`https_proxy=${quotedEgress}`,
+		`all_proxy=${quotedEgress}`,
+		`NO_PROXY=''`,
+		`no_proxy=''`,
+		`export NUWA_EGRESS EGRESS HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy NO_PROXY no_proxy`,
+	];
+	if (validAuth) {
+		lines.push(`NUWA_AUTH_HEADER_FILE=${shellQuote(validAuth)}`, `export NUWA_AUTH_HEADER_FILE`);
+	}
+	lines.push(
+		`curl() {`,
+		`  if [ -n "$NUWA_EGRESS" ] && [ -n "$NUWA_AUTH_HEADER_FILE" ] && [ -r "$NUWA_AUTH_HEADER_FILE" ]; then`,
+		`    command curl --noproxy '' -x "$NUWA_EGRESS" -H @"$NUWA_AUTH_HEADER_FILE" "$@"`,
+		`  elif [ -n "$NUWA_EGRESS" ]; then`,
+		`    command curl --noproxy '' -x "$NUWA_EGRESS" "$@"`,
+		`  elif [ -n "$NUWA_AUTH_HEADER_FILE" ] && [ -r "$NUWA_AUTH_HEADER_FILE" ]; then`,
+		`    command curl -H @"$NUWA_AUTH_HEADER_FILE" "$@"`,
+		`  else`,
+		`    command curl "$@"`,
+		`  fi`,
+		`}`,
+	);
+	return `${lines.join("\n")}\n${script}`;
+}
+
+const DEFAULT_PREFLIGHT_EXPECTED_STATUSES = [200, 204, 301, 302, 307, 308] as const;
+
+/**
+ * 探测前 Gate URL 基线探活（#23 / NW-03）：
+ * 当出口 IP/ASN 被边缘防火墙统一拦截（如 Gate URL 返回 403/406/429/503 或 WAF Challenge）时，
+ * 立即快速失败并标记 `status: "egress_blocked"` / `errorKind: "egress_blocked"`，绝不产出“目标路径不存在”的假阴性结论。
+ */
+export async function preflightEgressCheck(opts: PreflightEgressOptions): Promise<PreflightEgressResult> {
+	const gateUrl = String(opts.gateUrl ?? "").trim();
+	const expected = new Set<number>(
+		opts.expectedStatuses && opts.expectedStatuses.length > 0
+			? opts.expectedStatuses
+			: DEFAULT_PREFLIGHT_EXPECTED_STATUSES,
+	);
+	const timeoutMs = Math.max(500, Math.min(30_000, Math.floor(opts.timeoutMs ?? 8_000)));
+	const timeoutSec = Math.max(1, Math.ceil(timeoutMs / 1000));
+
+	let parsedGate: URL;
+	try {
+		parsedGate = new URL(gateUrl);
+		if (parsedGate.protocol !== "http:" && parsedGate.protocol !== "https:") {
+			throw new Error(`不支持的协议 ${parsedGate.protocol}`);
+		}
+	} catch (err) {
+		return {
+			ok: false,
+			status: "network_error",
+			errorKind: "network",
+			gateUrl,
+			reason: `Gate URL 非法: ${err instanceof Error ? err.message : String(err)}`,
+		};
+	}
+
+	let egressUrl: string | undefined;
+	if (opts.egressUrl !== undefined && String(opts.egressUrl).trim() !== "") {
+		egressUrl = normalizeTaskEgressUrl(opts.egressUrl);
+		if (!egressUrl) {
+			return {
+				ok: false,
+				status: "network_error",
+				errorKind: "network",
+				gateUrl: parsedGate.href,
+				reason: `非法出口代理地址: ${JSON.stringify(opts.egressUrl)}`,
+			};
+		}
+	}
+
+	const maskedEgress = egressUrl ? maskEgressUrl(egressUrl) : undefined;
+	const reportPool = (obs: EgressObservation) => {
+		if (opts.egressPool && opts.egressId) {
+			opts.egressPool.record(opts.egressId, obs);
+		}
+	};
+
+	const evaluateResponse = (
+		httpStatus: number,
+		headers: HeaderBagLike | string,
+		bodyText: string,
+		ttfbMs: number,
+		remoteIp?: string,
+	): PreflightEgressResult => {
+		const { bodyHash, bodyBytes } = computeBodyHash(bodyText);
+		const headerStr = typeof headers === "string" ? headers : serializeHeadersForInspection(headers);
+		const cfRay =
+			(typeof headers === "string"
+				? headerValue(headers, "cf-ray")
+				: readHeaderCaseInsensitive(headers, "cf-ray")) || undefined;
+		const cfMitigated =
+			typeof headers === "string"
+				? headerValue(headers, "cf-mitigated")
+				: readHeaderCaseInsensitive(headers, "cf-mitigated");
+		const waf = detectWafName(headerStr, bodyText, httpStatus);
+		const isChallenge = /challenge/i.test(cfMitigated) || EDGE_BLOCK_403_RE.test(`${headerStr}\n${bodyText}`);
+
+		// 1. 显式被边缘防火墙/WAF 拦截或返回 403/406/429/503（且不在期望放行码中） -> egress_blocked
+		const isBlockStatus = (httpStatus === 403 || httpStatus === 406 || httpStatus === 429 || httpStatus === 503) && !expected.has(httpStatus);
+		if (isBlockStatus || isChallenge) {
+			const effectiveWaf = waf ?? (httpStatus === 429 ? "rate-limit" : "edge-firewall");
+			reportPool({
+				ok: false,
+				statusCode: httpStatus,
+				ttfbMs,
+				blocked: true,
+				error: `preflight_${httpStatus}_${effectiveWaf}`,
+			});
+			return {
+				ok: false,
+				status: "egress_blocked",
+				errorKind: "egress_blocked",
+				gateUrl: parsedGate.href,
+				...(maskedEgress ? { egressUrl: maskedEgress } : {}),
+				httpStatus,
+				bodyBytes,
+				bodyHash,
+				ttfbMs,
+				waf: effectiveWaf,
+				...(cfRay ? { cfRay } : {}),
+				...(remoteIp ? { remoteIp } : {}),
+				reason: `出口门控探活被边缘防火墙拦截: HTTP ${httpStatus} (${bodyBytes}B, waf=${effectiveWaf})`,
+			};
+		}
+
+		// 2. 命中期望状态码且无边缘阻断 -> ok
+		if (expected.has(httpStatus)) {
+			reportPool({ ok: true, statusCode: httpStatus, ttfbMs });
+			return {
+				ok: true,
+				status: "ok",
+				gateUrl: parsedGate.href,
+				...(maskedEgress ? { egressUrl: maskedEgress } : {}),
+				httpStatus,
+				bodyBytes,
+				bodyHash,
+				ttfbMs,
+				...(waf ? { waf } : {}),
+				...(cfRay ? { cfRay } : {}),
+				...(remoteIp ? { remoteIp } : {}),
+				reason: `出口门控探活通过: HTTP ${httpStatus} (${bodyBytes}B, ttfb=${ttfbMs}ms)`,
+			};
+		}
+
+		// 3. 其他 5xx -> 归网络/上游异常
+		if (httpStatus >= 500 && httpStatus < 600) {
+			reportPool({ ok: false, statusCode: httpStatus, ttfbMs, error: `preflight_http_${httpStatus}` });
+			return {
+				ok: false,
+				status: "network_error",
+				errorKind: "network",
+				gateUrl: parsedGate.href,
+				...(maskedEgress ? { egressUrl: maskedEgress } : {}),
+				httpStatus,
+				bodyBytes,
+				bodyHash,
+				ttfbMs,
+				...(cfRay ? { cfRay } : {}),
+				...(remoteIp ? { remoteIp } : {}),
+				reason: `出口门控探活上游错误: HTTP ${httpStatus}`,
+			};
+		}
+
+		// 4. 非预期状态码（例如期望 200 却收到非期望 4xx）同样判定为门控受阻，防止继续盲探产生假阴性
+		reportPool({ ok: false, statusCode: httpStatus, ttfbMs, blocked: true, error: `preflight_unexpected_${httpStatus}` });
+		return {
+			ok: false,
+			status: "egress_blocked",
+			errorKind: "egress_blocked",
+			gateUrl: parsedGate.href,
+			...(maskedEgress ? { egressUrl: maskedEgress } : {}),
+			httpStatus,
+			bodyBytes,
+			bodyHash,
+			ttfbMs,
+			...(waf ? { waf } : {}),
+			...(cfRay ? { cfRay } : {}),
+			...(remoteIp ? { remoteIp } : {}),
+			reason: `出口门控探活返回非预期状态码 HTTP ${httpStatus}（期望 ${[...expected].join("/")}）`,
+		};
+	};
+
+	const startedAt = Date.now();
+
+	// 路径 A：显式提供 exec，或配置了代理且未注入 fetchFn -> 使用 curl -x 实走代理
+	if (opts.exec || (egressUrl && !opts.fetchFn)) {
+		const runner: ExecLike =
+			opts.exec ??
+			(async (cmd, args, execOpts) => {
+				const proc = Bun.spawn([cmd, ...args], {
+					cwd: execOpts?.cwd,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [stdout, stderr, code] = await Promise.all([
+					new Response(proc.stdout).text(),
+					new Response(proc.stderr).text(),
+					proc.exited,
+				]);
+				return { stdout, stderr, code };
+			});
+
+		const proxyArgs = egressUrl ? `--noproxy '' ${buildCurlProxyArgs(egressUrl).map(shellQuote).join(" ")}` : "";
+		const headerFlags = Object.entries(opts.headers ?? {})
+			.map(([k, v]) => `-H ${shellQuote(`${k}: ${v}`)}`)
+			.join(" ");
+		const script = [
+			...(egressUrl ? [`NO_PROXY=''`, `no_proxy=''`, `export NO_PROXY no_proxy`] : []),
+			`h=$(mktemp); b=$(mktemp)`,
+			`trap 'rm -f "$h" "$b"' EXIT`,
+			`curl -k -sS ${proxyArgs} ${headerFlags} -D "$h" -o "$b" --max-time ${timeoutSec} -w 'FINAL %{http_code} %{size_download} %{time_starttransfer} %{remote_ip}\\n' ${shellQuote(parsedGate.href)}`,
+			`rc=$?`,
+			`echo '---HEAD---'`,
+			`cat "$h"`,
+			`echo '---BODY---'`,
+			`head -c 8192 "$b"`,
+			`exit $rc`,
+		].join("\n");
+
+		try {
+			const res = await raceWithSignal(
+				runner("bash", ["-lc", script], { timeout: timeoutMs + 2000, cwd: opts.cwd, signal: opts.signal }),
+				opts.signal,
+			);
+			const head = res.stdout.split("---HEAD---")[1]?.split("---BODY---")[0] ?? "";
+			const body = res.stdout.split("---BODY---")[1] ?? "";
+			const fin = res.stdout.match(/^FINAL\s+(\d{3})\s+(\d+)\s+([0-9.]+)(?:\s+(\S+))?/m);
+			const statusHead = head.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\b/m)?.[1];
+			const httpStatus = Number(fin?.[1] ?? statusHead ?? 0);
+			const ttfbMs = fin?.[3] ? Math.round(Number(fin[3]) * 1000) : Math.max(0, Date.now() - startedAt);
+			const remoteIp = fin?.[4] && fin[4] !== "-" ? fin[4] : undefined;
+
+			if (!httpStatus || res.killed || CURL_NET_EXIT_CODES.has(res.code) || res.code === 97) {
+				const errText = res.stderr.trim() || `curl exit=${res.code}`;
+				reportPool({
+					ok: false,
+					ttfbMs,
+					connectionReset: true,
+					exitCode: res.code,
+					error: errText,
+				});
+				return {
+					ok: false,
+					status: "network_error",
+					errorKind: "network",
+					gateUrl: parsedGate.href,
+					...(maskedEgress ? { egressUrl: maskedEgress } : {}),
+					ttfbMs,
+					reason: `出口门控探活网络/代理故障 (${errText})`,
+				};
+			}
+
+			return evaluateResponse(httpStatus, head, body, ttfbMs, remoteIp);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			const ttfbMs = Math.max(0, Date.now() - startedAt);
+			reportPool({ ok: false, ttfbMs, connectionReset: true, error: msg });
+			return {
+				ok: false,
+				status: "network_error",
+				errorKind: "network",
+				gateUrl: parsedGate.href,
+				...(maskedEgress ? { egressUrl: maskedEgress } : {}),
+				ttfbMs,
+				reason: `出口门控探活异常: ${msg}`,
+			};
+		}
+	}
+
+	// 路径 B：使用 fetchFn 或内置 fetch 探活
+	const fetcher: PreflightFetchLike =
+		opts.fetchFn ??
+		(async (u, init) => {
+			const r = await fetch(u, {
+				method: init?.method ?? "GET",
+				headers: init?.headers,
+				signal: init?.signal,
+				redirect: init?.redirect ?? "manual",
+			});
+			return { ok: r.ok, status: r.status, text: () => r.text(), headers: r.headers };
+		});
+
+	const controller = new AbortController();
+	const onAbort = () => controller.abort();
+	opts.signal?.addEventListener("abort", onAbort, { once: true });
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const resp = await fetcher(parsedGate.href, {
+			method: "GET",
+			headers: opts.headers,
+			signal: controller.signal,
+			redirect: "manual",
+		});
+		const ttfbMs = Math.max(0, Date.now() - startedAt);
+		const bodyText = await resp.text();
+		return evaluateResponse(resp.status, resp.headers ?? {}, bodyText, ttfbMs);
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		const ttfbMs = Math.max(0, Date.now() - startedAt);
+		reportPool({ ok: false, ttfbMs, connectionReset: true, error: msg });
+		return {
+			ok: false,
+			status: "network_error",
+			errorKind: "network",
+			gateUrl: parsedGate.href,
+			...(maskedEgress ? { egressUrl: maskedEgress } : {}),
+			ttfbMs,
+			reason: `出口门控探活请求失败: ${msg}`,
+		};
+	} finally {
+		clearTimeout(timer);
+		opts.signal?.removeEventListener("abort", onAbort);
+	}
+}
+
+export interface RunAutoIntentOptions {
+	authHeaderFile?: string;
+	egressUrl?: string;
+	egressPool?: EgressPoolManager;
+	workerId?: string;
+	gateUrl?: string;
+	preflightExpectedStatuses?: readonly number[];
+	preflightFetchFn?: PreflightFetchLike;
+	skipPreflight?: boolean;
+}
+
+/** 执行单条自动意图：可选门控探活 + 出口代理注入 + 跑脚本 → 解析，无产出时附带失败分类信息。入账由调用方在锁内完成。 */
 export async function runAutoIntent(
 	rule: AutoRule,
 	st: NuwaState,
 	exec: ExecLike,
 	cwd: string,
 	signal?: AbortSignal,
-	opts?: { authHeaderFile?: string },
+	opts?: RunAutoIntentOptions,
 ): Promise<AutoRunResult> {
 	if (signal?.aborted) {
 		return {
@@ -1737,37 +3103,166 @@ export async function runAutoIntent(
 			retryAfterMs: 60_000,
 		};
 	}
+
+	const pool = opts?.egressPool;
+	const explicitEgress =
+		opts?.egressUrl !== undefined && String(opts.egressUrl).trim() !== ""
+			? opts.egressUrl
+			: !pool
+				? resolveConfiguredEgressUrl(process.env)
+				: undefined;
+
+	let lease: EgressLease | null = null;
+	let activeEgressUrl: string | undefined = explicitEgress;
+	let lastPreflight: PreflightEgressResult | undefined;
+
 	try {
+		// 1. 出口选择与门控基线探活（支持多出口池自动熔断故障转移）
+		if (pool && !explicitEgress) {
+			const triedIds: string[] = [];
+			const maxTries = Math.max(1, pool.size());
+			for (let attempt = 0; attempt < maxTries; attempt++) {
+				const candidate = pool.acquire({ workerId: opts?.workerId, excludeIds: triedIds });
+				if (!candidate) {
+					break;
+				}
+				triedIds.push(candidate.id);
+				if (opts?.gateUrl && !opts.skipPreflight) {
+					const pf = await preflightEgressCheck({
+						gateUrl: opts.gateUrl,
+						egressUrl: candidate.url,
+						expectedStatuses: opts.preflightExpectedStatuses,
+						exec: opts.preflightFetchFn ? undefined : exec,
+						cwd,
+						fetchFn: opts.preflightFetchFn,
+						signal,
+					});
+					lastPreflight = pf;
+					if (!pf.ok) {
+						candidate.release({
+							ok: false,
+							statusCode: pf.httpStatus,
+							ttfbMs: pf.ttfbMs,
+							blocked: pf.status === "egress_blocked",
+							connectionReset: pf.status === "network_error",
+							error: pf.reason,
+						});
+						continue;
+					}
+				}
+				lease = candidate;
+				activeEgressUrl = candidate.url;
+				break;
+			}
+
+			if (!lease) {
+				const isNetOnly = lastPreflight?.status === "network_error";
+				return {
+					ok: false,
+					error: lastPreflight?.reason ?? "出口池无健康可用出口（全部熔断或被边缘拦截）",
+					errorKind: isNetOnly ? "network" : "egress_blocked",
+					...(isNetOnly ? { retryAfterMs: 60_000 } : {}),
+					...(lastPreflight?.waf ? { waf: lastPreflight.waf } : {}),
+					...(lastPreflight ? { preflight: lastPreflight } : {}),
+				};
+			}
+		} else if (opts?.gateUrl && !opts.skipPreflight) {
+			const pf = await preflightEgressCheck({
+				gateUrl: opts.gateUrl,
+				egressUrl: activeEgressUrl,
+				expectedStatuses: opts.preflightExpectedStatuses,
+				exec: opts.preflightFetchFn ? undefined : exec,
+				cwd,
+				fetchFn: opts.preflightFetchFn,
+				signal,
+			});
+			lastPreflight = pf;
+			if (!pf.ok) {
+				return {
+					ok: false,
+					error: pf.reason,
+					errorKind: pf.errorKind ?? "egress_blocked",
+					...(pf.errorKind === "network" ? { retryAfterMs: 60_000 } : {}),
+					...(pf.waf ? { waf: pf.waf } : {}),
+					...(activeEgressUrl ? { egressUrl: maskEgressUrl(activeEgressUrl) } : {}),
+					preflight: pf,
+				};
+			}
+		}
+
+		// 2. 脚本构建与出口/认证头注入
 		const rawScript = rule.script(st);
-		const script = opts?.authHeaderFile ? injectAuthHeaderFileIntoScript(rawScript, opts.authHeaderFile) : rawScript;
+		const script = activeEgressUrl
+			? injectEgressIntoScript(rawScript, activeEgressUrl, opts?.authHeaderFile)
+			: opts?.authHeaderFile
+				? injectAuthHeaderFileIntoScript(rawScript, opts.authHeaderFile)
+				: rawScript;
+
+		const execStart = Date.now();
 		const res = await raceWithSignal(
 			exec("bash", ["-lc", script], { timeout: rule.timeoutMs, cwd, signal }),
 			signal,
 		);
+		const elapsedMs = Math.max(0, Date.now() - execStart);
 		const fact = rule.parse(res, st);
 		if (!fact) {
 			const cls = classifyAutoFailure(res);
+			lease?.release({
+				ok: cls.errorKind === "empty",
+				ttfbMs: elapsedMs,
+				connectionReset: cls.errorKind === "network",
+				exitCode: res.code,
+				blocked: cls.errorKind === "blocked_by_waf" || cls.errorKind === "egress_blocked",
+				error: cls.reason,
+			});
+			lease = null;
 			return {
 				ok: false,
 				error: `无产出 code=${res.code}${res.killed ? " killed" : ""} [${cls.errorKind}]`,
 				errorKind: cls.errorKind,
 				...(cls.retryAfterMs !== undefined ? { retryAfterMs: cls.retryAfterMs } : {}),
 				...(cls.waf !== undefined ? { waf: cls.waf } : {}),
+				...(activeEgressUrl ? { egressUrl: maskEgressUrl(activeEgressUrl) } : {}),
+				...(lastPreflight ? { preflight: lastPreflight } : {}),
 			};
 		}
+
+		const statusNum = fact.meta?.status;
+		const usedEgressId = lease?.id;
+		const isEdgeWafHit = Boolean(
+			fact.meta?.waf && (statusNum === 403 || statusNum === 429 || statusNum === 503),
+		);
+		lease?.release({
+			ok: !isEdgeWafHit,
+			...(isEdgeWafHit ? { statusCode: statusNum, blocked: true } : {}),
+			ttfbMs: elapsedMs,
+		});
+		lease = null;
+
 		return {
 			ok: true,
 			fact,
 			...(fact.meta?.waf ? { waf: fact.meta.waf } : {}),
+			...(usedEgressId ? { egressId: usedEgressId } : {}),
+			...(activeEgressUrl ? { egressUrl: maskEgressUrl(activeEgressUrl) } : {}),
+			...(lastPreflight ? { preflight: lastPreflight } : {}),
 		};
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		const isNetOrAbort = signal?.aborted || /abort|timed?\s*out|ETIMEDOUT|ECONNREFUSED|ENOTFOUND/i.test(msg);
+		lease?.release({
+			ok: false,
+			connectionReset: isNetOrAbort,
+			error: msg,
+		});
+		lease = null;
 		return {
 			ok: false,
 			error: msg,
 			...(isNetOrAbort ? { errorKind: "network" as const, retryAfterMs: 60_000 } : { errorKind: "empty" as const }),
 		};
+	} finally {
+		lease?.release();
 	}
 }
 
@@ -1776,8 +3271,9 @@ function isExclusiveRuleKey(canonicalKey: string): boolean {
 }
 
 /**
- * 受控并发与总预算自动批执行器（Issue #5）：
+ * 受控并发与总预算自动批执行器（Issue #5 / #23 / #36）：
  * - 默认 budgetMs = 90000ms，concurrency = 1（并发 >= 2 时 recon:ports 保持独占运行）
+ * - 支持传入 `egressUrl` / `egressPool` / `gateUrl`，多并发 worker 按池内最少负载/轮询分配出口
  * - 透传 AbortSignal 并在总预算耗尽或外部取消时立即终止后续派发，回调 opts.onBudgetSkip(remainingIds, reason)
  */
 export async function runAutoBatchManaged(
@@ -1889,13 +3385,23 @@ export async function runAutoBatchManaged(
 			const boundedRule: AutoRule =
 				remMs < rule.timeoutMs ? { ...rule, timeoutMs: remMs } : rule;
 
+			const intentOpts: RunAutoIntentOptions = {
+				workerId: `auto:${id}`,
+				...(opts?.authHeaderFile ? { authHeaderFile: opts.authHeaderFile } : {}),
+				...(opts?.egressUrl ? { egressUrl: opts.egressUrl } : {}),
+				...(opts?.egressPool ? { egressPool: opts.egressPool } : {}),
+				...(opts?.gateUrl ? { gateUrl: opts.gateUrl } : {}),
+				...(opts?.preflightExpectedStatuses ? { preflightExpectedStatuses: opts.preflightExpectedStatuses } : {}),
+				...(opts?.preflightFetchFn ? { preflightFetchFn: opts.preflightFetchFn } : {}),
+			};
+
 			const runRes = await runAutoIntent(
 				boundedRule,
 				latestState,
 				exec,
 				root,
 				batchController.signal,
-				opts?.authHeaderFile ? { authHeaderFile: opts.authHeaderFile } : undefined,
+				intentOpts,
 			);
 
 			// 若因预算耗尽或外部 abort 打断且未成功产出，归入剩余跳过列表由调用方回退 open
