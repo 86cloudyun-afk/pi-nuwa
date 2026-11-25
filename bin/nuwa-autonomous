@@ -30,11 +30,14 @@ import {
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
+	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 
 const VALID_MODES = new Set(["ctf", "pentest", "audit", "coding", "ops"]);
@@ -77,6 +80,11 @@ const MAX_SET_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_USD_PER_1M_TOKENS = 3.0;
 const WEBHOOK_TIMEOUT_MS = 5000;
 const WEBHOOK_MAX_ATTEMPTS = 3;
+const DEFAULT_GH_HTTP_TIMEOUT_SEC = 5;
+const DEFAULT_EXTERNAL_PROBE_TIMEOUT_MS = 5000;
+const DEFAULT_PAUSE_POLL_MS = 1000;
+const DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS = 300_000;
+const DEFAULT_SUBAGENT_HARD_TIMEOUT_MS = 900_000;
 
 const V4_EXT_MODULES = [
 	"lineage.ts",
@@ -136,6 +144,7 @@ const HELP_TEXT = `女娲 v5.0 外层无头守护器与环境自检工具 (nuwa-
   --verify-model <m>           双盲复验子代理模型（透传 NUWA_MODEL_VERIFY）
   --sandbox <none|docker|sidecar> 命令执行沙盒隔离模式（透传 NUWA_SANDBOX，默认: none）
   --sandbox-image <img>        Docker/Sidecar 沙盒镜像名（透传 NUWA_SANDBOX_IMAGE，默认: nuwa-sandbox:latest）
+  --egress-proxy <url>         统一出口代理 URL（同步注入 HTTP_PROXY/HTTPS_PROXY/NO_PROXY）
   --omp-bin <path>             指定 omp 可执行路径（默认: omp，测试可注入 stub）
   --dry-run                    仅打印规划配置与首轮启动命令并退出 0
   -h, --help                   显示本帮助信息
@@ -230,6 +239,7 @@ function parseArgs(argv) {
 		modeExplicit: false,
 		goal: "",
 		root: process.cwd(),
+		rootExplicit: false,
 		maxGenerations: 20,
 		maxHours: 12,
 		genTimeoutMinutes: DEFAULT_GEN_TIMEOUT_MINUTES,
@@ -249,6 +259,7 @@ function parseArgs(argv) {
 		sandbox: "none",
 		sandboxExplicit: false,
 		sandboxImage: "",
+		egressProxy: (process.env.NUWA_EGRESS_PROXY ?? "").trim(),
 		ompBin: "omp",
 		dryRun: false,
 		help: false,
@@ -287,6 +298,7 @@ function parseArgs(argv) {
 				break;
 			case "--root":
 				opts.root = take().trim();
+				opts.rootExplicit = true;
 				break;
 			case "--max-generations":
 				opts.maxGenerations = parsePositiveNumber(flag, take(), true);
@@ -357,6 +369,9 @@ function parseArgs(argv) {
 					throw new Error(`参数 --sandbox-image 取值非法: ${JSON.stringify(opts.sandboxImage)}`);
 				}
 				break;
+			case "--egress-proxy":
+				opts.egressProxy = take().trim();
+				break;
 			case "--omp-bin":
 				opts.ompBin = take().trim() || "omp";
 				break;
@@ -385,7 +400,28 @@ function parseArgs(argv) {
 			throw new Error(`参数 --webhook 仅支持 http/https URL`);
 		}
 	}
+	if (!opts.help && opts.egressProxy) {
+		let parsedProxy;
+		try {
+			parsedProxy = new URL(opts.egressProxy);
+		} catch {
+			throw new Error(`参数 --egress-proxy 不是合法 URL`);
+		}
+		if (
+			!["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"].includes(parsedProxy.protocol.toLowerCase()) ||
+			!parsedProxy.hostname
+		) {
+			throw new Error(`参数 --egress-proxy 仅支持 http/https/socks 代理 URL`);
+		}
+	}
 	opts.root = resolve(opts.root || process.cwd());
+	if (!opts.help && !opts.rootExplicit && !existsSync(join(opts.root, ".nuwa", "state.json"))) {
+		if (isVolatileTempPathDaemon(opts.root) || isSharedRootDaemon(opts.root)) {
+			const slugLabel = slugifyDaemon(opts.target || "workspace");
+			opts.root = join(resolveDefaultWorkspacesDirDaemon(), slugLabel);
+			opts.migratedFromTmp = true;
+		}
+	}
 	return opts;
 }
 
@@ -400,6 +436,9 @@ function parseDoctorArgs(argv) {
 		sandbox: "none",
 		sandboxImage: (process.env.NUWA_SANDBOX_IMAGE ?? "").trim() || "nuwa-sandbox:latest",
 		dockerBin: (process.env.NUWA_DOCKER_BIN ?? "").trim() || "docker",
+		ghBin: (process.env.NUWA_GH_BIN ?? "").trim() || "gh",
+		ghExplicit: Boolean((process.env.NUWA_GH_BIN ?? "").trim()),
+		checkGhAuth: (process.env.NUWA_DOCTOR_CHECK_GH ?? "").trim() === "1",
 	};
 
 	const needVal = (flag, i) => {
@@ -447,6 +486,13 @@ function parseDoctorArgs(argv) {
 			case "--docker-bin":
 				opts.dockerBin = take().trim() || "docker";
 				break;
+			case "--gh-bin":
+				opts.ghBin = take().trim() || "gh";
+				opts.ghExplicit = true;
+				break;
+			case "--check-gh-auth":
+				opts.checkGhAuth = true;
+				break;
 			default:
 				throw new Error(`doctor 未知参数: ${raw}（使用 nuwa-autonomous doctor --help 查看用法）`);
 		}
@@ -489,22 +535,119 @@ function resolveExecutable(binName) {
 	return null;
 }
 
-function probeBinaryVersion(binPath, versionArgs = ["--version"]) {
+function getGhHttpTimeoutSec() {
+	const raw = (process.env.NUWA_GH_HTTP_TIMEOUT ?? process.env.GH_HTTP_TIMEOUT ?? "").trim();
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_GH_HTTP_TIMEOUT_SEC;
+}
+
+function getExternalProbeTimeoutMs(fallbackMs = DEFAULT_EXTERNAL_PROBE_TIMEOUT_MS) {
+	const raw = (process.env.NUWA_EXTERNAL_PROBE_TIMEOUT_MS ?? "").trim();
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 50 ? Math.floor(n) : fallbackMs;
+}
+
+/** 受短超时与 GH_HTTP_TIMEOUT=5 硬保护的外部命令探活，避免 gh/git/docker 等外部 CLI 无限挂死。 */
+function runExternalProbe(binPath, args, opts = {}) {
+	const timeoutMs =
+		typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0
+			? Math.floor(opts.timeoutMs)
+			: getExternalProbeTimeoutMs();
+	const ghSec = String(getGhHttpTimeoutSec());
+	const env = {
+		...process.env,
+		GH_HTTP_TIMEOUT: ghSec,
+		GIT_TERMINAL_PROMPT: "0",
+		GIT_HTTP_LOW_SPEED_LIMIT: "1",
+		GIT_HTTP_LOW_SPEED_TIME: ghSec,
+		...(opts.env ?? {}),
+	};
 	try {
-		const res = spawnSync(binPath, versionArgs, {
+		const res = spawnSync(binPath, args, {
 			encoding: "utf8",
-			timeout: 3000,
+			timeout: timeoutMs,
+			killSignal: "SIGKILL",
+			env,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
-		if (res.error) return null;
-		const out = `${res.stdout ?? ""}\n${res.stderr ?? ""}`
-			.split("\n")
-			.map((s) => s.trim())
-			.find(Boolean);
-		return out || null;
-	} catch {
-		return null;
+		const timedOut =
+			Boolean(res.error && (res.error.code === "ETIMEDOUT" || /timed out|ETIMEDOUT/i.test(String(res.error.message ?? "")))) ||
+			(res.status === null && res.signal === "SIGKILL");
+		return {
+			ok: !res.error && !timedOut && res.status === 0,
+			timedOut,
+			status: res.status,
+			signal: res.signal,
+			stdout: String(res.stdout ?? ""),
+			stderr: String(res.stderr ?? ""),
+			error: res.error ? String(res.error.message ?? res.error) : "",
+			timeoutMs,
+		};
+	} catch (err) {
+		return {
+			ok: false,
+			timedOut: false,
+			status: -1,
+			signal: null,
+			stdout: "",
+			stderr: "",
+			error: err instanceof Error ? err.message : String(err),
+			timeoutMs,
+		};
 	}
+}
+
+function probeBinaryVersion(binPath, versionArgs = ["--version"]) {
+	const res = runExternalProbe(binPath, versionArgs, { timeoutMs: Math.min(3000, getExternalProbeTimeoutMs(3000)) });
+	if (res.timedOut || res.error) return null;
+	const out = `${res.stdout}\n${res.stderr}`
+		.split("\n")
+		.map((s) => s.trim())
+		.find(Boolean);
+	return out || null;
+}
+
+function checkGhCliProbe(ghBin, checkAuth = false) {
+	const binPath = resolveExecutable(ghBin);
+	const ghHttpTimeoutSec = getGhHttpTimeoutSec();
+	const timeoutMs = getExternalProbeTimeoutMs(DEFAULT_EXTERNAL_PROBE_TIMEOUT_MS);
+	if (!binPath) {
+		return {
+			ok: true,
+			critical: false,
+			available: false,
+			timedOut: false,
+			ghHttpTimeoutSec,
+			timeoutMs,
+			bin: ghBin,
+			reason: "未安装 gh（可选工具，不影响女娲核心运行）",
+		};
+	}
+	const probeArgs = checkAuth ? ["auth", "status"] : ["--version"];
+	const res = runExternalProbe(binPath, probeArgs, { timeoutMs: checkAuth ? timeoutMs : Math.min(2000, timeoutMs) });
+	if (res.timedOut) {
+		return {
+			ok: false,
+			critical: false,
+			available: true,
+			timedOut: true,
+			ghHttpTimeoutSec,
+			timeoutMs,
+			bin: binPath,
+			reason: `gh 探活超时（已按 ${timeoutMs}ms / GH_HTTP_TIMEOUT=${ghHttpTimeoutSec}s 保护截断，避免挂死）`,
+		};
+	}
+	return {
+		ok: true,
+		critical: false,
+		available: true,
+		timedOut: false,
+		...(checkAuth ? { authenticated: res.ok } : {}),
+		ghHttpTimeoutSec,
+		timeoutMs,
+		bin: binPath,
+		...(res.ok ? {} : { reason: checkAuth ? "gh 已安装但未登录（已快速返回，未阻塞）" : "gh 版本探测返回非零（已快速返回）" }),
+	};
 }
 
 function resolveAgentHome(overrideDir) {
@@ -927,6 +1070,9 @@ function runDoctor(argv) {
 	// 7. 检查 Docker 沙盒可用性
 	const dockerCheck = checkDockerSandbox(opts.dockerBin, opts.sandboxImage, opts.sandbox === "docker" || opts.sandbox === "sidecar");
 
+	// 8. 短超时安全探活 gh CLI（防挂死 80s；默认本地快速探测，指定 --gh-bin / --check-gh-auth 时受短超时保护探活 auth status）
+	const ghCheck = checkGhCliProbe(opts.ghBin, Boolean(opts.ghExplicit || opts.checkGhAuth));
+
 	const checks = {
 		bun: bunCheck,
 		omp: ompCheck,
@@ -935,6 +1081,7 @@ function runDoctor(argv) {
 		agents: agentsCheck,
 		toolchain: toolchainCheck,
 		docker: dockerCheck,
+		gh: ghCheck,
 	};
 
 	const allEntries = Object.entries(checks);
@@ -1019,6 +1166,604 @@ function reportFilePath(root) {
 	return join(root, ".nuwa", "REPORT.md");
 }
 
+function slugifyDaemon(raw) {
+	return (
+		String(raw ?? "")
+			.toLowerCase()
+			.replace(/^https?:\/\//i, "")
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-+|-+$/g, "")
+			.slice(0, 48) || "workspace"
+	);
+}
+
+function resolvePersistentStateDirDaemon() {
+	const explicit = (process.env.NUWA_STATE_DIR ?? "").trim();
+	if (explicit) return resolve(explicit);
+	const xdg = (process.env.XDG_STATE_HOME ?? "").trim();
+	if (xdg) return join(resolve(xdg), "nuwa");
+	return join(homedir(), ".local", "state", "nuwa");
+}
+
+function resolveDefaultWorkspacesDirDaemon() {
+	const explicitWs = (process.env.NUWA_WORKSPACES_DIR ?? "").trim();
+	if (explicitWs) return resolve(explicitWs);
+	const explicitState = (process.env.NUWA_STATE_DIR ?? "").trim();
+	if (explicitState) return join(resolve(explicitState), "workspaces");
+	const envAgentHome = (process.env.PI_AGENT_HOME ?? "").trim();
+	if (envAgentHome) return join(resolve(envAgentHome), "workspaces");
+	return join(resolvePersistentStateDirDaemon(), "workspaces");
+}
+
+function isSubpathOrEqualDaemon(candidate, base) {
+	const c = resolve(candidate);
+	const b = resolve(base);
+	if (c === b) return true;
+	const prefix = b.endsWith("/") ? b : `${b}/`;
+	return c.startsWith(prefix);
+}
+
+function isVolatileTempPathDaemon(dirPath) {
+	const raw = String(dirPath ?? "").trim();
+	if (!raw) return false;
+	const cands = new Set([resolve(raw)]);
+	try {
+		cands.add(realpathSync(raw));
+	} catch {
+		/* 目录可能尚不存在 */
+	}
+	const bases = new Set([resolve("/tmp"), resolve("/private/tmp"), resolve("/var/tmp"), resolve("/private/var/tmp"), resolve(tmpdir())]);
+	try {
+		bases.add(realpathSync(tmpdir()));
+	} catch {
+		/* ignore */
+	}
+	for (const cand of cands) {
+		for (const base of bases) {
+			if (isSubpathOrEqualDaemon(cand, base)) return true;
+		}
+	}
+	return false;
+}
+
+function isSharedRootDaemon(dirPath) {
+	const r = resolve(dirPath || process.cwd());
+	return [resolve("/"), resolve(homedir()), resolve("/tmp"), resolve("/private/tmp"), resolve(tmpdir()), resolve("/data/workspace")].includes(r);
+}
+
+function isDaemonTmpWarningSuppressed() {
+	const forceWarn = (process.env.NUWA_WARN_TMP_WORKSPACE ?? "").trim().toLowerCase();
+	if (forceWarn === "1" || forceWarn === "true") return false;
+	const allowTmp = (process.env.NUWA_ALLOW_TMP_WORKSPACE ?? "").trim().toLowerCase();
+	if (allowTmp === "1" || allowTmp === "true") return true;
+	const nodeEnv = (process.env.NODE_ENV ?? "").trim().toLowerCase();
+	if (nodeEnv === "test" || process.env.BUN_TEST === "1" || process.env.NUWA_TEST_MODE === "1") return true;
+	return false;
+}
+
+function atomicWriteJsonDaemon(filePath, data) {
+	mkdirSync(dirname(filePath), { recursive: true });
+	const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+	writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+	renameSync(tmp, filePath);
+}
+
+function appendJournalDaemon(root, rec) {
+	try {
+		const dir = join(root, ".nuwa");
+		mkdirSync(dir, { recursive: true });
+		appendFileSync(join(dir, "journal.jsonl"), `${JSON.stringify({ ts: new Date().toISOString(), ...rec })}\n`, "utf8");
+	} catch {
+		/* ignore */
+	}
+}
+
+function sleepSyncDaemon(ms) {
+	if (ms <= 0) return;
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.floor(ms));
+}
+
+function pidAliveDaemon(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function probePgidDaemon(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return null;
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close >= 0) {
+			const fields = stat.slice(close + 2).trim().split(/\s+/);
+			const pgid = Number(fields[2]);
+			if (Number.isInteger(pgid) && pgid > 0) return pgid;
+		}
+	} catch {
+		/* 非 Linux */
+	}
+	try {
+		const res = spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], {
+			encoding: "utf8",
+			timeout: 1500,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (res.status === 0) {
+			const pgid = Number(String(res.stdout ?? "").trim());
+			if (Number.isInteger(pgid) && pgid > 0) return pgid;
+		}
+	} catch {
+		/* ignore */
+	}
+	return null;
+}
+
+let daemonSelfPgidCached;
+function getDaemonSelfPgid() {
+	if (daemonSelfPgidCached !== undefined) return daemonSelfPgidCached;
+	daemonSelfPgidCached = probePgidDaemon(process.pid);
+	return daemonSelfPgidCached;
+}
+
+function isSafeDaemonTargetPid(pid) {
+	return Number.isInteger(pid) && pid > 1 && pid !== process.pid && pid !== process.ppid;
+}
+
+function isSafeDaemonTargetPgid(pgid) {
+	if (!Number.isInteger(pgid) || pgid <= 1) return false;
+	if (pgid === process.pid || pgid === process.ppid) return false;
+	const selfPgid = getDaemonSelfPgid();
+	if (selfPgid !== null && pgid === selfPgid) return false;
+	return true;
+}
+
+function isProcessAliveNonZombieDaemon(pid) {
+	if (!pidAliveDaemon(pid)) return false;
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close >= 0) {
+			const st = stat.slice(close + 2).trim()[0] ?? "";
+			return st !== "Z" && st !== "X";
+		}
+	} catch {
+		/* 非 Linux */
+	}
+	try {
+		const res = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+			encoding: "utf8",
+			timeout: 1500,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (res.status !== 0) return false;
+		const st = String(res.stdout ?? "").trim();
+		return Boolean(st) && !st.startsWith("Z") && !st.startsWith("X");
+	} catch {
+		return pidAliveDaemon(pid);
+	}
+}
+
+function isGroupAliveNonZombieDaemon(pgid, fallbackPid) {
+	if (!isSafeDaemonTargetPgid(pgid)) {
+		return fallbackPid ? isProcessAliveNonZombieDaemon(fallbackPid) : false;
+	}
+	let exists = false;
+	try {
+		process.kill(-pgid, 0);
+		exists = true;
+	} catch (err) {
+		exists = err?.code === "EPERM";
+	}
+	if (!exists) return fallbackPid ? isProcessAliveNonZombieDaemon(fallbackPid) : false;
+	try {
+		const res = spawnSync("ps", ["-axo", "pid=,pgid=,stat="], {
+			encoding: "utf8",
+			timeout: 1500,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (res.status === 0 && typeof res.stdout === "string" && res.stdout.trim()) {
+			for (const line of res.stdout.split("\n")) {
+				const parts = line.trim().split(/\s+/);
+				if (parts.length < 3) continue;
+				if (Number(parts[1]) === pgid && parts[2] && !parts[2].startsWith("Z") && !parts[2].startsWith("X")) {
+					return true;
+				}
+			}
+			return false;
+		}
+	} catch {
+		/* ignore */
+	}
+	return fallbackPid ? isProcessAliveNonZombieDaemon(fallbackPid) : true;
+}
+
+function killPidOrGroupSafeDaemon(pid, pgid, signal) {
+	if (!isSafeDaemonTargetPid(pid)) return false;
+	if (isSafeDaemonTargetPgid(pgid)) {
+		try {
+			process.kill(-pgid, signal);
+			return true;
+		} catch (err) {
+			if (err?.code === "ESRCH") {
+				try {
+					process.kill(pid, signal);
+					return true;
+				} catch {
+					return false;
+				}
+			}
+		}
+	}
+	try {
+		process.kill(pid, signal);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function processTrackerPathDaemon(root) {
+	return join(root, ".nuwa", "process-groups.json");
+}
+
+function readTrackedProcessesDaemon(root) {
+	const p = processTrackerPathDaemon(root);
+	if (!existsSync(p)) return [];
+	try {
+		const parsed = JSON.parse(readFileSync(p, "utf8"));
+		return Array.isArray(parsed?.records) ? parsed.records : [];
+	} catch {
+		return [];
+	}
+}
+
+function registerTrackedProcessDaemon(root, input) {
+	const pid = Number(input.pid);
+	if (!isSafeDaemonTargetPid(pid)) return null;
+	const probed = probePgidDaemon(pid);
+	const pgid = Number.isInteger(input.pgid) && input.pgid > 1 ? input.pgid : probed ?? pid;
+	const nowMs = Date.now();
+	const rec = {
+		pid,
+		pgid,
+		label: String(input.label || "omp-child").slice(0, 64),
+		...(input.taskId ? { taskId: String(input.taskId).slice(0, 96) } : {}),
+		...(input.command ? { command: String(input.command).slice(0, 200) } : {}),
+		startedAt: new Date(nowMs).toISOString(),
+		startedAtMs: nowMs,
+		ownerPid: process.pid,
+	};
+	try {
+		const prev = readTrackedProcessesDaemon(root).filter((r) => r?.pid !== pid);
+		prev.push(rec);
+		atomicWriteJsonDaemon(processTrackerPathDaemon(root), {
+			schema: 1,
+			updatedAt: new Date().toISOString(),
+			records: prev,
+		});
+	} catch {
+		/* 登记失败不阻断守护启动 */
+	}
+	return rec;
+}
+
+function unregisterTrackedProcessDaemon(root, pid) {
+	const p = processTrackerPathDaemon(root);
+	if (!existsSync(p)) return;
+	try {
+		const prev = readTrackedProcessesDaemon(root);
+		const next = prev.filter((r) => r?.pid !== pid);
+		if (next.length !== prev.length) {
+			atomicWriteJsonDaemon(p, { schema: 1, updatedAt: new Date().toISOString(), records: next });
+		}
+	} catch {
+		/* ignore */
+	}
+}
+
+/** 守护器侧进程组级联回收（SIGTERM -> graceMs -> SIGKILL），与 omp/storage.ts 的 ProcessGroupTracker 协议一致。 */
+function cleanupTrackedProcessesDaemon(root, opts = {}) {
+	const p = processTrackerPathDaemon(root);
+	if (!existsSync(p)) return { cleanedCount: 0, sigkillCount: 0 };
+	const graceMs =
+		typeof opts.graceMs === "number" && Number.isFinite(opts.graceMs) && opts.graceMs >= 0
+			? Math.floor(opts.graceMs)
+			: 500;
+	const records = readTrackedProcessesDaemon(root);
+	const targets = records.filter((r) => !opts.taskId || r?.taskId === opts.taskId);
+	if (targets.length === 0) return { cleanedCount: 0, sigkillCount: 0 };
+
+	const pending = [];
+	let cleanedCount = 0;
+	for (const rec of targets) {
+		if (!isSafeDaemonTargetPid(rec?.pid)) continue;
+		const pgid = Number(rec.pgid ?? rec.pid);
+		const alive = isSafeDaemonTargetPgid(pgid)
+			? isGroupAliveNonZombieDaemon(pgid, rec.pid)
+			: isProcessAliveNonZombieDaemon(rec.pid);
+		if (!alive) {
+			cleanedCount += 1;
+			continue;
+		}
+		if (killPidOrGroupSafeDaemon(rec.pid, pgid, "SIGTERM")) {
+			pending.push({ pid: rec.pid, pgid, useGroup: isSafeDaemonTargetPgid(pgid) });
+		}
+	}
+
+	const deadline = Date.now() + graceMs;
+	const aliveSet = new Set(pending);
+	while (aliveSet.size > 0) {
+		for (const item of [...aliveSet]) {
+			const alive = item.useGroup
+				? isGroupAliveNonZombieDaemon(item.pgid, item.pid)
+				: isProcessAliveNonZombieDaemon(item.pid);
+			if (!alive) {
+				cleanedCount += 1;
+				aliveSet.delete(item);
+			}
+		}
+		if (aliveSet.size === 0 || Date.now() >= deadline) break;
+		sleepSyncDaemon(Math.min(30, Math.max(1, deadline - Date.now())));
+	}
+
+	let sigkillCount = 0;
+	for (const item of aliveSet) {
+		if (killPidOrGroupSafeDaemon(item.pid, item.pgid, "SIGKILL")) {
+			sigkillCount += 1;
+			cleanedCount += 1;
+		}
+	}
+
+	try {
+		const handledPids = new Set(targets.map((r) => r?.pid));
+		const next = readTrackedProcessesDaemon(root).filter((r) => !handledPids.has(r?.pid));
+		atomicWriteJsonDaemon(p, { schema: 1, updatedAt: new Date().toISOString(), records: next });
+		if (cleanedCount > 0) {
+			appendJournalDaemon(root, {
+				type: "process_group_cleanup",
+				source: "nuwa-autonomous",
+				reason: opts.reason ?? "daemon_cleanup",
+				...(opts.taskId ? { taskId: opts.taskId } : {}),
+				cleanedCount,
+				sigkillCount,
+			});
+		}
+	} catch {
+		/* ignore */
+	}
+	return { cleanedCount, sigkillCount };
+}
+
+function readDaemonPausedState(root) {
+	const p = join(root, ".nuwa", "paused.json");
+	if (!existsSync(p)) return null;
+	try {
+		const parsed = JSON.parse(readFileSync(p, "utf8"));
+		if (parsed && typeof parsed.paused === "boolean") return parsed;
+	} catch {
+		/* ignore */
+	}
+	return null;
+}
+
+function isDaemonPaused(root) {
+	return readDaemonPausedState(root)?.paused === true;
+}
+
+/** 守护器侧子代理心跳看门狗巡检（与 omp/storage.ts 的 SubagentWatchdog 共用 .nuwa/subagent-watchdog.json）。 */
+function sweepSubagentWatchdogDaemon(root) {
+	const p = join(root, ".nuwa", "subagent-watchdog.json");
+	if (!existsSync(p)) return [];
+	let store;
+	try {
+		store = JSON.parse(readFileSync(p, "utf8"));
+	} catch {
+		return [];
+	}
+	if (!store?.tasks || typeof store.tasks !== "object") return [];
+	const nowMs = Date.now();
+	const timedOut = [];
+	let mutated = false;
+
+	for (const entry of Object.values(store.tasks)) {
+		if (!entry || entry.status !== "running") continue;
+		const idleLimit =
+			Number.isFinite(entry.idleTimeoutMs) && entry.idleTimeoutMs > 0
+				? entry.idleTimeoutMs
+				: DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS;
+		const hardLimit =
+			Number.isFinite(entry.hardTimeoutMs) && entry.hardTimeoutMs > 0
+				? entry.hardTimeoutMs
+				: DEFAULT_SUBAGENT_HARD_TIMEOUT_MS;
+		const elapsedMs = Math.max(0, nowMs - Number(entry.startedAt ?? nowMs));
+		const idleMs = Math.max(0, nowMs - Number(entry.lastOutputAt ?? entry.startedAt ?? nowMs));
+		let timeoutKind = "";
+		let reason = "";
+		if (elapsedMs >= hardLimit) {
+			timeoutKind = "hard_timeout";
+			reason = `子代理任务 ${entry.taskId} 触发硬超时 (${Math.round(elapsedMs / 1000)}s >= ${Math.round(hardLimit / 1000)}s)`;
+		} else if (idleMs >= idleLimit) {
+			timeoutKind = "idle_no_output";
+			reason = `子代理任务 ${entry.taskId} 触发无输出空闲超时 (${Math.round(idleMs / 1000)}s >= ${Math.round(idleLimit / 1000)}s)`;
+		}
+		if (!timeoutKind) continue;
+
+		cleanupTrackedProcessesDaemon(root, {
+			taskId: entry.taskId,
+			graceMs: 300,
+			reason: `watchdog:${timeoutKind}:${entry.taskId}`,
+		});
+		if (isSafeDaemonTargetPid(entry.pid)) {
+			killPidOrGroupSafeDaemon(entry.pid, Number(entry.pgid ?? entry.pid), "SIGTERM");
+		}
+		entry.status = "timeout";
+		entry.endedAt = nowMs;
+		entry.timeoutKind = timeoutKind;
+		entry.timeoutReason = reason;
+		mutated = true;
+		timedOut.push({ taskId: entry.taskId, timeoutKind, reason, idleMs, elapsedMs });
+		logErr(`[SubagentWatchdog] ${reason}，已标记 timeout 并释放并发槽位。`);
+		appendJournalDaemon(root, {
+			type: "subagent_timeout",
+			source: "nuwa-autonomous",
+			taskId: entry.taskId,
+			timeoutKind,
+			idleMs,
+			elapsedMs,
+			reason,
+		});
+	}
+
+	if (mutated) {
+		try {
+			store.updatedAt = new Date().toISOString();
+			atomicWriteJsonDaemon(p, store);
+		} catch {
+			/* ignore */
+		}
+	}
+	return timedOut;
+}
+
+function inspectGitMetadataDaemon(root) {
+	const gitEntry = join(root, ".git");
+	if (!existsSync(gitEntry)) return { gitPresent: false, gitHeadValid: false };
+	try {
+		const st = statSync(gitEntry);
+		if (st.isDirectory()) return { gitPresent: true, gitHeadValid: existsSync(join(gitEntry, "HEAD")) };
+		if (st.isFile()) {
+			const m = /^gitdir:\s*(.+)$/im.exec(readFileSync(gitEntry, "utf8").trim());
+			if (!m?.[1]) return { gitPresent: true, gitHeadValid: false };
+			return { gitPresent: true, gitHeadValid: existsSync(join(resolve(root, m[1].trim()), "HEAD")) };
+		}
+	} catch {
+		return { gitPresent: true, gitHeadValid: false };
+	}
+	return { gitPresent: false, gitHeadValid: false };
+}
+
+/** 守护器启动与每轮结算工作区完整性校验（与 omp/storage.ts 的 verifyWorkspaceIntegrity 协议一致）。 */
+function verifyWorkspaceIntegrityDaemon(root, opts = {}) {
+	const normRoot = resolve(root);
+	const warnings = [];
+	let exists = false;
+	try {
+		exists = existsSync(normRoot) && statSync(normRoot).isDirectory();
+	} catch {
+		exists = false;
+	}
+	const nuwaDir = join(normRoot, ".nuwa");
+	const hasNuwaDir = exists && existsSync(nuwaDir);
+	const metaPath = join(nuwaDir, "workspace-meta.json");
+	let meta = null;
+	if (hasNuwaDir && existsSync(metaPath)) {
+		try {
+			meta = JSON.parse(readFileSync(metaPath, "utf8"));
+		} catch {
+			meta = null;
+		}
+	}
+	const { gitPresent, gitHeadValid } = exists ? inspectGitMetadataDaemon(normRoot) : { gitPresent: false, gitHeadValid: false };
+	const expectGitEnv = (process.env.NUWA_EXPECT_GIT ?? "").trim() === "1";
+
+	if (exists && opts.recordBaseline && hasNuwaDir) {
+		try {
+			atomicWriteJsonDaemon(metaPath, {
+				schema: 1,
+				root: normRoot,
+				hadGit: Boolean(meta?.hadGit || gitPresent || expectGitEnv),
+				firstSeenAt: meta?.firstSeenAt ?? new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			});
+		} catch {
+			/* ignore */
+		}
+	}
+
+	const gitExpected = Boolean(expectGitEnv || meta?.hadGit || gitPresent);
+	if (!exists) {
+		warnings.push({
+			code: "NUWA_WORKSPACE_MISSING",
+			severity: "error",
+			message: `工作区目录已丢失: ${normRoot}`,
+		});
+	} else if (gitExpected && (!gitPresent || !gitHeadValid)) {
+		warnings.push({
+			code: "NUWA_GIT_METADATA_MISSING",
+			severity: "error",
+			message: !gitPresent ? `工作区 .git 元数据丢失: ${normRoot}` : `工作区 .git 损坏（缺少有效 HEAD）: ${normRoot}`,
+		});
+	}
+
+	const isVolatileTmp = isVolatileTempPathDaemon(normRoot);
+	if (isVolatileTmp && !isDaemonTmpWarningSuppressed()) {
+		warnings.push({
+			code: "NUWA_VOLATILE_TMP_WORKSPACE",
+			severity: "warn",
+			message: `工作区位于易失临时目录 (${normRoot})，建议迁移至持久化目录 ${resolveDefaultWorkspacesDirDaemon()} 或设置 NUWA_STATE_DIR`,
+		});
+	}
+
+	const hasError = warnings.some((w) => w.severity === "error");
+	const status = hasError ? "corrupted" : warnings.length > 0 ? "warn" : "ok";
+	if (hasError && hasNuwaDir) {
+		appendJournalDaemon(normRoot, {
+			type: "workspace_integrity_alert",
+			source: "nuwa-autonomous",
+			status,
+			root: normRoot,
+			warnings,
+		});
+	}
+	return { ok: !hasError, status, exists, isVolatileTmp, gitExpected, gitPresent, gitHeadValid, warnings };
+}
+
+function buildUnifiedNetworkEnvDaemon(egressUrl, allowedHosts = []) {
+	const cleanProxy = String(egressUrl ?? "").trim();
+	const ghSec = String(getGhHttpTimeoutSec());
+	const noProxySet = new Set(["127.0.0.1", "localhost", "::1"]);
+	if (cleanProxy) {
+		try {
+			const u = new URL(cleanProxy);
+			const h = u.hostname.toLowerCase();
+			if (h === "host.docker.internal" || h === "127.0.0.1" || h === "localhost" || h === "::1") {
+				noProxySet.add(h);
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+	const noProxy = [...noProxySet].join(",");
+	const out = {
+		GH_HTTP_TIMEOUT: ghSec,
+		GIT_TERMINAL_PROMPT: "0",
+		GIT_HTTP_LOW_SPEED_LIMIT: "1",
+		GIT_HTTP_LOW_SPEED_TIME: ghSec,
+		NO_PROXY: noProxy,
+		no_proxy: noProxy,
+	};
+	if (cleanProxy) {
+		out.HTTP_PROXY = cleanProxy;
+		out.http_proxy = cleanProxy;
+		out.HTTPS_PROXY = cleanProxy;
+		out.https_proxy = cleanProxy;
+		out.NUWA_EGRESS_PROXY = cleanProxy;
+		if (/^socks/i.test(cleanProxy)) {
+			out.ALL_PROXY = cleanProxy;
+			out.all_proxy = cleanProxy;
+		}
+	}
+	const cleanHosts = [...new Set(allowedHosts.map((h) => String(h ?? "").trim().toLowerCase()).filter(Boolean))];
+	if (cleanHosts.length > 0) {
+		out.NUWA_SCOPE_ALLOW_HOSTS = cleanHosts.join(",");
+	}
+	return out;
+}
+
 function readDiskState(root) {
 	const p = stateFilePath(root);
 	if (!existsSync(p)) return null;
@@ -1056,8 +1801,20 @@ function defaultGoalFor(mode, target) {
 }
 
 function buildChildEnv(opts, gen) {
+	const allowedHosts = [];
+	if (opts.target) {
+		try {
+			const parsed = new URL(/^https?:\/\//i.test(opts.target) ? opts.target : `http://${opts.target}`);
+			if (parsed.hostname) allowedHosts.push(parsed.hostname);
+		} catch {
+			/* ignore */
+		}
+	}
+	const effectiveProxy = (opts.egressProxy || process.env.NUWA_EGRESS_PROXY || "").trim();
+	const unifiedNetEnv = buildUnifiedNetworkEnvDaemon(effectiveProxy, allowedHosts);
 	const env = {
 		...process.env,
+		...unifiedNetEnv,
 		NUWA_LOOP: "1",
 		NUWA_INFINITE: "1",
 		NUWA_HEADLESS_DAEMON: "1",
@@ -1516,6 +2273,7 @@ async function awaitChildWithWatchdog(child, params) {
 	let timeoutReason = "";
 	let hardTimer = null;
 	let idleTimer = null;
+	let subagentSweepTimer = null;
 	let sigkillTimer = null;
 
 	const clearAllTimers = () => {
@@ -1527,11 +2285,19 @@ async function awaitChildWithWatchdog(child, params) {
 			clearInterval(idleTimer);
 			idleTimer = null;
 		}
+		if (subagentSweepTimer !== null) {
+			clearInterval(subagentSweepTimer);
+			subagentSweepTimer = null;
+		}
 		if (sigkillTimer !== null) {
 			clearTimeout(sigkillTimer);
 			sigkillTimer = null;
 		}
 	};
+
+	const childPid = Number(child?.pid ?? 0);
+	const probedChildPgid = childPid > 1 ? probePgidDaemon(childPid) : null;
+	const childPgid = probedChildPgid && isSafeDaemonTargetPgid(probedChildPgid) ? probedChildPgid : childPid;
 
 	const triggerWatchdog = (kind, reason) => {
 		if (settled || killing || isShuttingDown()) return;
@@ -1547,22 +2313,43 @@ async function awaitChildWithWatchdog(child, params) {
 			clearInterval(idleTimer);
 			idleTimer = null;
 		}
+		if (subagentSweepTimer !== null) {
+			clearInterval(subagentSweepTimer);
+			subagentSweepTimer = null;
+		}
 		logErr(reason);
-		try {
-			child.kill("SIGTERM");
-		} catch {
-			/* 子进程可能已退出 */
+		if (!killPidOrGroupSafeDaemon(childPid, childPgid, "SIGTERM")) {
+			try {
+				child.kill("SIGTERM");
+			} catch {
+				/* 子进程可能已退出 */
+			}
 		}
 		sigkillTimer = setTimeout(() => {
 			if (settled) return;
-			logErr(`第 ${gen} 代子进程在 SIGTERM 后 ${WATCHDOG_SIGKILL_GRACE_MS}ms 仍未退出，发送 SIGKILL 强制终止。`);
-			try {
-				child.kill("SIGKILL");
-			} catch {
-				/* ignore */
+			logErr(`第 ${gen} 代子进程在 SIGTERM 后 ${WATCHDOG_SIGKILL_GRACE_MS}ms 仍未退出，按进程组发送 SIGKILL 强制终止。`);
+			if (!killPidOrGroupSafeDaemon(childPid, childPgid, "SIGKILL")) {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					/* ignore */
+				}
 			}
+			cleanupTrackedProcessesDaemon(root, { graceMs: 200, reason: `watchdog_sigkill:${kind}` });
 		}, WATCHDOG_SIGKILL_GRACE_MS);
 	};
+
+	// 周期巡检子代理心跳看门狗（Issue #46 / NW-26）
+	const subagentPollMs = Math.max(50, Math.min(5000, Number(process.env.NUWA_WATCHDOG_POLL_MS ?? 2000) || 2000));
+	subagentSweepTimer = setInterval(() => {
+		if (settled || killing || isShuttingDown()) return;
+		try {
+			sweepSubagentWatchdogDaemon(root);
+		} catch {
+			/* ignore */
+		}
+	}, subagentPollMs);
+	subagentSweepTimer.unref?.();
 
 	// 分片调度硬截止定时器，避免超大毫秒数触发 32-bit setTimeout 溢出
 	const deadlineAt = Date.now() + Math.max(1, hardDeadlineMs);
@@ -1708,6 +2495,10 @@ async function main() {
 				...(envPreview.NUWA_MODEL_FAST ? { NUWA_MODEL_FAST: envPreview.NUWA_MODEL_FAST } : {}),
 				...(envPreview.NUWA_MODEL_DEEP ? { NUWA_MODEL_DEEP: envPreview.NUWA_MODEL_DEEP } : {}),
 				...(envPreview.NUWA_MODEL_VERIFY ? { NUWA_MODEL_VERIFY: envPreview.NUWA_MODEL_VERIFY } : {}),
+				...(envPreview.NUWA_EGRESS_PROXY ? { NUWA_EGRESS_PROXY: envPreview.NUWA_EGRESS_PROXY } : {}),
+				...(envPreview.HTTP_PROXY ? { HTTP_PROXY: envPreview.HTTP_PROXY, HTTPS_PROXY: envPreview.HTTPS_PROXY } : {}),
+				...(envPreview.NO_PROXY ? { NO_PROXY: envPreview.NO_PROXY } : {}),
+				GH_HTTP_TIMEOUT: envPreview.GH_HTTP_TIMEOUT,
 			},
 			command: [opts.ompBin, ...ompArgs],
 		};
@@ -1717,13 +2508,42 @@ async function main() {
 		process.exit(0);
 	}
 
+	if (opts.migratedFromTmp) {
+		log(`[WorkspaceGuard] 默认工作目录位于易失临时路径，已自动迁出至持久化工作区: ${opts.root}`);
+	}
 	mkdirSync(opts.root, { recursive: true });
 	persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal);
+
+	// 启动期工作区完整性与易失 /tmp 校验（Issue #47 / NW-27）
+	const reportIntegrityAlerts = async (phaseLabel, genNum, stateObj) => {
+		const check = verifyWorkspaceIntegrityDaemon(opts.root, { recordBaseline: phaseLabel === "startup" });
+		for (const w of check.warnings) {
+			if (w.severity === "error") {
+				logErr(`[WorkspaceGuard][${phaseLabel}] ${w.code}: ${w.message}`);
+			} else {
+				log(`[WorkspaceGuard][${phaseLabel}] WARN ${w.code}: ${w.message}`);
+			}
+		}
+		if (check.status === "corrupted" && opts.webhook) {
+			await sendDaemonWebhook(
+				opts.webhook,
+				opts.root,
+				buildWebhookEventPayload("workspace_corrupted", opts, stateObj, genNum, {
+					phaseLabel,
+					warnings: check.warnings,
+				}),
+			);
+		}
+		return check;
+	};
+	await reportIntegrityAlerts("startup", 0, initialState);
 
 	const rawBackoff = Number(process.env.NUWA_DAEMON_BACKOFF_MS ?? 2000);
 	const baseBackoffMs = Number.isFinite(rawBackoff) && rawBackoff >= 0 ? rawBackoff : 2000;
 	const rawMaxErr = Number(process.env.NUWA_DAEMON_MAX_ERRORS ?? 5);
 	const maxConsecutiveErrors = Number.isFinite(rawMaxErr) && rawMaxErr >= 1 ? Math.floor(rawMaxErr) : 5;
+	const rawPausePoll = Number(process.env.NUWA_PAUSE_POLL_MS ?? DEFAULT_PAUSE_POLL_MS);
+	const pausePollMs = Number.isFinite(rawPausePoll) && rawPausePoll >= 20 ? Math.floor(rawPausePoll) : DEFAULT_PAUSE_POLL_MS;
 
 	const rawGenTimeoutEnv = (process.env.NUWA_GEN_TIMEOUT_MS ?? "").trim();
 	const parsedGenTimeoutEnv = rawGenTimeoutEnv ? Number(rawGenTimeoutEnv) : NaN;
@@ -1747,29 +2567,76 @@ async function main() {
 	const handleSignal = (sig, code) => {
 		if (shuttingDown) return;
 		shuttingDown = true;
-		log(`收到信号 ${sig}，正在停止子进程并退出...`);
-		try {
-			activeChild?.kill("SIGTERM");
-		} catch {
-			/* 子进程可能已结束 */
+		log(`收到信号 ${sig}，正在级联回收子进程组并退出...`);
+		if (activeChild?.pid) {
+			const cPid = Number(activeChild.pid);
+			const cPgid = probePgidDaemon(cPid) ?? cPid;
+			if (!killPidOrGroupSafeDaemon(cPid, cPgid, "SIGTERM")) {
+				try {
+					activeChild.kill("SIGTERM");
+				} catch {
+					/* 子进程可能已结束 */
+				}
+			}
 		}
+		cleanupTrackedProcessesDaemon(opts.root, { graceMs: 400, reason: `signal:${sig}` });
 		process.exit(code);
 	};
 	process.on("SIGINT", () => handleSignal("SIGINT", 130));
 	process.on("SIGTERM", () => handleSignal("SIGTERM", 143));
+	process.on("SIGHUP", () => handleSignal("SIGHUP", 129));
+
+	// 软暂停优雅挂起等待器（Issue #44 / NW-24）：检测 paused.json 为 true 时挂起不强停，解除即恢复
+	const waitWhilePaused = async (genNum) => {
+		if (!isDaemonPaused(opts.root)) return "active";
+		const pState = readDaemonPausedState(opts.root);
+		log(`检测到软暂停标记 (reason=${pState?.reason || "未填写"})，进入优雅挂起等待恢复（非强停）...`);
+		await sendDaemonWebhook(
+			opts.webhook,
+			opts.root,
+			buildWebhookEventPayload("paused", opts, readDiskState(opts.root), genNum, {
+				reason: pState?.reason || "manual pause",
+			}),
+		);
+		while (!shuttingDown && Date.now() - startedAt < maxDurationMs) {
+			if (!isDaemonPaused(opts.root)) {
+				log("检测到软暂停已解除，立即恢复执行。");
+				await sendDaemonWebhook(
+					opts.webhook,
+					opts.root,
+					buildWebhookEventPayload("resumed", opts, readDiskState(opts.root), genNum, {}),
+				);
+				return "resumed";
+			}
+			const stDuringPause = readDiskState(opts.root);
+			if (stDuringPause?.project?.status === "completed") return "completed";
+			if (stDuringPause?.project?.status === "stopped" && !isReincarnateStop(stDuringPause)) return "stopped";
+			sweepSubagentWatchdogDaemon(opts.root);
+			await Bun.sleep(pausePollMs);
+		}
+		return "timeout";
+	};
 
 	let gen = 1;
 	let consecutiveErrors = 0;
 
 	while (gen <= opts.maxGenerations && Date.now() - startedAt < maxDurationMs) {
+		// 巡检子代理看门狗并处理软暂停
+		sweepSubagentWatchdogDaemon(opts.root);
+		const pauseResult = await waitWhilePaused(gen);
+		if (shuttingDown) return;
+		if (pauseResult === "timeout") break;
+
 		const preState = readDiskState(opts.root);
 		if (preState?.project?.status === "completed") {
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_completed" });
 			const summary = formatCompletionSummary(opts.root, preState, gen, startedAt);
 			log(summary);
 			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, preState, gen, { summary }));
 			process.exit(0);
 		}
 		if (preState?.project?.status === "stopped" && !isReincarnateStop(preState)) {
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_stopped" });
 			const reason = preState.project?.stopReason ?? "未记录";
 			log(`项目已停机 (status=stopped)，原因: ${reason}`);
 			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, preState, gen, { reason }));
@@ -1777,6 +2644,7 @@ async function main() {
 		}
 		const preBudget = checkBudgetCap(preState, opts);
 		if (preBudget.exceeded) {
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "budget_exceeded" });
 			log(`预算上限已触发：${preBudget.reason}（累计 tokens=${preBudget.cumulativeTokens}, cost=$${preBudget.cumulativeUsd.toFixed(4)}），守护进程干净退出 (exit=3)。`);
 			await sendDaemonWebhook(
 				opts.webhook,
@@ -1806,14 +2674,26 @@ async function main() {
 		let exitCode = 1;
 		let timedOut = false;
 		let timeoutKind = "";
+		let spawnedPid = 0;
 		try {
 			activeChild = Bun.spawn([opts.ompBin, ...ompArgs], {
 				cwd: opts.root,
 				env: childEnv,
+				detached: true,
 				stdin: "ignore",
 				stdout: "inherit",
 				stderr: "inherit",
 			});
+			spawnedPid = Number(activeChild.pid ?? 0);
+			if (spawnedPid > 1) {
+				registerTrackedProcessDaemon(opts.root, {
+					pid: spawnedPid,
+					pgid: spawnedPid,
+					label: "omp-child",
+					taskId: `gen-${gen}`,
+					command: opts.ompBin,
+				});
+			}
 			const watchRes = await awaitChildWithWatchdog(activeChild, {
 				root: opts.root,
 				gen,
@@ -1833,24 +2713,42 @@ async function main() {
 			logErr(`启动 ${opts.ompBin} 失败: ${err instanceof Error ? err.message : String(err)}`);
 			exitCode = 127;
 		} finally {
+			if (spawnedPid > 1) {
+				if (timedOut) {
+					cleanupTrackedProcessesDaemon(opts.root, {
+						taskId: `gen-${gen}`,
+						graceMs: 300,
+						reason: `gen_timeout:${timeoutKind}`,
+					});
+				} else {
+					unregisterTrackedProcessDaemon(opts.root, spawnedPid);
+				}
+			}
 			activeChild = null;
 		}
 
 		if (shuttingDown) return;
 
+		// 每轮结算后巡检子代理看门狗 + 校验工作区及 .git 完好性
+		sweepSubagentWatchdogDaemon(opts.root);
+		const postState = readDiskState(opts.root);
+		await reportIntegrityAlerts(`gen-${gen}-settle`, gen, postState);
+
 		if (timedOut && (timeoutKind === "hard_max_hours" || Date.now() - startedAt >= maxDurationMs)) {
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "hard_max_hours" });
 			logErr(`已达到最大运行时长上限 (${opts.maxHours}h)，超时终止第 ${gen} 代 (exit=124)。`);
 			process.exit(1);
 		}
 
-		const postState = readDiskState(opts.root);
 		if (postState?.project?.status === "completed") {
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_completed" });
 			const summary = formatCompletionSummary(opts.root, postState, gen, startedAt);
 			log(summary);
 			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, postState, gen, { summary }));
 			process.exit(0);
 		}
 		if (postState?.project?.status === "stopped" && !isReincarnateStop(postState)) {
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_stopped" });
 			const reason = postState.project?.stopReason ?? "未记录";
 			log(`项目已停机 (status=stopped)，原因: ${reason}`);
 			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, postState, gen, { reason }));
@@ -1858,6 +2756,7 @@ async function main() {
 		}
 		const postBudget = checkBudgetCap(postState, opts);
 		if (postBudget.exceeded) {
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "budget_exceeded" });
 			log(`预算上限已触发：${postBudget.reason}（累计 tokens=${postBudget.cumulativeTokens}, cost=$${postBudget.cumulativeUsd.toFixed(4)}），守护进程干净退出 (exit=3)。`);
 			await sendDaemonWebhook(
 				opts.webhook,
@@ -1874,6 +2773,7 @@ async function main() {
 		if (exitCode !== 0) {
 			consecutiveErrors += 1;
 			if (consecutiveErrors > maxConsecutiveErrors) {
+				cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "max_errors" });
 				const reason = `子进程连续异常退出 ${consecutiveErrors} 次（上限 ${maxConsecutiveErrors}）`;
 				logErr(`${reason}，停止守护。`);
 				await sendDaemonWebhook(
@@ -1919,7 +2819,8 @@ async function main() {
 		gen += 1;
 	}
 
-	// 循环结束前最后复核一次磁盘状态
+	// 循环结束前最后复核一次磁盘状态并清理所有登记子进程
+	cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "daemon_loop_exit" });
 	const finalState = readDiskState(opts.root);
 	if (finalState?.project?.status === "completed") {
 		const summary = formatCompletionSummary(opts.root, finalState, gen, startedAt);
