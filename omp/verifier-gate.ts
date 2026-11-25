@@ -12,6 +12,12 @@
  * 约束：仅使用 `import type` 引用 `./types`，严禁运行时 import `./nuwa`。
  */
 import type { Fact, FactKind, NuwaState, Phase } from "./types";
+import {
+	evaluatePositiveEvidenceGate,
+	type PositiveEvidenceGateInput,
+	type PositiveEvidenceGateResult,
+	type ResponseSnapshot,
+} from "./evidence";
 
 export type VerifyStage = "candidate" | "confirmed" | "rejected";
 
@@ -52,6 +58,27 @@ export interface VerificationOutcome {
 	stage?: "confirmed" | "rejected";
 	fact?: VerifiableFact;
 	reason?: string;
+	/** v5.1 (#24) 假阳性判定标识 */
+	falsePositive?: boolean;
+	/** v5.1 (#24) 降级建议记账类型 */
+	suggestedKind?: "note";
+	/** v5.1 (#24) 是否因假阳性复核门禁自动阻断升格并降级 */
+	downgraded?: boolean;
+	/** v5.1 (#24) 建议生成的 note(false_positive) 记账负载 */
+	downgradeNote?: {
+		kind: "note";
+		title: string;
+		detail: string;
+		falsePositiveOf: string;
+	};
+}
+
+export interface ResolveVerificationOptions {
+	falsePositive?: boolean;
+	output?: string;
+	response?: ResponseSnapshot;
+	baseline?: ResponseSnapshot | ResponseSnapshot[];
+	requireBusinessPayload?: boolean;
 }
 
 export const VERIFY_VULN_PREFIX = "verify-vuln:";
@@ -161,7 +188,7 @@ export function buildDoubleBlindVerifyIntentSpec(
 		`独立审查要求（默认假设候选为误报，须通过正负对照实验独立证实或证伪）:`,
 		`1. 优先由独立审查子代理 task(agent="nuwa-verifier") 执行，避免原发现视角确认偏差。`,
 		`2. 正例独立重现（Positive Control）：从零发起最小、非破坏性验证请求，独立确认异常行为可稳定复现且与目标直接相关。`,
-		`3. 负例基线对照（Negative Control）：构造等价的正常/无触发条件/匿名对照请求，确认正常响应与异常响应存在清晰可重复的因果差异，排除 Soft-404、通用报错页、静态回显、缓存污染或 WAF 误判。`,
+		`3. 负例基线对照（Negative Control）：构造等价的正常/无触发条件/匿名对照请求，比对状态码、字节数与响应体哈希（body_sha256），确认正向响应包含真实业务数据字段，排除仅 HTTP 200 + 微小错误壳（如 {"detail":"Not Found"}、<64B 空壳）、Soft-404、通用报错页、静态回显、缓存污染或 WAF 误判。`,
 		`4. 严格遵守授权 Scope 与最小影响原则，禁止破坏性操作，所有回显必须来自本次真实执行。`,
 		``,
 		`复验落盘契约:`,
@@ -182,15 +209,38 @@ export function buildDoubleBlindVerifyIntentSpec(
 }
 
 /**
+ * 构造假阳性降级 `note` 记账建议载荷（Issue #24 / NW-04）。
+ */
+export function buildFalsePositiveNote(
+	fact: Pick<VerifiableFact, "id" | "kind" | "title">,
+	reason: string,
+): { kind: "note"; title: string; detail: string; falsePositiveOf: string } {
+	return {
+		kind: "note",
+		title: `false_positive(${fact.id}): ${oneLine(fact.title, 80)}`,
+		detail: `原候选 ${fact.id} [${fact.kind}] 复核判定为假阳性并阻断升格：${reason}`,
+		falsePositiveOf: fact.id,
+	};
+}
+
+/**
+ * #24 (NW-04) 复核正向 `vuln`/`bypass`/`cred`/`loot` 结论是否存在假阳性风险。
+ */
+export function verifyPositiveConclusion(input: PositiveEvidenceGateInput): PositiveEvidenceGateResult {
+	return evaluatePositiveEvidenceGate(input);
+}
+
+/**
  * 结算双盲复验结果并回写原候选事实的 `verifyStage` 状态：
- * - `blocked === false`：将原候选升格为 `confirmed`（`verified = true`）；
- * - `blocked === true`：将原候选标记为 `rejected`（`verified = false`）。
+ * - `blocked === false`：先执行 v5.1 (#24) 假阳性门禁校验（如传入响应/基线/输出），若命中错误壳、空壳或同基线哈希则强制阻断升格并降级为 `rejected`（返回 `falsePositive: true`, `suggestedKind: "note"`）；通过后升格为 `confirmed`（`verified = true`）；
+ * - `blocked === true`：将原候选标记为 `rejected`（`verified = false`），并在命中误报语义时给出 `note` 记账建议。
  */
 export function resolveVerificationOutcome(
 	st: NuwaState,
 	intentKey: string,
 	blocked: boolean,
 	note?: string,
+	opts?: ResolveVerificationOptions,
 ): VerificationOutcome {
 	const factId = extractVerifyTargetFactId(intentKey);
 	if (!factId) {
@@ -210,6 +260,49 @@ export function resolveVerificationOutcome(
 	const trimmedNote = String(note ?? "").trim();
 
 	if (!blocked) {
+		let fpReason: string | undefined;
+		if (opts?.falsePositive === true) {
+			fpReason = trimmedNote || "显式标记为假阳性，阻断升格并降级为 note";
+		} else if (
+			opts &&
+			(opts.response !== undefined ||
+				opts.baseline !== undefined ||
+				opts.output !== undefined ||
+				opts.requireBusinessPayload === true)
+		) {
+			const gate = evaluatePositiveEvidenceGate({
+				kind: target.kind,
+				title: target.title,
+				detail: target.detail,
+				output: opts.output ?? target.output,
+				response: opts.response,
+				baseline: opts.baseline,
+				requireBusinessPayload: opts.requireBusinessPayload ?? true,
+			});
+			if (gate.falsePositive) {
+				fpReason = gate.reason;
+			}
+		}
+
+		if (fpReason) {
+			target.verifyStage = "rejected";
+			target.verified = false;
+			target.verifiedAt = ts;
+			target.verifiedBy = intentKey;
+			target.verifyNote = fpReason;
+			return {
+				matched: true,
+				factId,
+				stage: "rejected",
+				fact: target,
+				reason: fpReason,
+				falsePositive: true,
+				suggestedKind: "note",
+				downgraded: true,
+				downgradeNote: buildFalsePositiveNote(target, fpReason),
+			};
+		}
+
 		target.verifyStage = "confirmed";
 		target.verified = true;
 		target.verifiedAt = ts;
@@ -225,16 +318,27 @@ export function resolveVerificationOutcome(
 		};
 	}
 
+	const rejectReason = trimmedNote || "双盲复验驳回（正负对照未通过）";
 	target.verifyStage = "rejected";
 	target.verified = false;
 	target.verifiedAt = ts;
 	target.verifiedBy = intentKey;
-	target.verifyNote = trimmedNote || "双盲复验驳回（正负对照未通过）";
+	target.verifyNote = rejectReason;
+	const signalsFalsePositive =
+		opts?.falsePositive === true ||
+		/误报|假阳性|soft-404|基线一致|错误壳|false[_\s-]?positive/i.test(rejectReason);
 	return {
 		matched: true,
 		factId,
 		stage: "rejected",
 		fact: target,
+		...(signalsFalsePositive
+			? {
+					falsePositive: true,
+					suggestedKind: "note" as const,
+					downgradeNote: buildFalsePositiveNote(target, rejectReason),
+				}
+			: {}),
 	};
 }
 
@@ -276,11 +380,20 @@ export interface VerifyCommitValidationInput {
 	hasFreshExecution?: boolean;
 	executedByVerifier?: boolean;
 	requireVerifierWorker?: boolean;
+	/** v5.1 (#24) 复验回显与对照基线，用于阻断微小错误壳/空壳/同基线哈希误报升格 */
+	output?: string;
+	title?: string;
+	detail?: string;
+	response?: ResponseSnapshot;
+	baseline?: ResponseSnapshot | ResponseSnapshot[];
+	requireBusinessPayload?: boolean;
 }
 
 export interface VerifyCommitValidationResult {
 	ok: boolean;
 	reason?: string;
+	falsePositive?: boolean;
+	suggestedKind?: "note";
 }
 
 export interface FactVerifyPartition {
@@ -290,40 +403,72 @@ export interface FactVerifyPartition {
 }
 
 /**
- * 校验双盲复验提交（verify-vuln:*）的硬性门禁条件，防止绕过升格：
- * - 非 verify-vuln:* 意图或 blocked=true（驳回）直接放行；
- * - 复验确认必须使用 kind="vuln"（禁止用默认 note 绕过执行账本复验）；
- * - 要求存在晚于候选创建水位的新增独立工具执行记录（hasFreshExecution !== false）；
- * - 若启用 requireVerifierWorker 且已记录 worker，则必须由独立审查代理 nuwa-verifier 认领执行。
+ * 校验双盲复验提交（verify-vuln:*）及正向结论的硬性门禁条件，防止绕过升格与假阳性通过：
+ * - blocked=true（驳回）直接放行；
+ * - 对 verify-vuln:* 意图强制要求 kind="vuln"、存在晚于候选水位的新增独立执行记录，以及（如启用）nuwa-verifier 认领；
+ * - 对正向 vuln/bypass/cred/loot 提交，如提供 response/baseline/output，额外执行 #24 假阳性复核门禁，失败时返回 `falsePositive: true` 并建议降级为 `note`。
  */
 export function validateVerificationCommit(
 	input: VerifyCommitValidationInput,
 ): VerifyCommitValidationResult {
-	if (!input || !isVerifyVulnIntentKey(input.intentKey) || input.blocked === true) {
+	if (!input || input.blocked === true) {
 		return { ok: true };
 	}
 
 	const normKind = String(input.kind ?? "").trim().toLowerCase();
-	if (normKind !== "vuln") {
-		return {
-			ok: false,
-			reason: '双盲复验确认必须使用 kind="vuln" 并通过执行证据账本核验，禁止用默认 note 绕过升格',
-		};
+	const isVerifyIntent = isVerifyVulnIntentKey(input.intentKey);
+
+	if (isVerifyIntent) {
+		if (normKind !== "vuln") {
+			return {
+				ok: false,
+				reason: '双盲复验确认必须使用 kind="vuln" 并通过执行证据账本核验，禁止用默认 note 绕过升格',
+			};
+		}
+
+		if (input.hasFreshExecution === false) {
+			return {
+				ok: false,
+				reason: "双盲复验缺少晚于候选创建时间的独立工具执行记录，禁止复用历史输出直接升格",
+			};
+		}
+
+		const worker = String(input.worker ?? "").trim();
+		if (input.requireVerifierWorker && worker && worker !== "nuwa-verifier") {
+			return {
+				ok: false,
+				reason: "双盲复验须由独立审查代理 nuwa-verifier 认领执行",
+			};
+		}
 	}
 
-	if (input.hasFreshExecution === false) {
-		return {
-			ok: false,
-			reason: "双盲复验缺少晚于候选创建时间的独立工具执行记录，禁止复用历史输出直接升格",
-		};
-	}
-
-	const worker = String(input.worker ?? "").trim();
-	if (input.requireVerifierWorker && worker && worker !== "nuwa-verifier") {
-		return {
-			ok: false,
-			reason: "双盲复验须由独立审查代理 nuwa-verifier 认领执行",
-		};
+	const positiveKind =
+		normKind === "vuln" || normKind === "bypass" || normKind === "cred" || normKind === "loot";
+	if (
+		positiveKind &&
+		(input.response !== undefined ||
+			input.baseline !== undefined ||
+			input.output !== undefined ||
+			input.requireBusinessPayload === true)
+	) {
+		const gate = evaluatePositiveEvidenceGate({
+			kind: normKind,
+			title: input.title ?? input.candidateFact?.title,
+			detail: input.detail ?? input.candidateFact?.detail,
+			output: input.output,
+			response: input.response,
+			baseline: input.baseline,
+			requireBusinessPayload:
+				input.requireBusinessPayload ?? (input.response !== undefined || input.baseline !== undefined),
+		});
+		if (gate.falsePositive) {
+			return {
+				ok: false,
+				falsePositive: true,
+				suggestedKind: "note",
+				reason: gate.reason,
+			};
+		}
 	}
 
 	return { ok: true };

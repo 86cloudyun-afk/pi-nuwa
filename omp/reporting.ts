@@ -14,12 +14,13 @@
  * 约束：严禁运行时 `import` 或 `require` `./nuwa`，仅使用 `import type` 引用 `./types`。
  */
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { AssetNode, Fact, HypothesisNode, NuwaState } from "./types";
 import { partitionFactsByVerifyStage } from "./verifier-gate";
+import { computeBodyHash, extractHitEvidenceMetrics, readFactEvidenceLog } from "./evidence";
 import { redactVaultSecrets } from "./session-vault";
-import { atomicWrite, cell } from "./storage";
+import { atomicWrite, cell, journalPath, loadState } from "./storage";
 
 export interface FindingRuleMeta {
 	ruleId: string;
@@ -822,4 +823,882 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 		files: writtenFiles.sort(),
 		confirmedCount: confirmed.length,
 	};
+}
+
+// ============================================================================
+// v5.1 Episode 时间线导出与结构化归档索引检索
+// 覆盖 Issues: #42 (NW-22), #52 (NW-32)
+// ============================================================================
+
+type FactWithExtendedRefs = Fact & {
+	evidenceRef?: string;
+	agentResult?: Record<string, unknown>;
+	episode?: number;
+};
+
+export interface TimelineEventItem {
+	ts: string;
+	source: "fact" | "intent" | "journal" | "exec_ledger";
+	episode: number;
+	phase?: string;
+	id?: string;
+	kind?: string;
+	status?: string;
+	title: string;
+	command?: string;
+	summary?: string;
+	evidenceRef?: string;
+	evidenceExists?: boolean;
+	evidenceBytes?: number;
+	evidenceExcerpt?: string;
+	blocked?: boolean;
+}
+
+export interface EpisodeTimelineData {
+	schema: 1;
+	projectId: string;
+	target: string;
+	episodeFilter?: number;
+	currentEpisode: number;
+	generatedAt: string;
+	counts: {
+		total: number;
+		facts: number;
+		intents: number;
+		journal: number;
+		execLedger: number;
+		withEvidenceRef: number;
+	};
+	events: TimelineEventItem[];
+}
+
+export interface ExportEpisodeTimelineOptions {
+	episode?: number;
+	format?: "markdown" | "json";
+	state?: NuwaState;
+	includeEvidenceExcerpt?: boolean;
+}
+
+interface RawJournalLine {
+	ts?: string;
+	type?: string;
+	episode?: number;
+	phase?: string;
+	id?: string;
+	factId?: string;
+	intentId?: string;
+	title?: string;
+	note?: string;
+	reason?: string;
+	command?: string;
+	evidenceRef?: string;
+	blocked?: boolean;
+	[key: string]: unknown;
+}
+
+interface RawLedgerLine {
+	seq?: number;
+	ts?: string;
+	tool?: string;
+	command?: string;
+	agentName?: string;
+	sha1?: string;
+	bytes?: number;
+	snippet?: string;
+}
+
+function readJsonlRecords<T>(filePath: string): T[] {
+	if (!existsSync(filePath)) return [];
+	try {
+		const raw = readFileSync(filePath, "utf8");
+		const out: T[] = [];
+		for (const line of raw.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			try {
+				const parsed = JSON.parse(trimmed) as T;
+				if (parsed && typeof parsed === "object") out.push(parsed);
+			} catch {
+				/* 跳过损坏行 */
+			}
+		}
+		return out;
+	} catch {
+		return [];
+	}
+}
+
+function resolveEpisodeAtTimestamp(
+	ts: string,
+	boundaries: Array<{ tsMs: number; episode: number }>,
+	fallbackEpisode: number,
+): number {
+	const ms = Date.parse(ts);
+	if (!Number.isFinite(ms) || boundaries.length === 0) return fallbackEpisode;
+	let ep = boundaries[0]!.episode;
+	for (const b of boundaries) {
+		if (b.tsMs <= ms) ep = b.episode;
+		else break;
+	}
+	return ep;
+}
+
+function inspectEvidenceFile(
+	normRoot: string,
+	factId: string,
+	explicitRef?: string,
+	includeExcerpt = true,
+): { evidenceRef?: string; evidenceExists?: boolean; evidenceBytes?: number; evidenceExcerpt?: string } {
+	const safeId = factId.replace(/[^a-zA-Z0-9._-]/g, "_");
+	const defaultRef = `.nuwa/evidence/${safeId}.log`;
+	const ref = explicitRef?.trim() || (existsSync(join(normRoot, defaultRef)) ? defaultRef : undefined);
+	if (!ref) return {};
+	const full = resolve(normRoot, ref);
+	const evBase = resolve(join(normRoot, ".nuwa", "evidence"));
+	if (!full.startsWith(`${evBase}/`) && full !== evBase) {
+		return { evidenceRef: ref, evidenceExists: false };
+	}
+	if (!existsSync(full)) {
+		return { evidenceRef: ref, evidenceExists: false };
+	}
+	let bytes: number | undefined;
+	try {
+		bytes = statSync(full).size;
+	} catch {
+		bytes = undefined;
+	}
+	let excerpt: string | undefined;
+	if (includeExcerpt) {
+		const content = readFactEvidenceLog(normRoot, ref);
+		if (content) {
+			const compact = content.replace(/\r/g, "").trim();
+			excerpt = compact.length > 240 ? `${compact.slice(0, 240)}...` : compact;
+		}
+	}
+	return {
+		evidenceRef: ref,
+		evidenceExists: true,
+		...(bytes !== undefined ? { evidenceBytes: bytes } : {}),
+		...(excerpt ? { evidenceExcerpt: excerpt } : {}),
+	};
+}
+
+const SOURCE_ORDER: Record<TimelineEventItem["source"], number> = {
+	journal: 0,
+	exec_ledger: 1,
+	intent: 2,
+	fact: 3,
+};
+
+/**
+ * #42 (NW-22) 构建账本与落盘证据关联的结构化 Episode 时间线数据。
+ */
+export function buildEpisodeTimelineData(
+	root: string,
+	opts?: ExportEpisodeTimelineOptions,
+): EpisodeTimelineData {
+	const normRoot = resolve(root || process.cwd());
+	const st = opts?.state ?? loadState(normRoot);
+	const includeExcerpt = opts?.includeEvidenceExcerpt !== false;
+	const currentEpisode = st?.project?.episode && st.project.episode > 0 ? st.project.episode : 1;
+	const episodeFilter =
+		typeof opts?.episode === "number" && Number.isFinite(opts.episode) && opts.episode > 0
+			? Math.floor(opts.episode)
+			: undefined;
+
+	const rawJournal = readJsonlRecords<RawJournalLine>(journalPath(normRoot));
+	const rawLedger = readJsonlRecords<RawLedgerLine>(join(normRoot, ".nuwa", "exec-ledger.jsonl"));
+
+	// 从 journal 提取 episode 跃迁边界
+	const boundaries: Array<{ tsMs: number; episode: number }> = [];
+	for (const rec of rawJournal) {
+		if (typeof rec.episode === "number" && Number.isFinite(rec.episode) && rec.episode > 0 && rec.ts) {
+			const ms = Date.parse(rec.ts);
+			if (Number.isFinite(ms)) {
+				boundaries.push({ tsMs: ms, episode: Math.floor(rec.episode) });
+			}
+		}
+	}
+	boundaries.sort((a, b) => a.tsMs - b.tsMs);
+
+	const events: TimelineEventItem[] = [];
+
+	// 1. Journal 事件（跳过体积庞大的 snapshot 记录）
+	for (const rec of rawJournal) {
+		if (rec.type === "snapshot") continue;
+		const ts = typeof rec.ts === "string" && rec.ts ? rec.ts : new Date(0).toISOString();
+		const ep =
+			typeof rec.episode === "number" && Number.isFinite(rec.episode) && rec.episode > 0
+				? Math.floor(rec.episode)
+				: resolveEpisodeAtTimestamp(ts, boundaries, currentEpisode);
+		const summaryParts = [rec.title, rec.note, rec.reason]
+			.filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+			.map((x) => x.trim());
+		events.push({
+			ts,
+			source: "journal",
+			episode: ep,
+			...(typeof rec.phase === "string" ? { phase: rec.phase } : {}),
+			...(typeof rec.id === "string"
+				? { id: rec.id }
+				: typeof rec.factId === "string"
+					? { id: rec.factId }
+					: typeof rec.intentId === "string"
+						? { id: rec.intentId }
+						: {}),
+			kind: typeof rec.type === "string" ? rec.type : "event",
+			title: summaryParts[0] || `journal:${String(rec.type ?? "event")}`,
+			...(typeof rec.command === "string" && rec.command ? { command: rec.command } : {}),
+			...(summaryParts.length > 0 ? { summary: summaryParts.join(" | ") } : {}),
+			...(typeof rec.evidenceRef === "string" && rec.evidenceRef ? { evidenceRef: rec.evidenceRef } : {}),
+			...(rec.blocked === true ? { blocked: true } : {}),
+		});
+	}
+
+	// 2. 执行账本（exec-ledger.jsonl）
+	for (const rec of rawLedger) {
+		const ts = typeof rec.ts === "string" && rec.ts ? rec.ts : new Date(0).toISOString();
+		const ep = resolveEpisodeAtTimestamp(ts, boundaries, currentEpisode);
+		events.push({
+			ts,
+			source: "exec_ledger",
+			episode: ep,
+			id: rec.seq !== undefined ? `exec#${rec.seq}` : undefined,
+			kind: rec.tool || "exec",
+			title: `[${rec.tool || "exec"}${rec.agentName ? `/${rec.agentName}` : ""}] ${cell(rec.command || rec.snippet, 96)}`,
+			...(rec.command ? { command: rec.command } : {}),
+			summary: `bytes=${rec.bytes ?? 0} sha1=${(rec.sha1 ?? "").slice(0, 12)} ${cell(rec.snippet, 120)}`.trim(),
+		});
+	}
+
+	// 3. Intents（含 done / blocked / claimed 节点）
+	if (st?.intents) {
+		for (const intent of Object.values(st.intents)) {
+			if (!intent) continue;
+			const ts = intent.doneAt || intent.claimedAt || intent.createdAt || new Date(0).toISOString();
+			const ep = resolveEpisodeAtTimestamp(ts, boundaries, currentEpisode);
+			const linkedFact = intent.to ? (st.facts?.[intent.to] as FactWithExtendedRefs | undefined) : undefined;
+			const evMeta = linkedFact
+				? inspectEvidenceFile(normRoot, linkedFact.id, linkedFact.evidenceRef, includeExcerpt)
+				: {};
+			events.push({
+				ts,
+				source: "intent",
+				episode: ep,
+				phase: intent.phase,
+				id: intent.id,
+				kind: intent.key,
+				status: intent.status,
+				title: intent.title,
+				...(linkedFact?.command ? { command: linkedFact.command } : {}),
+				summary:
+					intent.status === "blocked"
+						? `blocked: ${intent.note || "无说明"}`
+						: intent.to
+							? `-> ${intent.to} (${linkedFact?.kind ?? "fact"})`
+							: intent.note || intent.status,
+				blocked: intent.status === "blocked",
+				...evMeta,
+			});
+		}
+	}
+
+	// 4. Facts（自动关联 .nuwa/evidence/<factId>.log）
+	if (st?.facts) {
+		for (const rawFact of Object.values(st.facts)) {
+			const fact = rawFact as FactWithExtendedRefs;
+			if (!fact || !fact.id) continue;
+			const ts = fact.verifiedAt || fact.createdAt || new Date(0).toISOString();
+			const ep =
+				typeof fact.episode === "number" && Number.isFinite(fact.episode) && fact.episode > 0
+					? Math.floor(fact.episode)
+					: resolveEpisodeAtTimestamp(ts, boundaries, currentEpisode);
+			const evMeta = inspectEvidenceFile(normRoot, fact.id, fact.evidenceRef, includeExcerpt);
+			events.push({
+				ts,
+				source: "fact",
+				episode: ep,
+				id: fact.id,
+				kind: fact.kind,
+				status: fact.verifyStage ?? (fact.kind === "blocked" ? "blocked" : "recorded"),
+				title: fact.title,
+				...(fact.command ? { command: fact.command } : {}),
+				summary: fact.detail || fact.output || "",
+				blocked: fact.kind === "blocked",
+				...evMeta,
+			});
+		}
+	}
+
+	const filtered =
+		episodeFilter !== undefined ? events.filter((e) => e.episode === episodeFilter) : events;
+
+	filtered.sort((a, b) => {
+		const ta = Date.parse(a.ts);
+		const tb = Date.parse(b.ts);
+		if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+		if (a.ts !== b.ts) return a.ts.localeCompare(b.ts);
+		if (SOURCE_ORDER[a.source] !== SOURCE_ORDER[b.source]) {
+			return SOURCE_ORDER[a.source] - SOURCE_ORDER[b.source];
+		}
+		return String(a.id ?? "").localeCompare(String(b.id ?? ""));
+	});
+
+	const data: EpisodeTimelineData = {
+		schema: 1,
+		projectId: st?.project?.id ?? "unknown",
+		target: st?.project?.url || st?.project?.target || "",
+		...(episodeFilter !== undefined ? { episodeFilter } : {}),
+		currentEpisode,
+		generatedAt: new Date().toISOString(),
+		counts: {
+			total: filtered.length,
+			facts: filtered.filter((e) => e.source === "fact").length,
+			intents: filtered.filter((e) => e.source === "intent").length,
+			journal: filtered.filter((e) => e.source === "journal").length,
+			execLedger: filtered.filter((e) => e.source === "exec_ledger").length,
+			withEvidenceRef: filtered.filter((e) => Boolean(e.evidenceRef)).length,
+		},
+		events: filtered,
+	};
+
+	return redactDeep(data, normRoot);
+}
+
+/**
+ * #42 (NW-22) 导出账本与落盘证据关联的 Episode 时间线（支持 `markdown` 与 `json` 两种格式）。
+ */
+export function exportEpisodeTimeline(root: string, opts?: ExportEpisodeTimelineOptions): string {
+	const data = buildEpisodeTimelineData(root, opts);
+	const format = opts?.format ?? "markdown";
+	if (format === "json") {
+		return `${JSON.stringify(data, null, 2)}\n`;
+	}
+
+	const heading =
+		data.episodeFilter !== undefined
+			? `# Episode E${data.episodeFilter} 账本与证据时间线`
+			: `# 全量账本与证据时间线 (当前 E${data.currentEpisode})`;
+
+	const lines: string[] = [
+		heading,
+		``,
+		`- 项目 ID: ${data.projectId}`,
+		`- 目标: ${data.target || "(未记录)"}`,
+		`- 导出时间: ${data.generatedAt}`,
+		`- 统计: total=${data.counts.total} · facts=${data.counts.facts} · intents=${data.counts.intents} · exec=${data.counts.execLedger} · journal=${data.counts.journal} · evidenceRef=${data.counts.withEvidenceRef}`,
+		``,
+		`| 时间 | E# | 来源 | ID | 类型/状态 | 标题与摘要 | 命令 | 证据指针 |`,
+		`|---|---|---|---|---|---|---|---|`,
+	];
+
+	if (data.events.length === 0) {
+		lines.push(`| - | - | - | - | - | (无匹配时间线记录) | - | - |`);
+	} else {
+		for (const ev of data.events) {
+			const kindStatus = [ev.kind, ev.status].filter(Boolean).join("/");
+			const titleSummary = ev.summary && ev.summary !== ev.title ? `${ev.title} — ${ev.summary}` : ev.title;
+			const evCell = ev.evidenceRef
+				? `${ev.evidenceRef}${ev.evidenceExists ? ` (${ev.evidenceBytes ?? 0}B)` : " (missing)"}`
+				: "-";
+			lines.push(
+				`| ${ev.ts} | E${ev.episode} | ${ev.source} | ${ev.id ?? "-"} | ${cell(kindStatus, 40)} | ${cell(titleSummary, 140)} | ${cell(ev.command, 90) || "-"} | ${cell(evCell, 80)} |`,
+			);
+		}
+	}
+
+	const excerptItems = data.events.filter((e) => e.evidenceRef && e.evidenceExcerpt);
+	if (excerptItems.length > 0) {
+		lines.push(``, `## 关联落盘证据摘录`);
+		for (const item of excerptItems) {
+			lines.push(
+				``,
+				`### ${item.id ?? item.title} (\`${item.evidenceRef}\`)`,
+				"```text",
+				item.evidenceExcerpt!,
+				"```",
+			);
+		}
+	}
+
+	lines.push(``);
+	return maybeRedact(lines.join("\n"), root);
+}
+
+// ----------------------------------------------------------------------------
+// #52 (NW-32) 结构化归档索引器 writeEpisodeArchiveIndex 与检索器 searchArchiveIndexes
+// ----------------------------------------------------------------------------
+
+export interface ArchiveFactRecord {
+	id: string;
+	kind: string;
+	title: string;
+	detail?: string;
+	target?: string;
+	command?: string;
+	statusCode?: number;
+	bytes?: number;
+	bodySha256?: string;
+	evidenceRef?: string;
+	verifyStage?: string;
+	blocked?: boolean;
+	createdAt?: string;
+}
+
+export interface ArchiveCommandRecord {
+	cmd: string;
+	statusCode?: number;
+	bytes?: number;
+	bodySha256?: string;
+	remoteIp?: string;
+	cfRay?: string;
+	server?: string;
+	timeTotal?: number;
+	factId?: string;
+	ts?: string;
+}
+
+export interface EpisodeArchiveInput {
+	episode: number;
+	projectId?: string;
+	target?: string;
+	phase?: string;
+	summary?: string;
+	state?: NuwaState;
+	facts?: ArchiveFactRecord[];
+	commands?: ArchiveCommandRecord[];
+	generatedAt?: string;
+}
+
+export interface EpisodeArchiveIndex {
+	schema: 1;
+	episode: number;
+	projectId: string;
+	target: string;
+	phase: string;
+	summary: string;
+	generatedAt: string;
+	facts: ArchiveFactRecord[];
+	commands: ArchiveCommandRecord[];
+	stats: {
+		factCount: number;
+		commandCount: number;
+		statusCodes: number[];
+		hashes: string[];
+	};
+}
+
+export interface WriteEpisodeArchiveResult {
+	episode: number;
+	jsonPath: string;
+	markdownPath: string;
+	index: EpisodeArchiveIndex;
+}
+
+export interface ArchiveSearchQuery {
+	text?: string;
+	factId?: string;
+	kind?: string;
+	episode?: number;
+	statusCode?: number;
+	hash?: string;
+	command?: string;
+	limit?: number;
+}
+
+export interface ArchiveSearchHit {
+	episode: number;
+	source: "fact" | "command";
+	archiveFile: string;
+	factId?: string;
+	kind?: string;
+	title?: string;
+	command?: string;
+	statusCode?: number;
+	bytes?: number;
+	bodySha256?: string;
+	evidenceRef?: string;
+	snippet: string;
+	score: number;
+}
+
+function extractArchiveFactFromState(fact: FactWithExtendedRefs, normRoot: string): ArchiveFactRecord {
+	const combinedText = `${fact.output ?? ""}\n${fact.detail ?? ""}`;
+	const metrics = extractHitEvidenceMetrics(combinedText);
+	const shaMatch = /\b(?:body_sha256|sha256)\s*[:=]\s*([a-fA-F0-9]{64})\b/i.exec(combinedText);
+	const bytesMatch = /\b(\d+)\s*B\b/.exec(combinedText);
+	const statusCode = fact.meta?.status ?? metrics.http_code;
+	const bytes =
+		metrics.size_download ??
+		(bytesMatch?.[1] ? Number(bytesMatch[1]) : undefined) ??
+		(fact.output !== undefined ? Buffer.byteLength(fact.output, "utf8") : undefined);
+	const bodySha256 =
+		shaMatch?.[1]?.toLowerCase() ??
+		(fact.output && fact.output.trim() ? computeBodyHash(fact.output.trim(), "sha256") : undefined);
+	const defaultEvRef = `.nuwa/evidence/${fact.id.replace(/[^a-zA-Z0-9._-]/g, "_")}.log`;
+	const evidenceRef = fact.evidenceRef || (existsSync(join(normRoot, defaultEvRef)) ? defaultEvRef : undefined);
+	const urlMatch = /https?:\/\/[^\s"'<>`]+/i.exec(`${fact.command ?? ""} ${fact.detail ?? ""}`);
+
+	return {
+		id: fact.id,
+		kind: fact.kind,
+		title: fact.title,
+		...(fact.detail ? { detail: fact.detail } : {}),
+		...(urlMatch?.[0] ? { target: urlMatch[0] } : {}),
+		...(fact.command ? { command: fact.command } : {}),
+		...(statusCode !== undefined ? { statusCode } : {}),
+		...(bytes !== undefined ? { bytes } : {}),
+		...(bodySha256 ? { bodySha256 } : {}),
+		...(evidenceRef ? { evidenceRef } : {}),
+		...(fact.verifyStage ? { verifyStage: fact.verifyStage } : {}),
+		...(fact.kind === "blocked" ? { blocked: true } : {}),
+		createdAt: fact.createdAt,
+	};
+}
+
+function renderEpisodeArchiveMarkdown(index: EpisodeArchiveIndex): string {
+	const lines: string[] = [
+		`# Episode E${index.episode} 结构化归档索引`,
+		``,
+		`- 项目 ID: ${index.projectId}`,
+		`- 目标: ${index.target || "(未记录)"}`,
+		`- 阶段: ${index.phase}`,
+		`- 生成时间: ${index.generatedAt}`,
+		`- 统计: facts=${index.stats.factCount} · commands=${index.stats.commandCount} · statusCodes=[${index.stats.statusCodes.join(", ")}]`,
+	];
+
+	if (index.summary) {
+		lines.push(``, `## 摘要`, index.summary);
+	}
+
+	lines.push(
+		``,
+		`## 事实索引表`,
+		`| factId | kind | 标题 | 状态码 | 字节数 | 响应哈希 (SHA-256) | 证据指针 | 命令 |`,
+		`|---|---|---|---|---|---|---|---|`,
+	);
+	if (index.facts.length === 0) {
+		lines.push(`| - | - | (无事实记录) | - | - | - | - | - |`);
+	} else {
+		for (const f of index.facts) {
+			lines.push(
+				`| ${f.id} | ${f.kind} | ${cell(f.title, 90)} | ${f.statusCode ?? "-"} | ${f.bytes ?? "-"} | ${f.bodySha256 ?? "-"} | ${f.evidenceRef ?? "-"} | ${cell(f.command, 90) || "-"} |`,
+			);
+		}
+	}
+
+	lines.push(
+		``,
+		`## 命令与探针指标表`,
+		`| 命令 | 状态码 | 字节数 | 响应哈希 (SHA-256) | remote_ip | cf_ray/server | 耗时(s) | 关联事实 |`,
+		`|---|---|---|---|---|---|---|---|`,
+	);
+	if (index.commands.length === 0) {
+		lines.push(`| (无命令记录) | - | - | - | - | - | - | - |`);
+	} else {
+		for (const c of index.commands) {
+			const edge = [c.cfRay, c.server].filter(Boolean).join(" / ") || "-";
+			lines.push(
+				`| ${cell(c.cmd, 110)} | ${c.statusCode ?? "-"} | ${c.bytes ?? "-"} | ${c.bodySha256 ?? "-"} | ${c.remoteIp ?? "-"} | ${cell(edge, 48)} | ${c.timeTotal ?? "-"} | ${c.factId ?? "-"} |`,
+			);
+		}
+	}
+
+	lines.push(``);
+	return lines.join("\n");
+}
+
+/**
+ * #52 (NW-32) 结构化归档索引器：
+ * 将 Episode 事实表、命令、状态码、字节数、响应哈希脱敏后持久化至
+ * `<root>/.nuwa/archive/episode-<N>.json` 与 `.md`，防止长会话压缩丢失精确检索能力。
+ */
+export function writeEpisodeArchiveIndex(
+	root: string,
+	episodeData: EpisodeArchiveInput,
+): WriteEpisodeArchiveResult {
+	const normRoot = resolve(root || process.cwd());
+	const st = episodeData.state;
+	const rawEp = episodeData.episode ?? st?.project?.episode ?? 1;
+	const episode = Number.isFinite(rawEp) && rawEp > 0 ? Math.floor(rawEp) : 1;
+
+	const archiveDir = join(normRoot, ".nuwa", "archive");
+	ensureSecureDir(join(normRoot, ".nuwa"));
+	ensureSecureDir(archiveDir);
+
+	// 合并显式传入与 state 中的 facts
+	const factMap = new Map<string, ArchiveFactRecord>();
+	if (st?.facts) {
+		for (const f of Object.values(st.facts)) {
+			if (!f || !f.id) continue;
+			factMap.set(f.id, extractArchiveFactFromState(f as FactWithExtendedRefs, normRoot));
+		}
+	}
+	for (const f of episodeData.facts ?? []) {
+		if (!f || !f.id) continue;
+		const prev = factMap.get(f.id);
+		factMap.set(f.id, {
+			...prev,
+			...f,
+			bodySha256: f.bodySha256 ? f.bodySha256.toLowerCase() : prev?.bodySha256,
+		});
+	}
+	const facts = [...factMap.values()].sort((a, b) => a.id.localeCompare(b.id));
+
+	// 合并显式 commands 与 facts 中携带的命令
+	const commands: ArchiveCommandRecord[] = [];
+	const cmdDedup = new Set<string>();
+	const pushCmd = (c: ArchiveCommandRecord) => {
+		const cmdText = String(c.cmd ?? "").trim();
+		if (!cmdText) return;
+		const key = `${cmdText}|${c.statusCode ?? ""}|${c.bytes ?? ""}|${c.bodySha256 ?? ""}|${c.factId ?? ""}`;
+		if (cmdDedup.has(key)) return;
+		cmdDedup.add(key);
+		commands.push({
+			...c,
+			cmd: cmdText,
+			...(c.bodySha256 ? { bodySha256: c.bodySha256.toLowerCase() } : {}),
+		});
+	};
+
+	for (const c of episodeData.commands ?? []) {
+		pushCmd(c);
+	}
+	for (const f of facts) {
+		if (f.command) {
+			pushCmd({
+				cmd: f.command,
+				statusCode: f.statusCode,
+				bytes: f.bytes,
+				bodySha256: f.bodySha256,
+				factId: f.id,
+				ts: f.createdAt,
+			});
+		}
+	}
+
+	const statusCodes = [
+		...new Set(
+			[
+				...facts.map((f) => f.statusCode),
+				...commands.map((c) => c.statusCode),
+			].filter((n): n is number => typeof n === "number" && Number.isFinite(n)),
+		),
+	].sort((a, b) => a - b);
+
+	const hashes = [
+		...new Set(
+			[
+				...facts.map((f) => f.bodySha256),
+				...commands.map((c) => c.bodySha256),
+			].filter((h): h is string => typeof h === "string" && h.trim().length > 0),
+		),
+	].sort();
+
+	const rawIndex: EpisodeArchiveIndex = {
+		schema: 1,
+		episode,
+		projectId: episodeData.projectId ?? st?.project?.id ?? "unknown",
+		target: episodeData.target ?? st?.project?.url ?? st?.project?.target ?? "",
+		phase: episodeData.phase ?? st?.project?.phase ?? "report",
+		summary: episodeData.summary ?? "",
+		generatedAt: episodeData.generatedAt ?? new Date().toISOString(),
+		facts,
+		commands,
+		stats: {
+			factCount: facts.length,
+			commandCount: commands.length,
+			statusCodes,
+			hashes,
+		},
+	};
+
+	const safeIndex = redactDeep(rawIndex, normRoot);
+	const jsonPath = join(archiveDir, `episode-${episode}.json`);
+	const markdownPath = join(archiveDir, `episode-${episode}.md`);
+
+	writeSecureFile(jsonPath, `${JSON.stringify(safeIndex, null, 2)}\n`);
+	writeSecureFile(markdownPath, maybeRedact(renderEpisodeArchiveMarkdown(safeIndex), normRoot));
+
+	return {
+		episode,
+		jsonPath,
+		markdownPath,
+		index: safeIndex,
+	};
+}
+
+/**
+ * #52 (NW-32) 结构化归档检索器：
+ * 扫描 `<root>/.nuwa/archive/episode-*.json`，支持按关键词、factId、kind、episode、
+ * statusCode、bodySha256（前缀/全匹配）与命令片段进行高速检索。
+ */
+export function searchArchiveIndexes(
+	root: string,
+	query: string | ArchiveSearchQuery,
+): ArchiveSearchHit[] {
+	const normRoot = resolve(root || process.cwd());
+	const archiveDir = join(normRoot, ".nuwa", "archive");
+	if (!existsSync(archiveDir)) return [];
+
+	const q: ArchiveSearchQuery =
+		typeof query === "string" ? { text: query } : query && typeof query === "object" ? query : {};
+
+	const textTokens = (q.text ?? "")
+		.trim()
+		.toLowerCase()
+		.split(/\s+/)
+		.filter(Boolean);
+	const factIdFilter = q.factId?.trim().toLowerCase();
+	const kindFilter = q.kind?.trim().toLowerCase();
+	const epFilter =
+		typeof q.episode === "number" && Number.isFinite(q.episode) && q.episode > 0
+			? Math.floor(q.episode)
+			: undefined;
+	const statusFilter =
+		typeof q.statusCode === "number" && Number.isFinite(q.statusCode)
+			? Math.floor(q.statusCode)
+			: undefined;
+	const hashFilter = q.hash?.trim().toLowerCase();
+	const cmdFilter = q.command?.trim().toLowerCase();
+	const limit =
+		typeof q.limit === "number" && Number.isFinite(q.limit) && q.limit > 0 ? Math.floor(q.limit) : 50;
+
+	let files: string[];
+	try {
+		files = readdirSync(archiveDir)
+			.filter((name) => /^episode-\d+\.json$/i.test(name))
+			.sort((a, b) => {
+				const na = Number(/\d+/.exec(a)?.[0] ?? 0);
+				const nb = Number(/\d+/.exec(b)?.[0] ?? 0);
+				return na - nb;
+			});
+	} catch {
+		return [];
+	}
+
+	const hits: ArchiveSearchHit[] = [];
+
+	for (const fileName of files) {
+		const fullPath = join(archiveDir, fileName);
+		let idx: EpisodeArchiveIndex;
+		try {
+			idx = JSON.parse(readFileSync(fullPath, "utf8")) as EpisodeArchiveIndex;
+		} catch {
+			continue;
+		}
+		if (!idx || typeof idx.episode !== "number") continue;
+		if (epFilter !== undefined && idx.episode !== epFilter) continue;
+
+		const relArchive = `.nuwa/archive/${fileName}`;
+
+		// 1. 检索 facts
+		for (const f of idx.facts ?? []) {
+			if (factIdFilter && f.id.toLowerCase() !== factIdFilter) continue;
+			if (kindFilter && f.kind.toLowerCase() !== kindFilter) continue;
+			if (statusFilter !== undefined && f.statusCode !== statusFilter) continue;
+			if (hashFilter && !(f.bodySha256 ?? "").toLowerCase().includes(hashFilter)) continue;
+			if (cmdFilter && !(f.command ?? "").toLowerCase().includes(cmdFilter)) continue;
+
+			const haystack = [
+				f.id,
+				f.kind,
+				f.title,
+				f.detail ?? "",
+				f.target ?? "",
+				f.command ?? "",
+				f.statusCode !== undefined ? String(f.statusCode) : "",
+				f.bytes !== undefined ? String(f.bytes) : "",
+				f.bodySha256 ?? "",
+				f.evidenceRef ?? "",
+			]
+				.join(" ")
+				.toLowerCase();
+
+			if (textTokens.length > 0 && !textTokens.every((t) => haystack.includes(t))) continue;
+
+			let score = 10;
+			if (factIdFilter && f.id.toLowerCase() === factIdFilter) score += 50;
+			if (hashFilter && f.bodySha256?.toLowerCase() === hashFilter) score += 40;
+			if (statusFilter !== undefined && f.statusCode === statusFilter) score += 15;
+			for (const t of textTokens) {
+				if (f.id.toLowerCase() === t) score += 40;
+				else if (f.title.toLowerCase().includes(t)) score += 15;
+				else if ((f.command ?? "").toLowerCase().includes(t)) score += 10;
+				else score += 5;
+			}
+
+			hits.push({
+				episode: idx.episode,
+				source: "fact",
+				archiveFile: relArchive,
+				factId: f.id,
+				kind: f.kind,
+				title: f.title,
+				...(f.command ? { command: f.command } : {}),
+				...(f.statusCode !== undefined ? { statusCode: f.statusCode } : {}),
+				...(f.bytes !== undefined ? { bytes: f.bytes } : {}),
+				...(f.bodySha256 ? { bodySha256: f.bodySha256 } : {}),
+				...(f.evidenceRef ? { evidenceRef: f.evidenceRef } : {}),
+				snippet: `${f.id} [${f.kind}] ${f.title}${f.statusCode !== undefined ? ` (${f.statusCode}/${f.bytes ?? "?"}B)` : ""}`,
+				score,
+			});
+		}
+
+		// 2. 检索 commands（当未限定非 command 专属 kindFilter 时）
+		if (!kindFilter) {
+			for (const c of idx.commands ?? []) {
+				if (factIdFilter && (c.factId ?? "").toLowerCase() !== factIdFilter) continue;
+				if (statusFilter !== undefined && c.statusCode !== statusFilter) continue;
+				if (hashFilter && !(c.bodySha256 ?? "").toLowerCase().includes(hashFilter)) continue;
+				if (cmdFilter && !c.cmd.toLowerCase().includes(cmdFilter)) continue;
+
+				const haystack = [
+					c.cmd,
+					c.factId ?? "",
+					c.statusCode !== undefined ? String(c.statusCode) : "",
+					c.bytes !== undefined ? String(c.bytes) : "",
+					c.bodySha256 ?? "",
+					c.remoteIp ?? "",
+					c.cfRay ?? "",
+					c.server ?? "",
+				]
+					.join(" ")
+					.toLowerCase();
+
+				if (textTokens.length > 0 && !textTokens.every((t) => haystack.includes(t))) continue;
+
+				let score = 8;
+				if (hashFilter && c.bodySha256?.toLowerCase() === hashFilter) score += 35;
+				if (cmdFilter && c.cmd.toLowerCase().includes(cmdFilter)) score += 20;
+				if (statusFilter !== undefined && c.statusCode === statusFilter) score += 12;
+				for (const t of textTokens) {
+					if (c.cmd.toLowerCase().includes(t)) score += 12;
+					else score += 4;
+				}
+
+				hits.push({
+					episode: idx.episode,
+					source: "command",
+					archiveFile: relArchive,
+					...(c.factId ? { factId: c.factId } : {}),
+					command: c.cmd,
+					...(c.statusCode !== undefined ? { statusCode: c.statusCode } : {}),
+					...(c.bytes !== undefined ? { bytes: c.bytes } : {}),
+					...(c.bodySha256 ? { bodySha256: c.bodySha256 } : {}),
+					snippet: `${cell(c.cmd, 100)}${c.statusCode !== undefined ? ` => ${c.statusCode}/${c.bytes ?? "?"}B` : ""}`,
+					score,
+				});
+			}
+		}
+	}
+
+	hits.sort((a, b) => {
+		if (b.score !== a.score) return b.score - a.score;
+		if (b.episode !== a.episode) return b.episode - a.episode;
+		if (a.source !== b.source) return a.source === "fact" ? -1 : 1;
+		return (a.factId ?? a.command ?? "").localeCompare(b.factId ?? b.command ?? "");
+	});
+
+	return hits.slice(0, limit);
 }

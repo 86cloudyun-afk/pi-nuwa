@@ -10,7 +10,17 @@
  * 约束：仅使用 import type 引用 ./types（严禁运行时 import ./nuwa），确保零循环依赖。
  */
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	writeSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { Phase } from "./types";
@@ -799,4 +809,1080 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 	}
 
 	return undefined;
+}
+
+// ============================================================================
+// v5.1 派单目标自动注入、派单守卫与回执登记表、批派单分片/溢写、在途目标去重池
+// 覆盖 Issues: #26 (NW-06), #27 (NW-07), #28 (NW-08), #50 (NW-30)
+// ============================================================================
+
+function sha256Short(input: string, len = 16): string {
+	return createHash("sha256").update(input, "utf8").digest("hex").slice(0, len);
+}
+
+function secureAtomicWriteJson(filePath: string, data: unknown): void {
+	mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+	const body = `${JSON.stringify(data, null, 2)}\n`;
+	const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${atomicLineageSeq++}`;
+	const fd = openSync(tmp, "w", 0o600);
+	try {
+		writeSync(fd, body);
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	try {
+		chmodSync(tmp, 0o600);
+	} catch {
+		/* 非 POSIX 忽略 */
+	}
+	renameSync(tmp, filePath);
+	try {
+		chmodSync(filePath, 0o600);
+	} catch {
+		/* 非 POSIX 忽略 */
+	}
+}
+
+// ----------------------------------------------------------------------------
+// #26 (NW-06) 派单构建时自动注入 resolved_host 与目标 URL
+// ----------------------------------------------------------------------------
+
+export interface DispatchTargetContext {
+	url?: string;
+	target?: string;
+	host?: string;
+	resolvedHost?: string;
+	port?: number;
+	scheme?: string;
+	resolvedIp?: string;
+	egress?: string;
+}
+
+export interface DispatchPacketInput {
+	task: string;
+	target: DispatchTargetContext;
+	intentId?: string;
+	agent?: string;
+	targetKey?: string;
+}
+
+export interface DispatchPacketResult {
+	task: string;
+	resolvedHost: string;
+	targetUrl: string;
+	targetKey: string;
+	injected: boolean;
+	replacedPlaceholders: number;
+}
+
+function resolveTargetEndpoint(target: DispatchTargetContext): { resolvedHost: string; targetUrl: string } {
+	const rawUrl = String(target.url ?? target.target ?? "").trim();
+	const rawHost = String(target.resolvedHost ?? target.host ?? "").trim();
+
+	if (rawUrl) {
+		const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawUrl)
+			? rawUrl
+			: `${target.scheme || (target.port === 443 ? "https" : "http")}://${rawUrl}`;
+		try {
+			const u = new URL(withScheme);
+			const host = rawHost || u.hostname;
+			const portPart = u.port
+				? `:${u.port}`
+				: target.port && !((u.protocol === "http:" && target.port === 80) || (u.protocol === "https:" && target.port === 443))
+					? `:${target.port}`
+					: "";
+			const pathname = u.pathname === "/" ? "" : u.pathname.replace(/\/+$/, "");
+			return {
+				resolvedHost: host,
+				targetUrl: `${u.protocol}//${host}${portPart}${pathname}${u.search}`,
+			};
+		} catch {
+			/* 回退到 host 拼接 */
+		}
+	}
+
+	const host = rawHost.replace(/^https?:\/\//i, "").split(/[/:?#]/)[0] ?? "";
+	const scheme = (target.scheme ?? (target.port === 443 ? "https" : "http")).replace(/:$/, "");
+	const portSuffix =
+		target.port && !((scheme === "http" && target.port === 80) || (scheme === "https" && target.port === 443))
+			? `:${target.port}`
+			: "";
+	const targetUrl = host ? `${scheme}://${host}${portSuffix}` : rawUrl;
+	return { resolvedHost: host, targetUrl };
+}
+
+/**
+ * #26 (NW-06) 将解析后的 `resolved_host` 与目标 URL 自动注入派单正文，
+ * 并展开残留的 `https://TARGET`、`[TARGET]`、`[HOST]`、`[DOMAIN]`、`$U` 等占位符。
+ */
+export function injectResolvedTargetContext(
+	taskText: string,
+	target: DispatchTargetContext,
+): { task: string; resolvedHost: string; targetUrl: string; replacedPlaceholders: number } {
+	const { resolvedHost, targetUrl } = resolveTargetEndpoint(target);
+	let body = String(taskText ?? "");
+	let replacedPlaceholders = 0;
+
+	const replaceAll = (re: RegExp, val: string) => {
+		if (!val) return;
+		body = body.replace(re, () => {
+			replacedPlaceholders++;
+			return val;
+		});
+	};
+
+	if (targetUrl) {
+		replaceAll(/https?:\/\/(?:TARGET|HOST|DOMAIN)(?::\d+)?/g, targetUrl);
+		replaceAll(/\$\{?U\}?/g, targetUrl);
+		replaceAll(/\[(?:TARGET_URL|URL)\]/g, targetUrl);
+	}
+	if (resolvedHost) {
+		replaceAll(/\[(?:TARGET|HOST|DOMAIN)\]/g, resolvedHost);
+		replaceAll(/\$\{?(?:TARGET|HOST|DOMAIN)\}?/g, resolvedHost);
+		replaceAll(/\b(?:TARGET|HOST|DOMAIN)\b/g, resolvedHost);
+	}
+
+	const headerLines: string[] = [];
+	if (resolvedHost && !new RegExp(`resolved_host\\s*[:=]\\s*${resolvedHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i").test(body)) {
+		headerLines.push(`resolved_host: ${resolvedHost}`);
+	}
+	if (targetUrl && !body.includes(`target_url: ${targetUrl}`)) {
+		headerLines.push(`target_url: ${targetUrl}`);
+	}
+	if (target.resolvedIp && !body.includes(`resolved_ip: ${target.resolvedIp}`)) {
+		headerLines.push(`resolved_ip: ${target.resolvedIp}`);
+	}
+	if (target.egress && !body.includes(`egress: ${target.egress}`)) {
+		headerLines.push(`egress: ${target.egress}`);
+	}
+
+	const finalTask =
+		headerLines.length > 0
+			? `[派单目标上下文]\n${headerLines.join("\n")}\n\n${body.trim()}`
+			: body.trim();
+
+	return {
+		task: finalTask,
+		resolvedHost,
+		targetUrl,
+		replacedPlaceholders,
+	};
+}
+
+/**
+ * #26 (NW-06) 构造带 `resolved_host` 与 `target_url` 自动注入的规范派单包。
+ */
+export function buildDispatchPacket(input: DispatchPacketInput): DispatchPacketResult {
+	const injectedRes = injectResolvedTargetContext(input.task, input.target);
+	const targetKey = normalizeDispatchTargetKey(
+		input.targetKey || injectedRes.targetUrl || injectedRes.resolvedHost || "",
+	);
+	return {
+		task: injectedRes.task,
+		resolvedHost: injectedRes.resolvedHost,
+		targetUrl: injectedRes.targetUrl,
+		targetKey,
+		injected: Boolean(injectedRes.resolvedHost || injectedRes.targetUrl),
+		replacedPlaceholders: injectedRes.replacedPlaceholders,
+	};
+}
+
+// ----------------------------------------------------------------------------
+// #27 (NW-07) 子代理派单校验 validateSubagentDispatch 与派单回执登记表
+// ----------------------------------------------------------------------------
+
+export interface SubagentDispatchPayload {
+	spawnId?: string;
+	agent?: string;
+	task?: string;
+	prompt?: string;
+	targetKey?: string;
+	targetUrl?: string;
+	resolvedHost?: string;
+	intentId?: string;
+	context?: Record<string, unknown> | string;
+	minTaskLength?: number;
+}
+
+export interface DispatchValidationResult {
+	ok: boolean;
+	accepted: boolean;
+	requeue: boolean;
+	reason?: string;
+	reasons: string[];
+	taskHash?: string;
+	spawnId?: string;
+	targetKey?: string;
+}
+
+export interface DispatchReceipt {
+	spawnId: string;
+	taskHash: string;
+	dispatchedAt: string;
+	targetKey: string;
+	agent?: string;
+	intentId?: string;
+	taskBytes: number;
+	acknowledgedAt?: string;
+	contextLength?: number;
+	status: "dispatched" | "acknowledged" | "requeued" | "completed" | "failed";
+}
+
+const EMPTY_AGENT_CONTEXT_RE =
+	/\b(?:no\s+assigned\s+task|awaiting\s+work\s+item|no\s+task\s+provided|empty\s+task)\b/i;
+const UNEXPANDED_DISPATCH_PLACEHOLDER_RE = /\[(?:TARGET|HOST|DOMAIN|URL)\]|https?:\/\/(?:TARGET|HOST|DOMAIN)\b/i;
+
+function extractTargetKeyFromDispatch(payload: SubagentDispatchPayload, taskText: string): string {
+	if (payload.targetKey && payload.targetKey.trim()) {
+		return normalizeDispatchTargetKey(payload.targetKey);
+	}
+	if (payload.targetUrl && payload.targetUrl.trim()) {
+		return normalizeDispatchTargetKey(payload.targetUrl);
+	}
+	const urlHit = /https?:\/\/[^\s"'<>`)\]]+/i.exec(taskText);
+	if (urlHit?.[0]) {
+		return normalizeDispatchTargetKey(urlHit[0].replace(/[),.;]+$/, ""));
+	}
+	if (payload.resolvedHost && payload.resolvedHost.trim()) {
+		return normalizeDispatchTargetKey(payload.resolvedHost);
+	}
+	const pathHit = /(?:^|\s)(\/[a-zA-Z0-9._~/%-]{2,})(?=$|\s|[,;)])/.exec(taskText);
+	if (pathHit?.[1]) {
+		return normalizeDispatchTargetKey(pathHit[1]);
+	}
+	return "";
+}
+
+/**
+ * #27 (NW-07) 校验子代理派单载荷：
+ * - 校验 `task` 非空、达到最小有效长度且不含空转占位描述；
+ * - 校验目标与执行上下文完整（禁止缺失目标信息或传入空 context 壳或未展开模板占位符）；
+ * - 不通过时直接拒收并返回 `requeue: true` 触发重排。
+ */
+export function validateSubagentDispatch(
+	payload: SubagentDispatchPayload | null | undefined,
+): DispatchValidationResult {
+	if (!payload || typeof payload !== "object") {
+		return {
+			ok: false,
+			accepted: false,
+			requeue: true,
+			reason: "派单载荷为空，已拒收并标记重排",
+			reasons: ["派单载荷为空"],
+		};
+	}
+
+	const rawTask = String(payload.task ?? payload.prompt ?? "").trim();
+	const minLen =
+		typeof payload.minTaskLength === "number" && Number.isFinite(payload.minTaskLength) && payload.minTaskLength > 0
+			? Math.floor(payload.minTaskLength)
+			: 8;
+	const reasons: string[] = [];
+
+	if (!rawTask) {
+		reasons.push("派单 task 为空");
+	} else {
+		if (EMPTY_AGENT_CONTEXT_RE.test(rawTask)) {
+			reasons.push("派单内容包含空任务占位语句（no assigned task / awaiting work item）");
+		}
+		if (rawTask.length < minLen) {
+			reasons.push(`派单 task 过短（${rawTask.length} < ${minLen} 字符），上下文不完整`);
+		}
+		if (UNEXPANDED_DISPATCH_PLACEHOLDER_RE.test(rawTask)) {
+			reasons.push("派单 task 含未展开目标占位符（[TARGET]/[HOST]/https://TARGET）");
+		}
+	}
+
+	const hasExplicitContext =
+		typeof payload.context === "string"
+			? payload.context.trim().length > 0
+			: payload.context !== undefined && payload.context !== null
+				? Object.keys(payload.context).length > 0
+				: false;
+	const explicitEmptyContext =
+		payload.context !== undefined && !hasExplicitContext;
+
+	const resolvedTargetKey = extractTargetKeyFromDispatch(payload, rawTask);
+	const hasTargetOrIntent =
+		Boolean(resolvedTargetKey) ||
+		Boolean(payload.resolvedHost?.trim()) ||
+		Boolean(payload.targetUrl?.trim()) ||
+		Boolean(payload.intentId?.trim()) ||
+		/\bresolved_host\s*[:=]/i.test(rawTask);
+
+	if (explicitEmptyContext && !hasTargetOrIntent) {
+		reasons.push("派单 context 为空且缺少目标/意图上下文");
+	} else if (rawTask && !hasTargetOrIntent && !hasExplicitContext) {
+		reasons.push("派单缺少目标上下文（需提供 targetUrl / resolvedHost / targetKey / intentId 或明确目标 URL）");
+	}
+
+	if (reasons.length > 0) {
+		return {
+			ok: false,
+			accepted: false,
+			requeue: true,
+			reason: `派单守卫拒收（需重排）: ${reasons.join("；")}`,
+			reasons,
+			spawnId: payload.spawnId?.trim() || undefined,
+			targetKey: resolvedTargetKey || undefined,
+		};
+	}
+
+	return {
+		ok: true,
+		accepted: true,
+		requeue: false,
+		reasons: [],
+		taskHash: sha256Short(rawTask, 16),
+		spawnId: payload.spawnId?.trim() || undefined,
+		targetKey: resolvedTargetKey || "unknown",
+	};
+}
+
+/**
+ * #27 (NW-07) 派单回执登记表：记录 `spawnId -> { taskHash, dispatchedAt, targetKey }`，
+ * 空任务直接拒收并标记重排，支持 spawn 后首条 context 长度回读核验与可选磁盘持久化。
+ */
+export class DispatchReceiptRegistry {
+	private readonly receipts = new Map<string, DispatchReceipt>();
+	private readonly persistPath?: string;
+
+	constructor(persistPath?: string) {
+		this.persistPath = persistPath ? resolve(persistPath) : undefined;
+		this.loadFromDisk();
+	}
+
+	private loadFromDisk(): void {
+		if (!this.persistPath || !existsSync(this.persistPath)) return;
+		const data = readJsonSafe<{ receipts?: Record<string, DispatchReceipt> }>(this.persistPath);
+		if (!data?.receipts || typeof data.receipts !== "object") return;
+		for (const [k, rec] of Object.entries(data.receipts)) {
+			if (rec && typeof rec.spawnId === "string" && typeof rec.taskHash === "string") {
+				this.receipts.set(k, rec);
+			}
+		}
+	}
+
+	private flushToDisk(): void {
+		if (!this.persistPath) return;
+		const obj: Record<string, DispatchReceipt> = {};
+		for (const [k, v] of this.receipts.entries()) {
+			obj[k] = v;
+		}
+		try {
+			secureAtomicWriteJson(this.persistPath, { schema: 1, updatedAt: new Date().toISOString(), receipts: obj });
+		} catch {
+			/* 持久化失败不影响内存登记表 */
+		}
+	}
+
+	register(
+		spawnId: string,
+		payload: SubagentDispatchPayload,
+	): {
+		ok: boolean;
+		requeue: boolean;
+		receipt?: DispatchReceipt;
+		validation: DispatchValidationResult;
+	} {
+		const sid = String(spawnId ?? payload?.spawnId ?? "").trim();
+		const validation = validateSubagentDispatch({ ...payload, spawnId: sid });
+		if (!sid) {
+			return {
+				ok: false,
+				requeue: true,
+				validation: {
+					...validation,
+					ok: false,
+					accepted: false,
+					requeue: true,
+					reason: "缺少有效 spawnId，无法登记派单回执",
+					reasons: [...validation.reasons, "缺少有效 spawnId"],
+				},
+			};
+		}
+
+		if (!validation.ok) {
+			const rejectedReceipt: DispatchReceipt = {
+				spawnId: sid,
+				taskHash: "",
+				dispatchedAt: new Date().toISOString(),
+				targetKey: validation.targetKey ?? "",
+				...(payload?.agent ? { agent: payload.agent } : {}),
+				...(payload?.intentId ? { intentId: payload.intentId } : {}),
+				taskBytes: Buffer.byteLength(String(payload?.task ?? payload?.prompt ?? ""), "utf8"),
+				status: "requeued",
+			};
+			this.receipts.set(sid, rejectedReceipt);
+			this.flushToDisk();
+			return { ok: false, requeue: true, receipt: rejectedReceipt, validation };
+		}
+
+		const rawTask = String(payload.task ?? payload.prompt ?? "").trim();
+		const receipt: DispatchReceipt = {
+			spawnId: sid,
+			taskHash: validation.taskHash!,
+			dispatchedAt: new Date().toISOString(),
+			targetKey: validation.targetKey ?? "unknown",
+			...(payload.agent ? { agent: payload.agent } : {}),
+			...(payload.intentId ? { intentId: payload.intentId } : {}),
+			taskBytes: Buffer.byteLength(rawTask, "utf8"),
+			status: "dispatched",
+		};
+		this.receipts.set(sid, receipt);
+		this.flushToDisk();
+		return { ok: true, requeue: false, receipt, validation };
+	}
+
+	/**
+	 * spawn 后回读 agent 首条 context：校验长度 > 0 且非空任务告警，通过才确认入列，否则标记重排。
+	 */
+	acknowledge(
+		spawnId: string,
+		firstContextText: string,
+	): { ok: boolean; requeue: boolean; reason?: string; receipt?: DispatchReceipt } {
+		const sid = String(spawnId ?? "").trim();
+		const rec = this.receipts.get(sid);
+		if (!rec) {
+			return { ok: false, requeue: true, reason: `未找到 spawnId=${sid} 的派单回执` };
+		}
+		const trimmed = String(firstContextText ?? "").trim();
+		if (trimmed.length === 0 || EMPTY_AGENT_CONTEXT_RE.test(trimmed)) {
+			rec.status = "requeued";
+			rec.contextLength = trimmed.length;
+			this.flushToDisk();
+			return {
+				ok: false,
+				requeue: true,
+				reason: `agent 侧首条 context 为空或缺失任务（spawnId=${sid}），已标记重排`,
+				receipt: rec,
+			};
+		}
+		rec.status = "acknowledged";
+		rec.acknowledgedAt = new Date().toISOString();
+		rec.contextLength = trimmed.length;
+		this.flushToDisk();
+		return { ok: true, requeue: false, receipt: rec };
+	}
+
+	get(spawnId: string): DispatchReceipt | undefined {
+		return this.receipts.get(String(spawnId ?? "").trim());
+	}
+
+	markStatus(spawnId: string, status: DispatchReceipt["status"]): DispatchReceipt | undefined {
+		const rec = this.receipts.get(String(spawnId ?? "").trim());
+		if (!rec) return undefined;
+		rec.status = status;
+		this.flushToDisk();
+		return rec;
+	}
+
+	list(filter?: { status?: DispatchReceipt["status"]; targetKey?: string }): DispatchReceipt[] {
+		const out: DispatchReceipt[] = [];
+		const normKey = filter?.targetKey ? normalizeDispatchTargetKey(filter.targetKey) : undefined;
+		for (const rec of this.receipts.values()) {
+			if (filter?.status && rec.status !== filter.status) continue;
+			if (normKey && rec.targetKey !== normKey) continue;
+			out.push(rec);
+		}
+		return out;
+	}
+
+	remove(spawnId: string): boolean {
+		const ok = this.receipts.delete(String(spawnId ?? "").trim());
+		if (ok) this.flushToDisk();
+		return ok;
+	}
+
+	clear(): void {
+		this.receipts.clear();
+		this.flushToDisk();
+	}
+}
+
+export function createDispatchReceiptRegistry(persistPath?: string): DispatchReceiptRegistry {
+	return new DispatchReceiptRegistry(persistPath);
+}
+
+// ----------------------------------------------------------------------------
+// #28 (NW-08) 批派单分片保护 chunkBatchTasks 与磁盘溢写 tasks_file
+// ----------------------------------------------------------------------------
+
+export const DEFAULT_BATCH_MAX_BYTES = 6000;
+
+export interface BatchTaskItem {
+	id?: string;
+	intentId?: string;
+	agent?: string;
+	targetKey?: string;
+	task: string;
+	[key: string]: unknown;
+}
+
+export interface ChunkBatchOptions {
+	/** 单片最大序列化字节数，默认 6000 */
+	maxBytes?: number;
+	/** 若提供 spillDir，超限时溢写至 <spillDir>/batch-<id>.json 返回轻量 tasks_file 引用 */
+	spillDir?: string;
+	/** 可选项目根目录，未传 spillDir 时溢写至 <root>/.nuwa/dispatches/batch-<id>.json */
+	root?: string;
+	/** 可选自定义批次 ID */
+	batchId?: string;
+	/** 是否在超限时优先整批溢写（当提供 spillDir/root 时默认为 true） */
+	preferSpill?: boolean;
+}
+
+export interface BatchChunk<T = BatchTaskItem> {
+	chunkIndex: number;
+	totalChunks: number;
+	bytes: number;
+	taskCount: number;
+	spilled: boolean;
+	tasks?: T[];
+	tasks_file?: string;
+}
+
+export interface ChunkBatchResult<T = BatchTaskItem> {
+	exceeded: boolean;
+	totalBytes: number;
+	maxBytes: number;
+	mode: "inline" | "chunked" | "spilled";
+	chunks: Array<BatchChunk<T>>;
+	tasks_file?: string;
+	spilledFiles: string[];
+}
+
+function resolveBatchSpillDirectory(opts?: ChunkBatchOptions): string | undefined {
+	if (opts?.spillDir && opts.spillDir.trim()) {
+		return resolve(opts.spillDir.trim());
+	}
+	if (opts?.root && opts.root.trim()) {
+		return join(resolve(opts.root.trim()), ".nuwa", "dispatches");
+	}
+	return undefined;
+}
+
+/**
+ * #28 (NW-08) 批派单分片保护：
+ * - 当序列化字节数 <= `maxBytes`（默认 `6000`）时保持 `mode="inline"` 原样返回；
+ * - 超过 `maxBytes` 且未指定 `spillDir`/`root` 时自动按字节上限切分为多个安全分片（`mode="chunked"`）；
+ * - 超过 `maxBytes` 且指定 `spillDir`（或 `root` -> `.nuwa/dispatches`）时溢写 `batch-<id>.json`，
+ *   返回轻量 `tasks_file` 引用（`mode="spilled"`），避免 ~6.5KB JSON 截断丢任务。
+ */
+export function chunkBatchTasks<T = BatchTaskItem>(
+	tasks: readonly T[],
+	opts?: ChunkBatchOptions,
+): ChunkBatchResult<T> {
+	const list = Array.isArray(tasks) ? [...tasks] : [];
+	const maxBytes =
+		typeof opts?.maxBytes === "number" && Number.isFinite(opts.maxBytes) && opts.maxBytes >= 128
+			? Math.floor(opts.maxBytes)
+			: DEFAULT_BATCH_MAX_BYTES;
+	const serializedAll = JSON.stringify(list);
+	const totalBytes = Buffer.byteLength(serializedAll, "utf8");
+	const spillDir = resolveBatchSpillDirectory(opts);
+
+	if (totalBytes <= maxBytes && opts?.preferSpill !== true) {
+		return {
+			exceeded: false,
+			totalBytes,
+			maxBytes,
+			mode: "inline",
+			chunks: [
+				{
+					chunkIndex: 0,
+					totalChunks: 1,
+					bytes: totalBytes,
+					taskCount: list.length,
+					spilled: false,
+					tasks: list,
+				},
+			],
+			spilledFiles: [],
+		};
+	}
+
+	const batchId =
+		opts?.batchId?.trim().replace(/[^a-zA-Z0-9._-]/g, "_") ||
+		`${Date.now()}-${sha256Short(serializedAll, 8)}`;
+
+	// 贪心装箱切分（用于 chunked 模式与 spill 模式的分片元信息）
+	const buckets: T[][] = [];
+	let current: T[] = [];
+	for (const item of list) {
+		const candidate = [...current, item];
+		const candBytes = Buffer.byteLength(JSON.stringify(candidate), "utf8");
+		if (current.length > 0 && candBytes > maxBytes) {
+			buckets.push(current);
+			current = [item];
+		} else {
+			current = candidate;
+		}
+	}
+	if (current.length > 0) {
+		buckets.push(current);
+	}
+
+	if (spillDir && (opts?.preferSpill !== false || buckets.some((b) => Buffer.byteLength(JSON.stringify(b), "utf8") > maxBytes))) {
+		mkdirSync(spillDir, { recursive: true, mode: 0o700 });
+		const mainFile = join(spillDir, `batch-${batchId}.json`);
+		secureAtomicWriteJson(mainFile, {
+			schema: 1,
+			batchId,
+			createdAt: new Date().toISOString(),
+			maxBytes,
+			totalBytes,
+			taskCount: list.length,
+			tasks: list,
+		});
+
+		const spilledFiles = [mainFile];
+		const chunks: Array<BatchChunk<T>> = [];
+
+		if (buckets.length <= 1) {
+			const refObj = { tasks_file: mainFile, taskCount: list.length };
+			chunks.push({
+				chunkIndex: 0,
+				totalChunks: 1,
+				bytes: Buffer.byteLength(JSON.stringify(refObj), "utf8"),
+				taskCount: list.length,
+				spilled: true,
+				tasks_file: mainFile,
+			});
+		} else {
+			for (let i = 0; i < buckets.length; i++) {
+				const bucket = buckets[i]!;
+				const chunkFile = join(spillDir, `batch-${batchId}-part${i + 1}.json`);
+				secureAtomicWriteJson(chunkFile, {
+					schema: 1,
+					batchId,
+					chunkIndex: i,
+					totalChunks: buckets.length,
+					createdAt: new Date().toISOString(),
+					taskCount: bucket.length,
+					tasks: bucket,
+				});
+				spilledFiles.push(chunkFile);
+				const refObj = { tasks_file: chunkFile, taskCount: bucket.length };
+				chunks.push({
+					chunkIndex: i,
+					totalChunks: buckets.length,
+					bytes: Buffer.byteLength(JSON.stringify(refObj), "utf8"),
+					taskCount: bucket.length,
+					spilled: true,
+					tasks_file: chunkFile,
+				});
+			}
+		}
+
+		return {
+			exceeded: totalBytes > maxBytes,
+			totalBytes,
+			maxBytes,
+			mode: "spilled",
+			chunks,
+			tasks_file: mainFile,
+			spilledFiles,
+		};
+	}
+
+	const chunks: Array<BatchChunk<T>> = buckets.map((bucket, idx) => ({
+		chunkIndex: idx,
+		totalChunks: buckets.length,
+		bytes: Buffer.byteLength(JSON.stringify(bucket), "utf8"),
+		taskCount: bucket.length,
+		spilled: false,
+		tasks: bucket,
+	}));
+
+	return {
+		exceeded: totalBytes > maxBytes,
+		totalBytes,
+		maxBytes,
+		mode: "chunked",
+		chunks,
+		spilledFiles: [],
+	};
+}
+
+/**
+ * 读取由 `chunkBatchTasks` 溢写至磁盘的 `tasks_file` JSON 任务列表。
+ */
+export function readSpilledBatchTasks<T = BatchTaskItem>(tasksFile: string): T[] {
+	const parsed = readJsonSafe<{ tasks?: T[] } | T[]>(resolve(tasksFile));
+	if (Array.isArray(parsed)) return parsed;
+	if (parsed && typeof parsed === "object" && Array.isArray(parsed.tasks)) {
+		return parsed.tasks;
+	}
+	return [];
+}
+
+// ----------------------------------------------------------------------------
+// #50 (NW-30) 跨子代理在途目标去重池 InflightTargetRegistry 与探针合并
+// ----------------------------------------------------------------------------
+
+export interface InflightTargetEntry {
+	targetKey: string;
+	intentId: string;
+	worker: string;
+	claimedAt: string;
+	claimedAtMs: number;
+	ttlMs: number;
+}
+
+export interface InflightClaimResult {
+	claimed: boolean;
+	targetKey: string;
+	existing?: InflightTargetEntry;
+	entry?: InflightTargetEntry;
+}
+
+export interface InflightFilterResult<T> {
+	accepted: T[];
+	skipped: Array<{
+		task: T;
+		targetKey: string;
+		reason: "inflight_duplicate" | "batch_duplicate";
+		existing?: InflightTargetEntry;
+	}>;
+}
+
+export interface ProbeTaskLike {
+	id?: string;
+	intentId?: string;
+	targetKey?: string;
+	target?: string;
+	url?: string;
+	probe?: string;
+	task?: string;
+	title?: string;
+	worker?: string;
+	priority?: number;
+	[key: string]: unknown;
+}
+
+export interface CoalescedProbeTask {
+	targetKey: string;
+	target: string;
+	intentIds: string[];
+	taskIds: string[];
+	probes: string[];
+	mergedTask: string;
+	priority: number;
+	sourceCount: number;
+	worker?: string;
+}
+
+/**
+ * 规范化派单目标键（统一大小写、默认端口、尾斜杠），确保跨子代理在途去重与探针合并准确命中。
+ */
+export function normalizeDispatchTargetKey(raw: string): string {
+	const trimmed = String(raw ?? "").trim();
+	if (!trimmed) return "";
+
+	// 保留显式前缀类型（如 endpoint:/admin、port:host:80）并规范其主体
+	const typedPrefix = /^(endpoint|port|host|path|chunk|asset|route):(.*)$/i.exec(trimmed);
+	if (typedPrefix) {
+		const prefix = typedPrefix[1]!.toLowerCase();
+		const rest = normalizeDispatchTargetKey(typedPrefix[2]!);
+		return `${prefix}:${rest}`;
+	}
+
+	if (/^https?:\/\//i.test(trimmed)) {
+		try {
+			const u = new URL(trimmed);
+			const proto = u.protocol.toLowerCase();
+			const host = u.hostname.toLowerCase();
+			const port =
+				u.port && !((proto === "http:" && u.port === "80") || (proto === "https:" && u.port === "443"))
+					? `:${u.port}`
+					: "";
+			const pathname = u.pathname === "/" ? "/" : u.pathname.replace(/\/+$/, "");
+			const params = [...u.searchParams.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+			const search = params.length > 0 ? `?${new URLSearchParams(params).toString()}` : "";
+			return `${proto}//${host}${port}${pathname}${search}`;
+		} catch {
+			/* 回退到字符串规范化 */
+		}
+	}
+
+	if (trimmed.startsWith("/")) {
+		const normPath = trimmed.replace(/\/{2,}/g, "/");
+		return normPath === "/" ? "/" : normPath.replace(/\/+$/, "").toLowerCase();
+	}
+
+	return trimmed.replace(/\/+$/, "").toLowerCase();
+}
+
+const DEFAULT_INFLIGHT_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * #50 (NW-30) 跨子代理在途目标去重池：
+ * 维护 `targetKey -> { intentId, worker, claimedAt }`，派单前过滤同 `targetKey` 重复任务，
+ * 避免多个子代理并发重复探测同一路由或静态 chunk。
+ */
+export class InflightTargetRegistry {
+	private readonly entries = new Map<string, InflightTargetEntry>();
+	private readonly defaultTtlMs: number;
+	private readonly persistPath?: string;
+
+	constructor(opts?: { ttlMs?: number; persistPath?: string }) {
+		this.defaultTtlMs =
+			typeof opts?.ttlMs === "number" && Number.isFinite(opts.ttlMs) && opts.ttlMs > 0
+				? opts.ttlMs
+				: DEFAULT_INFLIGHT_TTL_MS;
+		this.persistPath = opts?.persistPath ? resolve(opts.persistPath) : undefined;
+		this.loadFromDisk();
+	}
+
+	private loadFromDisk(): void {
+		if (!this.persistPath || !existsSync(this.persistPath)) return;
+		const data = readJsonSafe<{ entries?: Record<string, InflightTargetEntry> }>(this.persistPath);
+		if (!data?.entries || typeof data.entries !== "object") return;
+		for (const [k, rec] of Object.entries(data.entries)) {
+			if (rec && typeof rec.intentId === "string" && typeof rec.worker === "string") {
+				this.entries.set(k, rec);
+			}
+		}
+		this.pruneExpired();
+	}
+
+	private flushToDisk(): void {
+		if (!this.persistPath) return;
+		const obj: Record<string, InflightTargetEntry> = {};
+		for (const [k, v] of this.entries.entries()) {
+			obj[k] = v;
+		}
+		try {
+			secureAtomicWriteJson(this.persistPath, { schema: 1, updatedAt: new Date().toISOString(), entries: obj });
+		} catch {
+			/* ignore */
+		}
+	}
+
+	pruneExpired(nowMs = Date.now()): number {
+		let removed = 0;
+		for (const [key, entry] of this.entries.entries()) {
+			const ttl = entry.ttlMs > 0 ? entry.ttlMs : this.defaultTtlMs;
+			if (nowMs - entry.claimedAtMs >= ttl) {
+				this.entries.delete(key);
+				removed++;
+			}
+		}
+		if (removed > 0) this.flushToDisk();
+		return removed;
+	}
+
+	claim(
+		targetKey: string,
+		meta: { intentId: string; worker: string; claimedAt?: string; ttlMs?: number },
+	): InflightClaimResult {
+		const normKey = normalizeDispatchTargetKey(targetKey);
+		if (!normKey) {
+			return { claimed: false, targetKey: "" };
+		}
+		this.pruneExpired();
+		const existing = this.entries.get(normKey);
+		if (existing && !(existing.intentId === meta.intentId && existing.worker === meta.worker)) {
+			return { claimed: false, targetKey: normKey, existing };
+		}
+		const nowMs = meta.claimedAt ? Date.parse(meta.claimedAt) || Date.now() : Date.now();
+		const claimedAt = meta.claimedAt || new Date(nowMs).toISOString();
+		const entry: InflightTargetEntry = {
+			targetKey: normKey,
+			intentId: String(meta.intentId ?? "").trim() || "unknown",
+			worker: String(meta.worker ?? "").trim() || "fujiang",
+			claimedAt,
+			claimedAtMs: nowMs,
+			ttlMs:
+				typeof meta.ttlMs === "number" && Number.isFinite(meta.ttlMs) && meta.ttlMs > 0
+					? meta.ttlMs
+					: this.defaultTtlMs,
+		};
+		this.entries.set(normKey, entry);
+		this.flushToDisk();
+		return { claimed: true, targetKey: normKey, entry };
+	}
+
+	isInflight(targetKey: string): boolean {
+		const normKey = normalizeDispatchTargetKey(targetKey);
+		if (!normKey) return false;
+		this.pruneExpired();
+		return this.entries.has(normKey);
+	}
+
+	get(targetKey: string): InflightTargetEntry | undefined {
+		const normKey = normalizeDispatchTargetKey(targetKey);
+		if (!normKey) return undefined;
+		this.pruneExpired();
+		return this.entries.get(normKey);
+	}
+
+	release(targetKey: string, matcher?: { intentId?: string; worker?: string }): boolean {
+		const normKey = normalizeDispatchTargetKey(targetKey);
+		const existing = this.entries.get(normKey);
+		if (!existing) return false;
+		if (matcher?.intentId && existing.intentId !== matcher.intentId) return false;
+		if (matcher?.worker && existing.worker !== matcher.worker) return false;
+		const deleted = this.entries.delete(normKey);
+		if (deleted) this.flushToDisk();
+		return deleted;
+	}
+
+	releaseByIntent(intentId: string): number {
+		let count = 0;
+		for (const [k, v] of this.entries.entries()) {
+			if (v.intentId === intentId) {
+				this.entries.delete(k);
+				count++;
+			}
+		}
+		if (count > 0) this.flushToDisk();
+		return count;
+	}
+
+	releaseByWorker(worker: string): number {
+		let count = 0;
+		for (const [k, v] of this.entries.entries()) {
+			if (v.worker === worker) {
+				this.entries.delete(k);
+				count++;
+			}
+		}
+		if (count > 0) this.flushToDisk();
+		return count;
+	}
+
+	list(): InflightTargetEntry[] {
+		this.pruneExpired();
+		return [...this.entries.values()];
+	}
+
+	clear(): void {
+		this.entries.clear();
+		this.flushToDisk();
+	}
+
+	/**
+	 * 派单前过滤同 `targetKey` 在途重复任务与同批次重复任务；可选 `autoClaim=true` 自动登记占坑。
+	 */
+	filterTasks<T extends ProbeTaskLike>(
+		tasks: readonly T[],
+		opts?: { autoClaim?: boolean; defaultWorker?: string },
+	): InflightFilterResult<T> {
+		this.pruneExpired();
+		const accepted: T[] = [];
+		const skipped: InflightFilterResult<T>["skipped"] = [];
+		const batchSeen = new Set<string>();
+
+		for (const task of tasks) {
+			const rawKey = String(task.targetKey ?? task.url ?? task.target ?? "").trim();
+			const normKey = normalizeDispatchTargetKey(rawKey);
+			if (!normKey) {
+				accepted.push(task);
+				continue;
+			}
+			if (batchSeen.has(normKey)) {
+				skipped.push({ task, targetKey: normKey, reason: "batch_duplicate" });
+				continue;
+			}
+			const existing = this.entries.get(normKey);
+			if (existing) {
+				skipped.push({ task, targetKey: normKey, reason: "inflight_duplicate", existing });
+				continue;
+			}
+			batchSeen.add(normKey);
+			accepted.push(task);
+			if (opts?.autoClaim) {
+				this.claim(normKey, {
+					intentId: String(task.intentId ?? task.id ?? normKey),
+					worker: String(task.worker ?? opts.defaultWorker ?? "fujiang"),
+				});
+			}
+		}
+
+		return { accepted, skipped };
+	}
+}
+
+/**
+ * #50 (NW-30) 按规范化 `targetKey` 合并同目标探针，避免多个子代理重复抓取同一端点或同一批 chunk。
+ */
+export function coalesceProbesByTarget<T extends ProbeTaskLike>(tasks: readonly T[]): CoalescedProbeTask[] {
+	const groups = new Map<
+		string,
+		{
+			targetKey: string;
+			target: string;
+			intentIds: string[];
+			taskIds: string[];
+			probes: string[];
+			priority: number;
+			sourceCount: number;
+			worker?: string;
+			firstIndex: number;
+		}
+	>();
+
+	for (let i = 0; i < tasks.length; i++) {
+		const item = tasks[i]!;
+		const rawTarget = String(item.targetKey ?? item.url ?? item.target ?? "").trim();
+		const normKey = normalizeDispatchTargetKey(rawTarget) || `anon:${i}`;
+		const displayTarget = String(item.url ?? item.target ?? item.targetKey ?? normKey).trim();
+		const probeDesc = String(item.probe ?? item.task ?? item.title ?? "").trim();
+		const prio = typeof item.priority === "number" && Number.isFinite(item.priority) ? item.priority : 50;
+
+		let group = groups.get(normKey);
+		if (!group) {
+			group = {
+				targetKey: normKey,
+				target: displayTarget,
+				intentIds: [],
+				taskIds: [],
+				probes: [],
+				priority: prio,
+				sourceCount: 0,
+				worker: item.worker ? String(item.worker) : undefined,
+				firstIndex: i,
+			};
+			groups.set(normKey, group);
+		}
+
+		group.sourceCount += 1;
+		if (prio > group.priority) group.priority = prio;
+		if (!group.worker && item.worker) group.worker = String(item.worker);
+		if (item.intentId && !group.intentIds.includes(item.intentId)) {
+			group.intentIds.push(item.intentId);
+		}
+		if (item.id && !group.taskIds.includes(item.id)) {
+			group.taskIds.push(item.id);
+		}
+		if (probeDesc && !group.probes.includes(probeDesc)) {
+			group.probes.push(probeDesc);
+		}
+	}
+
+	return [...groups.values()]
+		.sort((a, b) => (b.priority !== a.priority ? b.priority - a.priority : a.firstIndex - b.firstIndex))
+		.map((g) => {
+			const mergedTask =
+				g.probes.length <= 1
+					? `[合并探针 target=${g.target}] ${g.probes[0] ?? "执行单次定向探测"}`
+					: [
+							`[合并同目标探针 target=${g.target} (合并 ${g.sourceCount} 条任务)]`,
+							...g.probes.map((p, idx) => `${idx + 1}. ${p}`),
+						].join("\n");
+			return {
+				targetKey: g.targetKey,
+				target: g.target,
+				intentIds: g.intentIds,
+				taskIds: g.taskIds,
+				probes: g.probes,
+				mergedTask,
+				priority: g.priority,
+				sourceCount: g.sourceCount,
+				...(g.worker ? { worker: g.worker } : {}),
+			};
+		});
 }
