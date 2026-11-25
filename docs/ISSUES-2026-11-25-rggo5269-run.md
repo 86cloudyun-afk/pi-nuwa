@@ -225,3 +225,15 @@ packet 已声明 `kind=vuln/service`，commit 仍须手填，主线程只能推�
 | NW-29 | P2 | blocked 计数与实际提交不一致 | 第 203–213 轮每轮 4 次 blocked commit，状态长期 `blocked=120` |
 
 合计 **29 项**（含首批 22 项）。远端对应：总表 #20，子 issue #21–#49。
+
+---
+
+# 第三批（自检补充，NW-30 – NW-32）
+
+| ID | 级别 | 问题 | 关键证据 |
+|---|---|---|---|
+| NW-30 | P1 | 跨子代理无去重 | 同批 4 个 agent 分别打 /admin /login /api /api/v1；ChunkHunt 与 ChunkRoutes 两 agent 各 1h+ 抽同一批 chunk，结论逐字相同 |
+| NW-31 | P2 | 回包无结构化 schema | 表格 / 5 行 / 纯脚本 / JSON / 带 Σ 尾注五种形态；commit 需人工摘 command/output |
+| NW-32 | P2 | 长会话图片化不可检索 | HISTORY 多为图片页，f0xx 数值与命令需重探测确认 |
+
+合计 **32 项**（NW-01…NW-32）。远端：总表 #20，子 issue #21–#52（连续无缺号）。
