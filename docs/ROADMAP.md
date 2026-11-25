@@ -1,11 +1,19 @@
-# 女娲模式演进路线图（v0.3 → v4.0）
+# 女娲模式演进路线图（v0.3 → v5.0）
 
-## 当前里程碑：v4.0.1（2026-11-25 已交付）
+## 当前里程碑：v5.0.0（2026-11-25 已交付）
+
+- **认证态攻击面闭环（Issue #16）**：`omp/session-vault.ts` 支持 JWT 过期解析、CSRF Cookie 镜像头与 `/nuwa session health` 过期巡检自动派生刷新意图；`omp/browser-recon.ts` 支持认证态 SPA 懒加载 Chunk 与同源 `.js.map` 接口发现；新增 `omp/auth-diff.ts`（`/nuwa authdiff`）确定性只读多角色鉴权差分矩阵（Auto-BOLA / BFLA + Soft-404 去噪）及认证态零明文头文件自动批执行。
+- **零信任常驻 Sidecar、抗 DNS 重绑定代理与一等 OOB（Issue #17）**：`omp/sandbox.ts` 扩展常驻只读 Sidecar 生命周期、精确容器内命令校验（`N-009`）与内置 HTTP/HTTPS `CONNECT` 抗 DNS 重绑定 Egress Proxy；`docker/Dockerfile.sandbox` 升级为 `base`/`lite`/`full` 多阶段无 root 镜像；新增 `omp/oob.ts`（`/nuwa oob`）受 `scope.oobDomains` 白名单门控的外带回调通道。
+- **多资产拓扑、跨事实假设图与领域解耦（Issue #18）**：新增 `omp/hypothesis.ts`（`/nuwa assets`）维护主目标/SAN/内网跳板/本地代码仓多资产拓扑，支持 5 类跨事实推理链与收益/成本评分，并在双盲复验驳回时自动级联失效假设与剪枝下游 `open` 意图；`omp/profiles.ts` 全流程解耦，`audit` 原生支持本地白盒源码目录。
+- **合规导出、离线评测靶场与成本治理（Issue #19）**：新增 `omp/reporting.ts`（`nuwa_report` / `/nuwa report` 支持分层 Markdown、JSON、仅含已确认漏洞的 SARIF 2.1.0 与 `0o600` SHA-256 脱敏审计证据包）；新增 10 场景离线确定性评测靶场 `benchmarks/` 与 `g4_v5` 门禁；`bin/nuwa-autonomous` 新增 `--sandbox sidecar`、`--max-total-tokens`/`--max-usd`（退出码 `3`）及脱敏重试 Webhook/死信队列。
+- **v4.1.0 安全闭环加固基线（Issues #11–#15）**：双盲复验 `kind="vuln"` 与账本水位核验、执行账本高熵校验与并发锁、`.nuwa/sessions/vault.json` 读写防篡改、自进化经验精准归因防污染与 90 天衰减、按派单精准动态模型路由、跨世代累计记账与看门狗、连接目标 vs 请求载荷 Scope 护栏与 `allowLoopback`/`oobDomains` 策略。
+
+## 历史里程碑：v4.0.1（2026-11-25 已交付）
 
 - **架构解耦与离线构建**：`omp/nuwa.ts` 拆分为 `types.ts`、`storage.ts`、`graph.ts`、`nuwa.ts` 四层核心 + 14 个专职能力模块；配套 `omp/env.d.ts` 与 `tsconfig.json` 零外置依赖静态构建；v1 Python 遗产归档至 `archive/v1/`。
 - **血缘追踪与全工具护栏**：`omp/lineage.ts` 打通父子异构 `sessionId` 血缘与动态模型路由；`checkToolScopeAndRisk` 覆盖 `bash`/`read`/`browser`/`web_search`/`eval`；`isTrustedEvidenceEvent` 根治编排工具账本污染。
 - **反噪侦察与 SPA 感知**：Soft-404 基线校准、内容级语义指纹实锤、工具链重武器升档（`nmap`/`ffuf`/`katana`/`nuclei`）及 Playwright/静态双模 SPA 接口提取（`omp/browser-recon.ts`）。
-- **便携知识库与自进化记忆**：随仓 `kb/` 种子与 `bun:sqlite` 幂等建库器、全参数化防注入 `kbLookupSafe`、`distillProjectExperience` 强脱敏经验回流与 UCB1 动态优先级提权。
+- **便携知识库与自进化记忆**：随仓 `kb/` 种子与 `bun:sqlite` 单文件 `DELETE` 模式幂等建库器、全参数化防注入 `kbLookupSafe`、`distillProjectExperience` 强脱敏经验回流与 UCB1 动态优先级提权。
 - **会话保险箱、双盲复验与容器沙盒**：`0o600` 多角色会话仓与零明文差分包、`candidate → confirmed` 双盲独立复验闸门、零信任只读 Docker 沙盒（`N-009`）与 `install.sh` / `nuwa-autonomous doctor` 开箱即用体检。
 
 ---

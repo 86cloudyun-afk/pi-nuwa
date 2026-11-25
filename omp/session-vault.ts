@@ -20,7 +20,8 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import type { Fact } from "./types";
+import { isHostInScope } from "./scope";
+import type { Fact, ScopePolicy } from "./types";
 
 export interface SessionRoleEntry {
 	role: string;
@@ -31,7 +32,61 @@ export interface SessionRoleEntry {
 	password?: string;
 	note?: string;
 	sourceFactId?: string;
+	/** 会话过期时间（ISO-8601 时间戳；可由 JWT exp 自动推断） */
+	expiresAt?: string;
+	/** 授权只读会话健康探测 URL */
+	checkUrl?: string;
+	/** 需自动镜像的 CSRF 请求头名（如 X-CSRF-Token） */
+	csrfHeader?: string;
+	/** 用于镜像至 csrfHeader 的 Cookie 键名（如 csrftoken） */
+	csrfCookie?: string;
+	/** 非敏感会话刷新指引（如登录端点路径，严禁存放明文凭据） */
+	loginHint?: string;
 	updatedAt: string;
+}
+
+export interface RoleHealthFetchResponse {
+	ok: boolean;
+	status: number;
+	headers?: { get(name: string): string | null };
+}
+
+export type RoleHealthFetchLike = (
+	url: string,
+	init?: {
+		method?: string;
+		headers?: Record<string, string>;
+		redirect?: "manual" | "follow" | "error";
+		signal?: AbortSignal;
+	},
+) => Promise<RoleHealthFetchResponse>;
+
+export interface CheckRoleHealthOptions {
+	checkUrl?: string;
+	scope?: ScopePolicy;
+	fetchFn?: RoleHealthFetchLike;
+	nowMs?: number;
+	timeoutMs?: number;
+}
+
+export interface RoleHealthResult {
+	role: string;
+	exists: boolean;
+	healthy: boolean;
+	expired: boolean;
+	reason: string;
+	status?: number;
+	expiresAt?: string;
+	checkedAt: string;
+}
+
+export interface RefreshIntentSpec {
+	key: string;
+	phase: "surface";
+	title: string;
+	detail: string;
+	priority: 92;
+	from: string[];
 }
 
 export interface SessionVault {
@@ -221,7 +276,60 @@ function normalizeStoredEntry(roleKey: string, raw: unknown): SessionRoleEntry |
 	if (typeof obj.sourceFactId === "string" && obj.sourceFactId.trim()) {
 		entry.sourceFactId = stripCrlf(obj.sourceFactId);
 	}
+	if (typeof obj.expiresAt === "string" && obj.expiresAt.trim()) {
+		entry.expiresAt = stripCrlf(obj.expiresAt);
+	}
+	if (typeof obj.checkUrl === "string" && obj.checkUrl.trim()) {
+		entry.checkUrl = stripCrlf(obj.checkUrl);
+	}
+	if (typeof obj.csrfHeader === "string" && obj.csrfHeader.trim()) {
+		const ch = stripCrlf(obj.csrfHeader).replace(/:\s*$/, "");
+		if (ch) entry.csrfHeader = ch;
+	}
+	if (typeof obj.csrfCookie === "string" && obj.csrfCookie.trim()) {
+		entry.csrfCookie = stripCrlf(obj.csrfCookie);
+	}
+	if (typeof obj.loginHint === "string" && obj.loginHint.trim()) {
+		entry.loginHint = stripCrlf(obj.loginHint);
+	}
 	return entry;
+}
+
+/**
+ * 安全解码 JWT 载荷中的 `exp`（Unix 秒）为 ISO-8601 字符串。
+ * 非 JWT、非法 base64url/JSON 或缺少有效数值 `exp` 时返回 `undefined`。
+ */
+export function decodeJwtExpiryIso(token: string): string | undefined {
+	try {
+		const raw = String(token ?? "")
+			.trim()
+			.replace(/^(?:Bearer|Token|JWT)\s+/i, "")
+			.trim();
+		if (!raw) return undefined;
+		const parts = raw.split(".");
+		if (parts.length !== 3) return undefined;
+		const headerSeg = parts[0] ?? "";
+		const payloadSeg = parts[1] ?? "";
+		if (!headerSeg || !payloadSeg) return undefined;
+		if (!/^[A-Za-z0-9_-]+={0,2}$/.test(payloadSeg)) return undefined;
+
+		let b64 = payloadSeg.replace(/-/g, "+").replace(/_/g, "/");
+		if (b64.length % 4 === 1) return undefined;
+		const pad = (4 - (b64.length % 4)) % 4;
+		if (pad > 0) b64 += "=".repeat(pad);
+
+		const decoded = Buffer.from(b64, "base64").toString("utf8");
+		if (!decoded.startsWith("{")) return undefined;
+		const parsed = JSON.parse(decoded) as Record<string, unknown>;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const exp = parsed.exp;
+		if (typeof exp !== "number" || !Number.isFinite(exp) || exp <= 0) return undefined;
+		const d = new Date(exp * 1000);
+		if (Number.isNaN(d.getTime())) return undefined;
+		return d.toISOString();
+	} catch {
+		return undefined;
+	}
 }
 
 function resolveVault(rootOrVault: string | SessionVault): SessionVault {
@@ -320,6 +428,24 @@ export function upsertSessionRole(root: string, input: SessionRoleInput): Sessio
 	if (note) entry.note = note;
 	const sourceFactId = mergeField(input.sourceFactId, prev?.sourceFactId);
 	if (sourceFactId) entry.sourceFactId = sourceFactId;
+	const checkUrl = mergeField(input.checkUrl, prev?.checkUrl);
+	if (checkUrl) entry.checkUrl = checkUrl;
+	const rawCsrfHeader = mergeField(input.csrfHeader, prev?.csrfHeader);
+	const csrfHeader = rawCsrfHeader ? rawCsrfHeader.replace(/:\s*$/, "") : undefined;
+	if (csrfHeader) entry.csrfHeader = csrfHeader;
+	const csrfCookie = mergeField(input.csrfCookie, prev?.csrfCookie);
+	if (csrfCookie) entry.csrfCookie = csrfCookie;
+	const loginHint = mergeField(input.loginHint, prev?.loginHint);
+	if (loginHint) entry.loginHint = loginHint;
+
+	let expiresAt = mergeField(input.expiresAt, prev?.expiresAt);
+	if (input.expiresAt === undefined && entry.bearer) {
+		const jwtExp = decodeJwtExpiryIso(entry.bearer);
+		if (jwtExp && (input.bearer !== undefined || !expiresAt)) {
+			expiresAt = jwtExp;
+		}
+	}
+	if (expiresAt) entry.expiresAt = expiresAt;
 
 	vault.roles[role] = entry;
 	vault.updatedAt = ts;
@@ -535,10 +661,354 @@ export function formatSessionVaultSummary(rootOrVault: string | SessionVault): s
 				.join(",");
 			parts.push(`headers=${hList}`);
 		}
+		if (e.expiresAt) parts.push(`exp=${e.expiresAt}`);
 		if (e.sourceFactId) parts.push(`from=${e.sourceFactId}`);
 		lines.push(`- ${parts.join(" | ")}`);
 	}
 	return redactVaultSecrets(lines.join("\n"), vault);
+}
+
+function extractCookieValueByName(cookieStr: string, cookieName: string): string | undefined {
+	const target = stripCrlf(cookieName);
+	if (!cookieStr || !target) return undefined;
+	const targetLower = target.toLowerCase();
+	let caseInsensitiveMatch: string | undefined;
+	for (const part of cookieStr.split(";")) {
+		const seg = part.trim();
+		if (!seg) continue;
+		const eq = seg.indexOf("=");
+		if (eq <= 0) continue;
+		const ck = seg.slice(0, eq).trim();
+		const cv = seg.slice(eq + 1).trim();
+		if (!ck || !cv) continue;
+		if (ck === target) return cv;
+		if (caseInsensitiveMatch === undefined && ck.toLowerCase() === targetLower) {
+			caseInsensitiveMatch = cv;
+		}
+	}
+	return caseInsensitiveMatch;
+}
+
+function buildEntryHeadersMap(entry: SessionRoleEntry): Record<string, string> {
+	const out: Record<string, string> = {};
+	const seenLower = new Set<string>();
+
+	const pushHeader = (name: string, val: string) => {
+		const cleanName = stripCrlf(name).replace(/:\s*$/, "");
+		const cleanVal = stripCrlf(val);
+		if (!cleanName || !cleanVal) return;
+		const key = cleanName.toLowerCase();
+		if (seenLower.has(key)) return;
+		seenLower.add(key);
+		out[cleanName] = cleanVal;
+	};
+
+	if (entry.cookie) {
+		pushHeader("Cookie", entry.cookie);
+	}
+	if (entry.bearer) {
+		const val = /^(?:Bearer|Basic|Token|JWT)\s+/i.test(entry.bearer)
+			? entry.bearer
+			: `Bearer ${entry.bearer}`;
+		pushHeader("Authorization", val);
+	}
+	if (entry.headers) {
+		for (const [k, v] of Object.entries(entry.headers)) {
+			pushHeader(k, v);
+		}
+	}
+	if (Object.keys(out).length === 0 && entry.username && entry.password) {
+		const b64 = Buffer.from(`${entry.username}:${entry.password}`, "utf8").toString("base64");
+		pushHeader("Authorization", `Basic ${b64}`);
+	}
+
+	if (entry.csrfHeader && entry.csrfCookie) {
+		const cleanCsrfHeader = stripCrlf(entry.csrfHeader).replace(/:\s*$/, "");
+		if (cleanCsrfHeader && !seenLower.has(cleanCsrfHeader.toLowerCase())) {
+			const cookieSource =
+				entry.cookie ??
+				Object.entries(out).find(([k]) => k.toLowerCase() === "cookie")?.[1] ??
+				"";
+			const csrfVal = extractCookieValueByName(cookieSource, entry.csrfCookie);
+			if (csrfVal) {
+				pushHeader(cleanCsrfHeader, csrfVal);
+			}
+		}
+	}
+
+	return out;
+}
+
+/**
+ * 提取指定角色的规范化 HTTP 认证头映射（含 Cookie、Authorization、自定义头、Basic 兜底及 CSRF Cookie 镜像头）。
+ * 角色不存在或名称非法时返回 `null`。
+ */
+export function getRoleHeadersMap(
+	rootOrVault: string | SessionVault,
+	role: string,
+): Record<string, string> | null {
+	let normRole: string;
+	try {
+		normRole = sanitizeRoleName(role);
+	} catch {
+		return null;
+	}
+	const vault = resolveVault(rootOrVault);
+	const entry = vault.roles[normRole];
+	if (!entry) return null;
+	return buildEntryHeadersMap(entry);
+}
+
+const LOGIN_REDIRECT_RE = /login|signin|auth|sso/i;
+const HEALTH_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * 检查指定角色会话的健康度与有效期：
+ * 1. 先校验角色存在性与 `expiresAt` / JWT `exp` 本地过期时间；
+ * 2. 若提供 `opts.checkUrl` 或角色已配置 `checkUrl`，先通过 `ScopePolicy`（若提供）做范围闭环校验，
+ *    再发送只读 `GET`（`redirect: "manual"`）识别 401/403、登录页重定向与 2xx 有效态。
+ */
+export async function checkRoleHealth(
+	rootOrVault: string | SessionVault,
+	role: string,
+	opts?: CheckRoleHealthOptions,
+): Promise<RoleHealthResult> {
+	const nowMs = opts?.nowMs ?? Date.now();
+	const checkedAt = new Date(nowMs).toISOString();
+
+	let normRole: string;
+	try {
+		normRole = sanitizeRoleName(role);
+	} catch {
+		return {
+			role: String(role ?? "").trim(),
+			exists: false,
+			healthy: false,
+			expired: true,
+			reason: "角色不存在",
+			checkedAt,
+		};
+	}
+
+	const vault = resolveVault(rootOrVault);
+	const entry = vault.roles[normRole];
+	if (!entry) {
+		return {
+			role: normRole,
+			exists: false,
+			healthy: false,
+			expired: true,
+			reason: "角色不存在",
+			checkedAt,
+		};
+	}
+
+	const expiresAt = entry.expiresAt ?? (entry.bearer ? decodeJwtExpiryIso(entry.bearer) : undefined);
+	if (expiresAt) {
+		const expMs = Date.parse(expiresAt);
+		if (Number.isFinite(expMs) && expMs <= nowMs) {
+			return {
+				role: normRole,
+				exists: true,
+				healthy: false,
+				expired: true,
+				reason: "凭据已过期 (expiresAt/JWT exp)",
+				expiresAt,
+				checkedAt,
+			};
+		}
+	}
+
+	const probeUrl = String(opts?.checkUrl ?? entry.checkUrl ?? "").trim();
+	if (!probeUrl) {
+		return {
+			role: normRole,
+			exists: true,
+			healthy: true,
+			expired: false,
+			reason: "凭据未过期（未配置在线探测 URL）",
+			...(expiresAt ? { expiresAt } : {}),
+			checkedAt,
+		};
+	}
+
+	let parsedUrl: URL;
+	try {
+		parsedUrl = new URL(probeUrl);
+	} catch {
+		return {
+			role: normRole,
+			exists: true,
+			healthy: false,
+			expired: false,
+			reason: "在线探测 URL 非法",
+			...(expiresAt ? { expiresAt } : {}),
+			checkedAt,
+		};
+	}
+
+	if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+		return {
+			role: normRole,
+			exists: true,
+			healthy: false,
+			expired: false,
+			reason: `拒绝非 HTTP(S) 探测协议: ${parsedUrl.protocol}`,
+			...(expiresAt ? { expiresAt } : {}),
+			checkedAt,
+		};
+	}
+
+	if (opts?.scope) {
+		const sc = isHostInScope(parsedUrl.hostname, opts.scope);
+		if (!sc.ok) {
+			return {
+				role: normRole,
+				exists: true,
+				healthy: false,
+				expired: false,
+				reason: sc.reason ?? `探测主机 ${parsedUrl.hostname} 超出 ScopePolicy 允许范围`,
+				...(expiresAt ? { expiresAt } : {}),
+				checkedAt,
+			};
+		}
+	}
+
+	const headers = getRoleHeadersMap(vault, normRole) ?? {};
+	const timeoutMs = Math.max(500, Math.min(30_000, opts?.timeoutMs ?? 8_000));
+	const fetcher: RoleHealthFetchLike =
+		opts?.fetchFn ??
+		(async (url, init) => {
+			const res = await fetch(url, {
+				method: init?.method ?? "GET",
+				headers: init?.headers,
+				redirect: init?.redirect ?? "manual",
+				signal: init?.signal,
+			});
+			return { ok: res.ok, status: res.status, headers: res.headers };
+		});
+
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const resp = await fetcher(parsedUrl.href, {
+			method: "GET",
+			headers,
+			redirect: "manual",
+			signal: controller.signal,
+		});
+		const status = resp.status;
+		if (status === 401 || status === 403) {
+			return {
+				role: normRole,
+				exists: true,
+				healthy: false,
+				expired: true,
+				status,
+				reason: `在线探测返回 HTTP ${status}，会话已失效或鉴权被拒`,
+				...(expiresAt ? { expiresAt } : {}),
+				checkedAt,
+			};
+		}
+		if (HEALTH_REDIRECT_STATUSES.has(status)) {
+			const loc = resp.headers?.get("location")?.trim() ?? "";
+			if (loc && LOGIN_REDIRECT_RE.test(loc)) {
+				return {
+					role: normRole,
+					exists: true,
+					healthy: false,
+					expired: true,
+					status,
+					reason: redactVaultSecrets(`在线探测重定向至登录/认证页 (HTTP ${status} -> ${loc})`, vault),
+					...(expiresAt ? { expiresAt } : {}),
+					checkedAt,
+				};
+			}
+			return {
+				role: normRole,
+				exists: true,
+				healthy: false,
+				expired: false,
+				status,
+				reason: redactVaultSecrets(`在线探测返回非预期重定向 (HTTP ${status})`, vault),
+				...(expiresAt ? { expiresAt } : {}),
+				checkedAt,
+			};
+		}
+		if (status >= 200 && status < 300) {
+			return {
+				role: normRole,
+				exists: true,
+				healthy: true,
+				expired: false,
+				status,
+				reason: "会话有效",
+				...(expiresAt ? { expiresAt } : {}),
+				checkedAt,
+			};
+		}
+		return {
+			role: normRole,
+			exists: true,
+			healthy: false,
+			expired: false,
+			status,
+			reason: `在线探测返回非预期状态码 HTTP ${status}`,
+			...(expiresAt ? { expiresAt } : {}),
+			checkedAt,
+		};
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return {
+			role: normRole,
+			exists: true,
+			healthy: false,
+			expired: false,
+			reason: redactVaultSecrets(`在线探测请求失败: ${msg}`, vault),
+			...(expiresAt ? { expiresAt } : {}),
+			checkedAt,
+		};
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/**
+ * 构造会话刷新高优意图规范（priority=92），用于触发代理重新获取有效认证态并回写 Session Vault。
+ */
+export function buildRefreshIntentSpec(
+	role: string,
+	reason: string,
+	checkUrl?: string,
+): RefreshIntentSpec {
+	let normRole: string;
+	try {
+		normRole = sanitizeRoleName(role);
+	} catch {
+		normRole =
+			String(role ?? "default")
+				.trim()
+				.toLowerCase()
+				.replace(/[^a-z0-9._-]+/g, "_")
+				.replace(/^[^a-z0-9]+/, "")
+				.slice(0, 64) || "default";
+	}
+	const cleanReason = stripCrlf(reason) || "会话已失效";
+	const cleanCheckUrl = checkUrl ? stripCrlf(checkUrl) : "";
+	const detailParts = [
+		`角色 ${normRole} 会话健康检测失败（${cleanReason}）。`,
+		cleanCheckUrl ? `健康探测地址: ${cleanCheckUrl}。` : "",
+		`请使用既有授权测试凭据重新登录获取新会话，通过 Session Vault 更新该角色凭据并验证恢复有效（严禁在日志、命令或事实中打印明文凭据）。`,
+	].filter(Boolean);
+
+	return {
+		key: `session-refresh:${normRole}`,
+		phase: "surface" as const,
+		title: `刷新认证会话 (${normRole})`,
+		detail: detailParts.join(" "),
+		priority: 92,
+		from: [],
+	};
 }
 
 /**
@@ -556,37 +1026,8 @@ export function materializeRoleHeaderFile(
 	const entry = vault.roles[normRole];
 	if (!entry) return null;
 
-	const headerLines: string[] = [];
-	const seenLower = new Set<string>();
-
-	const pushHeader = (name: string, val: string) => {
-		const cleanName = stripCrlf(name).replace(/:\s*$/, "");
-		const cleanVal = stripCrlf(val);
-		if (!cleanName || !cleanVal) return;
-		const key = cleanName.toLowerCase();
-		if (seenLower.has(key)) return;
-		seenLower.add(key);
-		headerLines.push(`${cleanName}: ${cleanVal}`);
-	};
-
-	if (entry.cookie) {
-		pushHeader("Cookie", entry.cookie);
-	}
-	if (entry.bearer) {
-		const val = /^(?:Bearer|Basic|Token|JWT)\s+/i.test(entry.bearer)
-			? entry.bearer
-			: `Bearer ${entry.bearer}`;
-		pushHeader("Authorization", val);
-	}
-	if (entry.headers) {
-		for (const [k, v] of Object.entries(entry.headers)) {
-			pushHeader(k, v);
-		}
-	}
-	if (headerLines.length === 0 && entry.username && entry.password) {
-		const b64 = Buffer.from(`${entry.username}:${entry.password}`, "utf8").toString("base64");
-		pushHeader("Authorization", `Basic ${b64}`);
-	}
+	const headersMap = buildEntryHeadersMap(entry);
+	const headerLines = Object.entries(headersMap).map(([k, v]) => `${k}: ${v}`);
 
 	const sessionsDir = join("/tmp/nuwa", safeProjectId, "sessions");
 	const filePath = join(sessionsDir, `${normRole}.headers`);

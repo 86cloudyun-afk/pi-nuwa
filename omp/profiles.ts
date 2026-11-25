@@ -16,6 +16,12 @@ export interface ProfileSeed {
 	priority?: number;
 }
 
+export interface ProfileFallbackSpec {
+	title: string;
+	detail: string;
+	priority: number;
+}
+
 export interface ProfileSpec {
 	mode: ProfileMode;
 	label: string;
@@ -23,6 +29,12 @@ export interface ProfileSpec {
 	phases: readonly Phase[];
 	requireHttpTarget: boolean;
 	seeds: Record<Phase, Array<{ key: string; title: string; detail: string; priority?: number }>>;
+	/** v5.0 领域解耦意图派生插件钩子（按模式将事实转化为领域专属意图）。 */
+	deriveIntents?: (st: NuwaState, cap?: number) => DerivedIntentSpec[];
+	/** v5.0 领域解耦兜底深挖插件钩子。 */
+	buildFallback?: (st: NuwaState, seqNum: number) => ProfileFallbackSpec;
+	/** v5.0 报告主标题模板。 */
+	reportTitle?: string;
 }
 
 export interface DerivedIntentSpec {
@@ -563,6 +575,140 @@ const OPS_SEEDS: Record<Phase, ProfileSeed[]> = {
 	],
 };
 
+const AUDIT_SEEDS: Record<Phase, ProfileSeed[]> = {
+	recon: [
+		{
+			key: "repo-inventory",
+			title: "代码库语言栈、入口与认证中间件盘点",
+			priority: 92,
+			detail: [
+				"目标: 测绘目标代码库 {HOST} 的主要语言栈、服务入口文件、Web/RPC 框架及全局认证/鉴权中间件装配链。",
+				"要求: 逐条标注核心模块路径与入口位置（file:line），禁止遗漏多服务/子包目录。",
+				"证据: kind=service 或 asset；附目录遍历与入口检索命令及关键输出。",
+			].join("\n"),
+		},
+		{
+			key: "dep-manifest",
+			title: "依赖清单与已知 CVE 供应链审计",
+			priority: 86,
+			detail: [
+				"目标: 解析 package.json、pom.xml、requirements.txt、go.mod、Cargo.toml 等依赖清单及锁文件，核查高危已知 CVE 与过旧核心框架版本。",
+				"要求: 对命中的组件与精确版本号结合 nuwa_kb 映射安全公告，并核对项目中是否实际调用受影响 API。",
+				"证据: kind=vuln 或 note；附清单文件摘录、版本核对与调用链位置（file:line）。",
+			].join("\n"),
+		},
+		{
+			key: "config-secrets",
+			title: "安全配置基线与敏感密钥暴露核查",
+			priority: 80,
+			detail: [
+				"目标: 审计配置文件、.env.example、Dockerfile、CORS/CSP/TLS/Cookie/Session 默认参数及历史硬编码凭证风险。",
+				"要求: 发现潜在密钥或弱默认配置时严格脱敏记录位置（file:line）与影响范围。",
+				"证据: kind=vuln、loot 或 note；附只读检索命令与脱敏回显。",
+			].join("\n"),
+		},
+	],
+	surface: [
+		{
+			key: "route-auth-map",
+			title: "HTTP/RPC 路由表与鉴权/RBAC 装饰器覆盖率测绘",
+			priority: 88,
+			detail: [
+				"目标: 提取全部 HTTP/GraphQL/gRPC 路由注册表、控制器与路由级认证/角色装饰器覆盖情况。",
+				"要求: 标出未挂认证中间件、仅前端隐藏或权限角色配置异常的接口位置（file:line）。",
+				"证据: kind=endpoint；detail 须列出路由、方法、控制器 file:line 与鉴权修饰状态。",
+			].join("\n"),
+		},
+		{
+			key: "input-sources",
+			title: "外部输入源与解析入口清点",
+			priority: 82,
+			detail: [
+				"目标: 盘点请求参数、HTTP Header、Cookie、文件上传、Webhook 回调、反序列化与模板渲染等全部外部不可信输入源。",
+				"要求: 记录输入解析器、Schema 校验位置与进入业务层前后的转换逻辑（file:line）。",
+				"证据: kind=endpoint 或 note；写明参数来源、校验边界与入口代码位置。",
+			].join("\n"),
+		},
+	],
+	vuln: [
+		{
+			key: "sink-injection",
+			title: "注入类危险汇点审计（SQL/NoSQL/命令/模板/LDAP）",
+			priority: 92,
+			detail: [
+				"目标: 沿外部输入源追踪至原始 SQL/NoSQL 查询拼接、OS 子进程执行、服务端模板渲染、表达式求值与 LDAP/XML 解析汇点。",
+				"要求: 仅入账具有明确污点流与可控参数的真实缺陷，必须给出完整 source -> sink 调用链与精确 file:line。",
+				"证据: kind=vuln 或 note；附关键代码片段与边界分析依据。",
+			].join("\n"),
+		},
+		{
+			key: "sink-access-control",
+			title: "访问控制越权与边界绕过审计（BOLA/BFLA/SSRF/路径遍历）",
+			priority: 88,
+			detail: [
+				"目标: 核查资源查询/修改接口的对象归属校验（BOLA）、管理功能角色校验（BFLA）以及出向 URL 请求（SSRF）与文件路径拼接（路径遍历）的白名单/规范化边界。",
+				"要求: 逐一核对是否存在租户隔离缺失、重定向绕过或路径规范化前校验缺陷，标注精确 file:line。",
+				"证据: kind=vuln 或 note；附权限检查缺失位置与最小触发条件。",
+			].join("\n"),
+		},
+		{
+			key: "sink-crypto-auth",
+			title: "认证会话、JWT 验签与密码学实现审计",
+			priority: 84,
+			detail: [
+				"目标: 审查 JWT 签名算法固定与密钥管理、会话固定/失效策略、口令哈希算法与加盐、弱随机数及硬编码密钥问题。",
+				"要求: 检查是否存在 alg=none/密钥混淆、恒定时间比较缺失或敏感令牌日志泄露（file:line）。",
+				"证据: kind=vuln 或 note；附代码证据位置与安全影响说明。",
+			].join("\n"),
+		},
+	],
+	exploit: [
+		{
+			key: "greybox-verify",
+			title: "高风险汇点最小非破坏性单测/灰盒验证",
+			priority: 90,
+			detail: [
+				"目标: 对已识别的高优先源码缺陷构造最小化、非破坏性单元测试或灰盒运行态验证，实证污点可达性与真实安全影响。",
+				"要求: 严禁破坏数据或改动生产配置；若框架或补偿控制阻断触发，如实记录证伪依据。",
+				"证据: kind=vuln 或 loot；必须附带实际执行的验证命令与原始回显。",
+			].join("\n"),
+		},
+	],
+	post: [
+		{
+			key: "impact-triage",
+			title: "影响面分级、可达性与补偿控制评估",
+			priority: 85,
+			detail: [
+				"目标: 结合认证前提、部署边界与补偿控制措施，对每条已确认缺陷评估实际爆炸半径、利用前置条件与风险等级。",
+				"要求: 区分外网匿名可达、认证后越权与仅内网/特定配置触发三类场景。",
+				"证据: kind=loot 或 note；汇总风险定级矩阵与可达性结论。",
+			].join("\n"),
+		},
+	],
+	report: [
+		{
+			key: "remediation-plan",
+			title: "精准修复补丁与回归验证方案整理",
+			priority: 92,
+			detail: [
+				"目标: 针对每条已确认缺陷输出精确 file:line 根因定位、最小化安全修复补丁建议以及对应回归单测设计。",
+				"要求: 修复建议必须可直接落地（参数化查询、白名单校验、归属权断言等），禁止泛泛口号。",
+				"证据: kind=note；整理完毕且满足验收条件后调用 nuwa_complete。",
+			].join("\n"),
+		},
+		{
+			key: "security-checklist",
+			title: "残留暴露面与纵深防御加固清单",
+			priority: 72,
+			detail: [
+				"目标: 梳理尚未触发漏洞但值得加固的依赖升级、安全响应头、日志脱敏与 CI 静态扫描门禁建议。",
+				"证据: kind=note。",
+			].join("\n"),
+		},
+	],
+};
+
 function cloneSeeds(src: Record<Phase, ProfileSeed[]>): Record<Phase, ProfileSeed[]> {
 	return {
 		recon: src.recon.map((s) => ({ ...s })),
@@ -592,6 +738,9 @@ export function getProfile(mode: string): ProfileSpec {
 				phases: [...STANDARD_PHASES],
 				requireHttpTarget: true,
 				seeds: cloneSeeds(SECURITY_SEEDS),
+				deriveIntents: () => [],
+				buildFallback: (st, seqNum) => buildSecurityFallbackIntent(st, seqNum),
+				reportTitle: "渗透报告",
 			};
 		case "audit":
 			return {
@@ -599,8 +748,12 @@ export function getProfile(mode: string): ProfileSpec {
 				label: "代码与配置安全审计",
 				proofKinds: ["vuln", "loot"],
 				phases: [...STANDARD_PHASES],
-				requireHttpTarget: true,
-				seeds: cloneSeeds(SECURITY_SEEDS),
+				requireHttpTarget: false,
+				seeds: cloneSeeds(AUDIT_SEEDS),
+				deriveIntents: (st, cap) => deriveAuditIntents(st, cap),
+				buildFallback: (st, seqNum) =>
+					isLocalAuditProject(st) ? buildLocalAuditFallbackIntent(st, seqNum) : buildSecurityFallbackIntent(st, seqNum),
+				reportTitle: "安全审计报告",
 			};
 		case "coding":
 			return {
@@ -610,6 +763,9 @@ export function getProfile(mode: string): ProfileSpec {
 				phases: [...STANDARD_PHASES],
 				requireHttpTarget: false,
 				seeds: cloneSeeds(CODING_SEEDS),
+				deriveIntents: (st, cap) => deriveCodingIntents(st, cap),
+				buildFallback: (st, seqNum) => buildCodingFallbackIntent(st, seqNum),
+				reportTitle: "软件工程交付报告",
 			};
 		case "ops":
 			return {
@@ -619,6 +775,9 @@ export function getProfile(mode: string): ProfileSpec {
 				phases: [...STANDARD_PHASES],
 				requireHttpTarget: false,
 				seeds: cloneSeeds(OPS_SEEDS),
+				deriveIntents: (st, cap) => deriveOpsIntents(st, cap),
+				buildFallback: (st, seqNum) => buildOpsFallbackIntent(st, seqNum),
+				reportTitle: "运维排障复盘报告",
 			};
 		case "ctf":
 		default:
@@ -629,6 +788,9 @@ export function getProfile(mode: string): ProfileSpec {
 				phases: [...STANDARD_PHASES],
 				requireHttpTarget: true,
 				seeds: cloneSeeds(SECURITY_SEEDS),
+				deriveIntents: () => [],
+				buildFallback: (st, seqNum) => buildSecurityFallbackIntent(st, seqNum),
+				reportTitle: "渗透报告",
 			};
 	}
 }
@@ -855,7 +1017,13 @@ export function buildReflectIntentSpec(
 
 	const mode = st.project.mode;
 	const hypothesisNoun =
-		mode === "coding" ? "实现/排障假设与验证任务" : mode === "ops" ? "根因排查假设与恢复验证项" : "新攻击假设与验证路径";
+		mode === "coding"
+			? "实现/排障假设与验证任务"
+			: mode === "ops"
+				? "根因排查假设与恢复验证项"
+				: mode === "audit"
+					? "代码审计风险假设与修复验证项"
+					: "新攻击假设与验证路径";
 
 	const triggerLabel = reason || (isStalled ? `stall=${stall}` : `phase-closing:${phase}`);
 
@@ -880,4 +1048,411 @@ export function buildReflectIntentSpec(
 		priority: 88,
 		from: fromIds,
 	};
+}
+
+// ============================================================================
+// v5.0 可插拔领域解耦派生、兜底规划与报告标题策略
+// ============================================================================
+
+const SOURCE_FILE_RE =
+	/(?:^|[\s'"`(])([A-Za-z0-9_./-]+\.(?:tsx?|jsx?|mjs|cjs|py|go|rs|java|kt|rb|php|cs|cpp|cc|c|h|hpp|swift))(?=$|[\s'"`),:;])/g;
+
+const DEP_MANIFEST_RE =
+	/\b(?:package\.json|package-lock\.json|bun\.lockb?|pnpm-lock\.yaml|yarn\.lock|pom\.xml|build\.gradle|requirements\.txt|pyproject\.toml|go\.mod|Cargo\.toml|composer\.json|Gemfile)\b/i;
+
+const CODING_ERROR_RE =
+	/\b(?:fail(?:ed|ure|ing)?|error|exception|traceback|assertionerror|typeerror|referenceerror|syntaxerror|ts\d{4}|eslint|biome|mypy|pyright|flake8|ruff|clippy|compile\s+error|build\s+failed|non-zero\s+exit)\b|失败|报错|类型错误|编译失败|异常/i;
+
+const OPS_FAULT_RE =
+	/\b(?:oom|out\s+of\s+memory|killed|timeout|timed\s+out|latency|slow|p95|p99|5\d\d|502|503|504|error|fatal|panic|crashloop|backoff|unhealthy|degraded|down|refused|reset|disk\s+full|no\s+space|cpu\s+high|deadlock|exhausted)\b|超时|内存溢出|高延迟|异常|故障|不可用|宕机|告警/i;
+
+const OPS_REMEDIATE_RE =
+	/\b(?:unhealthy|degraded|down|oom|timeout|502|503|504|crashloop|disk\s+full|drift|misconfig|exhausted|connection\s+refused|port\s+\d+|:\d{2,5})\b|故障|止损|漂移|异常|不可用|瓶颈/i;
+
+const OPS_VERIFY_RE =
+	/\b(?:remediat|recover|restart|rollback|patch|fix|health|probe|slo|latency|error\s+rate|unhealthy|degraded)\b|恢复|止损|探针|指标/i;
+
+const AUDIT_SINK_RE =
+	/\b(?:sink|taint|ast|sql|nosql|query|exec\s*\(|spawn\s*\(|eval\s*\(|system\s*\(|template|render_template_string|deserialize|pickle|unserialize|ssrf|traversal|lfi|jwt|crypto|hash|hardcoded|secret|cve-\d{4}-\d{4,7})\b|危险函数|汇点|污点|注入|反序列化|密钥|硬编码/i;
+
+const AUDIT_AUTHZ_RE =
+	/\b(?:route|router|controller|handler|middleware|auth|rbac|acl|permission|role|guard|session|jwt|oauth|admin|api|graphql|endpoint|decorator|annotation|bola|bfla|idor|ownership)\b|路由|鉴权|权限|认证|越权/i;
+
+const AUDIT_PATCH_RE =
+	/\b(?:vulnerable|vuln|cve-\d{4}-\d{4,7}|hardcoded|secret|leaked|bypass|injection|traversal|ssrf|idor|bola|bfla|rce|xss|csrf|misconfig)\b|漏洞|缺陷|硬编码|绕过|注入/i;
+
+function extractSourceFilesFromBlob(blob: string, max = 6): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const m of blob.matchAll(SOURCE_FILE_RE)) {
+		const raw = m[1]!;
+		if (!raw || /^https?:\/\//i.test(raw)) continue;
+		if (seen.has(raw)) continue;
+		seen.add(raw);
+		out.push(raw);
+		if (out.length >= max) break;
+	}
+	return out;
+}
+
+function collectActiveFacts(st: NuwaState): Fact[] {
+	return Object.values(st.facts ?? {})
+		.filter((f) => f.verifyStage !== "rejected" && f.kind !== "blocked")
+		.sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function factTextBlob(f: Fact): string {
+	return [
+		f.title ?? "",
+		f.detail ?? "",
+		f.output ?? "",
+		...(f.meta?.paths ?? []),
+		...(f.meta?.routes ?? []),
+		...(f.meta?.tech ?? []),
+	].join("\n");
+}
+
+/** 判断项目是否属于本地代码仓白盒审计模式（`mode === "audit"` 且目标为本地路径或 `scheme === "local"`）。 */
+export function isLocalAuditProject(st: NuwaState): boolean {
+	const p = st?.project;
+	if (!p || p.mode !== "audit") return false;
+	if (p.scheme === "local") return true;
+	const url = String(p.url ?? "").trim();
+	const target = String(p.target ?? "").trim();
+	if (/^(?:local|file):\/\//i.test(url) || /^(?:local|file):\/\//i.test(target)) return true;
+	if (!/^https?:\/\//i.test(url) && !/^https?:\/\//i.test(target)) {
+		if (/^(?:\.{1,2}(?:[\\/]|$)|[\\/]|~[\\/]|[a-zA-Z]:[\\/])/.test(target)) return true;
+		if (p.port === 0) return true;
+	}
+	return false;
+}
+
+function deriveCodingIntents(st: NuwaState, cap = 12): DerivedIntentSpec[] {
+	const limit = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : 12;
+	if (limit <= 0) return [];
+
+	const existing = new Set(Object.values(st.intents ?? {}).map((i) => i.key));
+	const out: DerivedIntentSpec[] = [];
+	const push = (spec: DerivedIntentSpec) => {
+		if (out.length >= limit || existing.has(spec.key)) return;
+		existing.add(spec.key);
+		out.push(spec);
+	};
+
+	for (const f of collectActiveFacts(st)) {
+		if (out.length >= limit) break;
+		const blob = factTextBlob(f);
+		const files = extractSourceFilesFromBlob(blob);
+		const hasError = f.kind === "vuln" || CODING_ERROR_RE.test(blob);
+		const hasChangeHint =
+			files.length > 0 ||
+			f.kind === "loot" ||
+			f.kind === "endpoint" ||
+			/\b(?:diff|changed|modified|implement|refactor|patch|module|export)\b|改动|实现|重构/i.test(blob);
+
+		if (hasError) {
+			const fileHint = files.length > 0 ? `涉及文件: ${files.join(", ")}` : "定位对应源码模块与报错栈";
+			push({
+				key: `coding-fix:${f.id}`,
+				phase: "exploit",
+				title: `修复缺陷与测试/类型错误 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					fileHint,
+					`目标: 针对 ${f.id} 记录的测试失败、类型报错或静态检查异常完成最小化根因修复，保持公共接口向后兼容。`,
+					`要求: 改动完成后执行构建与相关测试套件，将真实命令与通过摘要通过 nuwa_commit 入账。`,
+				].join("\n"),
+				priority: 88,
+				from: [f.id],
+			});
+		}
+
+		if (hasChangeHint) {
+			const fileList = files.length > 0 ? files.join(", ") : oneLine(f.title, 60);
+			push({
+				key: `coding-test:${f.id}`,
+				phase: "post",
+				title: `补充单元测试与回归验证 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					`关联模块: ${fileList}`,
+					`目标: 为变更代码补充正常路径与边界/异常路径单元测试，并执行回归测试确保 0 失败。`,
+					`证据: kind=loot 或 note；附实测测试命令与通过统计。`,
+				].join("\n"),
+				priority: 82,
+				from: [f.id],
+			});
+			push({
+				key: `coding-review:${f.id}`,
+				phase: "report",
+				title: `代码变更自审与接口兼容性核查 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					`关联模块: ${fileList}`,
+					`目标: 复核导出符号契约、错误处理、资源清理与 git diff 整洁度，确认无无关改动或临时文件残留。`,
+					`证据: kind=note；记录审查要点与兼容性结论。`,
+				].join("\n"),
+				priority: 74,
+				from: [f.id],
+			});
+		}
+	}
+
+	return out;
+}
+
+function deriveOpsIntents(st: NuwaState, cap = 12): DerivedIntentSpec[] {
+	const limit = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : 12;
+	if (limit <= 0) return [];
+
+	const existing = new Set(Object.values(st.intents ?? {}).map((i) => i.key));
+	const out: DerivedIntentSpec[] = [];
+	const push = (spec: DerivedIntentSpec) => {
+		if (out.length >= limit || existing.has(spec.key)) return;
+		existing.add(spec.key);
+		out.push(spec);
+	};
+
+	for (const f of collectActiveFacts(st)) {
+		if (out.length >= limit) break;
+		const blob = factTextBlob(f);
+		const hasFault = f.kind === "vuln" || OPS_FAULT_RE.test(blob);
+		const needsRemediate = f.kind === "vuln" || OPS_REMEDIATE_RE.test(blob);
+		const needsSloVerify = f.kind === "loot" || f.kind === "service" || OPS_VERIFY_RE.test(blob);
+
+		if (hasFault) {
+			push({
+				key: `ops-rca:${f.id}`,
+				phase: "vuln",
+				title: `故障根因关联分析 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					`目标: 结合错误日志聚类、资源指标（CPU/内存/磁盘/FD）与上下游依赖状态，验证 ${f.id} 指向的首要根因假设并排除伴随症状。`,
+					`要求: 仅执行只读诊断命令，明确异常起始时间线与根因证据链。`,
+				].join("\n"),
+				priority: 90,
+				from: [f.id],
+			});
+		}
+
+		if (needsRemediate) {
+			push({
+				key: `ops-remediate:${f.id}`,
+				phase: "exploit",
+				title: `低风险止损与恢复方案实施 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					`目标: 在留存旧配置备份与可秒级回滚前提下，针对 ${f.id} 的服务异常或配置漂移制定并实施低风险止损措施。`,
+					`要求: 严禁未确认的高危破坏指令，操作前后均记录可观测指标回显。`,
+				].join("\n"),
+				priority: 86,
+				from: [f.id],
+			});
+		}
+
+		if (needsSloVerify) {
+			push({
+				key: `ops-slo-verify:${f.id}`,
+				phase: "post",
+				title: `恢复后健康探针与 SLO 复验 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					`目标: 连续复验受影响服务健康探针、错误率、延迟分位（p95/p99）及告警收敛状态，确认稳定恢复。`,
+					`证据: kind=loot 或 note；附实测探活与指标回显。`,
+				].join("\n"),
+				priority: 82,
+				from: [f.id],
+			});
+		}
+	}
+
+	return out;
+}
+
+function deriveAuditIntents(st: NuwaState, cap = 12): DerivedIntentSpec[] {
+	if (!isLocalAuditProject(st)) return [];
+	const limit = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : 12;
+	if (limit <= 0) return [];
+
+	const existing = new Set(Object.values(st.intents ?? {}).map((i) => i.key));
+	const out: DerivedIntentSpec[] = [];
+	const push = (spec: DerivedIntentSpec) => {
+		if (out.length >= limit || existing.has(spec.key)) return;
+		existing.add(spec.key);
+		out.push(spec);
+	};
+
+	for (const f of collectActiveFacts(st)) {
+		if (out.length >= limit) break;
+		const blob = factTextBlob(f);
+		const files = extractSourceFilesFromBlob(blob);
+		const hasSinkOrDep = files.length > 0 || DEP_MANIFEST_RE.test(blob) || AUDIT_SINK_RE.test(blob);
+		const hasAuthzSurface = f.kind === "endpoint" || AUDIT_AUTHZ_RE.test(blob);
+		const hasFinding = f.kind === "vuln" || f.kind === "loot" || AUDIT_PATCH_RE.test(blob);
+
+		if (hasSinkOrDep) {
+			const locHint = files.length > 0 ? `关注文件: ${files.join(", ")}` : "关注依赖与核心处理模块";
+			push({
+				key: `audit-sink:${f.id}`,
+				phase: "vuln",
+				title: `白盒危险汇点与污点流审计 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					locHint,
+					`目标: 沿外部可控输入追踪至 SQL/NoSQL/命令/模板/反序列化/文件读写/出向请求汇点及依赖调用点，核验参数化与校验边界。`,
+					`证据: kind=vuln 或 note；必须标注精确 file:line 与完整污点路径。`,
+				].join("\n"),
+				priority: 90,
+				from: [f.id],
+			});
+		}
+
+		if (hasAuthzSurface) {
+			push({
+				key: `audit-authz:${f.id}`,
+				phase: "vuln",
+				title: `路由鉴权与对象级权限边界审计 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					`目标: 核查关联路由、控制器与中间件的认证守卫、RBAC 角色校验（BFLA）以及资源归属校验（BOLA/IDOR），确认无鉴权遗漏。`,
+					`证据: kind=vuln 或 note；逐项注明路由、file:line 与鉴权装饰器状态。`,
+				].join("\n"),
+				priority: 86,
+				from: [f.id],
+			});
+		}
+
+		if (hasFinding) {
+			push({
+				key: `audit-patch:${f.id}`,
+				phase: "report",
+				title: `根因定位、最小修复补丁与回归测试方案 (${f.id})`,
+				detail: [
+					`来源事实: ${f.id} [${f.kind}] ${oneLine(f.title, 80)}`,
+					`目标: 为 ${f.id} 对应风险输出精确 file:line 根因、最小化安全补丁建议与防回归单测用例设计。`,
+					`证据: kind=note；包含修复前后差异要点与验收验证步骤。`,
+				].join("\n"),
+				priority: 82,
+				from: [f.id],
+			});
+		}
+	}
+
+	return out;
+}
+
+/**
+ * 领域解耦意图派生入口：
+ * - `coding` / `ops` / 本地白盒 `audit`：产出专属工程、运维或白盒审计意图（绝不混入渗透扫描工具）；
+ * - `ctf` / `pentest` / 远程 HTTP `audit`：返回 `[]`，交由安全评估引擎 `deriveFromFacts` 处理。
+ */
+export function deriveProfileIntents(st: NuwaState, cap = 12): DerivedIntentSpec[] {
+	if (!st?.project) return [];
+	const prof = getProfile(st.project.mode);
+	return prof.deriveIntents ? prof.deriveIntents(st, cap) : [];
+}
+
+function recentFactSummary(st: NuwaState): string {
+	return Object.values(st.facts ?? {})
+		.filter((f) => f.verifyStage !== "rejected")
+		.slice(-8)
+		.map((f) => `${f.id}[${f.kind}] ${oneLine(f.title, 50)}`)
+		.join("；");
+}
+
+function buildCodingFallbackIntent(st: NuwaState, seqNum: number): ProfileFallbackSpec {
+	const ep = st.project.episode ?? 1;
+	const n = Number.isFinite(seqNum) && seqNum > 0 ? Math.floor(seqNum) : 1;
+	return {
+		title: `深度工程推进 ${st.project.phase} #${n}`,
+		priority: 35,
+		detail: [
+			`frontier 已空，自动扩张触发。工作区: ${st.project.url || st.project.target}（第 ${ep} 轮）`,
+			`已知事实: ${recentFactSummary(st) || "(无)"}`,
+			`从下面四项里选一项执行，必须产出新 fact 或 blocked note：`,
+			`1) 模块与类型深查：核对未覆盖源码文件、导出接口契约并执行静态类型检查/lint`,
+			`2) 测试覆盖补强：针对关键逻辑、空输入、并发与错误降级路径新增单元测试并运行测试套件`,
+			`3) 变更质量复核：审阅 git diff 与构建产物，排查向后兼容性退化或边界遗漏`,
+			`4) 交付收口核对：确认全量回归测试通过并补齐交付验收文档`,
+			`纪律: 命令必须实际执行，构建/测试回显原样入账。`,
+		].join("\n"),
+	};
+}
+
+function buildOpsFallbackIntent(st: NuwaState, seqNum: number): ProfileFallbackSpec {
+	const ep = st.project.episode ?? 1;
+	const n = Number.isFinite(seqNum) && seqNum > 0 ? Math.floor(seqNum) : 1;
+	return {
+		title: `深度运维排查 ${st.project.phase} #${n}`,
+		priority: 35,
+		detail: [
+			`frontier 已空，自动扩张触发。服务目标: ${st.project.url || st.project.target}（第 ${ep} 轮）`,
+			`已知事实: ${recentFactSummary(st) || "(无)"}`,
+			`从下面四项里选一项执行，必须产出新 fact 或 blocked note：`,
+			`1) 健康与资源采样：复查进程状态、监听端口、CPU/内存/磁盘/inode/FD 与负载趋势`,
+			`2) 日志与时间线聚类：筛选 ERROR/WARN/OOM/Timeout 峰值并与近期发布或配置变更对齐`,
+			`3) 依赖与瓶颈排查：核查数据库、缓存、消息队列、DNS、连接池与证书有效期`,
+			`4) 恢复与复盘核验：核对回滚预案、SLO 指标收敛、告警恢复状态与防复发改进项`,
+			`纪律: 坚持只读优先与可回滚原则，诊断与复验回显原样入账。`,
+		].join("\n"),
+	};
+}
+
+function buildLocalAuditFallbackIntent(st: NuwaState, seqNum: number): ProfileFallbackSpec {
+	const ep = st.project.episode ?? 1;
+	const n = Number.isFinite(seqNum) && seqNum > 0 ? Math.floor(seqNum) : 1;
+	return {
+		title: `深度白盒审计 ${st.project.phase} #${n}`,
+		priority: 35,
+		detail: [
+			`frontier 已空，自动扩张触发。代码仓: ${st.project.url || st.project.target}（第 ${ep} 轮）`,
+			`已知事实: ${recentFactSummary(st) || "(无)"}`,
+			`从下面四项里选一项执行，必须产出新 fact 或 blocked note：`,
+			`1) 路由与鉴权补漏：逐项复核控制器/中间件装饰器覆盖率，排查缺失认证或越权检查（标注 file:line）`,
+			`2) 危险汇点污点追踪：深度检索 SQL/命令/模板/反序列化/文件读写/出向请求调用链`,
+			`3) 供应链与配置复查：核对依赖清单已知 CVE、JWT/会话校验、CORS/CSP 与硬编码凭据风险`,
+			`4) 最小单测与修复方案：为已确认高风险缺陷补充最小非破坏性验证单测与精准修复补丁计划`,
+			`纪律: 每条发现必须附带精确 file:line 与真实检索/验证回显。`,
+		].join("\n"),
+	};
+}
+
+function buildSecurityFallbackIntent(st: NuwaState, seqNum: number): ProfileFallbackSpec {
+	const ep = st.project.episode ?? 1;
+	const n = Number.isFinite(seqNum) && seqNum > 0 ? Math.floor(seqNum) : 1;
+	return {
+		title: `强制深挖 ${st.project.phase} #${n}`,
+		priority: 35,
+		detail: [
+			`frontier 已空，自动扩张触发。目标: ${st.project.url}（第 ${ep} 轮）`,
+			`已知事实: ${recentFactSummary(st) || "(无)"}`,
+			`从下面四项里选一项执行，必须产出新 fact 或 blocked note：`,
+			`1) 已知服务换探测深度：nmap -sV --version-all -p <port> + 服务专属脚本（http-* / smb-* / mysql-*）`,
+			`2) 已知端点换变体：路径大小写/编码/后缀（.bak .old .zip ~）/参数污染/HTTP 方法覆盖`,
+			`3) 已知凭据换复用面：管理后台、数据库、SSH、Redis、API token`,
+			`4) 已知漏洞换利用链：读文件→配置→凭据→横向；或从报错里拿版本→匹配 CVE`,
+			`纪律: 命令必须实际执行，回显原样入账。`,
+		].join("\n"),
+	};
+}
+
+/**
+ * 返回与当前领域模式匹配的兜底深挖意图规范，避免 `coding`/`ops`/本地 `audit` 误发渗透扫描兜底指令。
+ */
+export function buildProfileFallbackIntent(st: NuwaState, seqNum: number): ProfileFallbackSpec {
+	if (!st?.project) {
+		return {
+			title: `强制深挖 recon #${Math.max(1, Math.floor(seqNum || 1))}`,
+			detail: "frontier 已空，请结合已有事实推进下一项验证任务。",
+			priority: 35,
+		};
+	}
+	const prof = getProfile(st.project.mode);
+	return prof.buildFallback ? prof.buildFallback(st, seqNum) : buildSecurityFallbackIntent(st, seqNum);
+}
+
+/** 按项目模式返回报告主标题。 */
+export function formatProfileReportTitle(st: NuwaState): string {
+	const mode = st?.project?.mode ?? "ctf";
+	return getProfile(mode).reportTitle ?? "渗透报告";
 }

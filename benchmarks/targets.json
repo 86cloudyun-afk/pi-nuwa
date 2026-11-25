@@ -1,0 +1,72 @@
+[
+  {
+    "id": "spa-soft404-trap",
+    "name": "SPA Soft-404 Catch-All Trap",
+    "category": "recon-hygiene",
+    "expectedVerdict": "no_false_positive",
+    "description": "Verifies Soft-404 baseline calibration suppresses catch-all HTTP 200 SPA HTML shells on nonexistent paths while keeping real API endpoints intact."
+  },
+  {
+    "id": "dual-role-bola-idor",
+    "name": "Dual-Role BOLA / IDOR Differential Check",
+    "category": "authorization",
+    "expectedVerdict": "confirmed_bola",
+    "description": "Verifies multi-role Session Vault header materialization, redacted differential replay packet generation, and cross-user BOLA detection on /api/orders/1001."
+  },
+  {
+    "id": "vertical-bfla-admin",
+    "name": "Vertical BFLA Admin Endpoint Access",
+    "category": "authorization",
+    "expectedVerdict": "confirmed_bfla",
+    "description": "Verifies vertical privilege differential check on /api/admin/metrics where a low-privilege user receives admin telemetry and classifies to NUWA-AUTH (CWE-287)."
+  },
+  {
+    "id": "auth-spa-bundle-api",
+    "name": "SPA & Authenticated JS Bundle API Extraction",
+    "category": "surface-discovery",
+    "expectedVerdict": "endpoints_discovered",
+    "description": "Verifies static SPA recon discovers React tech, /api/v2/invoices, and /graphql from public bundles, plus privileged routes from auth-gated /spa/admin-panel.js."
+  },
+  {
+    "id": "waf-429-rate-limit",
+    "name": "WAF / HTTP 429 Rate-Limit Classification",
+    "category": "resilience",
+    "expectedVerdict": "blocked_by_waf",
+    "description": "Verifies HTTP 429 with Retry-After and X-RateLimit-Remaining headers is deterministically classified as blocked_by_waf (rate-limit)."
+  },
+  {
+    "id": "blind-ssrf-oob-mock",
+    "name": "Blind SSRF Controlled OOB Mock & Scope Guard",
+    "category": "oob-verification",
+    "expectedVerdict": "confirmed_ssrf_oob",
+    "description": "Verifies oobDomains scope allowlist permits authorized canary domain, blocks unauthorized hosts, and records deterministic Interactsh-compatible canary hits."
+  },
+  {
+    "id": "mixed-tech-attribution",
+    "name": "Mixed Tech Stack KB Experience Attribution",
+    "category": "knowledge-base",
+    "expectedVerdict": "precise_attribution",
+    "description": "Verifies experience distillation attributes confirmed findings solely to the matching tech key, skips unverified candidates, and logs rejected findings as negative."
+  },
+  {
+    "id": "false-positive-verifier-catch",
+    "name": "Double-Blind Verifier False-Positive Catch",
+    "category": "verifier-gate",
+    "expectedVerdict": "false_positive_rejected",
+    "description": "Verifies candidate staging, anti-bypass validation, verifier rejection, proof gating, and exclusion of candidate/rejected findings from SARIF 2.1.0 output."
+  },
+  {
+    "id": "local-whitebox-audit",
+    "name": "Local Whitebox Audit Mode & Substantive Ledger",
+    "category": "whitebox-audit",
+    "expectedVerdict": "ledger_verified",
+    "description": "Verifies local non-HTTP target normalization, execution ledger recording, substantive evidence verification, and rejection of low-entropy generic HTTP headers."
+  },
+  {
+    "id": "vault-leak-sarif-redaction",
+    "name": "Zero-Leak Vault Redaction Across Markdown, JSON, SARIF & Bundle",
+    "category": "secret-hygiene",
+    "expectedVerdict": "zero_vault_leaks",
+    "description": "Verifies Session Vault secrets never leak into Markdown, JSON, SARIF 2.1.0, or any file under .nuwa/poc-bundle/ while preserving 0o700/0o600 permissions and SHA-256 manifest integrity."
+  }
+]

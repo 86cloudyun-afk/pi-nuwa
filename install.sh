@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-nuwa v4.0 安装器：一键部署 omp 原生扩展全模块、随仓便携知识库 kb.db、
+# pi-nuwa v5.0 安装器：一键部署 omp 原生扩展全模块、随仓便携知识库 kb.db、
 # 合规子代理模板（fujiang + nuwa-verifier）、nuwa-pentest skill 与无头守护器 nuwa-autonomous。
 #
 # 退出码：0 成功 / 1 依赖或自检缺失 / 2 参数错误 / 3 回滚失败
@@ -41,8 +41,12 @@ EXT_MODULES=(
   "omp/lineage.ts"
   "omp/kb.ts"
   "omp/session-vault.ts"
+  "omp/auth-diff.ts"
   "omp/verifier-gate.ts"
   "omp/sandbox.ts"
+  "omp/oob.ts"
+  "omp/hypothesis.ts"
+  "omp/reporting.ts"
   "omp/env.d.ts"
 )
 

@@ -1,5 +1,5 @@
 /**
- * nuwa-omp v4.1.0 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
+ * nuwa-omp v5.0.0 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
  *
  * 子模块分工：
  *   - `./types`         共享类型契约与常量
@@ -11,17 +11,21 @@
  *   - `./autoexec`      Soft-404 基线校准、内容指纹实锤与工具链自适应升档
  *   - `./browser-recon` SPA 动态无头浏览器与静态 JS Bundle 接口感知
  *   - `./kb`            随仓便携 SQLite FTS5 知识库与跨项目脱敏经验蒸馏
- *   - `./session-vault` 多角色认证会话保险箱与零明文鉴权差分重放
+ *   - `./session-vault` 多角色认证会话保险箱、会话健康巡检与零明文鉴权差分重放
+ *   - `./auth-diff`     确定性多角色只读鉴权差分矩阵（Auto-BOLA / BFLA）
  *   - `./verifier-gate` 候选漏洞双盲独立挑刺复验闸门
- *   - `./sandbox`       零信任 Docker 容器隔离包裹器
+ *   - `./sandbox`       零信任 Docker / Sidecar 沙盒与内置抗 DNS 重绑定 Egress Proxy
+ *   - `./oob`           一等 OOB 外带回调 Canary 通道（受 scope.oobDomains 门控）
+ *   - `./hypothesis`    多资产跳板拓扑、跨事实假设图推理与驳回剪枝
+ *   - `./reporting`     分层 Markdown / SARIF 2.1.0 / JSON / 脱敏 PoC 证据包导出
  */
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { setInterval as setNodeInterval } from "node:timers";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent, ToolCallEvent } from "@oh-my-pi/pi-coding-agent";
 import {
-	PHASE_ORDER, type AutoFactMeta, type AutoPlanResult, type Cfg, type CommitInput, type ExecRecordInput,
-	type ExpansionResult, type Fact, type FactKind, type FrontierItem, type Intent, type IntentStatus,
+	PHASE_ORDER, type AssetNode, type AutoFactMeta, type AutoPlanResult, type Cfg, type CommitInput, type ExecRecordInput,
+	type ExpansionResult, type Fact, type FactKind, type FrontierItem, type HypothesisNode, type Intent, type IntentStatus,
 	type Mode, type NuwaState, type Phase, type PolicyVerdict, type ProfileMode, type ProfileSpec,
 	type Project, type ReincarnatePolicy, type Runtime, type ScopePolicy, type Seed, type ToolchainCaps,
 	type VerifyEvidenceInput, type VerifyEvidenceResult, type VerifyStage,
@@ -38,8 +42,9 @@ import {
 	SEEDS, addFallbackIntent, addIntent, appendIntentSpecs, applyAutoItemResult, applyEmptyGuard,
 	autoPlan, budgetPressure, buildDirective, buildDoctorSummary, checkBashPolicy, checkTaskPolicy,
 	checkWritePolicy, claimAutoBatch, claimIntent, claimedFresh, collectPaths, commitIntent, compactFacts,
-	compactIntents, completeProject, deriveFromFacts, evidenceProblem, executeAutoBatchCycle,
-	executeCommitWithGates, executeScopeCommand, executeSessionCommand, extractEventOutput, extractTarget,
+	compactIntents, completeProject, deriveFromFacts, evidenceProblem, executeAssetsCommand,
+	executeAuthDiffWorkflow, executeAutoBatchCycle, executeCommitWithGates, executeOobCommand,
+	executeScopeCommand, executeSessionCommand, executeSessionHealthCommand, extractEventOutput, extractTarget,
 	formatScopeSummary, frontierList, isCompliantSandboxDockerCommand, kbLookup, kickPrompt, maybeAdvance,
 	newState, phaseIndex, pickMode, proofKinds, recordFlag, releaseAutoBatchRemaining, releaseStaleClaims,
 	renderDetail, reportMarkdown, runSpaSurfaceWorkflow, seedEpisode, seedPhase, settleSessionStopState,
@@ -55,30 +60,40 @@ import { bindSubagentSpawn, registerActiveSession, resolveLineageRoot, resolveTa
 import { distillProjectExperience, ensureBundledKb, kbLookupSafe } from "./kb";
 import { redactVaultSecrets } from "./session-vault";
 import { extractVerifyTargetFactId, isVerifyVulnIntentKey, validateVerificationCommit } from "./verifier-gate";
-import { readSandboxConfig, wrapCommandInDockerSandbox } from "./sandbox";
+import {
+	extractSandboxInnerCommand,
+	isCompliantSidecarCommand,
+	readSandboxConfig,
+	wrapCommandInDockerSandbox,
+	wrapCommandInSidecarSandbox,
+} from "./sandbox";
+import { ensurePrimaryAsset } from "./hypothesis";
+import { buildJsonReport, buildSarifReport, writePocBundle } from "./reporting";
 
-export const VERSION = "4.1.0";
+export const VERSION = "5.0.0";
 
 export {
 	PHASE_ORDER, SCHEMA, SEEDS, addFallbackIntent, addIntent, appendIntentSpecs, applyAutoItemResult,
 	applyEmptyGuard, atomicWrite, autoPlan, budgetPressure, buildDirective, buildDoctorSummary,
-	buildHandoffSummary, cell, checkBashPolicy, checkTaskPolicy, checkWritePolicy, claimAutoBatch,
-	claimIntent, claimedFresh, collectPaths, commitIntent, compactFacts, compactIntents, completeProject,
-	createInitialState, defaultProjectRoot, deriveFromFacts, evidenceProblem, extractTarget, findLocalRoot,
-	findRoot, formatScopeSummary, frontierList, getAgentHome, isSharedCwd, journalAppend, journalPath,
-	kbLookup, kickPrompt, loadState, lockPath, logEvent, maybeAdvance, migrateSapper, newState, nextFactId,
-	nextIntentId, normOneLine, normalizeState, normalizeTarget, normalizeTargetForMode, nowIso, phaseIndex,
-	pickMode, prepareNextGeneration, proofKinds, readCfg, readReincarnatePolicy, recordFlag,
-	releaseAutoBatchRemaining, releaseStaleClaims, renderDetail, reportMarkdown, runSpaSurfaceWorkflow,
-	saveState, seedEpisode, seedPhase, sha, shouldReincarnate, sigOf, slug, stateDir, statePath,
-	statusBoard, stopReason, withLock, writePointer,
+	buildHandoffSummary, buildJsonReport, buildSarifReport, cell, checkBashPolicy, checkTaskPolicy,
+	checkWritePolicy, claimAutoBatch, claimIntent, claimedFresh, collectPaths, commitIntent, compactFacts,
+	compactIntents, completeProject, createInitialState, defaultProjectRoot, deriveFromFacts,
+	ensurePrimaryAsset, evidenceProblem, executeAssetsCommand, executeAuthDiffWorkflow, executeOobCommand,
+	executeSessionHealthCommand, extractTarget, findLocalRoot, findRoot, formatScopeSummary, frontierList,
+	getAgentHome, isSharedCwd, journalAppend, journalPath, kbLookup, kickPrompt, loadState, lockPath,
+	logEvent, maybeAdvance, migrateSapper, newState, nextFactId, nextIntentId, normOneLine, normalizeState,
+	normalizeTarget, normalizeTargetForMode, nowIso, phaseIndex, pickMode, prepareNextGeneration,
+	proofKinds, readCfg, readReincarnatePolicy, recordFlag, releaseAutoBatchRemaining, releaseStaleClaims,
+	renderDetail, reportMarkdown, runSpaSurfaceWorkflow, saveState, seedEpisode, seedPhase, sha,
+	shouldReincarnate, sigOf, slug, stateDir, statePath, statusBoard, stopReason, withLock, writePocBundle,
+	writePointer,
 };
 
 export type {
-	AutoFactMeta, AutoPlanResult, Cfg, CommitInput, ExecRecordInput, ExpansionResult, Fact, FactKind,
-	FrontierItem, Intent, IntentStatus, Mode, NuwaState, Phase, PolicyVerdict, ProfileMode, ProfileSpec,
-	Project, ReincarnatePolicy, Runtime, SaveStateOptions, ScopePolicy, Seed, ToolchainCaps,
-	VerifyEvidenceInput, VerifyEvidenceResult, VerifyStage,
+	AssetNode, AutoFactMeta, AutoPlanResult, Cfg, CommitInput, ExecRecordInput, ExpansionResult, Fact,
+	FactKind, FrontierItem, HypothesisNode, Intent, IntentStatus, Mode, NuwaState, Phase, PolicyVerdict,
+	ProfileMode, ProfileSpec, Project, ReincarnatePolicy, Runtime, SaveStateOptions, ScopePolicy, Seed,
+	ToolchainCaps, VerifyEvidenceInput, VerifyEvidenceResult, VerifyStage,
 };
 
 function sidOf(ctx: ExtensionContext): string {
@@ -304,7 +319,8 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const curCfg = readCfg();
 				const sid = sidOf(ctx);
 				const mode = (p.mode ?? "ctf") as Mode;
-				const rawTarget = p.target ?? (!p.resume && !p.migrate && (mode === "coding" || mode === "ops") ? ctx.cwd : undefined);
+				const rawTarget =
+					p.target ?? (!p.resume && !p.migrate && (mode === "coding" || mode === "ops" || mode === "audit") ? ctx.cwd : undefined);
 				const want = rawTarget ? normalizeTargetForMode(rawTarget, mode).url : "";
 				let root: string;
 				if (p.root) {
@@ -338,6 +354,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						st.project.ownerSessionId = sid;
 						st.project.toolchain = probeToolchain();
 						st.project.sandboxMode = readSandboxConfig().mode;
+						ensurePrimaryAsset(st);
 						saveState(root, st, { reason: "init" });
 						return st;
 					});
@@ -360,6 +377,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						}
 						s.project.toolchain = probeToolchain();
 						s.project.sandboxMode = readSandboxConfig().mode;
+						ensurePrimaryAsset(s);
 						const prevStart = s.runtime.projectStartedAt ?? s.runtime.startedAt ?? Date.now();
 						const prevTurns = Math.max(0, Number(s.runtime.turns ?? 0));
 						const prevTotalTurns = Math.max(Number(s.runtime.totalTurns ?? 0), prevTurns);
@@ -402,6 +420,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const st = newState(rawTarget, p.goal ?? "", mode, curCfg, sid, p.scope);
 				st.project.toolchain = probeToolchain();
 				st.project.sandboxMode = readSandboxConfig().mode;
+				ensurePrimaryAsset(st);
 				const shouldAutoStart = (p.autoStart === true || (process.env.NUWA_AUTO_ON_INIT ?? "").trim() === "1") && hasExec();
 				let autoIds: string[] = [];
 				withLock(root, () => {
@@ -748,22 +767,53 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "nuwa_report",
 		label: "女娲报告",
-		description: "生成评估报告（攻击链、flag 台账、漏洞、资产、未完成面）。write=true 时写到 .nuwa/REPORT.md。",
+		description: "生成评估报告（支持 md/json/sarif 2.1.0，自动按 verifyStage 分层并全量脱敏）。write=true 时落盘，bundle=true 时同步导出脱敏 PoC 证据包。",
 		loadMode: "essential",
-		parameters: z.object({ write: z.boolean().default(false), root: z.string().optional() }),
+		parameters: z.object({
+			write: z.boolean().default(false),
+			format: z.enum(["md", "json", "sarif"]).default("md").describe("报告格式：md（默认）/ json / sarif"),
+			bundle: z.boolean().default(false).describe("是否同时生成 .nuwa/poc-bundle 脱敏证据包"),
+			root: z.string().optional(),
+		}),
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
 				const root = resolveRootWithLineage(ctx, p.root);
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
-				const md = redactVaultSecrets(reportMarkdown(st), root);
+				const fmt = p.format ?? "md";
+				let outText = "";
+				let fileName = "REPORT.md";
+				if (fmt === "sarif") {
+					outText = `${JSON.stringify(buildSarifReport(st, root), null, 2)}\n`;
+					fileName = "REPORT.sarif.json";
+				} else if (fmt === "json") {
+					outText = `${JSON.stringify(buildJsonReport(st, root), null, 2)}\n`;
+					fileName = "REPORT.json";
+				} else {
+					outText = redactVaultSecrets(reportMarkdown(st, root), root);
+				}
 				let path = "";
 				if (p.write) {
-					path = join(root, ".nuwa", "REPORT.md");
-					atomicWrite(path, md);
+					path = join(root, ".nuwa", fileName);
+					atomicWrite(path, outText);
 				}
-				return toolText(path ? `${md}\n\n已写入: ${path}` : md, { root, path });
+				let bundleDir = "";
+				let bundleFiles = 0;
+				if (p.bundle) {
+					const b = writePocBundle(root, st);
+					bundleDir = b.dir;
+					bundleFiles = b.files.length;
+				}
+				const suffixParts: string[] = [];
+				if (path) suffixParts.push(`已写入: ${path}`);
+				if (bundleDir) suffixParts.push(`脱敏证据包已生成: ${bundleDir} (${bundleFiles} 个文件)`);
+				return toolText(suffixParts.length ? `${outText}\n\n${suffixParts.join("\n")}` : outText, {
+					root,
+					path,
+					format: fmt,
+					...(bundleDir ? { bundleDir, bundleFiles } : {}),
+				});
 			} catch (e) {
 				return toolError(e);
 			}
@@ -880,9 +930,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand?.("nuwa", {
-		description: "女娲：/nuwa <任务> 开工 | /nuwa status | board | scope | session | doctor | spa | log [n] | why | stop | resume",
+		description: "女娲：/nuwa <任务> 开工 | /nuwa status | board | scope | session | authdiff | oob | assets | report | doctor | spa | log [n] | why | stop | resume",
 		getArgumentCompletions: (prefix: string) =>
-			["status", "board", "scope", "session", "doctor", "spa", "log", "why", "stop", "resume"]
+			["status", "board", "scope", "session", "authdiff", "oob", "assets", "report", "doctor", "spa", "log", "why", "stop", "resume"]
 				.filter((v) => v.startsWith(prefix))
 				.map((v) => ({ value: v, label: v })),
 		handler: async (args, ctx) => {
@@ -900,8 +950,78 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			if (arg === "doctor" || arg.startsWith("doctor ")) return notify(buildDoctorSummary(found));
 
 			if (arg === "session" || arg.startsWith("session ")) {
+				const subSession = arg.slice(7).trim();
+				if (subSession === "health" || subSession.startsWith("health ")) {
+					const r = await executeSessionHealthCommand(found, subSession.slice(6));
+					const stAfter = found ? loadState(found) : null;
+					if (found && stAfter) refreshUi(ctx as ExtensionContext, found, stAfter, true);
+					return notify(r.msg, r.level);
+				}
 				const r = executeSessionCommand(found, arg.slice(7));
 				return notify(r.msg, r.level);
+			}
+
+			if (arg === "authdiff" || arg.startsWith("authdiff ")) {
+				if (!found) return notify("当前目录没有女娲项目", "error");
+				try {
+					const rawPaths = arg.slice(8).trim();
+					const explicitPaths = rawPaths ? rawPaths.split(/\s+/).filter(Boolean) : undefined;
+					const r = await executeAuthDiffWorkflow(found, explicitPaths);
+					const stAfter = loadState(found);
+					if (stAfter) refreshUi(ctx as ExtensionContext, found, stAfter, true);
+					return notify(r.msg);
+				} catch (e) {
+					return notify(`鉴权差分失败: ${e instanceof Error ? e.message : String(e)}`, "error");
+				}
+			}
+
+			if (arg === "oob" || arg.startsWith("oob ")) {
+				const r = await executeOobCommand(found, arg.slice(3));
+				const stAfter = found ? loadState(found) : null;
+				if (found && stAfter) refreshUi(ctx as ExtensionContext, found, stAfter, true);
+				return notify(r.msg, r.level);
+			}
+
+			if (arg === "assets" || arg.startsWith("assets ")) {
+				const r = executeAssetsCommand(found);
+				const stAfter = found ? loadState(found) : null;
+				if (found && stAfter) refreshUi(ctx as ExtensionContext, found, stAfter, true);
+				return notify(r.msg, r.level);
+			}
+
+			if (arg === "report" || arg.startsWith("report ")) {
+				if (!found) return notify("当前目录没有女娲项目", "error");
+				const st = loadState(found);
+				if (!st) return notify("state 读取失败", "error");
+				const subFmt = (arg.slice(6).trim().toLowerCase() || "md");
+				try {
+					if (subFmt === "bundle") {
+						const b = writePocBundle(found, st);
+						return notify(`已生成脱敏证据包: ${b.dir}（${b.files.length} 个文件）`);
+					}
+					if (subFmt === "sarif") {
+						const sarif = buildSarifReport(st, found);
+						const outPath = join(found, ".nuwa", "REPORT.sarif.json");
+						atomicWrite(outPath, `${JSON.stringify(sarif, null, 2)}\n`);
+						const count = sarif.runs?.[0]?.results?.length ?? 0;
+						return notify(`SARIF 2.1.0 报告已写入: ${outPath}（已确认漏洞 ${count} 条）`);
+					}
+					if (subFmt === "json") {
+						const rep = buildJsonReport(st, found);
+						const outPath = join(found, ".nuwa", "REPORT.json");
+						atomicWrite(outPath, `${JSON.stringify(rep, null, 2)}\n`);
+						return notify(`JSON 报告已写入: ${outPath}`);
+					}
+					if (subFmt === "md" || subFmt === "markdown") {
+						const md = redactVaultSecrets(reportMarkdown(st, found), found);
+						const outPath = join(found, ".nuwa", "REPORT.md");
+						atomicWrite(outPath, md);
+						return notify(`Markdown 报告已写入: ${outPath}\n\n${md.slice(0, 1200)}`);
+					}
+					return notify("用法: /nuwa report [md | json | sarif | bundle]", "error");
+				} catch (e) {
+					return notify(`报告生成失败: ${e instanceof Error ? e.message : String(e)}`, "error");
+				}
 			}
 
 			if (arg === "spa" || arg.startsWith("spa ")) {
@@ -1039,7 +1159,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const curCfg = readCfg();
 			const sid = sidOf(ctx as ExtensionContext);
 			const mode = pickMode(arg);
-			const target = extractTarget(arg) ?? (mode === "coding" || mode === "ops" ? ctx.cwd : null);
+			const target = extractTarget(arg) ?? (mode === "coding" || mode === "ops" || mode === "audit" ? ctx.cwd : null);
 			const want = target ? normalizeTargetForMode(target, mode).url : "";
 			const root: string | null = target
 				? defaultProjectRoot(ctx.cwd, target, sid, mode)
@@ -1083,6 +1203,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const tc = probeToolchain();
 				st = withLock(root, () => {
 					const s = newState(target, arg, mode, curCfg, sid);
+					ensurePrimaryAsset(s);
 					s.project.toolchain = tc;
 					s.project.sandboxMode = readSandboxConfig().mode;
 					seedPhase(s, "recon");
@@ -1299,11 +1420,26 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			}
 			if (name === "bash") {
 				const cmd = typeof input.command === "string" ? input.command : "";
-				const v = checkBashPolicy(cmd, active, main, projScope, st.project.mode);
+				const sbCfg = active && !main ? readSandboxConfig() : null;
+				let cmdForPolicy = cmd;
+
+				if (sbCfg && (sbCfg.mode === "docker" || sbCfg.mode === "sidecar") && cmd.trim()) {
+					const isCompliant =
+						sbCfg.mode === "docker"
+							? isCompliantSandboxDockerCommand(cmd, st.project.id).ok
+							: isCompliantSidecarCommand(cmd, st.project.id).ok || isCompliantSandboxDockerCommand(cmd, st.project.id).ok;
+					if (isCompliant) {
+						const inner = extractSandboxInnerCommand(cmd, sbCfg.egressProxyUrl);
+						if (inner !== null) {
+							cmdForPolicy = inner;
+						}
+					}
+				}
+
+				const v = checkBashPolicy(cmdForPolicy, active, main, projScope, st.project.mode);
 				if (v) return v;
-				if (active && !main) {
-					const sbCfg = readSandboxConfig();
-					if (sbCfg.mode === "docker" && cmd.trim()) {
+				if (sbCfg && cmd.trim()) {
+					if (sbCfg.mode === "docker") {
 						const sbVerdict = isCompliantSandboxDockerCommand(cmd, st.project.id);
 						if (!sbVerdict.ok) {
 							let hintCmd = "";
@@ -1313,6 +1449,24 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 								hintCmd = "docker run --rm --read-only --cap-drop=ALL ...";
 							}
 							return { block: true, reason: `nuwa N-009: 已启用零信任 Docker 沙盒 (${sbVerdict.reason})；请改用合规沙盒包裹命令:\n${hintCmd}` };
+						}
+					} else if (sbCfg.mode === "sidecar") {
+						const scVerdict = isCompliantSidecarCommand(cmd, st.project.id);
+						const dkVerdict = scVerdict.ok ? { ok: true } : isCompliantSandboxDockerCommand(cmd, st.project.id);
+						if (!scVerdict.ok && !dkVerdict.ok) {
+							let hintCmd = "";
+							try {
+								hintCmd = wrapCommandInSidecarSandbox(cmd, {
+									projectId: st.project.id,
+									scope: projScope,
+									config: sbCfg,
+									proxyUrl: sbCfg.egressProxyUrl,
+									ensureWorkdir: false,
+								});
+							} catch {
+								hintCmd = `docker exec -w /tmp/nuwa/${st.project.id} nuwa-sb-${st.project.id} sh -c '...'`;
+							}
+							return { block: true, reason: `nuwa N-009: 已启用常驻零信任 Sidecar 沙盒 (${scVerdict.reason})；请改用合规 Sidecar 包裹命令:\n${hintCmd}` };
 						}
 					}
 				}

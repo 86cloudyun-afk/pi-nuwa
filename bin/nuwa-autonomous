@@ -1,13 +1,13 @@
 #!/usr/bin/env bun
 /**
- * bin/nuwa-autonomous — 女娲 v4.0 外层轻量无头守护器与环境健康体检工具。
+ * bin/nuwa-autonomous — 女娲 v5.0 外层轻量无头守护器与环境健康体检工具。
  *
  * 职责：
  * 1. 注入无头运行、世代轮转、沙盒隔离与动态模型分流环境变量
  *    （NUWA_LOOP/NUWA_INFINITE/NUWA_HEADLESS_DAEMON/NUWA_SANDBOX/NUWA_MODEL_* 等）。
  * 2. 以干净上下文循环拉起 omp 无头会话，读取磁盘 `.nuwa/state.json` 完成跨世代换血接力。
  * 3. 提供 `doctor [--json]` 子命令一键核验外部设备依赖（bun、omp、12 工具/模块、
- *    `<agentHome>/nuwa-kb/kb.db` 记录数、子代理模板 fujiang.md/nuwa-verifier.md、工具链与 Docker 沙盒）。
+ *    `<agentHome>/nuwa-kb/kb.db` 记录数、子代理模板 fujiang.md/nuwa-verifier.md、工具链与 Docker/Sidecar 沙盒）。
  * 4. 在目标完成（status=completed）时打印报告路径与摘要并退出 0；
  *    在非换代人工/硬闸停机（status=stopped）时打印停机原因并退出 2；
  *    在子进程异常退出（如 API 429/5xx 断流或崩溃）时按指数退避重启并继续读取磁盘接力。
@@ -16,12 +16,15 @@
  *   0 — 任务完成、--dry-run / --help 成功，或 doctor 核心依赖全部就绪
  *   1 — 子进程连续崩溃超限、超过世代/时长上限，或 doctor 缺失核心依赖
  *   2 — 参数错误或项目非换代停机（status=stopped）
+ *   3 — 跨世代累计 Token 或 USD 费用触发预算硬上限
  *   130 / 143 — 收到 SIGINT / SIGTERM 优雅退出
  */
 
 import { spawnSync } from "node:child_process";
 import {
 	accessSync,
+	appendFileSync,
+	chmodSync,
 	constants,
 	existsSync,
 	mkdirSync,
@@ -35,7 +38,7 @@ import { delimiter, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 
 const VALID_MODES = new Set(["ctf", "pentest", "audit", "coding", "ops"]);
-const VALID_SANDBOX_MODES = new Set(["none", "docker"]);
+const VALID_SANDBOX_MODES = new Set(["none", "docker", "sidecar"]);
 const REINCARNATE_STOP_RE = /(reincarnat|handoff|generation|换代)/i;
 
 const REQUIRED_NUWA_TOOLS = [
@@ -71,6 +74,9 @@ const DEFAULT_GEN_TIMEOUT_MINUTES = 45;
 const DEFAULT_IDLE_TIMEOUT_MINUTES = 0;
 const WATCHDOG_SIGKILL_GRACE_MS = 1500;
 const MAX_SET_TIMEOUT_MS = 2_147_483_647;
+const DEFAULT_USD_PER_1M_TOKENS = 3.0;
+const WEBHOOK_TIMEOUT_MS = 5000;
+const WEBHOOK_MAX_ATTEMPTS = 3;
 
 const V4_EXT_MODULES = [
 	"lineage.ts",
@@ -80,6 +86,8 @@ const V4_EXT_MODULES = [
 	"kb.ts",
 	"browser-recon.ts",
 ];
+
+const V5_EXT_MODULES = ["auth-diff.ts", "oob.ts", "hypothesis.ts", "reporting.ts"];
 
 const DOCTOR_PROBE_TOOLS = [
 	"curl",
@@ -98,7 +106,7 @@ const DOCTOR_PROBE_TOOLS = [
 
 const KB_TABLES = ["card", "cve", "poc", "technique", "kev", "epss", "experience"];
 
-const HELP_TEXT = `女娲 v4.0 外层无头守护器与环境自检工具 (nuwa-autonomous)
+const HELP_TEXT = `女娲 v5.0 外层无头守护器与环境自检工具 (nuwa-autonomous)
 
 用法:
   nuwa-autonomous --target <目标> [选项]
@@ -116,21 +124,25 @@ const HELP_TEXT = `女娲 v4.0 外层无头守护器与环境自检工具 (nuwa-
   --idle-timeout-minutes <m>   空闲看门狗超时（分钟，默认: 0=关闭；可用 NUWA_DAEMON_IDLE_MS 毫秒覆盖）
   --reincarnate-tokens <n>     单代触发换血的上下文 token 阈值（默认: 140000）
   --reincarnate-turns <n>      单代触发换血的轮次阈值（默认: 30）
+  --max-total-tokens <n>       跨世代累计 Token 硬上限（默认: 0=不限；触发退出码 3）
+  --max-usd <amount>           跨世代累计费用硬上限（USD，默认: 0=不限；触发退出码 3）
+  --usd-per-1m-tokens <rate>   每百万 Token 估算单价（USD，默认: 3.0）
+  --webhook <url>              状态告警 Webhook URL（自动脱敏载荷，失败重试后写 deadletter）
   --allow-subdomains           放行目标主域的子域名（NUWA_SCOPE_ALLOW_SUBDOMAINS=1）
   --allow-cidr <cidr>          追加放行的 IPv4 CIDR 网段，可重复传入或逗号分隔
   --model <m>                  透传给 omp 的主模型名（可选）
   --fast-model <m>             侦察/表面枚举子代理模型（透传 NUWA_MODEL_FAST）
   --deep-model <m>             深度漏洞/利用/复盘子代理模型（透传 NUWA_MODEL_DEEP）
   --verify-model <m>           双盲复验子代理模型（透传 NUWA_MODEL_VERIFY）
-  --sandbox <none|docker>      命令执行沙盒隔离模式（透传 NUWA_SANDBOX，默认: none）
-  --sandbox-image <img>        Docker 沙盒镜像名（透传 NUWA_SANDBOX_IMAGE，默认: nuwa-sandbox:latest）
+  --sandbox <none|docker|sidecar> 命令执行沙盒隔离模式（透传 NUWA_SANDBOX，默认: none）
+  --sandbox-image <img>        Docker/Sidecar 沙盒镜像名（透传 NUWA_SANDBOX_IMAGE，默认: nuwa-sandbox:latest）
   --omp-bin <path>             指定 omp 可执行路径（默认: omp，测试可注入 stub）
   --dry-run                    仅打印规划配置与首轮启动命令并退出 0
   -h, --help                   显示本帮助信息
 
 自检子命令 (doctor):
-  nuwa-autonomous doctor [--json] [--agent-home <dir>] [--omp-bin <path>] [--sandbox <none|docker>] [--sandbox-image <img>]
-  核验 bun、omp、12 工具/模块、kb.db 记录数、子代理模板、工具链与 Docker 沙盒可用性。
+  nuwa-autonomous doctor [--json] [--agent-home <dir>] [--omp-bin <path>] [--sandbox <none|docker|sidecar>] [--sandbox-image <img>]
+  核验 bun、omp、12 工具/模块、kb.db 记录数、子代理模板、工具链与 Docker/Sidecar 沙盒可用性。
   核心依赖全部就绪退出 0，缺失核心依赖退出 1。
 
 环境变量:
@@ -138,10 +150,15 @@ const HELP_TEXT = `女娲 v4.0 外层无头守护器与环境自检工具 (nuwa-
   NUWA_DAEMON_MAX_ERRORS       连续异常退出最大重试次数（默认: 5）
   NUWA_GEN_TIMEOUT_MS          单代子进程超时覆盖值（毫秒，优先于 --gen-timeout-minutes）
   NUWA_DAEMON_IDLE_MS          空闲看门狗超时覆盖值（毫秒，0=关闭，优先于 --idle-timeout-minutes）
+  NUWA_MAX_TOTAL_TOKENS        跨世代累计 Token 上限默认值（默认: 0=不限）
+  NUWA_MAX_USD                 跨世代累计费用上限默认值（USD，默认: 0=不限）
+  NUWA_USD_PER_1M_TOKENS       每百万 Token 估算单价默认值（USD，默认: 3.0）
+  NUWA_WEBHOOK_URL             状态告警 Webhook URL 默认值
+  NUWA_WEBHOOK_RETRY_MS        Webhook 重试基础间隔毫秒数（默认: 100/250ms，测试可设小值）
   PI_AGENT_HOME                指定 omp/pi agent 目录（默认自动探测 ~/.omp/agent 或 ~/.pi/agent）
 `;
 
-const DOCTOR_HELP_TEXT = `女娲 v4.0 环境自检子命令 (nuwa-autonomous doctor)
+const DOCTOR_HELP_TEXT = `女娲 v5.0 环境自检子命令 (nuwa-autonomous doctor)
 
 用法:
   nuwa-autonomous doctor [选项]
@@ -152,7 +169,7 @@ const DOCTOR_HELP_TEXT = `女娲 v4.0 环境自检子命令 (nuwa-autonomous doc
   --omp-bin <path>             指定 omp 可执行文件路径（默认: omp）
   --bun-bin <path>             指定 bun 可执行文件路径（默认: bun）
   --kb-db <path>               指定知识库 SQLite 路径（覆盖 NUWA_KB_DB）
-  --sandbox <none|docker>      指定预期运行模式；为 docker 时将 Docker 可用性纳入核心门禁
+  --sandbox <none|docker|sidecar> 指定预期运行模式；为 docker/sidecar 时将 Docker 可用性纳入核心门禁
   --sandbox-image <img>        指定校验的沙盒镜像名（默认: nuwa-sandbox:latest）
   --docker-bin <path>          指定 docker 可执行文件路径（默认: docker）
   -h, --help                   显示本帮助信息
@@ -188,6 +205,24 @@ function parseNonNegativeNumber(name, raw, integerOnly = false) {
 	return n;
 }
 
+function parseEnvNonNegativeNumber(name, fallback, integerOnly = false) {
+	const raw = (process.env[name] ?? "").trim();
+	if (!raw) return fallback;
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0 || (integerOnly && !Number.isInteger(n))) {
+		return fallback;
+	}
+	return n;
+}
+
+function parseEnvPositiveNumber(name, fallback) {
+	const raw = (process.env[name] ?? "").trim();
+	if (!raw) return fallback;
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n <= 0) return fallback;
+	return n;
+}
+
 function parseArgs(argv) {
 	const opts = {
 		target: "",
@@ -201,6 +236,10 @@ function parseArgs(argv) {
 		idleTimeoutMinutes: DEFAULT_IDLE_TIMEOUT_MINUTES,
 		reincarnateTokens: 140000,
 		reincarnateTurns: 30,
+		maxTotalTokens: parseEnvNonNegativeNumber("NUWA_MAX_TOTAL_TOKENS", 0, true),
+		maxUsd: parseEnvNonNegativeNumber("NUWA_MAX_USD", 0, false),
+		usdPer1mTokens: parseEnvPositiveNumber("NUWA_USD_PER_1M_TOKENS", DEFAULT_USD_PER_1M_TOKENS),
+		webhook: (process.env.NUWA_WEBHOOK_URL ?? "").trim(),
 		allowSubdomains: false,
 		allowCidrs: [],
 		model: "",
@@ -267,6 +306,18 @@ function parseArgs(argv) {
 			case "--reincarnate-turns":
 				opts.reincarnateTurns = parsePositiveNumber(flag, take(), true);
 				break;
+			case "--max-total-tokens":
+				opts.maxTotalTokens = parseNonNegativeNumber(flag, take(), true);
+				break;
+			case "--max-usd":
+				opts.maxUsd = parseNonNegativeNumber(flag, take(), false);
+				break;
+			case "--usd-per-1m-tokens":
+				opts.usdPer1mTokens = parsePositiveNumber(flag, take(), false);
+				break;
+			case "--webhook":
+				opts.webhook = take().trim();
+				break;
 			case "--allow-subdomains":
 				opts.allowSubdomains = true;
 				break;
@@ -321,7 +372,18 @@ function parseArgs(argv) {
 		throw new Error(`不支持的 --mode: ${opts.mode}（可选: ${[...VALID_MODES].join(", ")}）`);
 	}
 	if (!VALID_SANDBOX_MODES.has(opts.sandbox)) {
-		throw new Error(`不支持的 --sandbox: ${opts.sandbox}（可选: none, docker）`);
+		throw new Error(`不支持的 --sandbox: ${opts.sandbox}（可选: none, docker, sidecar）`);
+	}
+	if (!opts.help && opts.webhook) {
+		let parsedWebhook;
+		try {
+			parsedWebhook = new URL(opts.webhook);
+		} catch {
+			throw new Error(`参数 --webhook 不是合法 URL`);
+		}
+		if (!["http:", "https:"].includes(parsedWebhook.protocol) || !parsedWebhook.hostname) {
+			throw new Error(`参数 --webhook 仅支持 http/https URL`);
+		}
 	}
 	opts.root = resolve(opts.root || process.cwd());
 	return opts;
@@ -391,7 +453,7 @@ function parseDoctorArgs(argv) {
 	}
 
 	if (!VALID_SANDBOX_MODES.has(opts.sandbox)) {
-		throw new Error(`doctor 不支持的 --sandbox: ${opts.sandbox}（可选: none, docker）`);
+		throw new Error(`doctor 不支持的 --sandbox: ${opts.sandbox}（可选: none, docker, sidecar）`);
 	}
 	return opts;
 }
@@ -516,6 +578,16 @@ function checkExtensionInstallation(agentHome) {
 		}
 	}
 
+	const v5ModulesFound = [];
+	const v5ModulesMissing = [];
+	for (const mod of V5_EXT_MODULES) {
+		if (existsSync(join(extDir, mod))) {
+			v5ModulesFound.push(mod);
+		} else {
+			v5ModulesMissing.push(mod);
+		}
+	}
+
 	const conflicts = [];
 	if (existsSync(extRoot)) {
 		try {
@@ -553,6 +625,8 @@ function checkExtensionInstallation(agentHome) {
 		coreModulesMissing,
 		v4ModulesFound,
 		v4ModulesMissing,
+		v5ModulesFound,
+		v5ModulesMissing,
 		conflicts,
 		...(reason ? { reason } : {}),
 	};
@@ -851,7 +925,7 @@ function runDoctor(argv) {
 	const toolchainCheck = checkToolchain();
 
 	// 7. 检查 Docker 沙盒可用性
-	const dockerCheck = checkDockerSandbox(opts.dockerBin, opts.sandboxImage, opts.sandbox === "docker");
+	const dockerCheck = checkDockerSandbox(opts.dockerBin, opts.sandboxImage, opts.sandbox === "docker" || opts.sandbox === "sidecar");
 
 	const checks = {
 		bun: bunCheck,
@@ -909,7 +983,7 @@ function runDoctor(argv) {
 		`${badge(ompCheck)} omp: ${ompCheck.ok ? `${ompCheck.version ?? "ok"} (${ompCheck.path})` : ompCheck.reason}`,
 		`${badge(extensionCheck)} 扩展与工具: ${
 			extensionCheck.ok
-				? `v${extensionCheck.version ?? "?"} · 工具 ${extensionCheck.toolsCount}/${extensionCheck.toolsRequired} · 核心模块 ${extensionCheck.coreModulesFound.length}/${extensionCheck.coreModulesFound.length + extensionCheck.coreModulesMissing.length} · v4模块 ${extensionCheck.v4ModulesFound.length}/${V4_EXT_MODULES.length}`
+				? `v${extensionCheck.version ?? "?"} · 工具 ${extensionCheck.toolsCount}/${extensionCheck.toolsRequired} · 核心模块 ${extensionCheck.coreModulesFound.length}/${extensionCheck.coreModulesFound.length + extensionCheck.coreModulesMissing.length} · v4模块 ${extensionCheck.v4ModulesFound.length}/${V4_EXT_MODULES.length} · v5模块 ${extensionCheck.v5ModulesFound.length}/${V5_EXT_MODULES.length}`
 				: extensionCheck.reason
 		}`,
 		`${badge(kbCheck)} 知识库 KB: ${
@@ -993,6 +1067,7 @@ function buildChildEnv(opts, gen) {
 		NUWA_PROJECT: opts.root,
 		NUWA_GENERATION: String(gen),
 	};
+	delete env.NUWA_WEBHOOK_URL;
 	if (opts.target) {
 		env.NUWA_TARGET = opts.target;
 	}
@@ -1100,6 +1175,266 @@ function formatCompletionSummary(root, state, gen, startedAt) {
 	].join("\n");
 }
 
+function maskWebhookUrl(rawUrl) {
+	const text = String(rawUrl ?? "").trim();
+	if (!text) return "";
+	try {
+		const u = new URL(text);
+		const origin = `${u.protocol}//${u.host}`;
+		const segs = u.pathname.split("/").filter(Boolean);
+		if (segs.length >= 2) {
+			return `${origin}/${segs[0]}/***`;
+		}
+		if (segs.length === 1) {
+			const seg = segs[0];
+			const looksSecret = seg.length >= 16 || /[0-9a-f]{10,}|[A-Za-z0-9_-]{20,}/i.test(seg);
+			const pathPart = looksSecret ? "/***" : `/${seg}`;
+			return u.search ? `${origin}${pathPart}?***` : `${origin}${pathPart}`;
+		}
+		return u.search ? `${origin}/?***` : origin;
+	} catch {
+		return "***";
+	}
+}
+
+function collectVaultSecretStrings(root) {
+	if (!root) return [];
+	const vaultPath = join(root, ".nuwa", "sessions", "vault.json");
+	if (!existsSync(vaultPath)) return [];
+	try {
+		const parsed = JSON.parse(readFileSync(vaultPath, "utf8"));
+		const roles = parsed?.roles;
+		if (!roles || typeof roles !== "object") return [];
+		const secrets = new Set();
+		const pushVal = (v, minLen = 4) => {
+			const s = String(v ?? "").trim();
+			if (s.length >= minLen) secrets.add(s);
+		};
+		for (const entry of Object.values(roles)) {
+			if (!entry || typeof entry !== "object") continue;
+			if (typeof entry.bearer === "string") {
+				pushVal(entry.bearer, 4);
+				const bare = entry.bearer.replace(/^(?:Bearer|Token|Basic|JWT)\s+/i, "").trim();
+				if (bare) pushVal(bare, 4);
+			}
+			if (typeof entry.cookie === "string") {
+				pushVal(entry.cookie, 4);
+				for (const part of entry.cookie.split(";")) {
+					const eq = part.indexOf("=");
+					if (eq > 0) pushVal(part.slice(eq + 1), 4);
+				}
+			}
+			if (typeof entry.password === "string") {
+				pushVal(entry.password, 3);
+				if (typeof entry.username === "string" && entry.username.trim()) {
+					pushVal(Buffer.from(`${entry.username}:${entry.password}`, "utf8").toString("base64"), 4);
+				}
+			}
+			if (entry.headers && typeof entry.headers === "object") {
+				for (const [hk, hv] of Object.entries(entry.headers)) {
+					if (/(?:auth|token|key|secret|cookie|session|jwt|csrf|pass|cred|bearer)/i.test(hk)) {
+						pushVal(hv, 4);
+						const bare = String(hv ?? "").replace(/^(?:Bearer|Token|Basic|JWT)\s+/i, "").trim();
+						if (bare) pushVal(bare, 4);
+					}
+				}
+			}
+		}
+		return [...secrets].sort((a, b) => b.length - a.length);
+	} catch {
+		return [];
+	}
+}
+
+function redactSecretPatterns(text, vaultSecrets = []) {
+	let out = String(text ?? "");
+	if (!out) return out;
+	for (const secret of vaultSecrets) {
+		if (secret && out.includes(secret)) {
+			out = out.split(secret).join("***");
+		}
+	}
+	out = out
+		.replace(/(Authorization\s*:\s*(?:Bearer|Token|Basic|JWT)\s+)[^\s'",;\r\n]+/gi, "$1***")
+		.replace(/\b(Bearer|Token|Basic|JWT)\s+[A-Za-z0-9._~+/=-]{6,}/gi, "$1 ***")
+		.replace(/\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}\b/g, "eyJ***")
+		.replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|ak_[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{16,})\b/g, "***")
+		.replace(
+			/\b((?:password|passwd|pass|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token|cookie)\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;'"\r\n]+)/gi,
+			"$1***",
+		)
+		.replace(/(https?:\/\/)[^/\s@]+:[^/\s@]+@/gi, "$1***@")
+		.replace(/([?&](?:token|key|secret|auth|sig|password|pass|api_key)=)[^&\s]+/gi, "$1***");
+	return out;
+}
+
+function redactWebhookPayload(value, root, vaultSecrets = collectVaultSecretStrings(root)) {
+	if (typeof value === "string") {
+		return redactSecretPatterns(value, vaultSecrets);
+	}
+	if (Array.isArray(value)) {
+		return value.map((item) => redactWebhookPayload(item, root, vaultSecrets));
+	}
+	if (value && typeof value === "object") {
+		const out = {};
+		for (const [k, v] of Object.entries(value)) {
+			if (v === undefined) continue;
+			out[k] = redactWebhookPayload(v, root, vaultSecrets);
+		}
+		return out;
+	}
+	return value;
+}
+
+function appendWebhookDeadletter(root, entry) {
+	try {
+		const dir = join(root, ".nuwa");
+		mkdirSync(dir, { recursive: true });
+		const dlPath = join(dir, "webhook-deadletter.jsonl");
+		appendFileSync(dlPath, `${JSON.stringify(entry)}\n`, { encoding: "utf8", mode: 0o600 });
+		try {
+			chmodSync(dlPath, 0o600);
+		} catch {
+			/* 非 POSIX 文件系统忽略 */
+		}
+	} catch {
+		/* 写死信队列失败不崩溃守护进程 */
+	}
+}
+
+async function sendDaemonWebhook(webhookUrl, root, payload, opts = {}) {
+	const targetUrl = String(webhookUrl ?? "").trim();
+	if (!targetUrl) return { ok: false, skipped: true };
+
+	const redactedPayload = redactWebhookPayload(payload, root);
+	const body = JSON.stringify(redactedPayload);
+	const maskedUrl = maskWebhookUrl(targetUrl);
+	const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : WEBHOOK_TIMEOUT_MS;
+
+	let retryDelays = [100, 250];
+	if (Array.isArray(opts.retryDelaysMs)) {
+		retryDelays = opts.retryDelaysMs;
+	} else {
+		const envRetry = (process.env.NUWA_WEBHOOK_RETRY_MS ?? "").trim();
+		if (envRetry) {
+			const parsed = Number(envRetry);
+			if (Number.isFinite(parsed) && parsed >= 0) {
+				retryDelays = [parsed, parsed * 2];
+			}
+		}
+	}
+
+	let lastError = "unknown webhook error";
+	for (let attempt = 1; attempt <= WEBHOOK_MAX_ATTEMPTS; attempt += 1) {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		try {
+			const res = await fetch(targetUrl, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"User-Agent": "pi-nuwa-autonomous/5.0",
+				},
+				body,
+				signal: controller.signal,
+			});
+			if (res.ok) {
+				return { ok: true, status: res.status, attempts: attempt };
+			}
+			lastError = `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`;
+		} catch (err) {
+			const rawMsg = err instanceof Error ? err.message : String(err);
+			lastError = rawMsg.includes(targetUrl) ? rawMsg.split(targetUrl).join(maskedUrl) : rawMsg;
+		} finally {
+			clearTimeout(timer);
+		}
+
+		if (attempt < WEBHOOK_MAX_ATTEMPTS) {
+			const delayMs = retryDelays[attempt - 1] ?? retryDelays[retryDelays.length - 1] ?? 100;
+			if (delayMs > 0) {
+				await Bun.sleep(delayMs);
+			}
+		}
+	}
+
+	appendWebhookDeadletter(root, {
+		ts: new Date().toISOString(),
+		url: maskedUrl,
+		attempts: WEBHOOK_MAX_ATTEMPTS,
+		error: redactSecretPatterns(lastError),
+		payload: redactedPayload,
+	});
+	logErr(`Webhook 推送失败 (${maskedUrl}，已重试 ${WEBHOOK_MAX_ATTEMPTS} 次，已写入 .nuwa/webhook-deadletter.jsonl): ${redactSecretPatterns(lastError)}`);
+	return { ok: false, attempts: WEBHOOK_MAX_ATTEMPTS, error: lastError, deadlettered: true };
+}
+
+function computeCumulativeBudget(state, opts) {
+	const rt = state?.runtime ?? {};
+	const baseTokens = Number(rt.totalTokens ?? 0);
+	const curTokens = Number(rt.tokens ?? 0);
+	const cumulativeTokens =
+		(Number.isFinite(baseTokens) && baseTokens > 0 ? baseTokens : 0) +
+		(Number.isFinite(curTokens) && curTokens > 0 ? curTokens : 0);
+	const recordedUsd = Number(rt.totalCostUsd ?? 0);
+	const cumulativeUsd =
+		Number.isFinite(recordedUsd) && recordedUsd > 0
+			? recordedUsd
+			: (cumulativeTokens / 1_000_000) * opts.usdPer1mTokens;
+	return { cumulativeTokens, cumulativeUsd };
+}
+
+function checkBudgetCap(state, opts) {
+	if (!state) return { exceeded: false, cumulativeTokens: 0, cumulativeUsd: 0 };
+	const { cumulativeTokens, cumulativeUsd } = computeCumulativeBudget(state, opts);
+	if (opts.maxTotalTokens > 0 && cumulativeTokens >= opts.maxTotalTokens) {
+		return {
+			exceeded: true,
+			kind: "tokens",
+			limit: opts.maxTotalTokens,
+			cumulativeTokens,
+			cumulativeUsd,
+			reason: `跨世代累计 Token 已达上限 (${cumulativeTokens} >= ${opts.maxTotalTokens})`,
+		};
+	}
+	if (opts.maxUsd > 0 && cumulativeUsd >= opts.maxUsd) {
+		return {
+			exceeded: true,
+			kind: "usd",
+			limit: opts.maxUsd,
+			cumulativeTokens,
+			cumulativeUsd,
+			reason: `跨世代累计费用已达上限 ($${cumulativeUsd.toFixed(4)} >= $${opts.maxUsd.toFixed(4)})`,
+		};
+	}
+	return { exceeded: false, cumulativeTokens, cumulativeUsd };
+}
+
+function buildWebhookEventPayload(event, opts, state, gen, extra = {}) {
+	const { cumulativeTokens, cumulativeUsd } = computeCumulativeBudget(state, opts);
+	const facts = Object.values(state?.facts ?? {});
+	const flags = facts.filter((f) => f?.kind === "flag").length;
+	const confirmedVulns = facts.filter(
+		(f) => f?.kind === "vuln" && f?.verifyStage !== "candidate" && f?.verifyStage !== "rejected",
+	).length;
+	return {
+		event,
+		ts: new Date().toISOString(),
+		projectId: state?.project?.id ?? "",
+		target: state?.project?.url || state?.project?.target || opts.target,
+		mode: state?.project?.mode || opts.mode,
+		phase: state?.project?.phase || "recon",
+		status: state?.project?.status || "active",
+		generation: gen,
+		stateGeneration: Number(state?.runtime?.generation ?? gen),
+		cumulativeTokens,
+		cumulativeUsd: Number(cumulativeUsd.toFixed(6)),
+		factsCount: facts.length,
+		flags,
+		confirmedVulns,
+		...extra,
+	};
+}
+
 function persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal) {
 	try {
 		const dir = join(opts.root, ".nuwa");
@@ -1116,6 +1451,10 @@ function persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal
 			idleTimeoutMinutes: opts.idleTimeoutMinutes,
 			reincarnateTokens: opts.reincarnateTokens,
 			reincarnateTurns: opts.reincarnateTurns,
+			maxTotalTokens: opts.maxTotalTokens,
+			maxUsd: opts.maxUsd,
+			usdPer1mTokens: opts.usdPer1mTokens,
+			webhook: opts.webhook ? maskWebhookUrl(opts.webhook) : undefined,
 			allowSubdomains: opts.allowSubdomains,
 			allowCidrs: opts.allowCidrs,
 			model: opts.model || undefined,
@@ -1336,6 +1675,10 @@ async function main() {
 			idleTimeoutMinutes: opts.idleTimeoutMinutes,
 			reincarnateTokens: opts.reincarnateTokens,
 			reincarnateTurns: opts.reincarnateTurns,
+			maxTotalTokens: opts.maxTotalTokens,
+			maxUsd: opts.maxUsd,
+			usdPer1mTokens: opts.usdPer1mTokens,
+			webhook: opts.webhook ? maskWebhookUrl(opts.webhook) : null,
 			allowSubdomains: opts.allowSubdomains,
 			allowCidrs: opts.allowCidrs,
 			model: opts.model || null,
@@ -1421,12 +1764,30 @@ async function main() {
 	while (gen <= opts.maxGenerations && Date.now() - startedAt < maxDurationMs) {
 		const preState = readDiskState(opts.root);
 		if (preState?.project?.status === "completed") {
-			log(formatCompletionSummary(opts.root, preState, gen, startedAt));
+			const summary = formatCompletionSummary(opts.root, preState, gen, startedAt);
+			log(summary);
+			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, preState, gen, { summary }));
 			process.exit(0);
 		}
 		if (preState?.project?.status === "stopped" && !isReincarnateStop(preState)) {
-			log(`项目已停机 (status=stopped)，原因: ${preState.project?.stopReason ?? "未记录"}`);
+			const reason = preState.project?.stopReason ?? "未记录";
+			log(`项目已停机 (status=stopped)，原因: ${reason}`);
+			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, preState, gen, { reason }));
 			process.exit(2);
+		}
+		const preBudget = checkBudgetCap(preState, opts);
+		if (preBudget.exceeded) {
+			log(`预算上限已触发：${preBudget.reason}（累计 tokens=${preBudget.cumulativeTokens}, cost=$${preBudget.cumulativeUsd.toFixed(4)}），守护进程干净退出 (exit=3)。`);
+			await sendDaemonWebhook(
+				opts.webhook,
+				opts.root,
+				buildWebhookEventPayload("budget_exceeded", opts, preState, gen, {
+					reason: preBudget.reason,
+					limitKind: preBudget.kind,
+					limit: preBudget.limit,
+				}),
+			);
+			process.exit(3);
 		}
 
 		const remainingMaxHoursMs = maxDurationMs - (Date.now() - startedAt);
@@ -1484,18 +1845,47 @@ async function main() {
 
 		const postState = readDiskState(opts.root);
 		if (postState?.project?.status === "completed") {
-			log(formatCompletionSummary(opts.root, postState, gen, startedAt));
+			const summary = formatCompletionSummary(opts.root, postState, gen, startedAt);
+			log(summary);
+			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, postState, gen, { summary }));
 			process.exit(0);
 		}
 		if (postState?.project?.status === "stopped" && !isReincarnateStop(postState)) {
-			log(`项目已停机 (status=stopped)，原因: ${postState.project?.stopReason ?? "未记录"}`);
+			const reason = postState.project?.stopReason ?? "未记录";
+			log(`项目已停机 (status=stopped)，原因: ${reason}`);
+			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, postState, gen, { reason }));
 			process.exit(2);
+		}
+		const postBudget = checkBudgetCap(postState, opts);
+		if (postBudget.exceeded) {
+			log(`预算上限已触发：${postBudget.reason}（累计 tokens=${postBudget.cumulativeTokens}, cost=$${postBudget.cumulativeUsd.toFixed(4)}），守护进程干净退出 (exit=3)。`);
+			await sendDaemonWebhook(
+				opts.webhook,
+				opts.root,
+				buildWebhookEventPayload("budget_exceeded", opts, postState, gen, {
+					reason: postBudget.reason,
+					limitKind: postBudget.kind,
+					limit: postBudget.limit,
+				}),
+			);
+			process.exit(3);
 		}
 
 		if (exitCode !== 0) {
 			consecutiveErrors += 1;
 			if (consecutiveErrors > maxConsecutiveErrors) {
-				logErr(`子进程连续异常退出 ${consecutiveErrors} 次（上限 ${maxConsecutiveErrors}），停止守护。`);
+				const reason = `子进程连续异常退出 ${consecutiveErrors} 次（上限 ${maxConsecutiveErrors}）`;
+				logErr(`${reason}，停止守护。`);
+				await sendDaemonWebhook(
+					opts.webhook,
+					opts.root,
+					buildWebhookEventPayload("max_errors", opts, postState, gen, {
+						reason,
+						consecutiveErrors,
+						maxConsecutiveErrors,
+						exitCode,
+					}),
+				);
 				process.exit(1);
 			}
 			const delayMs = Math.min(60_000, baseBackoffMs * 2 ** (consecutiveErrors - 1));
@@ -1517,18 +1907,45 @@ async function main() {
 		consecutiveErrors = 0;
 		const nextGenHint = postState?.runtime?.handoffSummary ? "检测到交接摘要，准备拉起下一代" : "本代正常退出且任务仍活跃，准备拉起下一代";
 		log(`第 ${gen} 代会话结束 (exit=0)：${nextGenHint}`);
+		await sendDaemonWebhook(
+			opts.webhook,
+			opts.root,
+			buildWebhookEventPayload("reincarnate", opts, postState, gen, {
+				nextGeneration: gen + 1,
+				hasHandoff: Boolean(postState?.runtime?.handoffSummary),
+				reason: nextGenHint,
+			}),
+		);
 		gen += 1;
 	}
 
 	// 循环结束前最后复核一次磁盘状态
 	const finalState = readDiskState(opts.root);
 	if (finalState?.project?.status === "completed") {
-		log(formatCompletionSummary(opts.root, finalState, gen, startedAt));
+		const summary = formatCompletionSummary(opts.root, finalState, gen, startedAt);
+		log(summary);
+		await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, finalState, gen, { summary }));
 		process.exit(0);
 	}
 	if (finalState?.project?.status === "stopped" && !isReincarnateStop(finalState)) {
-		log(`项目已停机 (status=stopped)，原因: ${finalState.project?.stopReason ?? "未记录"}`);
+		const reason = finalState.project?.stopReason ?? "未记录";
+		log(`项目已停机 (status=stopped)，原因: ${reason}`);
+		await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, finalState, gen, { reason }));
 		process.exit(2);
+	}
+	const finalBudget = checkBudgetCap(finalState, opts);
+	if (finalBudget.exceeded) {
+		log(`预算上限已触发：${finalBudget.reason}（累计 tokens=${finalBudget.cumulativeTokens}, cost=$${finalBudget.cumulativeUsd.toFixed(4)}），守护进程干净退出 (exit=3)。`);
+		await sendDaemonWebhook(
+			opts.webhook,
+			opts.root,
+			buildWebhookEventPayload("budget_exceeded", opts, finalState, gen, {
+				reason: finalBudget.reason,
+				limitKind: finalBudget.kind,
+				limit: finalBudget.limit,
+			}),
+		);
+		process.exit(3);
 	}
 
 	const elapsedMs = Date.now() - startedAt;

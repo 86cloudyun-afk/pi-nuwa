@@ -123,6 +123,7 @@ export interface AutoBatchOptions {
 	concurrency?: number;
 	signal?: AbortSignal;
 	agentHome?: string;
+	authHeaderFile?: string;
 	getState?: () => NuwaState | null;
 	onResult?: (item: AutoBatchItemResult) => void | Promise<void>;
 	onBudgetSkip?: (remainingIds: string[], reason: BudgetSkipReason) => void | Promise<void>;
@@ -1694,6 +1695,31 @@ function raceWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T
 	});
 }
 
+const SAFE_AUTH_HEADER_FILE_RE = /^\/tmp\/nuwa\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\/sessions\/[a-z0-9][a-z0-9._-]{0,63}\.headers$/;
+
+/**
+ * 在不暴露任何明文凭据的前提下，为自动侦察脚本注入零明文角色头文件包装器（`curl -H @"$NUWA_AUTH_HEADER_FILE"`）。
+ * 仅接受位于 `/tmp/nuwa/<projectId>/sessions/<role>.headers` 的合法路径。
+ */
+export function injectAuthHeaderFileIntoScript(script: string, authHeaderFile?: string): string {
+	const raw = String(authHeaderFile ?? "").trim();
+	if (!raw || raw.includes("..") || !SAFE_AUTH_HEADER_FILE_RE.test(raw)) {
+		return script;
+	}
+	const prelude = [
+		`NUWA_AUTH_HEADER_FILE=${shellQuote(raw)}`,
+		`export NUWA_AUTH_HEADER_FILE`,
+		`curl() {`,
+		`  if [ -r "$NUWA_AUTH_HEADER_FILE" ]; then`,
+		`    command curl -H @"$NUWA_AUTH_HEADER_FILE" "$@"`,
+		`  else`,
+		`    command curl "$@"`,
+		`  fi`,
+		`}`,
+	].join("\n");
+	return `${prelude}\n${script}`;
+}
+
 /** 执行单条自动意图：跑脚本 → 解析，无产出时附带失败三分类信息。入账由调用方在锁内完成。 */
 export async function runAutoIntent(
 	rule: AutoRule,
@@ -1701,6 +1727,7 @@ export async function runAutoIntent(
 	exec: ExecLike,
 	cwd: string,
 	signal?: AbortSignal,
+	opts?: { authHeaderFile?: string },
 ): Promise<AutoRunResult> {
 	if (signal?.aborted) {
 		return {
@@ -1711,8 +1738,10 @@ export async function runAutoIntent(
 		};
 	}
 	try {
+		const rawScript = rule.script(st);
+		const script = opts?.authHeaderFile ? injectAuthHeaderFileIntoScript(rawScript, opts.authHeaderFile) : rawScript;
 		const res = await raceWithSignal(
-			exec("bash", ["-lc", rule.script(st)], { timeout: rule.timeoutMs, cwd, signal }),
+			exec("bash", ["-lc", script], { timeout: rule.timeoutMs, cwd, signal }),
 			signal,
 		);
 		const fact = rule.parse(res, st);
@@ -1860,7 +1889,14 @@ export async function runAutoBatchManaged(
 			const boundedRule: AutoRule =
 				remMs < rule.timeoutMs ? { ...rule, timeoutMs: remMs } : rule;
 
-			const runRes = await runAutoIntent(boundedRule, latestState, exec, root, batchController.signal);
+			const runRes = await runAutoIntent(
+				boundedRule,
+				latestState,
+				exec,
+				root,
+				batchController.signal,
+				opts?.authHeaderFile ? { authHeaderFile: opts.authHeaderFile } : undefined,
+			);
 
 			// 若因预算耗尽或外部 abort 打断且未成功产出，归入剩余跳过列表由调用方回退 open
 			if (!runRes.ok && (extAborted || budgetExceeded || opts?.signal?.aborted)) {

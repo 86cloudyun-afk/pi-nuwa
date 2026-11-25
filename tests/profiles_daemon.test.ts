@@ -126,7 +126,7 @@ describe("omp/profiles.ts 多领域 Profile 引擎", () => {
 
 		const cases: Array<{ mode: ProfileMode; proofKinds: string[]; requireHttpTarget: boolean }> = [
 			{ mode: "ctf", proofKinds: ["flag"], requireHttpTarget: true },
-			{ mode: "audit", proofKinds: ["vuln", "loot"], requireHttpTarget: true },
+			{ mode: "audit", proofKinds: ["vuln", "loot"], requireHttpTarget: false },
 			{ mode: "pentest", proofKinds: ["vuln", "loot", "flag"], requireHttpTarget: true },
 			{ mode: "coding", proofKinds: ["loot", "note"], requireHttpTarget: false },
 			{ mode: "ops", proofKinds: ["loot", "note"], requireHttpTarget: false },

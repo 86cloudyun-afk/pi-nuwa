@@ -108,7 +108,10 @@ export interface PlaywrightContextLike {
 }
 
 export interface PlaywrightBrowserLike {
-	newContext(options?: { ignoreHTTPSErrors?: boolean }): Promise<PlaywrightContextLike>;
+	newContext(options?: {
+		ignoreHTTPSErrors?: boolean;
+		extraHTTPHeaders?: Record<string, string>;
+	}): Promise<PlaywrightContextLike>;
 	close(): Promise<void>;
 }
 
@@ -125,6 +128,12 @@ export interface SpaReconOptions {
 	playwrightLoader?: () => Promise<PlaywrightLike | null>;
 	fetchFn?: FetchLike;
 	signal?: AbortSignal;
+	/** 认证态只读探测附加请求头（绝不写入命令、日志或事实输出） */
+	authHeaders?: Record<string, string>;
+	/** 认证态角色标识（非敏感，用于标记产出事实来源） */
+	authRole?: string;
+	/** 是否发现并解析同源 .js.map SourceMap（默认 true，严格受 maxBundles 与同源限制） */
+	discoverSourceMaps?: boolean;
 }
 
 function clip(text: string, max: number): string {
@@ -696,6 +705,125 @@ function discoverSameOriginBundles(
 	return { bundleUrls: found, blocked };
 }
 
+function mergeHeadersWithAccept(
+	acceptValue: string,
+	authHeaders?: Record<string, string>,
+): Record<string, string> {
+	const merged: Record<string, string> = {};
+	if (authHeaders) {
+		for (const [k, v] of Object.entries(authHeaders)) {
+			const cleanK = String(k ?? "")
+				.replace(/[\r\n]+/g, " ")
+				.replace(/:\s*$/, "")
+				.trim();
+			const cleanV = String(v ?? "")
+				.replace(/[\r\n]+/g, " ")
+				.trim();
+			if (!cleanK || !cleanV) continue;
+			if (cleanK.toLowerCase() === "accept") continue;
+			merged[cleanK] = cleanV;
+		}
+	}
+	merged.Accept = acceptValue;
+	return merged;
+}
+
+function discoverLazyChunksFromJs(
+	jsCode: string,
+	bundleUrl: URL,
+	baseUrl: URL,
+	scope: ScopePolicy,
+): { chunkUrls: string[]; blocked: number } {
+	const chunkUrls: string[] = [];
+	const seen = new Set<string>();
+	let blocked = 0;
+	if (!jsCode) return { chunkUrls, blocked };
+
+	const rawCandidates: string[] = [];
+	const dynamicImportRe =
+		/\bimport\s*\(\s*(?:\/\*[\s\S]*?\*\/\s*)?["']([^"'\s`${}<>\\]{2,240}\.(?:m?js|cjs)(?:\?[^"'\s`${}<>\\]*)?)["']\s*\)/g;
+	for (const m of jsCode.matchAll(dynamicImportRe)) {
+		if (m[1]) rawCandidates.push(m[1].trim());
+	}
+
+	const chunkLiteralRe =
+		/["']((?:https?:\/\/[^"'\s`${}<>\\]{3,160})?(?:\/|\.\.?\/)(?:(?:_next\/static\/chunks|_nuxt|assets|static|chunks|js|dist|build|pages)\/[A-Za-z0-9._~/-]{1,200}|[A-Za-z0-9._~/-]{0,160}(?:chunk|bundle|lazy|async)[A-Za-z0-9._~/-]{0,80})\.(?:m?js|cjs)(?:\?[A-Za-z0-9._~=&%-]*)?)["']/gi;
+	for (const m of jsCode.matchAll(chunkLiteralRe)) {
+		if (m[1]) rawCandidates.push(m[1].trim());
+	}
+
+	for (const rawRef of rawCandidates) {
+		if (!rawRef || rawRef.startsWith("data:") || rawRef.startsWith("blob:")) continue;
+		let resolved: URL;
+		try {
+			resolved = new URL(rawRef, bundleUrl);
+		} catch {
+			continue;
+		}
+		if (resolved.protocol !== "http:" && resolved.protocol !== "https:") continue;
+		if (resolved.origin !== baseUrl.origin || !isHostInScope(resolved.hostname, scope).ok) {
+			blocked++;
+			continue;
+		}
+		const href = resolved.href;
+		if (seen.has(href)) continue;
+		seen.add(href);
+		chunkUrls.push(href);
+	}
+
+	return { chunkUrls, blocked };
+}
+
+function discoverSourceMapUrl(
+	jsCode: string,
+	bundleUrl: URL,
+	baseUrl: URL,
+	scope: ScopePolicy,
+): { mapUrl: string | null; blocked: number } {
+	if (!jsCode) return { mapUrl: null, blocked: 0 };
+
+	let lastIdx = -1;
+	let lastRaw = "";
+
+	const lineMapRe = /\/\/[#@]\s*sourceMappingURL\s*=\s*([^\s'"]+)/g;
+	for (const m of jsCode.matchAll(lineMapRe)) {
+		const idx = m.index ?? -1;
+		if (m[1] && idx >= lastIdx) {
+			lastIdx = idx;
+			lastRaw = m[1].trim();
+		}
+	}
+	const blockMapRe = /\/\*[#@]\s*sourceMappingURL\s*=\s*([^\s*'"]+)\s*\*\//g;
+	for (const m of jsCode.matchAll(blockMapRe)) {
+		const idx = m.index ?? -1;
+		if (m[1] && idx >= lastIdx) {
+			lastIdx = idx;
+			lastRaw = m[1].trim();
+		}
+	}
+
+	if (!lastRaw || lastRaw.startsWith("data:") || lastRaw.startsWith("blob:")) {
+		return { mapUrl: null, blocked: 0 };
+	}
+
+	let resolved: URL;
+	try {
+		resolved = new URL(lastRaw, bundleUrl);
+	} catch {
+		return { mapUrl: null, blocked: 0 };
+	}
+	if (resolved.protocol !== "http:" && resolved.protocol !== "https:") {
+		return { mapUrl: null, blocked: 0 };
+	}
+	if (!/\.map$/i.test(resolved.pathname)) {
+		return { mapUrl: null, blocked: 0 };
+	}
+	if (resolved.origin !== baseUrl.origin || !isHostInScope(resolved.hostname, scope).ok) {
+		return { mapUrl: null, blocked: 1 };
+	}
+	return { mapUrl: resolved.href, blocked: 0 };
+}
+
 function defaultFetchImpl(): FetchLike {
 	return async (input, init) => {
 		const res = await fetch(input, {
@@ -814,6 +942,7 @@ function buildSpaAutoFact(
 	routes: readonly string[],
 	endpoints: readonly SpaApiEndpoint[],
 	bundlesCount: number,
+	authRole?: string,
 ): AutoFact | null {
 	if (endpoints.length === 0 && routes.length === 0) {
 		return null;
@@ -833,8 +962,13 @@ function buildSpaAutoFact(
 		return `${ep.method} ${ep.path}${qPart}${bPart}${gqlPart}`;
 	});
 
+	const cleanRole = String(authRole ?? "")
+		.replace(/[\r\n\s]+/g, "")
+		.slice(0, 64);
+
 	const detailParts = [
 		`mode=${mode}`,
+		cleanRole ? `authRole=${cleanRole}` : "",
 		`tech=${tech.length ? tech.join(",") : "-"}`,
 		`bundles=${bundlesCount}`,
 		routes.length ? `routes=${routes.slice(0, 10).join(",")}` : "",
@@ -860,7 +994,7 @@ function buildSpaAutoFact(
 }
 
 /**
- * 模式 B 核心实现：静态解析首屏 HTML 与最多 8 个同源 JS Bundle，
+ * 模式 B 核心实现：静态解析首屏 HTML 与最多 8 个同源 JS Bundle（含按需懒加载 Chunk 与同源 SourceMap），
  * 提取 API 路由与 fetch/axios/XHR/GraphQL 接口，过滤静态资源后缀，并产出统一 AutoFact。
  */
 export async function extractStaticBundleApis(
@@ -868,7 +1002,14 @@ export async function extractStaticBundleApis(
 	baseUrl: string,
 	scope: ScopePolicy,
 	fetchFn?: FetchLike,
-	opts?: { maxBundles?: number; timeoutMs?: number; signal?: AbortSignal },
+	opts?: {
+		maxBundles?: number;
+		timeoutMs?: number;
+		signal?: AbortSignal;
+		authHeaders?: Record<string, string>;
+		authRole?: string;
+		discoverSourceMaps?: boolean;
+	},
 ): Promise<StaticBundleExtractResult> {
 	let parsedBase: URL;
 	try {
@@ -883,6 +1024,7 @@ export async function extractStaticBundleApis(
 
 	const maxBundles = Math.min(MAX_STATIC_BUNDLES, Math.max(0, Math.floor(opts?.maxBundles ?? MAX_STATIC_BUNDLES)));
 	const timeoutMs = Math.max(500, Math.min(60_000, opts?.timeoutMs ?? 8_000));
+	const discoverSourceMaps = opts?.discoverSourceMaps !== false;
 	const fetcher = fetchFn ?? defaultFetchImpl();
 
 	const endpointMap = new Map<string, SpaApiEndpoint>();
@@ -896,20 +1038,40 @@ export async function extractStaticBundleApis(
 		blockedRequests += res.blocked;
 	}
 
-	// 2. 发现并抓取最多 8 个同源 JS Bundle
+	// 2. 发现并抓取最多 maxBundles 个同源 JS Bundle / 懒加载 Chunk / SourceMap
 	const { bundleUrls, blocked: blockedScriptHosts } = discoverSameOriginBundles(html, parsedBase, scope, maxBundles);
 	blockedRequests += blockedScriptHosts;
 
+	const queue: Array<{ url: string; kind: "js" | "sourcemap" }> = [];
+	const queued = new Set<string>();
+	const enqueue = (url: string, kind: "js" | "sourcemap") => {
+		if (queued.has(url)) return;
+		queued.add(url);
+		queue.push({ url, kind });
+	};
+	for (const u of bundleUrls) {
+		enqueue(u, "js");
+	}
+
 	const fetchedBundles: string[] = [];
-	for (const bundleUrl of bundleUrls) {
+	let fetchedAttempts = 0;
+
+	while (queue.length > 0 && fetchedAttempts < maxBundles) {
 		if (opts?.signal?.aborted) break;
+		const item = queue.shift()!;
+		fetchedAttempts++;
+
 		const controller = new AbortController();
 		const onAbort = () => controller.abort();
 		opts?.signal?.addEventListener("abort", onAbort, { once: true });
 		const timer = setTimeout(() => controller.abort(), timeoutMs);
 		try {
-			const fetched = await scopedGetFetch(bundleUrl, scope, fetcher, {
-				headers: { Accept: "application/javascript, text/javascript, */*" },
+			const accept =
+				item.kind === "sourcemap"
+					? "application/json, */*"
+					: "application/javascript, text/javascript, */*";
+			const fetched = await scopedGetFetch(item.url, scope, fetcher, {
+				headers: mergeHeadersWithAccept(accept, opts?.authHeaders),
 				signal: controller.signal,
 				requireSameOrigin: parsedBase.origin,
 			});
@@ -920,11 +1082,66 @@ export async function extractStaticBundleApis(
 			const resp = fetched.response;
 			if (!resp.ok) continue;
 			const rawText = await resp.text();
-			const jsCode = rawText.length > MAX_BUNDLE_BYTES ? rawText.slice(0, MAX_BUNDLE_BYTES) : rawText;
+			const clippedText = rawText.length > MAX_BUNDLE_BYTES ? rawText.slice(0, MAX_BUNDLE_BYTES) : rawText;
+			queued.add(fetched.finalUrl);
+
+			if (item.kind === "sourcemap") {
+				try {
+					const parsedMap = JSON.parse(clippedText) as { sourcesContent?: unknown };
+					if (parsedMap && typeof parsedMap === "object" && Array.isArray(parsedMap.sourcesContent)) {
+						fetchedBundles.push(fetched.finalUrl);
+						let consumed = 0;
+						for (const entry of parsedMap.sourcesContent) {
+							if (typeof entry !== "string" || !entry.trim()) continue;
+							const remaining = MAX_BUNDLE_BYTES - consumed;
+							if (remaining <= 0) break;
+							const snippet = entry.length > remaining ? entry.slice(0, remaining) : entry;
+							consumed += snippet.length;
+							if (techSources.length < 32) techSources.push(snippet);
+							const res = extractApisAndRoutesFromJs(
+								snippet,
+								parsedBase,
+								scope,
+								"static-bundle",
+								endpointMap,
+								routeSet,
+							);
+							blockedRequests += res.blocked;
+						}
+					}
+				} catch {
+					/* 非法或截断的 SourceMap JSON 安全忽略 */
+				}
+				continue;
+			}
+
 			fetchedBundles.push(fetched.finalUrl);
-			techSources.push(jsCode);
-			const res = extractApisAndRoutesFromJs(jsCode, parsedBase, scope, "static-bundle", endpointMap, routeSet);
+			if (techSources.length < 32) techSources.push(clippedText);
+			const res = extractApisAndRoutesFromJs(clippedText, parsedBase, scope, "static-bundle", endpointMap, routeSet);
 			blockedRequests += res.blocked;
+
+			let finalBundleUrl = parsedBase;
+			try {
+				finalBundleUrl = new URL(fetched.finalUrl);
+			} catch {
+				/* 回退 parsedBase */
+			}
+
+			// 发现同源懒加载 JS Chunk（受剩余 maxBundles 预算约束）
+			const lazy = discoverLazyChunksFromJs(clippedText, finalBundleUrl, parsedBase, scope);
+			blockedRequests += lazy.blocked;
+			for (const chunkUrl of lazy.chunkUrls) {
+				enqueue(chunkUrl, "js");
+			}
+
+			// 可选发现同源 .js.map SourceMap（受剩余 maxBundles 预算约束）
+			if (discoverSourceMaps) {
+				const sm = discoverSourceMapUrl(clippedText, finalBundleUrl, parsedBase, scope);
+				blockedRequests += sm.blocked;
+				if (sm.mapUrl) {
+					enqueue(sm.mapUrl, "sourcemap");
+				}
+			}
 		} catch {
 			/* 单个 Bundle 抓取超时或网络异常不影响其余 Bundle 分析 */
 		} finally {
@@ -938,7 +1155,15 @@ export async function extractStaticBundleApis(
 	const endpoints = [...endpointMap.values()].sort(
 		(a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method),
 	);
-	const fact = buildSpaAutoFact(parsedBase.href, "static", tech, routes, endpoints, fetchedBundles.length);
+	const fact = buildSpaAutoFact(
+		parsedBase.href,
+		"static",
+		tech,
+		routes,
+		endpoints,
+		fetchedBundles.length,
+		opts?.authRole,
+	);
 
 	return {
 		tech,
@@ -1044,7 +1269,11 @@ export async function runSpaRecon(
 					headless: true,
 					args: ["--no-sandbox", "--disable-gpu"],
 				});
-				context = await browser.newContext({ ignoreHTTPSErrors: true });
+				const hasAuthHeaders = Boolean(opts?.authHeaders && Object.keys(opts.authHeaders).length > 0);
+				context = await browser.newContext({
+					ignoreHTTPSErrors: true,
+					...(hasAuthHeaders ? { extraHTTPHeaders: { ...opts!.authHeaders } } : {}),
+				});
 				page = await context.newPage();
 
 				const endpointMap = new Map<string, SpaApiEndpoint>();
@@ -1174,6 +1403,9 @@ export async function runSpaRecon(
 							maxBundles,
 							timeoutMs: Math.min(timeoutMs, 8_000),
 							signal: opts?.signal,
+							authHeaders: opts?.authHeaders,
+							authRole: opts?.authRole,
+							discoverSourceMaps: opts?.discoverSourceMaps,
 						})
 					: { tech: [], routes: [], endpoints: [], bundles: [], blockedRequests: 0, fact: null };
 
@@ -1193,6 +1425,7 @@ export async function runSpaRecon(
 					routes,
 					endpoints,
 					staticSuppl.bundles.length,
+					opts?.authRole,
 				);
 
 				return {
@@ -1228,7 +1461,7 @@ export async function runSpaRecon(
 	let finalBaseUrl = parsedUrl.href;
 	try {
 		const fetched = await scopedGetFetch(parsedUrl.href, scope, fetcher, {
-			headers: { Accept: "text/html,application/xhtml+xml,*/*" },
+			headers: mergeHeadersWithAccept("text/html,application/xhtml+xml,*/*", opts?.authHeaders),
 			signal: controller.signal,
 		});
 		if (!fetched.ok) {
@@ -1287,6 +1520,9 @@ export async function runSpaRecon(
 		maxBundles,
 		timeoutMs: Math.min(timeoutMs, 8_000),
 		signal: opts?.signal,
+		authHeaders: opts?.authHeaders,
+		authRole: opts?.authRole,
+		discoverSourceMaps: opts?.discoverSourceMaps,
 	});
 
 	return {

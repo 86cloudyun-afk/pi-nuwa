@@ -190,22 +190,33 @@ export function normalizeTarget(raw: string): { url: string; host: string; port:
 	};
 }
 
-/** 按 Profile 模式规范化目标：coding/ops 允许本地路径或服务标识（无需强制 HTTP）。 */
+/** 按 Profile 模式规范化目标：coding/ops/audit 允许本地路径或服务标识（无需强制 HTTP）。 */
 export function normalizeTargetForMode(
 	raw: string,
 	mode: Mode = "ctf",
 ): { url: string; host: string; port: number; scheme: string } {
 	const text = (raw ?? "").trim();
 	if (!text) throw new Error("target 为空");
-	if (mode !== "coding" && mode !== "ops") {
+	if (mode !== "coding" && mode !== "ops" && mode !== "audit") {
 		return normalizeTarget(text);
 	}
-	try {
-		if (/^https?:\/\//i.test(text) || /^((?:\d{1,3}\.){3}\d{1,3}|localhost)(?::\d{1,5})?(?:\/|$)/i.test(text)) {
-			return normalizeTarget(text);
+	const looksLocalPath =
+		text === "." ||
+		text === ".." ||
+		/^(?:\/|\.\.?\/|~\/|local:\/\/)/i.test(text) ||
+		/^[A-Za-z]:[\\/]/.test(text);
+	if (!looksLocalPath) {
+		try {
+			if (
+				/^https?:\/\//i.test(text) ||
+				/^((?:\d{1,3}\.){3}\d{1,3}|localhost)(?::\d{1,5})?(?:\/|$)/i.test(text) ||
+				(mode === "audit" && /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,24}(?::\d{1,5})?(?:\/|$)/i.test(text))
+			) {
+				return normalizeTarget(text);
+			}
+		} catch {
+			/* 回退为本地目录目标 */
 		}
-	} catch {
-		/* 回退为本地目录目标 */
 	}
 	const clean = text.replace(/^local:\/\//i, "").replace(/\/+$/, "") || "workspace";
 	const label = slug(clean.split("/").filter(Boolean).pop() ?? clean);

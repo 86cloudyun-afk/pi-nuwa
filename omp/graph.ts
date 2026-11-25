@@ -46,7 +46,15 @@ import {
 import { prepareNextGeneration, readReincarnatePolicy, shouldReincarnate } from "./reincarnate";
 import { checkNuwaDirTamper, checkScopeAndRisk, defaultScopeForTarget, isHostInScope } from "./scope";
 import { adaptPacketForToolchain, getLatestLedgerSeq, probeToolchain, recordToolExecution } from "./evidence";
-import { buildReflectIntentSpec, deriveKbIntents, getProfile } from "./profiles";
+import {
+	buildProfileFallbackIntent,
+	buildReflectIntentSpec,
+	deriveKbIntents,
+	deriveProfileIntents,
+	formatProfileReportTitle,
+	getProfile,
+	isLocalAuditProject,
+} from "./profiles";
 import {
 	canonicalAutoKey,
 	enrichmentRulesForToolchain,
@@ -69,10 +77,14 @@ import {
 } from "./kb";
 import {
 	buildAuthDiffPacketSection,
+	buildRefreshIntentSpec,
+	checkRoleHealth,
 	clearSessionVault,
 	formatSessionVaultSummary,
+	getRoleHeadersMap,
 	ingestCredFactToVault,
 	loadSessionVault,
+	materializeRoleHeaderFile,
 	redactVaultSecrets,
 	removeSessionRole,
 	upsertSessionRole,
@@ -87,7 +99,33 @@ import {
 	shouldStageAsCandidate,
 	validateVerificationCommit,
 } from "./verifier-gate";
-import { probeDockerAvailable, readSandboxConfig, wrapCommandInDockerSandbox } from "./sandbox";
+import {
+	isCompliantSidecarCommand,
+	probeDockerAvailable,
+	readSandboxConfig,
+	wrapCommandInDockerSandbox,
+	wrapCommandInSidecarSandbox,
+} from "./sandbox";
+import { runAuthDiffMatrix, type AuthDiffMatrixOptions, type AuthDiffMatrixResult } from "./auth-diff";
+import {
+	buildOobEvidenceFact,
+	generateOobCanary,
+	loadOobCanaries,
+	pollOobCallbacks,
+} from "./oob";
+import {
+	ensurePrimaryAsset,
+	formatAssetTopology,
+	propagateFactRejection,
+	syncAssetsFromFacts,
+	synthesizeCrossFactHypotheses,
+} from "./hypothesis";
+import {
+	buildJsonReport,
+	buildSarifReport,
+	renderStratifiedMarkdownReport,
+	writePocBundle,
+} from "./reporting";
 
 const VERSION = NUWA_VERSION;
 
@@ -548,7 +586,7 @@ export function renderDetail(detail: string, st: NuwaState, intentId: string): s
 
 function seedsForProject(st: NuwaState, phase: Phase): Seed[] {
 	const mode = st.project.mode;
-	if (mode === "coding" || mode === "ops") {
+	if (mode === "coding" || mode === "ops" || isLocalAuditProject(st)) {
 		const prof = getProfile(mode);
 		return prof.seeds[phase] ?? [];
 	}
@@ -760,7 +798,17 @@ export function compactFacts(st: NuwaState, keepNotes = NOTE_KEEP): number {
 
 export function appendIntentSpecs(
 	st: NuwaState,
-	specs: Array<{ key: string; phase: Phase; title: string; detail: string; priority: number; from: string[] }>,
+	specs: Array<{
+		key: string;
+		phase: Phase;
+		title: string;
+		detail: string;
+		priority: number;
+		from: string[];
+		hypothesisId?: string;
+		assetId?: string;
+		authRole?: string;
+	}>,
 	cap = INTENT_SOFT_CAP,
 ): string[] {
 	const existing = new Set(Object.values(st.intents).map((i) => i.key));
@@ -782,6 +830,9 @@ export function appendIntentSpecs(
 			priority: spec.priority,
 			attempts: 0,
 			createdAt: nowIso(),
+			...(spec.hypothesisId ? { hypothesisId: spec.hypothesisId } : {}),
+			...(spec.assetId ? { assetId: spec.assetId } : {}),
+			...(spec.authRole ? { authRole: spec.authRole } : {}),
 		};
 		added.push(id);
 	}
@@ -790,13 +841,28 @@ export function appendIntentSpecs(
 
 /**
  * 从已有事实派生下一层意图：优先消费结构化 f.meta（ports/paths/san），并兼容文本扫描。
- * 服务→服务深挖 / SAN 子域枚举，端点→逐路径审计，漏洞→利用/横向，凭据→复用，资产→枚举，战利品→复盘。
+ * 非网络安全模式（coding / ops / 本地白盒 audit）全量交由领域 Profile 插件派生，绝不混入扫描器命令；
+ * 安全评估模式在常规事实派生后追加跨事实假设图推理（synthesizeCrossFactHypotheses）。
  */
 export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): ExpansionResult {
+	try {
+		syncAssetsFromFacts(st);
+	} catch {
+		/* 资产拓扑同步异常不阻塞主派生 */
+	}
+
 	const existing = new Set(Object.values(st.intents).map((i) => i.key));
 	const added: string[] = [];
 	const rules: string[] = [];
-	const push = (key: string, phase: Phase, title: string, detail: string, priority: number, from: string[]) => {
+	const push = (
+		key: string,
+		phase: Phase,
+		title: string,
+		detail: string,
+		priority: number,
+		from: string[],
+		extra?: { hypothesisId?: string; assetId?: string; authRole?: string },
+	) => {
 		if (existing.has(key)) return;
 		if (Object.keys(st.intents).length >= cap) return;
 		existing.add(key);
@@ -812,10 +878,21 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 			priority,
 			attempts: 0,
 			createdAt: nowIso(),
+			...(extra?.hypothesisId ? { hypothesisId: extra.hypothesisId } : {}),
+			...(extra?.assetId ? { assetId: extra.assetId } : {}),
+			...(extra?.authRole ? { authRole: extra.authRole } : {}),
 		};
 		added.push(id);
 		rules.push(key);
 	};
+
+	if (st.project.mode === "coding" || st.project.mode === "ops" || isLocalAuditProject(st)) {
+		const profSpecs = deriveProfileIntents(st, Math.max(1, cap - Object.keys(st.intents).length));
+		for (const sp of profSpecs) {
+			push(sp.key, sp.phase, sp.title, sp.detail, sp.priority, sp.from);
+		}
+		return { added, rules };
+	}
 
 	const projScope =
 		st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
@@ -1006,6 +1083,19 @@ export function deriveFromFacts(st: NuwaState, cap = INTENT_SOFT_CAP): Expansion
 				break;
 		}
 	}
+
+	try {
+		const synth = synthesizeCrossFactHypotheses(st, 6);
+		for (const sp of synth.intents) {
+			push(sp.key, sp.phase, sp.title, sp.detail, sp.priority, sp.from, {
+				hypothesisId: sp.hypothesisId,
+				...(sp.assetId ? { assetId: sp.assetId } : {}),
+			});
+		}
+	} catch {
+		/* 假设图推理异常不阻塞主派生 */
+	}
+
 	return { added, rules };
 }
 
@@ -1037,35 +1127,24 @@ export function seedEpisode(st: NuwaState, episode: number): string[] {
 	return added;
 }
 
-/** frontier 彻底空时的兜底：生成一条强制深挖意图，保证队列永不为空。 */
+/** frontier 彻底空时的兜底：按领域 Profile 生成强制深挖意图，保证队列永不为空且不跨领域污染。 */
 export function addFallbackIntent(st: NuwaState): string | null {
 	if (Object.keys(st.intents).length >= INTENT_SOFT_CAP + 200) return null;
 	const ep = st.project.episode ?? 1;
 	const n = Object.values(st.intents).filter((i) => i.key.startsWith("fallback:")).length + 1;
 	const key = `fallback:e${ep}:${n}`;
 	if (Object.values(st.intents).some((i) => i.key === key)) return null;
-	const recent = Object.values(st.facts)
-		.slice(-8)
-		.map((f) => `${f.id}[${f.kind}] ${normOneLine(f.title, 50)}`);
+	const fbSpec = buildProfileFallbackIntent(st, n);
 	const id = nextIntentId(st);
 	st.intents[id] = {
 		id,
 		phase: st.project.phase,
 		key,
-		title: `强制深挖 ${st.project.phase} #${n}`,
-		detail: [
-			`frontier 已空，自动扩张触发。目标: ${st.project.url}（第 ${ep} 轮）`,
-			`已知事实: ${recent.join("；") || "(无)"}`,
-			`从下面四项里选一项执行，必须产出新 fact 或 blocked note：`,
-			`1) 已知服务换探测深度：nmap -sV --version-all -p <port> + 服务专属脚本（http-* / smb-* / mysql-*）`,
-			`2) 已知端点换变体：路径大小写/编码/后缀（.bak .old .zip ~）/参数污染/HTTP 方法覆盖`,
-			`3) 已知凭据换复用面：管理后台、数据库、SSH、Redis、API token`,
-			`4) 已知漏洞换利用链：读文件→配置→凭据→横向；或从报错里拿版本→匹配 CVE`,
-			`纪律: 命令必须实际执行，回显原样入账。`,
-		].join("\n"),
+		title: normOneLine(fbSpec.title, 120),
+		detail: fbSpec.detail,
 		from: [],
 		status: "open",
-		priority: 35,
+		priority: fbSpec.priority,
 		attempts: 0,
 		createdAt: nowIso(),
 	};
@@ -1305,18 +1384,27 @@ export function claimIntent(
 		);
 	}
 	const sbCfg = readSandboxConfig();
-	if (sbCfg.mode === "docker") {
+	if (sbCfg.mode === "docker" || sbCfg.mode === "sidecar") {
 		try {
 			const projScope = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
-			const sampleWrapped = wrapCommandInDockerSandbox(`curl -k -sS -I ${st.project.url}`, {
-				projectId: st.project.id,
-				scope: projScope,
-				config: sbCfg,
-				ensureWorkdir: false,
-			});
+			const sampleWrapped =
+				sbCfg.mode === "sidecar"
+					? wrapCommandInSidecarSandbox(`curl -k -sS -I ${st.project.url}`, {
+							projectId: st.project.id,
+							scope: projScope,
+							config: sbCfg,
+							proxyUrl: sbCfg.egressProxyUrl,
+							ensureWorkdir: false,
+						})
+					: wrapCommandInDockerSandbox(`curl -k -sS -I ${st.project.url}`, {
+							projectId: st.project.id,
+							scope: projScope,
+							config: sbCfg,
+							ensureWorkdir: false,
+						});
 			extraSections.push(
 				"",
-				`[零信任 Docker 沙盒已启用 (${sbCfg.image})]: 所有探测命令必须通过容器沙盒包裹执行，模板示例:\n  ${sampleWrapped}`,
+				`[零信任 ${sbCfg.mode === "sidecar" ? "Sidecar " : ""}Docker 沙盒已启用 (${sbCfg.image})]: 所有探测命令必须通过容器沙盒包裹执行，模板示例:\n  ${sampleWrapped}`,
 			);
 		} catch {
 			/* ignore sandbox sample generation error */
@@ -1649,12 +1737,19 @@ export function statusBoard(st: NuwaState, root?: string): string {
 	const totalTokens = (rt.totalTokens ?? 0) + rt.tokens;
 	const turnsDisp = totalTurns > rt.turns ? `${rt.turns}(total=${totalTurns})` : `${rt.turns}`;
 	const tokensDisp = (rt.totalTokens ?? 0) > 0 ? `${rt.tokens}(total=${totalTokens})` : `${rt.tokens}`;
+	const assetCount = Object.keys(st.assets ?? {}).length;
+	const hypCount = Object.values(st.hypotheses ?? {}).filter((h) => h.status === "open" || h.status === "active").length;
+	const extraMetaParts: string[] = [];
+	if (assetCount > 1) extraMetaParts.push(`assets=${assetCount}`);
+	if (hypCount > 0) extraMetaParts.push(`hyp=${hypCount}`);
+	if (p.sandboxMode && p.sandboxMode !== "none") extraMetaParts.push(`sandbox=${p.sandboxMode}`);
+	const extraMeta = extraMetaParts.length ? ` · ${extraMetaParts.join(" · ")}` : "";
 	const budgetLine = cfg.infinite
 		? `budget: ∞ 永动 · gen=${gen} · turns=${turnsDisp} · ${mins}min · tokens=${tokensDisp} · stall=${rt.stall} idle=${rt.idle} · pressure=${Math.round(pressure * 100)}% · ep=${p.episode ?? 1} expand=${rt.expansions ?? 0}`
 		: `budget: 预算受限 · gen=${gen} · turns=${turnsDisp}/${cfg.maxTurns} · ${mins}/${cfg.maxMinutes}min · tokens=${tokensDisp}/${cfg.maxTokens} · stall=${rt.stall}/${cfg.maxStall} idle=${rt.idle}/${cfg.maxIdle}`;
 	return [
 		`女娲 v${VERSION} · ${p.url} · ${p.mode} · ${p.status}`,
-		`phase=${p.phase} · facts=${Object.keys(st.facts).length} (${kindLine || "无"}) · cand=${candCount} · roles=${roleCount} · kb=${kbReady} · state=${stateKb}KB · rules=${rulesSource} · net-retry=${netRetry}`,
+		`phase=${p.phase} · facts=${Object.keys(st.facts).length} (${kindLine || "无"}) · cand=${candCount} · roles=${roleCount} · kb=${kbReady} · state=${stateKb}KB · rules=${rulesSource} · net-retry=${netRetry}${extraMeta}`,
 		budgetLine,
 		`rejects=${rt.completionRejects} · 目标: ${p.goal}`,
 		table,
@@ -1662,87 +1757,8 @@ export function statusBoard(st: NuwaState, root?: string): string {
 	].join("\n");
 }
 
-export function reportMarkdown(st: NuwaState): string {
-	const p = st.project;
-	const facts = Object.values(st.facts).sort((a, b) => a.id.localeCompare(b.id));
-	const intents = Object.values(st.intents).sort((a, b) => a.id.localeCompare(b.id));
-	const flags = facts.filter((f) => f.kind === "flag");
-	const vulnPart = partitionFactsByVerifyStage(facts, "vuln");
-	const confirmedVulns = vulnPart.confirmed;
-	const candidateVulns = vulnPart.candidate;
-	const rejectedVulns = vulnPart.rejected;
-	const queue = intents.filter((i) => i.status === "open" || i.status === "claimed");
-	const chain = intents
-		.filter((i) => i.status === "done" && i.to)
-		.map((i) => `| ${i.id} | ${i.phase} | ${cell(i.title, 80)} | ${i.to} | ${st.facts[i.to as string]?.kind ?? "?"} | ${cell(st.facts[i.to as string]?.command, 90)} |`);
-
-	const conclusionLine = flags.length
-		? `取得 flag ${flags.length} 个：${flags.map((f) => f.detail.replace(/^值:\s*/, "")).join(" / ")}`
-		: confirmedVulns.length
-			? `未取得 flag；确认漏洞 ${confirmedVulns.length} 条${candidateVulns.length ? `（另有待复验候选 ${candidateVulns.length} 条）` : ""}${rejectedVulns.length ? `（已驳回误报 ${rejectedVulns.length} 条）` : ""}，最高危害见下表。`
-			: candidateVulns.length
-				? `未取得可验收证据（当前仅有待复验候选漏洞 ${candidateVulns.length} 条，尚未通过双盲复验确认）。`
-				: `未取得可验收证据。`;
-
-	const extraVulnSections: string[] = [];
-	if (candidateVulns.length > 0) {
-		extraVulnSections.push(
-			``,
-			`## 待复验候选漏洞（Candidate）`,
-			`| fact | 标题 | 证据 | 命令 |`,
-			`|---|---|---|---|`,
-			...candidateVulns.map((f) => `| ${f.id} | ${cell(f.title, 80)} | ${cell(f.output, 120)} | ${cell(f.command, 100)} |`),
-		);
-	}
-	if (rejectedVulns.length > 0) {
-		extraVulnSections.push(
-			``,
-			`## 已驳回误报（Rejected）`,
-			`| fact | 标题 | 驳回说明 |`,
-			`|---|---|---|`,
-			...rejectedVulns.map((f) => `| ${f.id} | ${cell(f.title, 80)} | ${cell(f.verifyNote ?? f.detail, 140)} |`),
-		);
-	}
-
-	return [
-		`# 渗透报告 — ${p.host}:${p.port}`,
-		``,
-		`- 目标: ${p.url}`,
-		`- 模式: ${p.mode} · 状态: ${p.status} · 阶段: ${p.phase}`,
-		`- 开始: ${p.createdAt} · 完成: ${p.completedAt ?? "-"}`,
-		`- 目标描述: ${p.goal}`,
-		``,
-		`## 结论`,
-		conclusionLine,
-		``,
-		`## 攻击链`,
-		`| intent | 阶段 | 动作 | fact | 类型 | 命令 |`,
-		`|---|---|---|---|---|---|`,
-		...(chain.length ? chain : ["| - | - | 无已完成节点 | - | - | - |"]),
-		``,
-		`## Flag 台账`,
-		flags.length
-			? [`| fact | 值 | 命令 | 时间 |`, `|---|---|---|---|`, ...flags.map((f) => `| ${f.id} | ${cell(f.detail.replace(/^值:\s*/, ""), 80)} | ${cell(f.command, 100)} | ${f.createdAt} |`)].join("\n")
-			: "无",
-		``,
-		`## 漏洞`,
-		confirmedVulns.length
-			? [`| fact | 标题 | 证据 | 命令 |`, `|---|---|---|---|`, ...confirmedVulns.map((f) => `| ${f.id} | ${cell(f.title, 80)} | ${cell(f.output, 120)} | ${cell(f.command, 100)} |`)].join("\n")
-			: "无",
-		...extraVulnSections,
-		``,
-		`## 资产与服务`,
-		facts.filter((f) => ["target", "asset", "service", "endpoint", "cred", "loot"].includes(f.kind)).length
-			? [`| fact | 类型 | 标题 | 详情 |`, `|---|---|---|---|`, ...facts.filter((f) => ["target", "asset", "service", "endpoint", "cred", "loot"].includes(f.kind)).map((f) => `| ${f.id} | ${f.kind} | ${cell(f.title, 80)} | ${cell(f.detail, 160)} |`)].join("\n")
-			: "无",
-		``,
-		`## 未完成面`,
-		queue.length ? queue.map((i) => `- ${i.id} [${i.phase}] ${i.title} (${i.status})`).join("\n") : "无",
-		``,
-		`## 阻塞项`,
-		intents.filter((i) => i.status === "blocked").map((i) => `- ${i.id} ${i.title}: ${i.note ?? ""}`).join("\n") || "无",
-		``,
-	].join("\n");
+export function reportMarkdown(st: NuwaState, root?: string): string {
+	return renderStratifiedMarkdownReport(st, root, { title: formatProfileReportTitle(st) });
 }
 
 export function buildDirective(st: NuwaState, cfg: Cfg): string {
@@ -2092,8 +2108,27 @@ export function formatScopeSummary(scope: ScopePolicy): string {
 	].join("\n");
 }
 
+function pickPrimaryVaultRole(root: string): { role: string; headers: Record<string, string> } | null {
+	try {
+		const vault = loadSessionVault(root);
+		const names = Object.keys(vault.roles ?? {}).sort();
+		if (names.length === 0) return null;
+		const now = Date.now();
+		// 优先选择未过期的角色
+		const chosen =
+			names.find((r) => {
+				const exp = vault.roles[r]?.expiresAt;
+				return !exp || !Number.isFinite(Date.parse(exp)) || Date.parse(exp) > now;
+			}) ?? names[0]!;
+		const headers = getRoleHeadersMap(vault, chosen);
+		return headers && Object.keys(headers).length > 0 ? { role: chosen, headers } : null;
+	} catch {
+		return null;
+	}
+}
+
 /**
- * 执行 SPA 动态/静态表面路由提取并自动入账与派生端点审计意图。
+ * 执行 SPA 动态/静态表面路由提取并自动入账与派生端点审计意图（有会话保险箱角色时自动以认证态扫描）。
  */
 export async function runSpaSurfaceWorkflow(
 	root: string,
@@ -2104,7 +2139,12 @@ export async function runSpaSurfaceWorkflow(
 	if (!st0) throw new Error("未找到有效 .nuwa/state.json");
 	const projScope =
 		st0.project.scope ?? defaultScopeForTarget(st0.project.url || st0.project.target, st0.project.mode);
-	const spa = await runSpaRecon(st0.project.url, projScope, opts);
+	const vaultAuth = !opts?.authHeaders ? pickPrimaryVaultRole(normRoot) : null;
+	const mergedOpts: SpaReconOptions = {
+		...opts,
+		...(vaultAuth ? { authHeaders: vaultAuth.headers, authRole: opts?.authRole ?? vaultAuth.role } : {}),
+	};
+	const spa = await runSpaRecon(st0.project.url, projScope, mergedOpts);
 	if (!spa.fact) {
 		return { spa, derived: [] };
 	}
@@ -2449,7 +2489,29 @@ export function executeCommitWithGates(
 		});
 
 		const extraLines: string[] = [];
-		if (ingestedRole) extraLines.push(`会话保险箱已收纳角色: ${ingestedRole}（凭据已自动掩码脱敏）`);
+		if (ingestedRole) {
+			extraLines.push(`会话保险箱已收纳角色: ${ingestedRole}（凭据已自动掩码脱敏）`);
+			if (s.project.scheme !== "local") {
+				const postAuthIds = appendIntentSpecs(s, [
+					{
+						key: `post-auth:recon:${ingestedRole}`,
+						phase: "surface",
+						title: `认证态二次侦察与鉴权差分 (${ingestedRole})`,
+						detail: [
+							`目标: 会话保险箱已收纳角色 ${ingestedRole}，对 ${s.project.url} 执行认证态路由发现（/nuwa spa）与多角色鉴权差分（/nuwa authdiff）。`,
+							`要求: 优先识别登录后新增的管理面、业务 API 与对象级资源路径，使用物化头文件零明文重放，杜绝明文凭据外泄。`,
+						].join("\n"),
+						priority: 89,
+						from: r.fact ? [r.fact.id] : [],
+						authRole: ingestedRole,
+					},
+				]);
+				if (postAuthIds.length > 0) {
+					logEvent(root, { type: "post_auth_spawn", role: ingestedRole, intent: postAuthIds[0] });
+					extraLines.push(`已派生认证态攻击面扩展意图: ${postAuthIds[0]} (role=${ingestedRole})`);
+				}
+			}
+		}
 
 		if (isVerifyVulnIntentKey(intentKey)) {
 			const outcome = resolveVerificationOutcome(s, intentKey, Boolean(p.blocked), p.blocked ? safeNote : safeDetail || safeTitle);
@@ -2462,7 +2524,22 @@ export function executeCommitWithGates(
 						`双盲复验通过: ${outcome.factId} 已升格为 confirmed${d.added.length ? `（派生后续利用意图: ${d.added.join(" ")}）` : ""}`,
 					);
 				} else {
-					extraLines.push(`双盲复验驳回: ${outcome.factId} 已标记为 rejected`);
+					const pruned = outcome.factId ? propagateFactRejection(s, outcome.factId, safeNote) : { invalidatedHypotheses: [], invalidatedIntents: [] };
+					if (pruned.invalidatedHypotheses.length || pruned.invalidatedIntents.length) {
+						logEvent(root, {
+							type: "rejection_pruned",
+							factId: outcome.factId,
+							hypotheses: pruned.invalidatedHypotheses,
+							intents: pruned.invalidatedIntents,
+						});
+					}
+					extraLines.push(
+						`双盲复验驳回: ${outcome.factId} 已标记为 rejected${
+							pruned.invalidatedIntents.length || pruned.invalidatedHypotheses.length
+								? `（自动剪枝假设 ${pruned.invalidatedHypotheses.length} 条 / 意图 ${pruned.invalidatedIntents.length} 条）`
+								: ""
+						}`,
+					);
 				}
 			}
 		} else if (stageCand && r.fact) {
@@ -2480,6 +2557,14 @@ export function executeCommitWithGates(
 			extraLines.push(
 				`候选漏洞暂存: ${r.fact.id} verifyStage=candidate${verifyIntentId ? ` → 已自动派发独立双盲复验意图 ${verifyIntentId} (推荐 agent="nuwa-verifier")` : ""}`,
 			);
+		}
+
+		if (!p.blocked && r.fact && ["service", "asset", "endpoint", "loot", "vuln"].includes(r.fact.kind)) {
+			try {
+				syncAssetsFromFacts(s);
+			} catch {
+				/* ignore asset sync error */
+			}
 		}
 
 		saveState(root, s, p.kind === "flag" && !p.blocked ? { reason: "flag" } : undefined);
@@ -2666,6 +2751,18 @@ export async function executeAutoBatchCycle(opts: {
 
 	const st0 = loadState(normRoot);
 	if (!st0) return;
+	const batchStartedAt = Date.now();
+	const batchDeadline = batchStartedAt + Math.max(1, budgetMs);
+	const vaultAuth = pickPrimaryVaultRole(normRoot);
+	let authHeaderFile: string | undefined;
+	if (vaultAuth) {
+		try {
+			authHeaderFile = materializeRoleHeaderFile(normRoot, st0.project.id, vaultAuth.role) ?? undefined;
+		} catch {
+			authHeaderFile = undefined;
+		}
+	}
+
 	const enrichMap = new Map(enrichmentRulesForToolchain(st0.project.toolchain).map((r) => [r.key, r]));
 	const spaIds: string[] = [];
 	const enrichIds: string[] = [];
@@ -2684,6 +2781,7 @@ export async function executeAutoBatchCycle(opts: {
 			concurrency,
 			signal: opts.signal,
 			agentHome: getAgentHome(),
+			...(authHeaderFile ? { authHeaderFile } : {}),
 			getState: () => loadState(normRoot),
 			onResult: async (item: AutoBatchItemResult) => {
 				if (!item?.id || !item?.result) return;
@@ -2691,7 +2789,10 @@ export async function executeAutoBatchCycle(opts: {
 					const latest = loadState(normRoot);
 					if (latest && latest.project.scheme !== "local") {
 						const sc = latest.project.scope ?? defaultScopeForTarget(latest.project.url || latest.project.target, latest.project.mode);
-						const spaFallback = await runSpaRecon(latest.project.url, sc, { signal: opts.signal });
+						const spaFallback = await runSpaRecon(latest.project.url, sc, {
+							signal: opts.signal,
+							...(vaultAuth ? { authHeaders: vaultAuth.headers, authRole: vaultAuth.role } : {}),
+						});
 						if (spaFallback.fact) {
 							commitOne(item.id, { ok: true, fact: spaFallback.fact });
 							return;
@@ -2729,7 +2830,8 @@ export async function executeAutoBatchCycle(opts: {
 	}
 
 	for (const id of enrichIds) {
-		if (opts.signal.aborted) {
+		const remMs = batchDeadline - Date.now();
+		if (opts.signal.aborted || remMs <= 0) {
 			releaseSingleOnAbort(id);
 			continue;
 		}
@@ -2737,7 +2839,15 @@ export async function executeAutoBatchCycle(opts: {
 		if (!latest) break;
 		const rule = enrichMap.get(canonicalAutoKey(latest.intents[id]?.key ?? ""));
 		if (!rule) continue;
-		const res = await runAutoIntent(rule, latest, opts.execFn, normRoot, opts.signal);
+		const boundedRule = remMs < rule.timeoutMs ? { ...rule, timeoutMs: Math.max(1000, remMs) } : rule;
+		const res = await runAutoIntent(
+			boundedRule,
+			latest,
+			opts.execFn,
+			normRoot,
+			opts.signal,
+			authHeaderFile ? { authHeaderFile } : undefined,
+		);
 		if (!res.ok && opts.signal.aborted) {
 			releaseSingleOnAbort(id);
 			continue;
@@ -2746,14 +2856,19 @@ export async function executeAutoBatchCycle(opts: {
 	}
 
 	for (const id of spaIds) {
-		if (opts.signal.aborted) {
+		const remMs = batchDeadline - Date.now();
+		if (opts.signal.aborted || remMs <= 0) {
 			releaseSingleOnAbort(id);
 			continue;
 		}
 		const latest = loadState(normRoot);
 		if (!latest) break;
 		const sc = latest.project.scope ?? defaultScopeForTarget(latest.project.url || latest.project.target, latest.project.mode);
-		const spaRes = await runSpaRecon(latest.project.url, sc, { signal: opts.signal });
+		const spaRes = await runSpaRecon(latest.project.url, sc, {
+			signal: opts.signal,
+			timeoutMs: Math.min(15_000, Math.max(1_500, remMs)),
+			...(vaultAuth ? { authHeaders: vaultAuth.headers, authRole: vaultAuth.role } : {}),
+		});
 		if (opts.signal.aborted) {
 			releaseSingleOnAbort(id);
 			continue;
@@ -2881,4 +2996,277 @@ export function settleSessionStopState(opts: {
 	});
 
 	return { state, directive, turn, stoppedWhy, reincarnated, episode, phase, facts, stall, autoIds };
+}
+
+/**
+ * 执行多角色只读鉴权差分矩阵工作流（/nuwa authdiff）：
+ * 自动收集已发现路径或显式路径，按 ScopePolicy 与 Session Vault 执行只读差分，
+ * 若发现疑似越权则以 candidate 暂存并自动派生独立双盲复验意图。
+ */
+export async function executeAuthDiffWorkflow(
+	root: string,
+	explicitPaths?: string[],
+	opts?: AuthDiffMatrixOptions,
+): Promise<{ result: AuthDiffMatrixResult; factId?: string; verifyIntentId?: string; msg: string }> {
+	const normRoot = resolve(root);
+	const st0 = loadState(normRoot);
+	if (!st0) throw new Error("未找到有效 .nuwa/state.json");
+	if (st0.project.scheme === "local") {
+		throw new Error("本地非 HTTP 项目不支持多角色 HTTP 鉴权差分");
+	}
+	const projScope =
+		st0.project.scope ?? defaultScopeForTarget(st0.project.url || st0.project.target, st0.project.mode);
+
+	const pathSet = new Set<string>();
+	for (const p of explicitPaths ?? []) {
+		if (p.trim()) pathSet.add(p.trim());
+	}
+	if (pathSet.size === 0) {
+		for (const f of Object.values(st0.facts)) {
+			for (const mp of f.meta?.paths ?? []) {
+				if (mp.startsWith("/")) pathSet.add(mp);
+			}
+		}
+	}
+	if (pathSet.size === 0) {
+		for (const defPath of ["/admin", "/api/admin", "/api/v1/users", "/api/user/1", "/api/order/1001"]) {
+			pathSet.add(defPath);
+		}
+	}
+
+	const result = await runAuthDiffMatrix(st0.project.url, [...pathSet], normRoot, projScope, opts);
+	let factId: string | undefined;
+	let verifyIntentId: string | undefined;
+
+	if (result.fact) {
+		recordToolExecution(normRoot, {
+			tool: "auth-diff",
+			command: result.fact.command,
+			output: result.fact.output,
+		});
+		withLock(normRoot, () => {
+			const s = loadState(normRoot);
+			if (!s) return;
+			const fid = nextFactId(s);
+			const f: Fact = {
+				id: fid,
+				kind: "vuln",
+				title: normOneLine(result.fact!.title, 120),
+				detail: result.fact!.detail,
+				command: result.fact!.command,
+				output: result.fact!.output,
+				key: `authdiff:${sha(`${s.project.id}|${result.fact!.title}`)}`,
+				createdAt: nowIso(),
+				meta: result.fact!.meta,
+				verified: false,
+				verifyStage: "candidate",
+				evidenceSeq: getLatestLedgerSeq(normRoot),
+			};
+			s.facts[fid] = f;
+			factId = fid;
+			const vSpec = buildDoubleBlindVerifyIntentSpec(s, f);
+			if (vSpec) {
+				const added = appendIntentSpecs(s, [vSpec]);
+				verifyIntentId = added[0];
+			}
+			syncAssetsFromFacts(s);
+			saveState(normRoot, s);
+			logEvent(normRoot, {
+				type: "auth_diff",
+				tested: result.testedPaths.length,
+				findings: result.findings.length,
+				factId,
+				verifyIntentId,
+			});
+		});
+	}
+
+	const msg = [
+		`多角色鉴权差分完成: roles=[${result.roles.join(",")}] tested=${result.testedPaths.length} findings=${result.findings.length}`,
+		...result.findings.slice(0, 6).map((f) => `- [${f.kind}] ${f.summary}`),
+		...(factId
+			? [`已暂存候选漏洞 ${factId} (verifyStage=candidate)${verifyIntentId ? ` · 自动派发双盲复验 ${verifyIntentId}` : ""}`]
+			: ["未发现明显越权差分异常。"]),
+	].join("\n");
+
+	return { result, factId, verifyIntentId, msg };
+}
+
+/**
+ * 执行 `/nuwa oob [list | gen <domain> [purpose] | poll <url> [token]]` 外带回调管理命令。
+ */
+export async function executeOobCommand(
+	found: string | null,
+	subArg: string,
+	fetchFn?: (url: string, init?: { method?: string; headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>,
+): Promise<{ msg: string; level: "info" | "error" }> {
+	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
+	const normRoot = resolve(found);
+	const st = loadState(normRoot);
+	if (!st) return { msg: "state 读取失败", level: "error" };
+	const scope = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
+	const sub = subArg.trim();
+
+	if (!sub || sub === "list") {
+		const list = loadOobCanaries(normRoot);
+		const domains = (scope.oobDomains ?? []).join(", ") || "(未配置，请先 /nuwa scope +oob <domain>)";
+		if (list.length === 0) {
+			return { msg: `OOB 域名白名单: ${domains}\n当前尚无活跃 Canary（用法: /nuwa oob gen <domain> [purpose] | poll <url> [token]）`, level: "info" };
+		}
+		return {
+			msg: [
+				`OOB 域名白名单: ${domains}`,
+				`活跃 Canary (${list.length}):`,
+				...list.map((c) => `- ${c.id}: ${c.fqdn} (hits=${c.matchedHits}${c.purpose ? `, ${c.purpose}` : ""})`),
+			].join("\n"),
+			level: "info",
+		};
+	}
+
+	const parts = sub.split(/\s+/);
+	const op = parts[0]?.toLowerCase() ?? "";
+	if (op === "gen") {
+		const domain = parts[1]?.trim() || scope.oobDomains?.[0] || "";
+		if (!domain) {
+			return { msg: "缺少 OOB 域名。请先 /nuwa scope +oob <domain> 再执行 /nuwa oob gen <domain>", level: "error" };
+		}
+		const purpose = parts.slice(2).join(" ").trim() || undefined;
+		try {
+			const canary = generateOobCanary(normRoot, {
+				projectId: st.project.id,
+				domain,
+				scope,
+				purpose,
+			});
+			logEvent(normRoot, { type: "oob_gen", id: canary.id, fqdn: canary.fqdn });
+			return { msg: `已生成 OOB Canary ${canary.id}: ${canary.fqdn}`, level: "info" };
+		} catch (e) {
+			return { msg: `生成 OOB Canary 失败: ${e instanceof Error ? e.message : String(e)}`, level: "error" };
+		}
+	}
+
+	if (op === "poll") {
+		const pollUrl = parts[1]?.trim() ?? "";
+		const authToken = parts[2]?.trim() || undefined;
+		if (!pollUrl) {
+			return { msg: "用法: /nuwa oob poll <pollUrl> [authToken]", level: "error" };
+		}
+		const polled = await pollOobCallbacks(normRoot, { pollUrl, scope, authToken, fetchFn });
+		if (!polled.ok) {
+			return { msg: `OOB 回调轮询失败: ${polled.error ?? "unknown"}`, level: "error" };
+		}
+		const matchedFacts: string[] = [];
+		for (const canary of polled.matchedCanaries) {
+			const canaryHits = polled.hits.filter((h) => h.matchedCanaryId === canary.id);
+			if (canaryHits.length === 0) continue;
+			const fact = buildOobEvidenceFact(canary, canaryHits);
+			recordToolExecution(normRoot, { tool: "oob-poll", command: fact.command, output: fact.output });
+			withLock(normRoot, () => {
+				const s = loadState(normRoot);
+				if (!s) return;
+				const fid = nextFactId(s);
+				s.facts[fid] = {
+					id: fid,
+					kind: "vuln",
+					title: normOneLine(fact.title, 120),
+					detail: fact.detail,
+					command: fact.command,
+					output: fact.output,
+					key: `oob:${canary.id}`,
+					createdAt: nowIso(),
+					verified: false,
+					verifyStage: "candidate",
+					evidenceSeq: getLatestLedgerSeq(normRoot),
+				};
+				const vSpec = buildDoubleBlindVerifyIntentSpec(s, s.facts[fid]!);
+				if (vSpec) appendIntentSpecs(s, [vSpec]);
+				saveState(normRoot, s);
+				matchedFacts.push(fid);
+			});
+		}
+		logEvent(normRoot, { type: "oob_poll", hits: polled.hits.length, matchedFacts });
+		return {
+			msg: `OOB 轮询完成: 命中 ${polled.hits.length} 条回调${matchedFacts.length ? ` · 已暂存候选事实 ${matchedFacts.join(", ")}` : ""}`,
+			level: "info",
+		};
+	}
+
+	return { msg: "未知 oob 子命令。用法: /nuwa oob [list | gen <domain> [purpose] | poll <url> [token]]", level: "error" };
+}
+
+/**
+ * 执行 `/nuwa assets`：同步并输出多资产拓扑表与跨事实假设图摘要。
+ */
+export function executeAssetsCommand(found: string | null): { msg: string; level: "info" | "error" } {
+	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
+	const normRoot = resolve(found);
+	const st = withLock(normRoot, () => {
+		const s = loadState(normRoot);
+		if (!s) return null;
+		syncAssetsFromFacts(s);
+		saveState(normRoot, s);
+		return s;
+	});
+	if (!st) return { msg: "state 读取失败", level: "error" };
+	const topo = formatAssetTopology(st);
+	const hyps = Object.values(st.hypotheses ?? {}).sort((a, b) => a.id.localeCompare(b.id));
+	const hypBlock = hyps.length
+		? [
+				"",
+				`跨事实假设图 (${hyps.length}):`,
+				...hyps.map((h) => `- ${h.id} [${h.status}] ${h.title} (from=${h.requiredFacts.join(",")}, gain=${h.expectedGain}/cost=${h.estimatedCost})`),
+			].join("\n")
+		: "\n跨事实假设图: (暂无)";
+	return { msg: `${topo}${hypBlock}`, level: "info" };
+}
+
+/**
+ * 执行 `/nuwa session health [role] [checkUrl]` 会话保活与过期巡检；若失效则自动派生刷新意图。
+ */
+export async function executeSessionHealthCommand(
+	found: string | null,
+	subArg: string,
+	fetchFn?: (url: string, init?: { method?: string; headers?: Record<string, string>; redirect?: "manual" | "follow" | "error"; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; headers?: { get(name: string): string | null } }>,
+): Promise<{ msg: string; level: "info" | "error" }> {
+	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
+	const normRoot = resolve(found);
+	const st = loadState(normRoot);
+	if (!st) return { msg: "state 读取失败", level: "error" };
+	const vault = loadSessionVault(normRoot);
+	const allRoles = Object.keys(vault.roles).sort();
+	if (allRoles.length === 0) {
+		return { msg: "会话保险箱为空，无需巡检。", level: "info" };
+	}
+	const parts = subArg.trim().split(/\s+/).filter(Boolean);
+	const targetRoles = parts[0] && vault.roles[parts[0].toLowerCase()] ? [parts[0].toLowerCase()] : allRoles;
+	const explicitUrl = parts[0] && /^https?:\/\//i.test(parts[0]) ? parts[0] : parts[1];
+	const scope = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
+
+	const lines: string[] = [`会话健康巡检 (${targetRoles.length} 个角色):`];
+	const spawnedRefresh: string[] = [];
+	for (const role of targetRoles) {
+		const health = await checkRoleHealth(normRoot, role, {
+			...(explicitUrl ? { checkUrl: explicitUrl } : {}),
+			scope,
+			fetchFn,
+		});
+		lines.push(`- ${role}: ${health.healthy ? "HEALTHY" : "EXPIRED"} (${health.reason})`);
+		if (health.expired) {
+			const spec = buildRefreshIntentSpec(role, health.reason, explicitUrl ?? vault.roles[role]?.checkUrl);
+			withLock(normRoot, () => {
+				const s = loadState(normRoot);
+				if (!s) return;
+				const added = appendIntentSpecs(s, [spec]);
+				if (added.length) {
+					spawnedRefresh.push(...added);
+					saveState(normRoot, s);
+					logEvent(normRoot, { type: "session_refresh_spawn", role, intent: added[0], reason: health.reason });
+				}
+			});
+		}
+	}
+	if (spawnedRefresh.length > 0) {
+		lines.push(`已自动派生会话刷新意图: ${spawnedRefresh.join(" ")}`);
+	}
+	return { msg: lines.join("\n"), level: "info" };
 }

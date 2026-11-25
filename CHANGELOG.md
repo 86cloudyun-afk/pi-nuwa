@@ -1,5 +1,27 @@
 # Changelog
 
+## 5.0.0 — 2026-11-25
+
+架构跃升与自主评估闭环大版本（Issues #16–#19）：全面贯通认证态攻击面自动化、零信任常驻 Sidecar 沙盒与抗 DNS 重绑定出向代理、一等 OOB 回调通道、多资产跳板拓扑与跨事实假设图推理、全流程 Profile 领域解耦、企业级 SARIF 2.1.0 / 脱敏审计证据包、守护器成本封顶与告警，以及 10 场景离线确定性评测靶场；严格维持 12 个 `nuwa_*` 工具 100% 向后兼容。
+
+### 四大核心升级
+
+- **认证态攻击面闭环与自动化鉴权差分（Issue #16）**：
+  - `omp/session-vault.ts` 扩展角色元数据（`expiresAt`、`checkUrl`、`csrfHeader`、`csrfCookie`、`loginHint`），新增 `decodeJwtExpiryIso`、`getRoleHeadersMap`（自动镜像 CSRF Cookie 至请求头）、`checkRoleHealth`（JWT 本地过期 + 401/403/登录页 302 探活）与 `buildRefreshIntentSpec`；支持 `/nuwa session health` 自动巡检并派生 `session-refresh:<role>` 刷新意图。
+  - `omp/browser-recon.ts` 支持携带会话保险箱认证头执行认证态 SPA 侦察（Playwright `extraHTTPHeaders` + 静态抓取注入），新增懒加载 Chunk 与同源 `.js.map` SourceMap 隐藏 API 发现；`nuwa_commit(kind="cred")` 收纳新角色后自动派生 `post-auth:recon:<role>` 认证态侦察意图。
+  - 新增 `omp/auth-diff.ts`（`runAuthDiffMatrix`）与 `/nuwa authdiff [paths...]`：严格只读 `GET` 多角色对照（匿名 vs 管理员 vs 同级普通用户），结合双随机路径 Soft-404 过滤与 JSON 结构键 Jaccard 相似度，确定性检出 `unauth_access` / `vertical_bfla` / `horizontal_bola`（BOLA 与 BFLA 精确分层无串扰），自动暂存 `verifyStage="candidate"` 并派发双盲复验；`omp/autoexec.ts` 新增 `injectAuthHeaderFileIntoScript` 零明文 `-H @"$NUWA_AUTH_HEADER_FILE"` 认证态自动批执行。
+- **零信任常驻 Sidecar、抗 DNS 重绑定 Egress Proxy 与一等 OOB 通道（Issue #17）**：
+  - `omp/sandbox.ts` 扩展 `SandboxMode = "none" | "docker" | "sidecar"`，新增项目级常驻只读 Sidecar 生命周期（`sidecarContainerName`、`buildSidecarStartArgs`、`buildSidecarExecArgs`、`wrapCommandInSidecarSandbox`、`isCompliantSidecarCommand`、`extractSandboxInnerCommand`、`ensureProjectSidecar`、`execInProjectSidecar`、`stopProjectSidecar`），与 `N-009` 钩子深度集成且精确校验容器内实际命令，消除预检脚本与代理环境变量引发的回环误报。
+  - 内置零依赖抗 DNS 重绑定出向代理 `startScopedEgressProxy` / `validateEgressTarget`：支持 HTTP 正向代理与 HTTPS `CONNECT` 隧道，直连已校验 IP 阻断 DNS 重绑定至云元数据（`169.254.0.0/16`）/ 未授权私网 / 回环，拦截越界 `30x` 重定向（返回 `403 nuwa-egress N-007`），并提供 `onTraffic` 响应预览回流；`docker/Dockerfile.sandbox` 升级为 `base` / `lite` / `full` 多阶段无 root 镜像。
+  - 新增 `omp/oob.ts` 与 `/nuwa oob [list|gen|poll]`：一等外带回调 Canary 通道，严格受 `ScopePolicy.oobDomains` 白名单门控，支持 `0o600` 持久化、Interactsh/通用回调解析与候选证据入账。
+- **多资产跳板拓扑、跨事实假设图推理与领域 Profile 解耦（Issue #18）**：
+  - 新增 `omp/hypothesis.ts` 与 `/nuwa assets`：维护主资产、SAN 子域、内网/跳板主机与本地代码仓多资产拓扑（`AssetNode`）；内置 5 类跨事实推理链（SSRF+内网、文件读取+配置/上传、认证态/凭据+特权面、白盒汇点+存活端点、非 HTTP 服务+CVE/配置）按收益/成本/置信度确定性排序（`HypothesisNode`）；双盲复验驳回前置事实时自动执行 `propagateFactRejection` 级联失效关联假设并剪枝未执行 `open` 意图。
+  - `omp/profiles.ts` 与 `omp/storage.ts` 解耦全流程领域派生与兜底逻辑：`audit` 支持本地源码目录白盒审计（`requireHttpTarget: false` + 6 阶段白盒种子），`coding`/`ops`/本地 `audit` 的自动派生与兜底意图彻底隔离渗透扫描器指令。
+- **离线评测靶场、SARIF 2.1.0 / 脱敏证据包与守护器成本告警（Issue #19）**：
+  - 新增 `omp/reporting.ts`：`nuwa_report` 保持原有工具契约并扩展 `format="md"|"json"|"sarif"` 与 `bundle=true`（同步开放 `/nuwa report [md|json|sarif|bundle]`），支持仅含已确认漏洞的 SARIF 2.1.0 导出、结构化 JSON、分层 Markdown，以及 `0o700/0o600` 权限含 `manifest.json` SHA-256 校验与全量 Vault 凭据脱敏的 `.nuwa/poc-bundle/` 审计取证包。
+  - `bin/nuwa-autonomous` 新增 `--sandbox sidecar`、`--max-total-tokens`、`--max-usd`、`--usd-per-1m-tokens`（触发硬封顶优雅退出码 `3`）与 `--webhook`（脱敏载荷 + URL 掩码 + 3 次重试 + `0o600` `.nuwa/webhook-deadletter.jsonl` 死信队列）。
+  - 新增 `benchmarks/` 离线确定性评测靶场（10 场景覆盖 Soft-404、认证态 SPA、BOLA/BFLA、双盲误报驳回、账本防幻觉、Sidecar/Egress Proxy、OOB、假设剪枝、本地白盒、SARIF/证据包零泄露）与 `tests/gates/g4_v5.sh` 阶段门禁。
+
 ## 4.1.0 — 2026-11-25
 
 安全闭环加固与运行时可靠性升级版本（Issues #11–#15）：封堵双盲复验与执行账本绕过面、消除自进化记忆跨技术栈误污染、修复动态模型路由串台、补齐跨世代累积记账与无头守护单代卡死看门狗，并显著提升 Scope 护栏（N-007）的载荷识别精度。
