@@ -42,6 +42,16 @@ export interface VerifyEvidenceInput {
 	minSeq?: number;
 	sinceTs?: string;
 	requireSubstantive?: boolean;
+	/** v5.1 可选未授权/404 负向对照基线响应体，用于假阳性哈希比对（#24） */
+	baselineBody?: string;
+	/** v5.1 可选未授权/404 负向对照基线哈希（sha256 或 md5）（#24） */
+	baselineHash?: string;
+	/** v5.1 可选 HTTP 状态码（#24） */
+	statusCode?: number;
+	/** v5.1 可选响应体字节数（#24） */
+	bodyBytes?: number;
+	/** v5.1 显式启用完整假阳性复核门禁（#24） */
+	checkFalsePositive?: boolean;
 }
 
 export interface VerifyEvidenceResult {
@@ -50,6 +60,10 @@ export interface VerifyEvidenceResult {
 	reason?: string;
 	matchedSeq?: number;
 	matchedAgent?: string;
+	/** v5.1 假阳性复核失败标记（#24） */
+	falsePositive?: boolean;
+	/** v5.1 假阳性降级建议类型（#24） */
+	suggestedKind?: "note";
 }
 
 export interface ToolchainCaps {
@@ -740,12 +754,64 @@ export function verifyExecutionEvidence(root: string, input: VerifyEvidenceInput
 	const normKind = String(input.kind ?? "").trim().toLowerCase();
 	const strictActive = Boolean(input.strict) || envMode === "1";
 	const requireSubstantive = Boolean(input.requireSubstantive);
-	const substantiveMode = requireSubstantive || normKind === "vuln" || normKind === "cred";
+	const substantiveMode = requireSubstantive || normKind === "vuln" || normKind === "cred" || normKind === "bypass";
 
 	const rawOut = String(input.output ?? "");
 	const trimmedOut = rawOut.trim();
 	const redactedRawOut = safeRedact(rawOut, normRoot);
 	const redactedTrimmedOut = redactedRawOut.trim();
+
+	// v5.1 (#24): 正向 vuln/bypass/cred/loot 假阳性门禁（拦截微小错误壳、HTTP 200 空壳与同基线哈希响应）
+	const isPositiveFindingKind =
+		normKind === "vuln" || normKind === "bypass" || normKind === "cred" || normKind === "loot";
+	if (isPositiveFindingKind && trimmedOut.length > 0) {
+		const hasExplicitFpCheck =
+			Boolean(input.checkFalsePositive) ||
+			input.baselineBody !== undefined ||
+			input.baselineHash !== undefined ||
+			input.statusCode !== undefined ||
+			input.bodyBytes !== undefined;
+		const substantiveLinesPrecheck = extractSubstantiveLines(rawOut);
+		// 仅含通用 HTTP 状态/响应头时交由下方既有低信息熵过滤器返回精确提示
+		if (substantiveLinesPrecheck.length > 0 || hasExplicitFpCheck) {
+			const fpCheck = evaluatePositiveEvidenceGate({
+				kind: normKind,
+				output: rawOut,
+				response:
+					input.statusCode !== undefined || input.bodyBytes !== undefined
+						? {
+								statusCode: input.statusCode,
+								bodyBytes: input.bodyBytes,
+								body: extractHttpBodyFromOutput(rawOut),
+							}
+						: undefined,
+				baseline:
+					input.baselineBody !== undefined || input.baselineHash !== undefined
+						? {
+								body: input.baselineBody,
+								bodySha256:
+									input.baselineHash && input.baselineHash.trim().length === 64
+										? input.baselineHash.trim().toLowerCase()
+										: undefined,
+								bodyMd5:
+									input.baselineHash && input.baselineHash.trim().length === 32
+										? input.baselineHash.trim().toLowerCase()
+										: undefined,
+							}
+						: undefined,
+				requireBusinessPayload: hasExplicitFpCheck,
+			});
+			if (fpCheck.falsePositive) {
+				return {
+					ok: false,
+					verified: false,
+					falsePositive: true,
+					suggestedKind: "note",
+					reason: fpCheck.reason ?? `假阳性复核未通过: ${normKind} 疑似错误壳或与负向基线一致，建议降级为 note 记账`,
+				};
+			}
+		}
+	}
 
 	const explicitFlag = String(input.flagValue ?? "").trim();
 	const inferredFlag =
@@ -1057,4 +1123,1163 @@ export function adaptPacketForToolchain(packet: string, caps: ToolchainCaps): st
 		`请勿直接调用缺失命令，改用以下本地合规替代方案:`,
 		...hints,
 	].join("\n");
+}
+
+// ============================================================================
+// v5.1 证据门禁加固、交付真实性校验、命中指标、落盘取证与结构化回包解析
+// 覆盖 Issues: #24 (NW-04), #26 (NW-06), #39 (NW-19), #42 (NW-22), #51 (NW-31)
+// ============================================================================
+
+/** #39 (NW-19) 推荐强制使用的 curl -w 指标格式串。 */
+export const REQUIRED_CURL_WRITE_OUT =
+	"http_code=%{http_code} size_download=%{size_download} remote_ip=%{remote_ip} time_total=%{time_total}";
+
+const POSITIVE_FINDING_KINDS = new Set<string>(["vuln", "bypass", "cred", "loot"]);
+
+const META_ENVELOPE_KEYS = new Set<string>([
+	"detail",
+	"error",
+	"err",
+	"errmsg",
+	"error_msg",
+	"error_message",
+	"message",
+	"msg",
+	"code",
+	"errcode",
+	"status",
+	"statuscode",
+	"status_code",
+	"statustext",
+	"status_text",
+	"ok",
+	"success",
+	"timestamp",
+	"time",
+	"ts",
+	"requestid",
+	"request_id",
+	"traceid",
+	"trace_id",
+	"path",
+	"url",
+	"title",
+	"type",
+]);
+
+const ERROR_TEXT_RE =
+	/\b(?:not\s+found|page\s+not\s+found|route\s+not\s+found|cannot\s+(?:get|post|put|delete|patch)\s+\/|unauthorized|forbidden|access\s+denied|permission\s+denied|method\s+not\s+allowed|bad\s+request|invalid\s+(?:token|session|credentials?|request|route|path)|missing\s+(?:token|auth|parameter)|please\s+log\s*in|unauthenticated|session\s+expired|internal\s+server\s+error)\b|找不到此頁面|找不到此页面|页面不存在|頁面不存在|未登录|未登入|无权限|無權限|NEXT_HTTP_ERROR_FALLBACK/i;
+
+const SOFT_404_MARKER_RE =
+	/NEXT_HTTP_ERROR_FALLBACK|找不到此頁面|找不到此页面|<title>\s*404\b|404\s+not\s+found|page\s+not\s+found|route\s+not\s+found/i;
+
+const SUBSTANTIVE_PROOF_RE =
+	/(?:flag|ctf)\{[^}\s]{2,}\}|uid=\d+\([^)]+\)|root:x:0:0:|-----BEGIN [A-Z0-9 ]+ KEY-----|SQLSTATE\[|syntax\s+error\s+near|[A-Z0-9_]{3,}(?:PASSWORD|SECRET|TOKEN|KEY|HASH)\s*=\s*\S+|Bearer\s+[A-Za-z0-9._-]{12,}/i;
+
+const SECURITY_PROOF_HEADER_RE =
+	/^(?:Set-Cookie|Authorization|Proxy-Authorization|X-Api-Key|X-Auth-Token|X-Session-Token|X-Access-Token|X-Debug-[A-Za-z0-9-]+|Access-Control-Allow-Credentials)\s*:\s*\S+/im;
+
+export interface ResponseSnapshot {
+	statusCode?: number;
+	body?: string;
+	bodyBytes?: number;
+	bodySha256?: string;
+	bodyMd5?: string;
+	headers?: Record<string, string>;
+}
+
+export interface PositiveEvidenceGateInput {
+	kind: FactKind | "bypass" | string;
+	title?: string;
+	detail?: string;
+	output?: string;
+	response?: ResponseSnapshot;
+	baseline?: ResponseSnapshot | ResponseSnapshot[];
+	requireBusinessPayload?: boolean;
+	minBodyBytes?: number;
+}
+
+export interface PositiveEvidenceGateResult {
+	ok: boolean;
+	falsePositive: boolean;
+	reason?: string;
+	reasons: string[];
+	suggestedKind?: "note";
+	recommendedAction: "accept" | "downgrade_to_note" | "require_verification";
+	matchedSignals: string[];
+}
+
+/**
+ * 计算响应体摘要哈希（支持 sha256 与 md5）。
+ */
+export function computeBodyHash(body: string, algo: "sha256" | "md5" = "sha256"): string {
+	return createHash(algo).update(String(body ?? ""), "utf8").digest("hex");
+}
+
+function extractHttpStatusFromOutput(text: string): number | undefined {
+	const raw = String(text ?? "");
+	const httpLine = /\bHTTP\/\d(?:\.\d)?\s+(\d{3})\b/i.exec(raw);
+	if (httpLine?.[1]) return Number(httpLine[1]);
+	const metricLine = /\bhttp_code\s*[:=]\s*(\d{3})\b/i.exec(raw);
+	if (metricLine?.[1]) return Number(metricLine[1]);
+	return undefined;
+}
+
+function extractHttpBodyFromOutput(text: string): string {
+	const raw = String(text ?? "");
+	if (!raw) return "";
+	const norm = raw.replace(/\r\n/g, "\n");
+	if (/^HTTP\/\d(?:\.\d)?\s+\d{3}/i.test(norm.trimStart())) {
+		const sepIdx = norm.indexOf("\n\n");
+		if (sepIdx >= 0) {
+			return norm.slice(sepIdx + 2).trim();
+		}
+		// 仅含状态行与响应头时无正文
+		const lines = norm
+			.split("\n")
+			.map((l) => l.trim())
+			.filter(Boolean);
+		if (lines.every((l) => /^HTTP\/\d/i.test(l) || /^[A-Za-z0-9-]+:\s*/.test(l))) {
+			return "";
+		}
+	}
+	return raw.trim();
+}
+
+function isNonEmptyBusinessValue(val: unknown): boolean {
+	if (val === null || val === undefined || val === false) return false;
+	if (typeof val === "string") {
+		const t = val.trim();
+		if (!t) return false;
+		if (ERROR_TEXT_RE.test(t)) return false;
+		return true;
+	}
+	if (typeof val === "number") return Number.isFinite(val);
+	if (typeof val === "boolean") return val;
+	if (Array.isArray(val)) return val.length > 0 && val.some((item) => isNonEmptyBusinessValue(item));
+	if (typeof val === "object") {
+		const entries = Object.entries(val as Record<string, unknown>);
+		if (entries.length === 0) return false;
+		return entries.some(([k, v]) => !META_ENVELOPE_KEYS.has(k.toLowerCase()) && isNonEmptyBusinessValue(v));
+	}
+	return false;
+}
+
+function tryParseJsonBody(body: string): { parsed: boolean; value?: unknown } {
+	const t = String(body ?? "").trim();
+	if (!t || (t[0] !== "{" && t[0] !== "[")) return { parsed: false };
+	try {
+		return { parsed: true, value: JSON.parse(t) };
+	} catch {
+		return { parsed: false };
+	}
+}
+
+/**
+ * 判断响应正文是否包含实质业务数据或高置信度漏洞实锤（排除空壳与错误信封）。
+ */
+export function hasSubstantiveBusinessData(body: string): boolean {
+	const trimmed = String(body ?? "").trim();
+	if (!trimmed) return false;
+	if (SOFT_404_MARKER_RE.test(trimmed)) return false;
+	if (SUBSTANTIVE_PROOF_RE.test(trimmed)) return true;
+
+	const jsonRes = tryParseJsonBody(trimmed);
+	if (jsonRes.parsed) {
+		const val = jsonRes.value;
+		if (Array.isArray(val)) {
+			return val.length > 0 && val.some((item) => isNonEmptyBusinessValue(item));
+		}
+		if (val && typeof val === "object") {
+			const obj = val as Record<string, unknown>;
+			if (obj.ok === false || obj.success === false) return false;
+			if (typeof obj.error === "string" && obj.error.trim().length > 0) return false;
+			if (typeof obj.detail === "string" && ERROR_TEXT_RE.test(obj.detail)) return false;
+			if (typeof obj.message === "string" && ERROR_TEXT_RE.test(obj.message)) return false;
+			if (typeof obj.msg === "string" && ERROR_TEXT_RE.test(obj.msg)) return false;
+			if (typeof obj.code === "number" && (obj.code === 401 || obj.code === 403 || obj.code === 404 || obj.code >= 500)) {
+				return false;
+			}
+			for (const [k, v] of Object.entries(obj)) {
+				const lk = k.toLowerCase();
+				if (lk === "data" || lk === "result" || lk === "items" || lk === "records" || lk === "list" || lk === "user") {
+					if (isNonEmptyBusinessValue(v)) return true;
+					continue;
+				}
+				if (!META_ENVELOPE_KEYS.has(lk) && isNonEmptyBusinessValue(v)) {
+					return true;
+				}
+			}
+			return false;
+		}
+		return false;
+	}
+
+	const bytes = Buffer.byteLength(trimmed, "utf8");
+	if (bytes < 64) {
+		// 极短非 JSON 正文需避开空 HTML 壳、纯错误文本与低信息熵模板
+		if (ERROR_TEXT_RE.test(trimmed)) return false;
+		if (/^<(?:!doctype|html|head|body|div|span|p|h1)[^>]*>[\s\S]*<\/(?:html|body|div|span|p|h1)>$/i.test(trimmed)) {
+			const stripped = trimmed.replace(/<[^>]+>/g, "").trim();
+			if (!stripped || stripped.length < 16 || ERROR_TEXT_RE.test(stripped)) return false;
+		}
+		if (LOW_ENTROPY_BOILERPLATE_RE.test(trimmed) || PUNCTUATION_ONLY_RE.test(trimmed)) return false;
+		return false;
+	}
+
+	return !ERROR_TEXT_RE.test(trimmed.slice(0, 512));
+}
+
+/**
+ * 识别微小错误壳、Soft-404 外壳或 `<64B` 空壳响应（Issue #24 / NW-04）。
+ */
+export function isTinyErrorEnvelope(
+	body: string,
+	statusCode?: number,
+	minBytes = 64,
+	explicitBodyBytes?: number,
+): { isEnvelope: boolean; signal?: string; reason?: string } {
+	const trimmed = String(body ?? "").trim();
+	const actualBytes =
+		typeof explicitBodyBytes === "number" && Number.isFinite(explicitBodyBytes) && explicitBodyBytes >= 0
+			? explicitBodyBytes
+			: Buffer.byteLength(trimmed, "utf8");
+
+	if (actualBytes === 0) {
+		return {
+			isEnvelope: true,
+			signal: "empty_body_shell",
+			reason: `响应体为空 (0B${statusCode ? `, HTTP ${statusCode}` : ""})，缺乏实质业务证据`,
+		};
+	}
+
+	if (SOFT_404_MARKER_RE.test(trimmed)) {
+		return {
+			isEnvelope: true,
+			signal: "soft_404_marker",
+			reason: "响应命中 Soft-404 / NEXT_HTTP_ERROR_FALLBACK 特征，属于误报外壳",
+		};
+	}
+
+	const jsonRes = tryParseJsonBody(trimmed);
+	if (jsonRes.parsed) {
+		const val = jsonRes.value;
+		if (
+			val === null ||
+			(Array.isArray(val) && val.length === 0) ||
+			(typeof val === "object" && !Array.isArray(val) && Object.keys(val as Record<string, unknown>).length === 0)
+		) {
+			return {
+				isEnvelope: true,
+				signal: "empty_json_shell",
+				reason: `响应体为空 JSON 壳 (${actualBytes}B)，不含业务数据`,
+			};
+		}
+		if (val && typeof val === "object" && !Array.isArray(val)) {
+			const obj = val as Record<string, unknown>;
+			const keys = Object.keys(obj);
+			const nonMetaKeys = keys.filter((k) => !META_ENVELOPE_KEYS.has(k.toLowerCase()));
+			const hasRealBusinessField = nonMetaKeys.some((k) => isNonEmptyBusinessValue(obj[k]));
+			const dataVal = obj.data ?? obj.result ?? obj.items;
+			const hasNonEmptyData = dataVal !== undefined && isNonEmptyBusinessValue(dataVal);
+			const valuesText = keys
+				.map((k) => (typeof obj[k] === "string" ? String(obj[k]) : ""))
+				.filter(Boolean)
+				.join(" ");
+
+			if (
+				!hasRealBusinessField &&
+				!hasNonEmptyData &&
+				(ERROR_TEXT_RE.test(valuesText) ||
+					obj.ok === false ||
+					obj.success === false ||
+					(typeof obj.code === "number" && (obj.code === 401 || obj.code === 403 || obj.code === 404 || obj.code >= 500)))
+			) {
+				return {
+					isEnvelope: true,
+					signal: "tiny_error_json_envelope",
+					reason: `响应为错误信封 (${actualBytes}B, ${trimmed.slice(0, 80)})，缺乏业务数据字段`,
+				};
+			}
+
+			if (actualBytes < minBytes && !hasRealBusinessField && !hasNonEmptyData) {
+				return {
+					isEnvelope: true,
+					signal: "tiny_shell_under_64b",
+					reason: `响应为 <${minBytes}B 微小信封壳 (${actualBytes}B)，仅含状态/元信息无实质业务数据`,
+				};
+			}
+		}
+	}
+
+	if (actualBytes < minBytes) {
+		if (ERROR_TEXT_RE.test(trimmed)) {
+			return {
+				isEnvelope: true,
+				signal: "tiny_error_text",
+				reason: `响应为 <${minBytes}B 错误文本壳 (${actualBytes}B)`,
+			};
+		}
+		if (LOW_ENTROPY_BOILERPLATE_RE.test(trimmed) || PUNCTUATION_ONLY_RE.test(trimmed)) {
+			return {
+				isEnvelope: true,
+				signal: "tiny_boilerplate_shell",
+				reason: `响应为 <${minBytes}B 低熵空壳 (${actualBytes}B)`,
+			};
+		}
+		if (
+			statusCode === 200 &&
+			!hasSubstantiveBusinessData(trimmed)
+		) {
+			return {
+				isEnvelope: true,
+				signal: "http_200_tiny_shell",
+				reason: `仅凭 HTTP 200 + <${minBytes}B 微小响应壳 (${actualBytes}B) 不足以证实阳性结论，缺少业务数据`,
+			};
+		}
+	}
+
+	return { isEnvelope: false };
+}
+
+function hashesForSnapshot(snap: ResponseSnapshot): { sha256?: string; md5?: string; normSha256?: string } {
+	const sha256 = snap.bodySha256 ? snap.bodySha256.trim().toLowerCase() : undefined;
+	const md5 = snap.bodyMd5 ? snap.bodyMd5.trim().toLowerCase() : undefined;
+	if (snap.body !== undefined) {
+		const rawBody = String(snap.body);
+		return {
+			sha256: sha256 || computeBodyHash(rawBody, "sha256"),
+			md5: md5 || computeBodyHash(rawBody, "md5"),
+			normSha256: computeBodyHash(rawBody.trim(), "sha256"),
+		};
+	}
+	return { sha256, md5 };
+}
+
+/**
+ * #24 (NW-04) 正向 vuln / bypass / cred / loot 结论假阳性复核门禁：
+ * - 拦截仅凭 HTTP 200 + 微小错误壳（如 `{"detail":"Not Found"}`、`<64B` 空壳）通过的误报；
+ * - 拦截与未授权/404 基线响应体哈希完全一致的假阳性；
+ * - 失败时返回 `falsePositive: true` 并建议以 `note` 记账，阻断误报升格。
+ */
+export function evaluatePositiveEvidenceGate(input: PositiveEvidenceGateInput): PositiveEvidenceGateResult {
+	const normKind = String(input?.kind ?? "").trim().toLowerCase();
+	if (!POSITIVE_FINDING_KINDS.has(normKind)) {
+		return {
+			ok: true,
+			falsePositive: false,
+			reasons: [],
+			recommendedAction: "accept",
+			matchedSignals: [],
+		};
+	}
+
+	const minBodyBytes =
+		typeof input.minBodyBytes === "number" && Number.isFinite(input.minBodyBytes) && input.minBodyBytes > 0
+			? Math.floor(input.minBodyBytes)
+			: 64;
+
+	const rawOutput = String(input.output ?? "");
+	const derivedStatus = input.response?.statusCode ?? extractHttpStatusFromOutput(rawOutput);
+	const derivedBody =
+		input.response?.body !== undefined ? String(input.response.body) : extractHttpBodyFromOutput(rawOutput);
+	const derivedBodyBytes =
+		input.response?.bodyBytes !== undefined
+			? input.response.bodyBytes
+			: derivedBody !== "" || input.response?.body !== undefined
+				? Buffer.byteLength(derivedBody.trim(), "utf8")
+				: undefined;
+
+	const candidateSnap: ResponseSnapshot = {
+		statusCode: derivedStatus,
+		body: derivedBody,
+		bodyBytes: derivedBodyBytes,
+		bodySha256: input.response?.bodySha256,
+		bodyMd5: input.response?.bodyMd5,
+		headers: input.response?.headers,
+	};
+
+	const reasons: string[] = [];
+	const matchedSignals: string[] = [];
+
+	// 1. 负向对照基线哈希一致性校验（与未授权 / 404 基线逐字节一致则必为假阳性）
+	const baselines = Array.isArray(input.baseline)
+		? input.baseline
+		: input.baseline
+			? [input.baseline]
+			: [];
+	if (baselines.length > 0) {
+		const candHashes = hashesForSnapshot(candidateSnap);
+		for (const base of baselines) {
+			if (!base) continue;
+			const baseHashes = hashesForSnapshot(base);
+			const shaMatched = Boolean(candHashes.sha256 && baseHashes.sha256 && candHashes.sha256 === baseHashes.sha256);
+			const normShaMatched = Boolean(
+				candHashes.normSha256 && baseHashes.normSha256 && candHashes.normSha256 === baseHashes.normSha256,
+			);
+			const md5Matched = Boolean(candHashes.md5 && baseHashes.md5 && candHashes.md5 === baseHashes.md5);
+			if (shaMatched || normShaMatched || md5Matched) {
+				matchedSignals.push("baseline_body_hash_identical");
+				reasons.push(
+					`响应体哈希与未授权/404 负向对照基线完全一致 (${candHashes.sha256?.slice(0, 16) ?? candHashes.md5 ?? "matched"})，疑似路由兜底或假阳性`,
+				);
+				break;
+			}
+		}
+	}
+
+	// 2. 微小错误壳与 HTTP 200 <64B 空壳校验
+	// 若调用方未显式提供 response 且 rawOutput 为 curl -I 这类无正文但含高价值安全响应头（如 Set-Cookie/Authorization/X-Debug-*）的输出，不误判为 0B 空壳
+	const isHeadOnlyWithSecurityHeader =
+		input.response === undefined &&
+		derivedBody === "" &&
+		SECURITY_PROOF_HEADER_RE.test(rawOutput) &&
+		!rawOutput.replace(/\r\n/g, "\n").includes("\n\n");
+
+	const shouldCheckEnvelope =
+		!isHeadOnlyWithSecurityHeader &&
+		(input.response !== undefined ||
+			input.requireBusinessPayload === true ||
+			derivedStatus !== undefined ||
+			tryParseJsonBody(derivedBody).parsed ||
+			SOFT_404_MARKER_RE.test(derivedBody) ||
+			LOW_ENTROPY_BOILERPLATE_RE.test(derivedBody));
+
+	if (shouldCheckEnvelope) {
+		const envVerdict = isTinyErrorEnvelope(derivedBody, derivedStatus, minBodyBytes, derivedBodyBytes);
+		if (envVerdict.isEnvelope) {
+			matchedSignals.push(envVerdict.signal ?? "tiny_error_envelope");
+			if (envVerdict.reason) reasons.push(envVerdict.reason);
+		} else if (
+			input.requireBusinessPayload === true &&
+			derivedStatus === 200 &&
+			!hasSubstantiveBusinessData(derivedBody)
+		) {
+			matchedSignals.push("missing_business_payload");
+			reasons.push("HTTP 200 响应缺少实质业务数据字段，须复核确认而非直接升格阳性");
+		}
+	}
+
+	if (reasons.length > 0) {
+		return {
+			ok: false,
+			falsePositive: true,
+			reason: `假阳性复核拦截 (${normKind} -> 建议降级为 note): ${reasons.join("；")}`,
+			reasons,
+			suggestedKind: "note",
+			recommendedAction: "downgrade_to_note",
+			matchedSignals,
+		};
+	}
+
+	return {
+		ok: true,
+		falsePositive: false,
+		reasons: [],
+		recommendedAction: "accept",
+		matchedSignals,
+	};
+}
+
+// ----------------------------------------------------------------------------
+// #26 (NW-06) 交付真实性校验 validateDeliverableRealism(text, targetHost)
+// ----------------------------------------------------------------------------
+
+export type DeliverableViolation =
+	| "placeholder_bracket"
+	| "unexpanded_target_literal"
+	| "script_only_no_status"
+	| "missing_probe_metrics"
+	| "target_host_mismatch";
+
+export interface DeliverableRealismResult {
+	ok: boolean;
+	reject: boolean;
+	reasons: string[];
+	violations: DeliverableViolation[];
+	matchedPlaceholders: string[];
+	matchedLiterals: string[];
+}
+
+const BRACKET_PLACEHOLDER_RE = /\[[A-Z_]{2,}\]/g;
+const BRACKET_PLACEHOLDER_TEST_RE = /\[[A-Z_]{2,}\]/;
+const UNEXPANDED_LITERAL_RE =
+	/(?:\$\{?(?:U|URL|TARGET|HOST|DOMAIN)\}?|\b(?:TARGET|HOST|DOMAIN)\b)/g;
+const SCRIPT_FRAGMENT_RE =
+	/(?:^|\n)\s*(?:#!\/bin\/|for\s+\w+\s+in\b|while\s+|if\s+\[|[A-Z_][A-Z0-9_]*\s*=\s*["']?https?:\/\/|[A-Z_][A-Z0-9_]*\s*=\s*["']?\$|curl\s+-[a-zA-Z]|python3?\s+-c\b)/m;
+const REAL_HTTP_STATUS_RE =
+	/(?:HTTP\/\d(?:\.\d)?\s+[1-5]\d{2}\b|\bhttp_code\s*[:=]\s*[1-5]\d{2}\b|"http_code"\s*:\s*[1-5]\d{2}\b|\bstatus(?:_code)?\s*[:=]\s*[1-5]\d{2}\b)/i;
+const REAL_PROBE_METRIC_RE =
+	/(?:\bremote_ip\s*[:=]\s*[0-9a-fA-F:.]+|"remote_ip"\s*:\s*"[0-9a-fA-F:.]+"|\bcf[-_]ray\s*[:=]\s*[A-Za-z0-9-]+|"cf_ray"\s*:\s*"[A-Za-z0-9-]+"|\bsize_download\s*[:=]\s*\d+|"size_download"\s*:\s*\d+|\btime_total\s*[:=]\s*\d+(?:\.\d+)?|"time_total"\s*:\s*\d+(?:\.\d+)?|\bserver\s*[:=]\s*[A-Za-z0-9._/-]+|"server"\s*:\s*"[A-Za-z0-9._/-]+")/i;
+
+function normalizeTargetHostName(raw: string | undefined): string {
+	const s = String(raw ?? "").trim();
+	if (!s) return "";
+	try {
+		const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(s) ? s : `http://${s}`;
+		return new URL(withScheme).hostname.toLowerCase();
+	} catch {
+		return s.replace(/^https?:\/\//i, "").split(/[/:?#]/)[0]?.toLowerCase() ?? "";
+	}
+}
+
+/**
+ * #26 (NW-06) 校验子代理回包真实性：
+ * 拦截含 `\[[A-Z_]{2,}\]` 占位符、未展开的字面量 `TARGET`/`HOST`/`DOMAIN`/`$U`、
+ * 仅脚本无状态码、缺少实际探针指标或目标主机错配的模板化回包。
+ */
+export function validateDeliverableRealism(text: string, targetHost?: string): DeliverableRealismResult {
+	const raw = String(text ?? "");
+	const trimmed = raw.trim();
+	const reasons: string[] = [];
+	const violations: DeliverableViolation[] = [];
+	const matchedPlaceholders: string[] = [];
+	const matchedLiterals: string[] = [];
+
+	if (!trimmed) {
+		return {
+			ok: false,
+			reject: true,
+			reasons: ["回包内容为空，拒绝落账"],
+			violations: ["missing_probe_metrics"],
+			matchedPlaceholders,
+			matchedLiterals,
+		};
+	}
+
+	// 1. 拦截方括号大写占位符 \[[A-Z_]{2,}\]
+	const phHits = [...new Set(raw.match(BRACKET_PLACEHOLDER_RE) ?? [])];
+	if (phHits.length > 0) {
+		matchedPlaceholders.push(...phHits);
+		violations.push("placeholder_bracket");
+		reasons.push(`回包含未填充占位符: ${phHits.slice(0, 6).join(", ")}`);
+	}
+
+	// 2. 拦截未展开字面量 TARGET / HOST / DOMAIN / $U
+	const litHits = [...new Set(raw.match(UNEXPANDED_LITERAL_RE) ?? [])];
+	if (litHits.length > 0) {
+		matchedLiterals.push(...litHits);
+		violations.push("unexpanded_target_literal");
+		reasons.push(`回包含未展开的目标字面量/变量: ${litHits.slice(0, 6).join(", ")}`);
+	}
+
+	const hasHttpStatus = REAL_HTTP_STATUS_RE.test(raw);
+	const hasProbeMetrics = REAL_PROBE_METRIC_RE.test(raw);
+	const looksLikeScript = SCRIPT_FRAGMENT_RE.test(raw);
+
+	// 3. 仅脚本或变量赋值，没有 HTTP/ 状态行或实际状态码
+	if (looksLikeScript && !hasHttpStatus) {
+		violations.push("script_only_no_status");
+		reasons.push("回包仅含脚本/命令模板而无真实 HTTP 状态码输出，判定为未执行");
+	}
+
+	// 4. 缺少实际探针指标（remote_ip / cf_ray / server / size_download / time_total 或实际状态码）
+	if (!hasProbeMetrics || !hasHttpStatus) {
+		if (!violations.includes("script_only_no_status") || !hasProbeMetrics) {
+			violations.push("missing_probe_metrics");
+			reasons.push("缺少实际网络探针观测指标（需包含真实 HTTP 状态码及 remote_ip / cf_ray / server / size_download / time_total）");
+		}
+	}
+
+	// 5. 若提供 targetHost，校验正文 URL 未指向明显偏离的错配主机
+	const normTargetHost = normalizeTargetHostName(targetHost);
+	if (normTargetHost) {
+		const urlMatches = raw.match(/https?:\/\/[^\s"'<>`)\]]+/gi) ?? [];
+		if (urlMatches.length > 0) {
+			const hosts = new Set<string>();
+			for (const u of urlMatches) {
+				try {
+					hosts.add(new URL(u.replace(/[),.;]+$/, "")).hostname.toLowerCase());
+				} catch {
+					/* ignore */
+				}
+			}
+			const hostMatchesTarget = [...hosts].some(
+				(h) => h === normTargetHost || h.endsWith(`.${normTargetHost}`),
+			);
+			const textMentionsTarget = raw.toLowerCase().includes(normTargetHost);
+			if (hosts.size > 0 && !hostMatchesTarget && !textMentionsTarget) {
+				violations.push("target_host_mismatch");
+				reasons.push(`回包 URL 主机 (${[...hosts].join(", ")}) 与授权目标主机 ${normTargetHost} 不一致`);
+			}
+		}
+	}
+
+	return {
+		ok: violations.length === 0,
+		reject: violations.length > 0,
+		reasons,
+		violations,
+		matchedPlaceholders,
+		matchedLiterals,
+	};
+}
+
+// ----------------------------------------------------------------------------
+// #39 (NW-19) 子代理命中证据必需字段校验
+// ----------------------------------------------------------------------------
+
+export interface HitEvidenceMetrics {
+	http_code?: number;
+	size_download?: number;
+	remote_ip?: string;
+	cf_ray?: string;
+	server?: string;
+	time_total?: number;
+}
+
+export interface HitEvidenceValidationResult {
+	ok: boolean;
+	missingFields: string[];
+	metrics: HitEvidenceMetrics;
+	edgeOrOrigin: "cloudflare_edge" | "origin_or_proxy" | "unknown";
+	reason?: string;
+}
+
+const VALID_IP_RE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{3,39})$/;
+
+function toFiniteNumber(v: unknown): number | undefined {
+	if (typeof v === "number" && Number.isFinite(v)) return v;
+	if (typeof v === "string" && v.trim() !== "") {
+		const n = Number(v.trim().replace(/s$/i, ""));
+		if (Number.isFinite(n)) return n;
+	}
+	return undefined;
+}
+
+function cleanStringField(v: unknown): string | undefined {
+	if (typeof v !== "string") return undefined;
+	const t = v.trim();
+	if (!t || BRACKET_PLACEHOLDER_TEST_RE.test(t) || /^(?:n\/a|none|null|unknown|-)$/i.test(t)) return undefined;
+	return t;
+}
+
+/**
+ * 从结构化对象或原始 curl -D - -w 输出中提取命中证据必需指标。
+ */
+export function extractHitEvidenceMetrics(raw: string | Record<string, unknown>): HitEvidenceMetrics {
+	if (raw && typeof raw === "object") {
+		const obj = raw as Record<string, unknown>;
+		return {
+			http_code: toFiniteNumber(obj.http_code ?? obj.httpCode ?? obj.status_code ?? obj.statusCode),
+			size_download: toFiniteNumber(obj.size_download ?? obj.sizeDownload ?? obj.bytes),
+			remote_ip: cleanStringField(obj.remote_ip ?? obj.remoteIp),
+			cf_ray: cleanStringField(obj.cf_ray ?? obj.cfRay ?? obj["cf-ray"]),
+			server: cleanStringField(obj.server ?? obj.Server),
+			time_total: toFiniteNumber(obj.time_total ?? obj.timeTotal),
+		};
+	}
+
+	const text = String(raw ?? "");
+	const httpCodeMatch =
+		/\bhttp_code\s*[:=]\s*(\d{3})\b/i.exec(text) ??
+		/\bHTTP\/\d(?:\.\d)?\s+(\d{3})\b/i.exec(text);
+	const sizeMatch = /\bsize_download\s*[:=]\s*(\d+)\b/i.exec(text);
+	const ipMatch = /\bremote_ip\s*[:=]\s*([0-9a-fA-F:.]+)\b/i.exec(text);
+	const cfRayMatch = /\bcf[-_]ray\s*[:=]\s*([A-Za-z0-9-]+)\b/i.exec(text);
+	const serverMatch = /(?:^|\n|\s)server\s*[:=]\s*([^\r\n,;]+)/i.exec(text);
+	const timeMatch = /\btime_total\s*[:=]\s*(\d+(?:\.\d+)?)s?\b/i.exec(text);
+
+	return {
+		http_code: httpCodeMatch?.[1] ? Number(httpCodeMatch[1]) : undefined,
+		size_download: sizeMatch?.[1] ? Number(sizeMatch[1]) : undefined,
+		remote_ip: cleanStringField(ipMatch?.[1]),
+		cf_ray: cleanStringField(cfRayMatch?.[1]),
+		server: cleanStringField(serverMatch?.[1]),
+		time_total: timeMatch?.[1] ? Number(timeMatch[1]) : undefined,
+	};
+}
+
+/**
+ * #39 (NW-19) 校验子代理命中证据必需字段：
+ * 必需包含 `http_code`、`size_download`、`remote_ip`、`cf_ray` 或 `server`、`time_total`。
+ */
+export function validateHitEvidenceFields(
+	raw: string | Record<string, unknown> | HitEvidenceMetrics,
+): HitEvidenceValidationResult {
+	const metrics = extractHitEvidenceMetrics(raw as string | Record<string, unknown>);
+	const missingFields: string[] = [];
+
+	if (
+		metrics.http_code === undefined ||
+		!Number.isInteger(metrics.http_code) ||
+		metrics.http_code < 100 ||
+		metrics.http_code > 599
+	) {
+		missingFields.push("http_code");
+	}
+	if (metrics.size_download === undefined || metrics.size_download < 0) {
+		missingFields.push("size_download");
+	}
+	if (!metrics.remote_ip || !VALID_IP_RE.test(metrics.remote_ip)) {
+		missingFields.push("remote_ip");
+	}
+	if (!metrics.cf_ray && !metrics.server) {
+		missingFields.push("cf_ray|server");
+	}
+	if (metrics.time_total === undefined || metrics.time_total < 0) {
+		missingFields.push("time_total");
+	}
+
+	const isCloudflare =
+		Boolean(metrics.cf_ray) || Boolean(metrics.server && /cloudflare/i.test(metrics.server));
+	const edgeOrOrigin: HitEvidenceValidationResult["edgeOrOrigin"] =
+		missingFields.length > 0
+			? "unknown"
+			: isCloudflare
+				? "cloudflare_edge"
+				: "origin_or_proxy";
+
+	if (missingFields.length > 0) {
+		return {
+			ok: false,
+			missingFields,
+			metrics,
+			edgeOrOrigin,
+			reason: `子代理命中证据缺少必需字段: ${missingFields.join(", ")}（须附带 curl -w 指标与 cf_ray/server 响应头）`,
+		};
+	}
+
+	return {
+		ok: true,
+		missingFields: [],
+		metrics,
+		edgeOrOrigin,
+	};
+}
+
+// ----------------------------------------------------------------------------
+// #42 (NW-22) 原始响应/日志落盘至 .nuwa/evidence/<factId>.log 与 evidenceRef 指针
+// ----------------------------------------------------------------------------
+
+export interface SaveEvidenceLogInput {
+	factId: string;
+	command?: string;
+	output?: string;
+	rawResponse?: string;
+	headers?: Record<string, string>;
+	metadata?: Record<string, unknown>;
+	ts?: string;
+}
+
+export interface SavedEvidenceLog {
+	factId: string;
+	/** 相对项目根路径指针，格式为 `.nuwa/evidence/<factId>.log` */
+	evidenceRef: string;
+	absolutePath: string;
+	bytes: number;
+	sha256: string;
+}
+
+function sanitizeFactFileId(factId: string): string {
+	const clean = String(factId ?? "")
+		.trim()
+		.replace(/[^a-zA-Z0-9._-]/g, "_");
+	if (!clean || clean === "." || clean === "..") {
+		throw new Error(`非法 factId，无法落盘证据日志: ${factId}`);
+	}
+	return clean;
+}
+
+/**
+ * #42 (NW-22) 将原始响应/执行日志脱敏后原子落盘到 `<root>/.nuwa/evidence/<factId>.log`，
+ * 并返回相对路径指针 `evidenceRef`（`.nuwa/evidence/<factId>.log`）。
+ */
+export function saveFactEvidenceLog(root: string, input: SaveEvidenceLogInput): SavedEvidenceLog {
+	const normRoot = resolve(root || process.cwd());
+	const safeId = sanitizeFactFileId(input.factId);
+	const evDir = join(normRoot, ".nuwa", "evidence");
+	mkdirSync(evDir, { recursive: true, mode: 0o700 });
+	try {
+		chmodSync(evDir, 0o700);
+	} catch {
+		/* 非 POSIX 忽略 */
+	}
+
+	const ts = input.ts && input.ts.trim() ? input.ts.trim() : new Date().toISOString();
+	const sections: string[] = [
+		`=== NUWA EVIDENCE LOG ===`,
+		`fact_id: ${safeId}`,
+		`timestamp: ${ts}`,
+	];
+	if (input.command) {
+		sections.push(`command: ${safeRedact(String(input.command), normRoot)}`);
+	}
+	if (input.metadata && Object.keys(input.metadata).length > 0) {
+		sections.push(`metadata: ${safeRedact(JSON.stringify(input.metadata), normRoot)}`);
+	}
+	if (input.headers && Object.keys(input.headers).length > 0) {
+		sections.push(`--- HEADERS ---`);
+		for (const [k, v] of Object.entries(input.headers)) {
+			sections.push(`${k}: ${safeRedact(String(v), normRoot)}`);
+		}
+	}
+	if (input.output !== undefined) {
+		sections.push(`--- OUTPUT ---`);
+		sections.push(safeRedact(String(input.output), normRoot));
+	}
+	if (input.rawResponse !== undefined && input.rawResponse !== input.output) {
+		sections.push(`--- RAW RESPONSE ---`);
+		sections.push(safeRedact(String(input.rawResponse), normRoot));
+	}
+
+	const content = `${sections.join("\n")}\n`;
+	const fileName = `${safeId}.log`;
+	const absolutePath = join(evDir, fileName);
+	const tmpPath = `${absolutePath}.tmp-${process.pid}-${Date.now()}-${atomicLedgerSeq++}`;
+	try {
+		writeFileSync(tmpPath, content, { encoding: "utf8", mode: 0o600 });
+		try {
+			chmodSync(tmpPath, 0o600);
+		} catch {
+			/* ignore */
+		}
+		renameSync(tmpPath, absolutePath);
+		try {
+			chmodSync(absolutePath, 0o600);
+		} catch {
+			/* ignore */
+		}
+	} catch (err) {
+		try {
+			unlinkSync(tmpPath);
+		} catch {
+			/* ignore */
+		}
+		throw err;
+	}
+
+	return {
+		factId: safeId,
+		evidenceRef: `.nuwa/evidence/${fileName}`,
+		absolutePath,
+		bytes: Buffer.byteLength(content, "utf8"),
+		sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+	};
+}
+
+/**
+ * 安全读取 `<root>/.nuwa/evidence/<factId>.log`（严格防目录穿越）。
+ */
+export function readFactEvidenceLog(root: string, evidenceRefOrFactId: string): string | null {
+	const normRoot = resolve(root || process.cwd());
+	const evDir = resolve(join(normRoot, ".nuwa", "evidence"));
+	const rawRef = String(evidenceRefOrFactId ?? "").trim();
+	if (!rawRef) return null;
+
+	const candidate =
+		rawRef.startsWith(".nuwa/evidence/") || rawRef.startsWith("./.nuwa/evidence/")
+			? resolve(normRoot, rawRef)
+			: resolve(evDir, rawRef.endsWith(".log") ? rawRef : `${rawRef}.log`);
+
+	if (!candidate.startsWith(`${evDir}/`) && candidate !== evDir) {
+		return null;
+	}
+	if (!existsSync(candidate)) return null;
+	try {
+		return readFileSync(candidate, "utf8");
+	} catch {
+		return null;
+	}
+}
+
+// ----------------------------------------------------------------------------
+// #51 (NW-31) 结构化 AgentResult 类型与 parseAgentResult(raw) 解析器
+// ----------------------------------------------------------------------------
+
+export type AgentResultStatus = "ok" | "hit" | "confirmed" | "rejected" | "blocked" | "negative" | "error";
+
+export interface AgentEvidenceItem {
+	cmd: string;
+	http_code?: number;
+	size_download?: number;
+	remote_ip?: string;
+	cf_ray?: string;
+	server?: string;
+	time_total?: number;
+	body_sha256?: string;
+	snippet?: string;
+}
+
+export interface AgentResult {
+	status: AgentResultStatus | string;
+	target: string;
+	evidence: AgentEvidenceItem[];
+	blocked: boolean;
+	summary: string;
+	next: string;
+	blockedReason?: string;
+}
+
+export interface ParseAgentResultOutcome {
+	ok: boolean;
+	format: "json" | "fenced_json" | "embedded_json" | "legacy_5line" | "invalid";
+	result?: AgentResult;
+	error?: string;
+	warnings: string[];
+}
+
+function parseBlockedFlag(raw: unknown): { blocked: boolean; blockedReason?: string } {
+	if (typeof raw === "boolean") return { blocked: raw };
+	if (typeof raw === "string") {
+		const t = raw.trim();
+		if (!t || /^(?:无|none|no|false|null|n\/a|-)$/i.test(t)) {
+			return { blocked: false };
+		}
+		return { blocked: true, blockedReason: t };
+	}
+	return { blocked: Boolean(raw) };
+}
+
+function normalizeEvidenceItem(rawItem: unknown): AgentEvidenceItem | null {
+	if (!rawItem || typeof rawItem !== "object") return null;
+	const obj = rawItem as Record<string, unknown>;
+	const cmd = String(obj.cmd ?? obj.command ?? "").trim();
+	const metrics = extractHitEvidenceMetrics(obj);
+	const bodySha = cleanStringField(obj.body_sha256 ?? obj.bodySha256 ?? obj.sha256);
+	const snippet = typeof obj.snippet === "string" && obj.snippet.trim() ? obj.snippet.trim() : undefined;
+
+	return {
+		cmd,
+		...(metrics.http_code !== undefined ? { http_code: metrics.http_code } : {}),
+		...(metrics.size_download !== undefined ? { size_download: metrics.size_download } : {}),
+		...(metrics.remote_ip !== undefined ? { remote_ip: metrics.remote_ip } : {}),
+		...(metrics.cf_ray !== undefined ? { cf_ray: metrics.cf_ray } : {}),
+		...(metrics.server !== undefined ? { server: metrics.server } : {}),
+		...(metrics.time_total !== undefined ? { time_total: metrics.time_total } : {}),
+		...(bodySha !== undefined ? { body_sha256: bodySha } : {}),
+		...(snippet !== undefined ? { snippet } : {}),
+	};
+}
+
+function buildAgentResultFromObject(
+	obj: Record<string, unknown>,
+	format: "json" | "fenced_json" | "embedded_json",
+): ParseAgentResultOutcome {
+	const warnings: string[] = [];
+	const hasCoreField =
+		typeof obj.status === "string" ||
+		typeof obj.summary === "string" ||
+		Array.isArray(obj.evidence);
+
+	if (!hasCoreField) {
+		return {
+			ok: false,
+			format: "invalid",
+			error: "JSON 对象缺少 AgentResult 核心字段（需至少包含 status / summary / evidence）",
+			warnings,
+		};
+	}
+
+	const { blocked, blockedReason } = parseBlockedFlag(obj.blocked);
+	const rawBlockedReason =
+		typeof obj.blockedReason === "string" && obj.blockedReason.trim()
+			? obj.blockedReason.trim()
+			: blockedReason;
+
+	const status =
+		typeof obj.status === "string" && obj.status.trim()
+			? obj.status.trim()
+			: blocked
+				? "blocked"
+				: "ok";
+	const target = String(obj.target ?? "").trim();
+	const summary = String(obj.summary ?? obj.conclusion ?? "").trim();
+	const next = String(obj.next ?? obj.nextStep ?? "").trim();
+
+	const evidenceRaw = Array.isArray(obj.evidence) ? obj.evidence : [];
+	const evidence: AgentEvidenceItem[] = [];
+	for (const item of evidenceRaw) {
+		const norm = normalizeEvidenceItem(item);
+		if (norm) evidence.push(norm);
+	}
+
+	if (evidence.length === 0 && !blocked) {
+		warnings.push("evidence 数组为空");
+	}
+	for (let i = 0; i < evidence.length; i++) {
+		const v = validateHitEvidenceFields(evidence[i]!);
+		if (!v.ok) {
+			warnings.push(`evidence[${i}] 缺少字段: ${v.missingFields.join(", ")}`);
+		}
+	}
+
+	return {
+		ok: true,
+		format,
+		result: {
+			status,
+			target,
+			evidence,
+			blocked,
+			summary,
+			next,
+			...(rawBlockedReason ? { blockedReason: rawBlockedReason } : {}),
+		},
+		warnings,
+	};
+}
+
+function extractBalancedJsonObjects(raw: string): string[] {
+	const out: string[] = [];
+	let depth = 0;
+	let start = -1;
+	let inString = false;
+	let escaped = false;
+
+	for (let i = 0; i < raw.length; i++) {
+		const ch = raw[i]!;
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+			} else if (ch === "\\") {
+				escaped = true;
+			} else if (ch === '"') {
+				inString = false;
+			}
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === "{") {
+			if (depth === 0) start = i;
+			depth++;
+		} else if (ch === "}") {
+			if (depth > 0) {
+				depth--;
+				if (depth === 0 && start >= 0) {
+					out.push(raw.slice(start, i + 1));
+					start = -1;
+				}
+			}
+		}
+	}
+	return out;
+}
+
+function parseLegacyFiveLineResult(raw: string): ParseAgentResultOutcome | null {
+	const conclusion = /(?:^|\n)\s*结论\s*[:：]\s*(.+)/.exec(raw)?.[1]?.trim();
+	const evidenceLine = /(?:^|\n)\s*证据\s*[:：]\s*(.+)/.exec(raw)?.[1]?.trim();
+	const cmdLine = /(?:^|\n)\s*命令\s*[:：]\s*(.+)/.exec(raw)?.[1]?.trim();
+	const blockedLine = /(?:^|\n)\s*阻断\s*[:：]\s*(.+)/.exec(raw)?.[1]?.trim();
+	const nextLine = /(?:^|\n)\s*下一步\s*[:：]\s*(.+)/.exec(raw)?.[1]?.trim();
+
+	if (!conclusion || (!evidenceLine && !cmdLine && !blockedLine)) {
+		return null;
+	}
+
+	const { blocked, blockedReason } = parseBlockedFlag(blockedLine ?? "");
+	const metrics = extractHitEvidenceMetrics(`${evidenceLine ?? ""}\n${cmdLine ?? ""}`);
+	const urlMatch = /https?:\/\/[^\s"'<>`]+/i.exec(`${cmdLine ?? ""} ${conclusion}`);
+	const shaMatch = /\bbody_sha256\s*[:=]\s*([a-fA-F0-9]{64})\b/i.exec(evidenceLine ?? "");
+
+	const status = blocked
+		? "blocked"
+		: /\bCONFIRMED\b/i.test(conclusion)
+			? "confirmed"
+			: /\bREJECTED\b/i.test(conclusion)
+				? "rejected"
+				: "ok";
+
+	const evidence: AgentEvidenceItem[] =
+		cmdLine || evidenceLine
+			? [
+					{
+						cmd: cmdLine ?? "",
+						...(metrics.http_code !== undefined ? { http_code: metrics.http_code } : {}),
+						...(metrics.size_download !== undefined ? { size_download: metrics.size_download } : {}),
+						...(metrics.remote_ip !== undefined ? { remote_ip: metrics.remote_ip } : {}),
+						...(metrics.cf_ray !== undefined ? { cf_ray: metrics.cf_ray } : {}),
+						...(metrics.server !== undefined ? { server: metrics.server } : {}),
+						...(metrics.time_total !== undefined ? { time_total: metrics.time_total } : {}),
+						...(shaMatch?.[1] ? { body_sha256: shaMatch[1] } : {}),
+						...(evidenceLine ? { snippet: evidenceLine } : {}),
+					},
+				]
+			: [];
+
+	return {
+		ok: true,
+		format: "legacy_5line",
+		result: {
+			status,
+			target: urlMatch?.[0] ?? "",
+			evidence,
+			blocked,
+			summary: conclusion,
+			next: nextLine ?? "",
+			...(blockedReason ? { blockedReason } : {}),
+		},
+		warnings: ["检测到旧版 5 行文本格式，建议切换为标准 JSON AgentResult 回包"],
+	};
+}
+
+/**
+ * #51 (NW-31) 解析子代理结构化回包 `AgentResult`：
+ * 兼容纯 JSON、Markdown fenced JSON（```json ... ```）、嵌入 JSON 及旧版 5 行摘要降级解析。
+ */
+export function parseAgentResult(raw: string | Record<string, unknown>): ParseAgentResultOutcome {
+	if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+		return buildAgentResultFromObject(raw as Record<string, unknown>, "json");
+	}
+
+	const text = String(raw ?? "").trim();
+	if (!text) {
+		return { ok: false, format: "invalid", error: "回包为空", warnings: [] };
+	}
+
+	// 1. 纯 JSON 解析
+	if (text.startsWith("{") && text.endsWith("}")) {
+		try {
+			const parsed = JSON.parse(text);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				return buildAgentResultFromObject(parsed as Record<string, unknown>, "json");
+			}
+		} catch {
+			/* 回退到 fenced / embedded 解析 */
+		}
+	}
+
+	// 2. Markdown fenced JSON（```json ... ``` 或 ``` ... ```）
+	const fenceRe = /```(?:json|JSON)?\s*\r?\n([\s\S]*?)```/g;
+	for (let m = fenceRe.exec(text); m !== null; m = fenceRe.exec(text)) {
+		const block = (m[1] ?? "").trim();
+		if (!block.startsWith("{")) continue;
+		try {
+			const parsed = JSON.parse(block);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				const out = buildAgentResultFromObject(parsed as Record<string, unknown>, "fenced_json");
+				if (out.ok) return out;
+			}
+		} catch {
+			/* 尝试下一个代码块 */
+		}
+	}
+
+	// 3. 嵌入式 JSON 对象兜底（前后带说明文本或 Σ 尾注）
+	const embeddedBlocks = extractBalancedJsonObjects(text);
+	for (const block of embeddedBlocks) {
+		try {
+			const parsed = JSON.parse(block);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				const out = buildAgentResultFromObject(parsed as Record<string, unknown>, "embedded_json");
+				if (out.ok) return out;
+			}
+		} catch {
+			/* 忽略非 JSON 花括号片段 */
+		}
+	}
+
+	// 4. 旧版 5 行契约兼容降级
+	const legacy = parseLegacyFiveLineResult(text);
+	if (legacy) return legacy;
+
+	return {
+		ok: false,
+		format: "invalid",
+		error: "无法解析为合法的 AgentResult JSON（也未匹配旧版 5 行回包格式）",
+		warnings: [],
+	};
 }
