@@ -209,3 +209,19 @@ packet 已声明 `kind=vuln/service`，commit 仍须手填，主线程只能推�
 | 需 token | `member/profile`、`member/bank`、`game/*` | f045 |
 | 注册 | 真实面 `PUT /api/v1/member/signup`，需短信码 + Turnstile 双门；零账号创建 | RegisterFlow |
 | 后台 | `/zh-tw/rest/admin/*` 前端页存在（31KB 级），`/api/v1/admin/*` 命名空间不存在；78 个模块键 | AdminModules |
+
+---
+
+# 第二批（第 213 轮复盘补充，NW-23 – NW-29）
+
+| ID | 级别 | 问题 | 关键证据 |
+|---|---|---|---|
+| NW-23 | P1 | 派生去重键错误：新面被拒、死面重复 | 四条新提示 `nuwa_plan` 全「新增 0 条」；端口 21/22/23/53/110/111 被判死 3–4 轮；frontier 空时 expand 反出 11 条 |
+| NW-24 | P2 | 停机路径不可发现 | `nuwa_stop` 三次调用才成功：schema 错 → 「永动模式只有目标完成才停」→ 需 `confirm="STOP"` |
+| NW-25 | P1 | phase 机卡死 | `phase=report(E6)` 连续 60+ 轮；vuln done=4/blocked=76，exploit 0/1，post 0/1 |
+| NW-26 | P1 | 子代理无超时无看门狗 | CmdInjProbe 1h54m、PathTraversal 1h54m、RegisterFlow 1h47m、MemberEnum 1h27m，全程 running |
+| NW-27 | P1 | 运行期工作区丢失 | 第 183 轮 commit 61f9c95 成功后，第 208 轮 `/tmp/nuwa-study/.git` 不存在，目录只剩 docs/ |
+| NW-28 | P1 | 工具层网络策略不一致 | bash: `nuwa N-007 靶标越界 (api.github.com)`；python urlopen → 200；gh auth 挂死 80s |
+| NW-29 | P2 | blocked 计数与实际提交不一致 | 第 203–213 轮每轮 4 次 blocked commit，状态长期 `blocked=120` |
+
+合计 **29 项**（含首批 22 项）。远端对应：总表 #20，子 issue #21–#49。
