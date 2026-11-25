@@ -19,9 +19,25 @@ export interface ScopePolicy {
 	oobDomains?: string[];
 }
 
+export type EnforcementLayer = "shell-guard" | "egress-proxy" | "sandbox-net";
+
 export interface ScopeBlockVerdict {
 	block: true;
 	reason: string;
+	layer?: EnforcementLayer;
+}
+
+export interface ScopeCheckOptions {
+	layer?: EnforcementLayer;
+}
+
+/** 统一格式化安全阻断原因，显式标明规则号与执行拦截层（如 [layer=shell-guard]）。 */
+export function formatScopeBlockReason(
+	layer: EnforcementLayer,
+	detail: string,
+	code: "N-007" | "N-008" | "N-003" = "N-007",
+): string {
+	return `nuwa ${code} [layer=${layer}]: ${detail}`;
 }
 
 const NON_TLD_EXTS = new Set(
@@ -248,7 +264,144 @@ const CODE_IDENTIFIERS = new Set([
 	"console.error",
 ]);
 
-const INTERPRETER_CMDS = new Set(["python", "python3", "node", "bun", "ruby", "perl", "php"]);
+const INTERPRETER_CMDS = new Set(["python", "python2", "python3", "node", "nodejs", "bun", "ruby", "perl", "php"]);
+
+function isInterpreterCmd(cmdName: string): boolean {
+	if (INTERPRETER_CMDS.has(cmdName)) return true;
+	return /^(?:python[23](?:\.\d+)?|ruby\d+(?:\.\d+)?|perl\d*(?:\.\d+)?|php\d+(?:\.\d+)?)$/.test(cmdName);
+}
+
+const INTERPRETER_INLINE_FLAGS = new Set(["-c", "-e", "-E", "-r", "-p", "--eval", "--print"]);
+
+const INLINE_SCRIPT_NET_HINT_RE =
+	/(?:\b(?:urllib|urllib3|requests|httpx|aiohttp|http\.client|socket|fetch|axios|undici|got|superagent|http\.get|https\.get|http\.request|https\.request|net\.connect|net\.createConnection|tls\.connect|dns\.lookup|dns\.resolve|Net::HTTP|OpenURI|TCPSocket|HTTParty|Faraday|IO::Socket|LWP|HTTP::Tiny|Mojo::UserAgent|file_get_contents|fsockopen|pfsockopen|curl_init|stream_socket_client|gethostbyname|getaddrinfo|create_connection|HTTPConnection|HTTPSConnection|urlopen|PeerAddr|PeerHost)\b|(?:require\s*\(\s*|from\s+)['"`](?:node:)?(?:http|https|http2|net|tls|dns|dgram)['"`])/i;
+
+/** 对内联脚本做纯静态引号字面量拼接折叠（如 'https://' + 'api.github.com' -> 'https://api.github.com'），仅用于静态外连审计。 */
+function foldInlineStringConcats(code: string): string {
+	let out = code;
+	for (let pass = 0; pass < 4; pass++) {
+		const next = out
+			// 同引号显式拼接（Python/JS/Ruby '+'、PHP/Perl '.'）或 Python 相邻字面量拼接
+			.replace(/'([^'\\\r\n]*)'\s*(?:[+.]\s*)?'([^'\\\r\n]*)'/g, "'$1$2'")
+			.replace(/"([^"\\\r\n]*)"\s*(?:[+.]\s*)?"([^"\\\r\n]*)"/g, '"$1$2"');
+		if (next === out) break;
+		out = next;
+	}
+	return out;
+}
+
+/**
+ * 从 python/python3 -c、node -e、bun -e、ruby -e、perl -e、php -r 等内联脚本代码中提取潜在网络目标（URL、域名、IP）。
+ * 规则：
+ *   1. 先折叠同引号字符串拼接，防 "https://" + "api.github.com" 绕过；
+ *   2. 提取完整 URL（含模板字符串插值占位化）；
+ *   3. 提取常见多语言网络 API 调用中的主机字面量（urllib/requests/fetch/http.get/net.connect/Net::HTTP/IO::Socket/fsockopen/curl_init 等）；
+ *   4. 当代码包含网络模块/API 上下文时，扫描引号包裹的字符串字面量中合法域名或 host:port，严防绕过；
+ *   5. 严禁从未加引号的代码属性标识符（如 logging.info / myapp.app / obj.to）误提取域名。
+ */
+export function extractInlineScriptTargets(code: string): string[] {
+	const raw = String(code ?? "");
+	if (!raw.trim()) return [];
+
+	const found: string[] = [];
+	const seen = new Set<string>();
+	const push = (cand: string, allowCidr = false) => {
+		const cleaned = String(cand ?? "").trim();
+		if (!cleaned || !isPlausibleTargetToken(cleaned)) return;
+		const norm = normalizeHostToken(cleaned, allowCidr);
+		if (!norm || !isPlausibleTargetToken(norm)) return;
+		if (norm === "nuwa-tpl-var" || norm === "255.255.255.255" || norm === "255.255.255.0" || norm === "255.255.0.0") {
+			return;
+		}
+		if (CODE_IDENTIFIERS.has(norm.toLowerCase())) return;
+		if (!seen.has(norm)) {
+			seen.add(norm);
+			found.push(norm);
+		}
+	};
+
+	// 将 JS 模板插值替换为安全占位符，避免 `https://${x}.evil.org` 被 `}` 截断，同时避免纯变量 `https://${host}` 误报
+	const folded = foldInlineStringConcats(raw)
+		.replace(/:\$\{[^}]*\}/g, ":80")
+		.replace(/\$\{[^}]*\}/g, "nuwa-tpl-var");
+
+	// 1. 提取内联代码中的显式 scheme:// URL
+	const urlRe =
+		/\b(?:https?|wss?|ftps?|s?ftp|ssh|ldaps?|rediss?|mysql|postgres(?:ql)?|mongodb|socks(?:4a?|5h?)?):\/\/[^\s'"`<>|;&),}\]]+/gi;
+	for (const m of folded.matchAll(urlRe)) {
+		const h = extractUrlHostnameLoose(m[0]);
+		if (h && h !== "nuwa-tpl-var") push(h);
+	}
+
+	// 2. 提取多语言显式网络 API / 连接对象配置中的主机字面量
+	const apiHostPatterns: RegExp[] = [
+		// Python / Ruby / PHP / Perl / Node 函数首参为 host 字符串
+		/\b(?:HTTPConnection|HTTPSConnection|Telnet|FTP|SMTP|IMAP4|POP3|getaddrinfo|gethostbyname|fsockopen|pfsockopen|stream_socket_client)\s*\(\s*['"`](\[[^\]]+\]|[^'"`\s]+)['"`]/g,
+		// Ruby Net::HTTP.get('host', '/path') / Net::HTTP.start('host', 443) / TCPSocket.new('host', 80)
+		/\b(?:Net::HTTP\.(?:get|get_response|start|new|post_form)|TCPSocket\.(?:new|open))\s*\(\s*['"`](\[[^\]]+\]|[^'"`\s]+)['"`]/g,
+		// Node net.connect(port, 'host') / require('net').connect(port, 'host') / tls.connect(port, 'host') / dns.lookup('host')
+		/(?:\b(?:net|tls)|require\s*\(\s*['"`](?:node:)?(?:net|tls)['"`]\s*\))\.(?:connect|createConnection)\s*\(\s*\d+\s*,\s*['"`](\[[^\]]+\]|[^'"`\s]+)['"`]/g,
+		/(?:\bdns|require\s*\(\s*['"`](?:node:)?dns['"`]\s*\))\.(?:lookup|resolve|resolve4|resolve6|resolveAny)\s*\(\s*['"`]([^'"`\s]+)['"`]/g,
+		// Python socket connect(('host', port))
+		/\b(?:create_connection|connect|connect_ex)\s*\(\s*\(\s*['"`](\[[^\]]+\]|[^'"`\s]+)['"`]/g,
+		// JS/TS/Ruby/Perl/Python 关键字或对象字段 host / hostname / PeerAddr / PeerHost
+		/\b(?:hostname|host|PeerAddr|PeerHost)\s*(?::|=>|=)\s*['"`](\[[^\]]+\]|[^'"`\s]+)['"`]/g,
+		// URL 参数传递（包括无 scheme 写法或 curl_init / urlopen / fetch / file_get_contents）
+		/\b(?:urlopen|Request|fetch|curl_init|file_get_contents|URI\.open|URI\.parse)\s*\(\s*['"`]([^'"`\s]+)['"`]/g,
+	];
+	for (const re of apiHostPatterns) {
+		for (const m of folded.matchAll(re)) {
+			const val = m[1];
+			if (!val) continue;
+			if (SCHEME_URL_PREFIX_RE.test(val)) {
+				const h = extractUrlHostnameLoose(val);
+				if (h && h !== "nuwa-tpl-var") push(h);
+				continue;
+			}
+			const cleaned = val.replace(/^(?:tcp|ssl|tls|udp):\/\//i, "");
+			const hostPart = cleaned.startsWith("[")
+				? cleaned.slice(1, cleaned.indexOf("]") > 1 ? cleaned.indexOf("]") : undefined)
+				: cleaned.split("/")[0]!.replace(/:\d{1,5}$/, "");
+			if (parseIpv4(hostPart) !== null || isIpv6Literal(hostPart) || looksLikeDomain(hostPart)) {
+				push(hostPart);
+			}
+		}
+	}
+
+	// 3. 若脚本命中网络模块/函数特征，再扫描引号字面量中的独立域名或 host:port（如 host='api.github.com'）
+	if (INLINE_SCRIPT_NET_HINT_RE.test(folded)) {
+		for (const m of folded.matchAll(/(['"`])([^'"`\r\n]{3,253})\1/g)) {
+			const lit = (m[2] ?? "").trim();
+			if (!lit || /\s/.test(lit)) continue;
+			if (SCHEME_URL_PREFIX_RE.test(lit)) {
+				const h = extractUrlHostnameLoose(lit);
+				if (h && h !== "nuwa-tpl-var") push(h);
+				continue;
+			}
+			// 跳过文件路径、MIME 类型、模块通配符与相对路径
+			if (/^(?:\.{0,2}\/|~\/|\/)/.test(lit)) continue;
+			if (lit.includes("/") && !/^[a-z0-9.-]+(?::\d{1,5})?\/[^\s]*$/i.test(lit)) continue;
+			const hostOnly = lit.split("/")[0]!.replace(/:\d{1,5}$/, "");
+			if (!hostOnly || hostOnly.includes("nuwa-tpl-var")) continue;
+			if (parseIpv4(hostOnly) !== null || looksLikeDomain(hostOnly)) {
+				push(hostOnly);
+			}
+		}
+	}
+
+	return found;
+}
+
+/** 提取命令中的 heredoc 主体文本（如 python3 - <<'EOF' ... EOF），用于内联脚本越界检测。 */
+function extractHeredocBodiesForInterpreters(text: string): string[] {
+	const bodies: string[] = [];
+	const re =
+		/\b(?:python[23]?(?:\.\d+)?|node(?:js)?|bun|ruby\d*|perl\d*|php\d*)\b[^\n]*<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?[^\n]*\n([\s\S]*?)\n\s*\1(?:\s|$)/g;
+	for (const m of text.matchAll(re)) {
+		if (m[2]?.trim()) bodies.push(m[2]);
+	}
+	return bodies;
+}
 
 const NET_CLIENT_CMDS = new Set([
 	"curl",
@@ -812,7 +965,7 @@ function extractBareDomainsFromCommands(rest: string, onCandidate: (domain: stri
 
 		const cmdName = (tokens[idx]!.text.split("/").pop() ?? tokens[idx]!.text).toLowerCase();
 
-		if (INTERPRETER_CMDS.has(cmdName)) {
+		if (isInterpreterCmd(cmdName)) {
 			let sawInlineCode = false;
 			let skippedScriptFile = false;
 			for (let i = idx + 1; i < tokens.length; i++) {
@@ -820,9 +973,31 @@ function extractBareDomainsFromCommands(rest: string, onCandidate: (domain: stri
 				if (tok.afterRedirect) continue;
 				const val = tok.text;
 				if (!val) continue;
-				if (val === "-c" || val === "-e" || val === "-r" || val === "--eval" || val === "--print" || val === "-m") {
+				if (INTERPRETER_INLINE_FLAGS.has(val) || val === "-m") {
 					sawInlineCode = true;
-					i += 1; // 跳过内联代码字符串本身，避免将 Python/JS 属性如 logging.info / myapp.app 误判为域名
+					const codeIdx = nextNonRedirectIndex(tokens, i + 1);
+					if (val !== "-m" && codeIdx < tokens.length) {
+						for (const inlineHost of extractInlineScriptTargets(tokens[codeIdx]!.text)) {
+							onCandidate(inlineHost);
+						}
+					}
+					i = codeIdx; // 跳过内联代码字符串本身，避免将无引号 Python/JS 属性如 logging.info / myapp.app 误判为域名
+					continue;
+				}
+				// 紧贴写法：如 python3 -c"..." / node -e"..." / php -r"..." / node --eval="..."
+				if (val.startsWith("--eval=") || val.startsWith("--print=")) {
+					sawInlineCode = true;
+					const inlineCode = val.slice(val.indexOf("=") + 1);
+					for (const inlineHost of extractInlineScriptTargets(inlineCode)) {
+						onCandidate(inlineHost);
+					}
+					continue;
+				}
+				if (/^-(?:c|e|E|r|p).+/.test(val)) {
+					sawInlineCode = true;
+					for (const inlineHost of extractInlineScriptTargets(val.slice(2))) {
+						onCandidate(inlineHost);
+					}
 					continue;
 				}
 				if (val.startsWith("-")) continue;
@@ -1492,8 +1667,69 @@ export function extractCommandTargets(cmd: string): string[] {
 		if (m[1] && m[1].includes(":")) addTarget(m[1]);
 	}
 
-	// 10. 网络相关命令与脚本外部参数中的裸域名（跳过 -c/-e 内联代码正文及 -o/-D/-oN 等非主机选项值）
+	// 10. 网络相关命令与解释器内联脚本（python -c / node -e / bun -e / ruby -e / perl -e / php -r）外部参数及代码目标提取
 	extractBareDomainsFromCommands(rest, (cand) => addTarget(cand));
+
+	// 10b. 对原始文本再次单独解析解释器内联脚本（确保被步骤 1 抽走完整 URL 后的拼接/API 域名与 heredoc 均被完整覆盖）
+	for (const tokens of parsedSubcmds) {
+		const cmdIdx = findSubcommandIndex(tokens);
+		if (cmdIdx >= tokens.length) continue;
+		const cmdName = (tokens[cmdIdx]!.text.split("/").pop() ?? tokens[cmdIdx]!.text).toLowerCase();
+		if (!isInterpreterCmd(cmdName)) continue;
+		for (let i = cmdIdx + 1; i < tokens.length; i++) {
+			const tok = tokens[i]!;
+			if (tok.afterRedirect) continue;
+			const val = tok.text;
+			if (INTERPRETER_INLINE_FLAGS.has(val)) {
+				const nextIdx = nextNonRedirectIndex(tokens, i + 1);
+				if (nextIdx < tokens.length) {
+					for (const t of extractInlineScriptTargets(tokens[nextIdx]!.text)) {
+						addTarget(t, t.includes("/"));
+					}
+					i = nextIdx;
+				}
+				continue;
+			}
+			if (val.startsWith("--eval=") || val.startsWith("--print=")) {
+				for (const t of extractInlineScriptTargets(val.slice(val.indexOf("=") + 1))) {
+					addTarget(t, t.includes("/"));
+				}
+				continue;
+			}
+			if (/^-(?:c|e|E|r|p).+/.test(val)) {
+				for (const t of extractInlineScriptTargets(val.slice(2))) {
+					addTarget(t, t.includes("/"));
+				}
+			}
+		}
+	}
+	for (const hdBody of extractHeredocBodiesForInterpreters(text)) {
+		for (const t of extractInlineScriptTargets(hdBody)) {
+			addTarget(t, t.includes("/"));
+		}
+	}
+
+	// 10c. 管道喂入解释器（如 echo "import urllib..." | python3 / printf "..." | node）
+	for (let c = 1; c < parsedSubcmds.length; c++) {
+		const curIdx = findSubcommandIndex(parsedSubcmds[c]!);
+		if (curIdx >= parsedSubcmds[c]!.length) continue;
+		const curCmd = (parsedSubcmds[c]![curIdx]!.text.split("/").pop() ?? parsedSubcmds[c]![curIdx]!.text).toLowerCase();
+		if (!isInterpreterCmd(curCmd)) continue;
+		const prevTokens = parsedSubcmds[c - 1]!;
+		const prevIdx = findSubcommandIndex(prevTokens);
+		if (prevIdx >= prevTokens.length) continue;
+		const prevCmd = (prevTokens[prevIdx]!.text.split("/").pop() ?? prevTokens[prevIdx]!.text).toLowerCase();
+		if (prevCmd === "echo" || prevCmd === "printf") {
+			const pipedCode = prevTokens
+				.slice(prevIdx + 1)
+				.filter((t) => !t.afterRedirect)
+				.map((t) => t.text)
+				.join(" ");
+			for (const t of extractInlineScriptTargets(pipedCode)) {
+				addTarget(t, t.includes("/"));
+			}
+		}
+	}
 
 	// 11. 递归检查掩码值中出现的可执行命令替换（如 -d "x=$(curl http://evil.com)"），严防命令替换绕过 N-007
 	for (const sub of embeddedSubCmds) {
@@ -1638,16 +1874,23 @@ export function checkScopeAndRisk(
 	cmd: string,
 	scope: ScopePolicy,
 	mode: Mode | string,
+	opts?: ScopeCheckOptions,
 ): ScopeBlockVerdict | null {
 	const text = String(cmd ?? "");
 	if (!text.trim()) return null;
+	const layer: EnforcementLayer = opts?.layer ?? "shell-guard";
 
 	if (!scope.allowDestructive) {
 		for (const item of DESTRUCTIVE_PATTERNS) {
 			if (item.re.test(text)) {
 				return {
 					block: true,
-					reason: `nuwa N-008: 拦截高危破坏性操作 (${item.label})；mode=${mode} 默认禁止破坏性指令`,
+					layer,
+					reason: formatScopeBlockReason(
+						layer,
+						`拦截高危破坏性操作 (${item.label})；mode=${mode} 默认禁止破坏性指令`,
+						"N-008",
+					),
 				};
 			}
 		}
@@ -1659,7 +1902,12 @@ export function checkScopeAndRisk(
 		if (!res.ok) {
 			return {
 				block: true,
-				reason: `nuwa N-007: 靶标越界 (${target}) — ${res.reason ?? "不在授权 Scope 内"}`,
+				layer,
+				reason: formatScopeBlockReason(
+					layer,
+					`靶标越界 (${target}) — ${res.reason ?? "不在授权 Scope 内"}`,
+					"N-007",
+				),
 			};
 		}
 	}
@@ -1769,6 +2017,7 @@ export function checkToolScopeAndRisk(
 	input: Record<string, unknown> | null | undefined,
 	scope: ScopePolicy,
 	mode: Mode | string = "ctf",
+	opts?: ScopeCheckOptions,
 ): ScopeBlockVerdict | null {
 	const name = String(toolName ?? "").trim().toLowerCase();
 	if (!name) return null;
@@ -1779,10 +2028,11 @@ export function checkToolScopeAndRisk(
 		const cmd = typeof params.command === "string" ? params.command : "";
 		const tamper = checkNuwaDirTamper(cmd);
 		if (tamper) return tamper;
-		return checkScopeAndRisk(cmd, scope, normMode);
+		return checkScopeAndRisk(cmd, scope, normMode, { layer: opts?.layer ?? "shell-guard" });
 	}
 
 	if (name === "read" || name === "read_file" || name === "fetch" || name === "web_fetch") {
+		const layer: EnforcementLayer = opts?.layer ?? "egress-proxy";
 		const rawPath =
 			typeof params.path === "string"
 				? params.path.trim()
@@ -1810,6 +2060,7 @@ export function checkToolScopeAndRisk(
 			) {
 				return {
 					block: true,
+					layer: "shell-guard",
 					reason: "nuwa N-003: 禁止通过 read 工具读取 .nuwa/sessions/vault.json 明文凭据",
 				};
 			}
@@ -1819,14 +2070,20 @@ export function checkToolScopeAndRisk(
 			if (!host) {
 				return {
 					block: true,
-					reason: `nuwa N-007: ${name} URL 非法或缺少有效目标主机 (${rawPath})`,
+					layer,
+					reason: formatScopeBlockReason(layer, `${name} URL 非法或缺少有效目标主机 (${rawPath})`, "N-007"),
 				};
 			}
 			const res = isHostInScope(host, scope);
 			if (!res.ok) {
 				return {
 					block: true,
-					reason: `nuwa N-007: ${name} 远程靶标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+					layer,
+					reason: formatScopeBlockReason(
+						layer,
+						`${name} 远程靶标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+						"N-007",
+					),
 				};
 			}
 		}
@@ -1834,11 +2091,13 @@ export function checkToolScopeAndRisk(
 	}
 
 	if (name === "browser" || name.startsWith("browser_")) {
+		const layer: EnforcementLayer = opts?.layer ?? "egress-proxy";
 		const allowFileAccess = params.allow_file_access === true || params.allowFileAccess === true;
 		if (allowFileAccess && normMode !== "coding") {
 			return {
 				block: true,
-				reason: `nuwa N-008: browser 在 mode=${normMode} 下禁止开启 allow_file_access: true`,
+				layer,
+				reason: formatScopeBlockReason(layer, `browser 在 mode=${normMode} 下禁止开启 allow_file_access: true`, "N-008"),
 			};
 		}
 
@@ -1852,7 +2111,8 @@ export function checkToolScopeAndRisk(
 				if (normMode !== "coding") {
 					return {
 						block: true,
-						reason: `nuwa N-008: browser 在 mode=${normMode} 下禁止访问本地 file:// URL`,
+						layer,
+						reason: formatScopeBlockReason(layer, `browser 在 mode=${normMode} 下禁止访问本地 file:// URL`, "N-008"),
 					};
 				}
 			} else if (/^(?:https?|wss?):\/\//i.test(rawUrl)) {
@@ -1860,20 +2120,27 @@ export function checkToolScopeAndRisk(
 				if (!host) {
 					return {
 						block: true,
-						reason: `nuwa N-007: browser URL 非法或无法解析主机 (${rawUrl})`,
+						layer,
+						reason: formatScopeBlockReason(layer, `browser URL 非法或无法解析主机 (${rawUrl})`, "N-007"),
 					};
 				}
 				const res = isHostInScope(host, browserScope);
 				if (!res.ok) {
 					return {
 						block: true,
-						reason: `nuwa N-007: browser 目标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+						layer,
+						reason: formatScopeBlockReason(
+							layer,
+							`browser 目标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+							"N-007",
+						),
 					};
 				}
 			} else if (/^[a-z][a-z0-9+.-]*:/i.test(rawUrl)) {
 				return {
 					block: true,
-					reason: `nuwa N-007: browser 不受支持的非授权协议 (${rawUrl})`,
+					layer,
+					reason: formatScopeBlockReason(layer, `browser 不受支持的非授权协议 (${rawUrl})`, "N-007"),
 				};
 			} else {
 				const host = parseTargetHost(rawUrl);
@@ -1882,7 +2149,12 @@ export function checkToolScopeAndRisk(
 					if (!res.ok) {
 						return {
 							block: true,
-							reason: `nuwa N-007: browser 目标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+							layer,
+							reason: formatScopeBlockReason(
+								layer,
+								`browser 目标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+								"N-007",
+							),
 						};
 					}
 				}
@@ -1903,7 +2175,8 @@ export function checkToolScopeAndRisk(
 			if (rawDomain === "*" && !(browserScope.allowHosts ?? []).includes("*")) {
 				return {
 					block: true,
-					reason: "nuwa N-007: browser allowed_domains 禁止配置全局通配符 *",
+					layer,
+					reason: formatScopeBlockReason(layer, "browser allowed_domains 禁止配置全局通配符 *", "N-007"),
 				};
 			}
 			const candHost = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawDomain)
@@ -1913,7 +2186,12 @@ export function checkToolScopeAndRisk(
 			if (!res.ok) {
 				return {
 					block: true,
-					reason: `nuwa N-007: browser allowed_domains 越界 (${rawDomain}) — ${res.reason ?? "不在授权 Scope 内"}`,
+					layer,
+					reason: formatScopeBlockReason(
+						layer,
+						`browser allowed_domains 越界 (${rawDomain}) — ${res.reason ?? "不在授权 Scope 内"}`,
+						"N-007",
+					),
 				};
 			}
 		}
@@ -1922,6 +2200,7 @@ export function checkToolScopeAndRisk(
 	}
 
 	if (name === "web_search" || name === "websearch" || name === "google_search") {
+		const layer: EnforcementLayer = opts?.layer ?? "egress-proxy";
 		const isSecurityEvalMode = normMode !== "coding" && normMode !== "ops";
 		if (!isSecurityEvalMode) return null;
 		if ((process.env.NUWA_ALLOW_WEB_SEARCH ?? "").trim() === "1") return null;
@@ -1931,13 +2210,19 @@ export function checkToolScopeAndRisk(
 		if (leak) {
 			return {
 				block: true,
-				reason: `nuwa N-007: web_search 在安全评估模式 (${normMode}) 下禁止外泄目标私网 IP 或内网域名特征 (${leak})；确需开启请设 NUWA_ALLOW_WEB_SEARCH=1`,
+				layer,
+				reason: formatScopeBlockReason(
+					layer,
+					`web_search 在安全评估模式 (${normMode}) 下禁止外泄目标私网 IP 或内网域名特征 (${leak})；确需开启请设 NUWA_ALLOW_WEB_SEARCH=1`,
+					"N-007",
+				),
 			};
 		}
 		return null;
 	}
 
 	if (name === "eval") {
+		const layer: EnforcementLayer = opts?.layer ?? "shell-guard";
 		const code =
 			typeof params.code === "string"
 				? params.code
@@ -1951,24 +2236,23 @@ export function checkToolScopeAndRisk(
 		if (hasNuwaSessionsReference(code)) {
 			return {
 				block: true,
+				layer,
 				reason: "nuwa N-003: 禁止读取或篡改 .nuwa/sessions/vault.json 会话保险箱明文凭据",
 			};
 		}
 
-		// 将模板插值替换为占位标识，既避免 '}' 截断 URL，又能拦截 https://${x}.evil.org 外带并放行纯变量主机
-		const normalizedCode = code
-			.replace(/:\$\{[^}]*\}/g, ":80")
-			.replace(/\$\{[^}]*\}/g, "nuwa-tpl-var");
-
-		for (const m of normalizedCode.matchAll(/\b(?:https?|wss?):\/\/[^\s'"`<>|;&),}\]]+/gi)) {
-			const rawUrl = m[0].replace(/[.,;:!?]+$/, "");
-			const host = parseHostnameFromUrlStrict(rawUrl);
-			if (!host || host === "nuwa-tpl-var") continue;
+		const targets = extractInlineScriptTargets(code);
+		for (const host of targets) {
 			const res = isHostInScope(host, scope);
 			if (!res.ok) {
 				return {
 					block: true,
-					reason: `nuwa N-007: eval 代码内 URL 靶标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+					layer,
+					reason: formatScopeBlockReason(
+						layer,
+						`eval 代码内 URL/主机靶标越界 (${host}) — ${res.reason ?? "不在授权 Scope 内"}`,
+						"N-007",
+					),
 				};
 			}
 		}
@@ -1976,4 +2260,105 @@ export function checkToolScopeAndRisk(
 	}
 
 	return null;
+}
+
+export interface UnifiedNetworkEnvOptions {
+	extraNoProxy?: readonly string[];
+	includeAllProxy?: boolean;
+	ghHttpTimeoutSec?: number;
+}
+
+const VALID_EGRESS_SCHEMES = new Set(["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"]);
+
+function sanitizeEgressProxyUrl(raw: string | null | undefined): string {
+	const s = String(raw ?? "").trim();
+	if (!s) return "";
+	if (/[\r\n\s]/.test(s)) {
+		throw new Error(`非法 egressUrl: 包含空白或换行符 (${JSON.stringify(s)})`);
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(s);
+	} catch {
+		throw new Error(`非法 egressUrl: 无法解析 URL (${JSON.stringify(s)})`);
+	}
+	if (!VALID_EGRESS_SCHEMES.has(parsed.protocol.toLowerCase()) || !parsed.hostname) {
+		throw new Error(`非法 egressUrl 协议或主机: ${JSON.stringify(s)}`);
+	}
+	return s;
+}
+
+/**
+ * 统一跨运行时网络边界环境变量构造器（Issue #48 / NW-28）：
+ * 为 bash/curl/wget/python/node/bun/ruby/perl/php/gh 统一注入 HTTP_PROXY/http_proxy/HTTPS_PROXY/https_proxy/NO_PROXY/no_proxy，
+ * 同步写入 NUWA_SCOPE_ALLOW_HOSTS 与 GH_HTTP_TIMEOUT，避免不同工具层各自走不同代理或无限挂死。
+ */
+export function buildUnifiedNetworkEnv(
+	egressUrl?: string | null,
+	allowedHosts?: readonly string[] | ScopePolicy | null,
+	opts: UnifiedNetworkEnvOptions = {},
+): Record<string, string> {
+	const cleanProxy = sanitizeEgressProxyUrl(egressUrl);
+
+	const rawAllowed = Array.isArray(allowedHosts)
+		? allowedHosts
+		: allowedHosts && typeof allowedHosts === "object" && Array.isArray((allowedHosts as ScopePolicy).allowHosts)
+			? (allowedHosts as ScopePolicy).allowHosts
+			: [];
+	const normalizedAllowed = uniqClean(rawAllowed, true);
+
+	const noProxyItems: string[] = [];
+	const noProxySeen = new Set<string>();
+	const addNoProxy = (item: string) => {
+		const v = String(item ?? "").trim().toLowerCase();
+		if (!v || /[\r\n\s,]/.test(v) || noProxySeen.has(v)) return;
+		noProxySeen.add(v);
+		noProxyItems.push(v);
+	};
+
+	// 本地回环与代理自身宿主始终直连，避免代理循环
+	addNoProxy("127.0.0.1");
+	addNoProxy("localhost");
+	addNoProxy("::1");
+	if (cleanProxy) {
+		try {
+			const proxyHost = normalizeHostToken(new URL(cleanProxy).hostname, false);
+			if (proxyHost && (proxyHost === "host.docker.internal" || isLoopbackHost(proxyHost))) {
+				addNoProxy(proxyHost);
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+	for (const extra of opts.extraNoProxy ?? []) {
+		addNoProxy(extra);
+	}
+
+	const noProxyVal = noProxyItems.join(",");
+	const ghTimeout =
+		typeof opts.ghHttpTimeoutSec === "number" && Number.isFinite(opts.ghHttpTimeoutSec) && opts.ghHttpTimeoutSec > 0
+			? String(Math.floor(opts.ghHttpTimeoutSec))
+			: "5";
+
+	const env: Record<string, string> = {
+		HTTP_PROXY: cleanProxy,
+		http_proxy: cleanProxy,
+		HTTPS_PROXY: cleanProxy,
+		https_proxy: cleanProxy,
+		NO_PROXY: noProxyVal,
+		no_proxy: noProxyVal,
+		GH_HTTP_TIMEOUT: ghTimeout,
+	};
+
+	if (cleanProxy) {
+		env.NUWA_EGRESS_PROXY = cleanProxy;
+		if (opts.includeAllProxy || /^socks/i.test(cleanProxy)) {
+			env.ALL_PROXY = cleanProxy;
+			env.all_proxy = cleanProxy;
+		}
+	}
+	if (normalizedAllowed.length > 0) {
+		env.NUWA_SCOPE_ALLOW_HOSTS = normalizedAllowed.join(",");
+	}
+	return env;
 }

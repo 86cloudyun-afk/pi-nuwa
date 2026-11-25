@@ -10,6 +10,7 @@
  *
  * 约束：严禁运行时 `import "./nuwa"`，保持纯单向无环模块依赖。
  */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	appendFileSync,
@@ -20,6 +21,7 @@ import {
 	openSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	renameSync,
 	statSync,
 	unlinkSync,
@@ -61,8 +63,34 @@ function pointerDirPath(): string {
 	return join(getAgentHome(), "cache/nuwa-current.d");
 }
 
+/** 解析持久化共享状态根目录（迁出 /tmp）：优先 NUWA_STATE_DIR > XDG_STATE_HOME/nuwa > ~/.local/state/nuwa。 */
+export function resolvePersistentStateDir(env: Record<string, string | undefined> = process.env): string {
+	const explicit = env.NUWA_STATE_DIR?.trim();
+	if (explicit) return resolve(explicit);
+	const xdg = env.XDG_STATE_HOME?.trim();
+	if (xdg) return join(resolve(xdg), "nuwa");
+	return join(homedir(), ".local", "state", "nuwa");
+}
+
+/** 解析默认持久化工作区目录（绝不默认落入 /tmp）：优先 NUWA_WORKSPACES_DIR > NUWA_STATE_DIR/workspaces > <agentHome>/workspaces > ~/.local/state/nuwa/workspaces。 */
+export function resolveDefaultWorkspacesDir(env: Record<string, string | undefined> = process.env): string {
+	const explicitWs = env.NUWA_WORKSPACES_DIR?.trim();
+	if (explicitWs) return resolve(explicitWs);
+	const explicitState = env.NUWA_STATE_DIR?.trim();
+	if (explicitState) return join(resolve(explicitState), "workspaces");
+	const envAgentHome = env.PI_AGENT_HOME?.trim();
+	if (envAgentHome) return join(resolve(envAgentHome), "workspaces");
+	return join(resolvePersistentStateDir(env), "workspaces");
+}
+
 function projectsDirPath(): string {
-	return join(getAgentHome(), "cache/nuwa-projects");
+	const explicitState = process.env.NUWA_STATE_DIR?.trim();
+	if (explicitState) return join(resolve(explicitState), "workspaces");
+	// 兼容显式指定 PI_AGENT_HOME（含既有单测与旧缓存目录布局）
+	if (process.env.PI_AGENT_HOME?.trim()) {
+		return join(getAgentHome(), "cache/nuwa-projects");
+	}
+	return join(resolvePersistentStateDir(), "workspaces");
 }
 
 const loggedInvalidAutoCfg = new Set<string>();
@@ -685,7 +713,16 @@ export function isSharedCwd(cwd: string): boolean {
 		.map((s) => s.trim())
 		.filter(Boolean)
 		.map((s) => resolve(s));
-	return [resolve(tmpdir()), resolve(homedir()), resolve("/"), resolve("/data/workspace"), ...extra].includes(r);
+	const sharedRoots = [
+		resolve(tmpdir()),
+		resolve("/tmp"),
+		resolve("/private/tmp"),
+		resolve(homedir()),
+		resolve("/"),
+		resolve("/data/workspace"),
+		...extra,
+	];
+	return sharedRoots.includes(r);
 }
 
 /** 共享根只服务“恰好在该目录”的会话；普通项目根允许会话指针跨 cwd 指向。 */
@@ -988,4 +1025,1305 @@ export function migrateSapper(root: string): NuwaState {
 		}
 	}
 	return st;
+}
+
+// ============================================================================
+// v5.1 运行时守卫扩展：
+//   - Issue #40 (NW-20): ProcessGroupTracker & cleanupTrackedProcesses
+//   - Issue #44 (NW-24): 软暂停状态 setPausedState / isPausedState
+//   - Issue #46 (NW-26): 子代理心跳与超时看门狗 SubagentWatchdog
+//   - Issue #47 (NW-27): /tmp 临时目录告警与工作区完整性校验 verifyWorkspaceIntegrity
+// ============================================================================
+
+export interface TrackedProcessRecord {
+	pid: number;
+	pgid: number;
+	label: string;
+	taskId?: string;
+	command?: string;
+	startedAt: string;
+	startedAtMs: number;
+	procStart?: string | null;
+	ownerPid: number;
+}
+
+export interface TrackProcessInput {
+	pid: number;
+	pgid?: number;
+	label: string;
+	taskId?: string;
+	command?: string;
+}
+
+export interface CleanupProcessOptions {
+	taskId?: string;
+	labels?: string[];
+	graceMs?: number;
+	pollMs?: number;
+	reason?: string;
+	dryRun?: boolean;
+}
+
+export interface CleanedProcessOutcome {
+	pid: number;
+	pgid: number;
+	label: string;
+	taskId?: string;
+	signal: "SIGTERM" | "SIGKILL" | "already_exited" | "skipped_unsafe" | "dry_run";
+	groupKilled: boolean;
+	reason?: string;
+}
+
+export interface CleanupProcessResult {
+	ok: boolean;
+	cleaned: CleanedProcessOutcome[];
+	remaining: TrackedProcessRecord[];
+	skippedUnsafe: number;
+}
+
+interface ProcessTrackerStore {
+	schema: number;
+	updatedAt: string;
+	records: TrackedProcessRecord[];
+}
+
+export function processTrackerPath(root: string): string {
+	return join(stateDir(root), "process-groups.json");
+}
+
+let cachedSelfPgid: number | null | undefined;
+
+/** 探测指定 PID 所属的 POSIX 进程组 PGID；跨 macOS/Linux 兼容。 */
+export function probeProcessGroupId(pid: number): number | null {
+	if (!Number.isInteger(pid) || pid <= 0) return null;
+	// 优先在 Linux 直接读 /proc/<pid>/stat（第 5 字段 pgrp），零子进程开销
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close >= 0) {
+			const fields = stat.slice(close + 2).trim().split(/\s+/);
+			// close 后依次为 state(0), ppid(1), pgrp(2)
+			const pgid = Number(fields[2]);
+			if (Number.isInteger(pgid) && pgid > 0) return pgid;
+		}
+	} catch {
+		/* 非 Linux 或 /proc 不可读，回退 ps */
+	}
+	try {
+		const res = spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], {
+			encoding: "utf8",
+			timeout: 1500,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (res.status === 0) {
+			const pgid = Number(String(res.stdout ?? "").trim());
+			if (Number.isInteger(pgid) && pgid > 0) return pgid;
+		}
+	} catch {
+		/* ps 不可用 */
+	}
+	return null;
+}
+
+function getCurrentProcessPgid(): number | null {
+	if (cachedSelfPgid !== undefined) return cachedSelfPgid;
+	cachedSelfPgid = probeProcessGroupId(process.pid);
+	return cachedSelfPgid;
+}
+
+/** 检测单进程是否存活且非僵尸态（Z/X），避免同步宽限期内未 reap 的子进程误触发 SIGKILL。 */
+export function isProcessAliveNonZombie(pid: number): boolean {
+	if (!pidAlive(pid)) return false;
+	// Linux: 读取 /proc/<pid>/stat state 字段
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close >= 0) {
+			const state = stat.slice(close + 2).trim()[0] ?? "";
+			if (state === "Z" || state === "X") return false;
+			return true;
+		}
+	} catch {
+		/* 非 Linux，回退 ps */
+	}
+	try {
+		const res = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+			encoding: "utf8",
+			timeout: 1500,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (res.status !== 0) return false;
+		const st = String(res.stdout ?? "").trim();
+		if (!st) return false;
+		return !st.startsWith("Z") && !st.startsWith("X");
+	} catch {
+		return pidAlive(pid);
+	}
+}
+
+/** 检测进程组中是否仍有存活（非僵尸）成员。 */
+function isProcessGroupAliveNonZombie(pgid: number, fallbackPid?: number): boolean {
+	if (!Number.isInteger(pgid) || pgid <= 1) {
+		return fallbackPid ? isProcessAliveNonZombie(fallbackPid) : false;
+	}
+	let groupExists = false;
+	try {
+		process.kill(-pgid, 0);
+		groupExists = true;
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException)?.code;
+		if (code === "EPERM") {
+			groupExists = true;
+		} else {
+			groupExists = false;
+		}
+	}
+	if (!groupExists) {
+		return fallbackPid ? isProcessAliveNonZombie(fallbackPid) : false;
+	}
+	// 通过标准 POSIX ps 检查该进程组是否还有非僵尸成员
+	try {
+		const res = spawnSync("ps", ["-axo", "pid=,pgid=,stat="], {
+			encoding: "utf8",
+			timeout: 1500,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (res.status === 0 && typeof res.stdout === "string" && res.stdout.trim()) {
+			const lines = res.stdout.split("\n");
+			for (const line of lines) {
+				const parts = line.trim().split(/\s+/);
+				if (parts.length < 3) continue;
+				const rowPgid = Number(parts[1]);
+				const rowStat = parts[2] ?? "";
+				if (rowPgid === pgid && rowStat && !rowStat.startsWith("Z") && !rowStat.startsWith("X")) {
+					return true;
+				}
+			}
+			return false;
+		}
+	} catch {
+		/* ps 失败时回退到 fallbackPid 判定 */
+	}
+	return fallbackPid ? isProcessAliveNonZombie(fallbackPid) : true;
+}
+
+function isSafeTargetPid(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 1) return false;
+	if (pid === process.pid || pid === process.ppid) return false;
+	return true;
+}
+
+function isSafeTargetPgid(pgid: number): boolean {
+	if (!Number.isInteger(pgid) || pgid <= 1) return false;
+	if (pgid === process.pid || pgid === process.ppid) return false;
+	const selfPgid = getCurrentProcessPgid();
+	if (selfPgid !== null && pgid === selfPgid) return false;
+	return true;
+}
+
+function isSameProcessInstance(rec: TrackedProcessRecord): boolean {
+	if (!rec.procStart) return true;
+	const curStart = procStartTime(rec.pid);
+	if (!curStart) return true;
+	return curStart === rec.procStart;
+}
+
+function sendSignalSafe(
+	rec: TrackedProcessRecord,
+	signal: "SIGTERM" | "SIGKILL",
+): { sent: boolean; groupKilled: boolean; unsafeReason?: string } {
+	if (!isSafeTargetPid(rec.pid)) {
+		return { sent: false, groupKilled: false, unsafeReason: `拒绝向受保护或非法 PID(${rec.pid}) 发送信号` };
+	}
+	if (!isSameProcessInstance(rec)) {
+		return { sent: false, groupKilled: false, unsafeReason: `PID(${rec.pid}) 启动时间已变化，疑似 PID 复用，跳过清理` };
+	}
+	const canKillGroup = isSafeTargetPgid(rec.pgid);
+	if (canKillGroup) {
+		try {
+			process.kill(-rec.pgid, signal);
+			return { sent: true, groupKilled: true };
+		} catch (err) {
+			const code = (err as NodeJS.ErrnoException)?.code;
+			if (code === "ESRCH") {
+				// 进程组已退出，尝试确认单 PID（以防成员脱离原组）
+				try {
+					process.kill(rec.pid, signal);
+					return { sent: true, groupKilled: false };
+				} catch {
+					return { sent: false, groupKilled: true };
+				}
+			}
+			// EPERM 等回退单进程
+		}
+	}
+	try {
+		process.kill(rec.pid, signal);
+		return { sent: true, groupKilled: false };
+	} catch {
+		return { sent: false, groupKilled: false };
+	}
+}
+
+/**
+ * 进程组登记簿（Issue #40 / NW-20）：
+ * 持久化记录派生子进程 PID/PGID 及标签（如 chromeproxy/chromium/subagent），
+ * 在任务取消、nuwa_stop 与退出信号时按 -pgid 执行 SIGTERM -> 宽限期 -> SIGKILL 级联回收。
+ * 安全红线：严禁向 <= 1、当前进程 PID/PPID 或当前进程 PGID 发送任何信号。
+ */
+export class ProcessGroupTracker {
+	readonly root: string;
+
+	constructor(root: string) {
+		this.root = resolve(root);
+	}
+
+	filePath(): string {
+		return processTrackerPath(this.root);
+	}
+
+	private readStore(): ProcessTrackerStore {
+		const raw = readJson<ProcessTrackerStore>(this.filePath());
+		if (raw && Array.isArray(raw.records)) {
+			return raw;
+		}
+		return { schema: 1, updatedAt: nowIso(), records: [] };
+	}
+
+	private writeStore(records: TrackedProcessRecord[]): void {
+		const payload: ProcessTrackerStore = {
+			schema: 1,
+			updatedAt: nowIso(),
+			records,
+		};
+		atomicWrite(this.filePath(), JSON.stringify(payload, null, 2));
+	}
+
+	register(input: TrackProcessInput): TrackedProcessRecord {
+		const pid = Number(input.pid);
+		if (!Number.isInteger(pid) || pid <= 1) {
+			throw new Error(`非法子进程 PID: ${String(input.pid)}（必须为大于 1 的正整数）`);
+		}
+		if (pid === process.pid || pid === process.ppid) {
+			throw new Error(`禁止将当前宿主进程或父进程 (${pid}) 登记为可清理子进程`);
+		}
+		const probedPgid = probeProcessGroupId(pid);
+		const explicitPgid = Number.isInteger(input.pgid) && (input.pgid as number) > 1 ? (input.pgid as number) : null;
+		const pgid = explicitPgid ?? probedPgid ?? pid;
+		const nowMs = Date.now();
+		const rec: TrackedProcessRecord = {
+			pid,
+			pgid,
+			label: normOneLine(input.label || "child", 64) || "child",
+			...(input.taskId ? { taskId: normOneLine(input.taskId, 96) } : {}),
+			...(input.command ? { command: normOneLine(input.command, 200) } : {}),
+			startedAt: new Date(nowMs).toISOString(),
+			startedAtMs: nowMs,
+			procStart: procStartTime(pid),
+			ownerPid: process.pid,
+		};
+		withLock(this.root, () => {
+			const store = this.readStore();
+			const filtered = store.records.filter((r) => r.pid !== pid);
+			filtered.push(rec);
+			this.writeStore(filtered);
+		});
+		logEvent(this.root, {
+			type: "process_tracked",
+			pid: rec.pid,
+			pgid: rec.pgid,
+			label: rec.label,
+			...(rec.taskId ? { taskId: rec.taskId } : {}),
+		});
+		return rec;
+	}
+
+	unregister(pid: number): boolean {
+		if (!existsSync(this.filePath())) return false;
+		let removed = false;
+		withLock(this.root, () => {
+			const store = this.readStore();
+			const next = store.records.filter((r) => r.pid !== pid);
+			removed = next.length !== store.records.length;
+			if (removed) {
+				this.writeStore(next);
+			}
+		});
+		return removed;
+	}
+
+	list(opts?: { aliveOnly?: boolean; taskId?: string; labels?: string[] }): TrackedProcessRecord[] {
+		const store = this.readStore();
+		const labelSet = opts?.labels && opts.labels.length > 0 ? new Set(opts.labels.map((s) => s.toLowerCase())) : null;
+		return store.records.filter((r) => {
+			if (opts?.taskId && r.taskId !== opts.taskId) return false;
+			if (labelSet && !labelSet.has(r.label.toLowerCase())) return false;
+			if (opts?.aliveOnly) {
+				const alive = isSafeTargetPgid(r.pgid)
+					? isProcessGroupAliveNonZombie(r.pgid, r.pid)
+					: isProcessAliveNonZombie(r.pid);
+				if (!alive) return false;
+			}
+			return true;
+		});
+	}
+
+	pruneDead(): number {
+		if (!existsSync(this.filePath())) return 0;
+		let pruned = 0;
+		withLock(this.root, () => {
+			const store = this.readStore();
+			const alive: TrackedProcessRecord[] = [];
+			for (const r of store.records) {
+				const stillAlive = isSafeTargetPgid(r.pgid)
+					? isProcessGroupAliveNonZombie(r.pgid, r.pid)
+					: isProcessAliveNonZombie(r.pid);
+				if (stillAlive) alive.push(r);
+				else pruned += 1;
+			}
+			if (pruned > 0) this.writeStore(alive);
+		});
+		return pruned;
+	}
+
+	cleanup(opts: CleanupProcessOptions = {}): CleanupProcessResult {
+		if (!existsSync(this.filePath())) {
+			return { ok: true, cleaned: [], remaining: [], skippedUnsafe: 0 };
+		}
+		const graceMs =
+			typeof opts.graceMs === "number" && Number.isFinite(opts.graceMs) && opts.graceMs >= 0
+				? Math.min(30_000, Math.floor(opts.graceMs))
+				: 1500;
+		const pollMs =
+			typeof opts.pollMs === "number" && Number.isFinite(opts.pollMs) && opts.pollMs >= 5
+				? Math.min(500, Math.floor(opts.pollMs))
+				: 30;
+		const labelSet = opts.labels && opts.labels.length > 0 ? new Set(opts.labels.map((s) => s.toLowerCase())) : null;
+
+		const store = this.readStore();
+		const targets: TrackedProcessRecord[] = [];
+		const untouched: TrackedProcessRecord[] = [];
+
+		for (const rec of store.records) {
+			const matchTask = !opts.taskId || rec.taskId === opts.taskId;
+			const matchLabel = !labelSet || labelSet.has(rec.label.toLowerCase());
+			if (matchTask && matchLabel) {
+				targets.push(rec);
+			} else {
+				untouched.push(rec);
+			}
+		}
+
+		const outcomes: CleanedProcessOutcome[] = [];
+		let skippedUnsafe = 0;
+
+		if (opts.dryRun) {
+			for (const rec of targets) {
+				if (!isSafeTargetPid(rec.pid) || !isSameProcessInstance(rec)) {
+					skippedUnsafe += 1;
+					outcomes.push({
+						pid: rec.pid,
+						pgid: rec.pgid,
+						label: rec.label,
+						taskId: rec.taskId,
+						signal: "skipped_unsafe",
+						groupKilled: false,
+						reason: "受保护进程或 PID 复用",
+					});
+					continue;
+				}
+				outcomes.push({
+					pid: rec.pid,
+					pgid: rec.pgid,
+					label: rec.label,
+					taskId: rec.taskId,
+					signal: "dry_run",
+					groupKilled: isSafeTargetPgid(rec.pgid),
+				});
+			}
+			return { ok: true, cleaned: outcomes, remaining: store.records, skippedUnsafe };
+		}
+
+		const pendingTerm: Array<{ rec: TrackedProcessRecord; groupKilled: boolean }> = [];
+
+		for (const rec of targets) {
+			if (!isSafeTargetPid(rec.pid)) {
+				skippedUnsafe += 1;
+				outcomes.push({
+					pid: rec.pid,
+					pgid: rec.pgid,
+					label: rec.label,
+					taskId: rec.taskId,
+					signal: "skipped_unsafe",
+					groupKilled: false,
+					reason: `禁止向非法或宿主 PID(${rec.pid}) 发送信号`,
+				});
+				continue;
+			}
+			if (!isSameProcessInstance(rec)) {
+				skippedUnsafe += 1;
+				outcomes.push({
+					pid: rec.pid,
+					pgid: rec.pgid,
+					label: rec.label,
+					taskId: rec.taskId,
+					signal: "skipped_unsafe",
+					groupKilled: false,
+					reason: `PID(${rec.pid}) 启动时间已变，跳过防误杀`,
+				});
+				continue;
+			}
+			const alive = isSafeTargetPgid(rec.pgid)
+				? isProcessGroupAliveNonZombie(rec.pgid, rec.pid)
+				: isProcessAliveNonZombie(rec.pid);
+			if (!alive) {
+				outcomes.push({
+					pid: rec.pid,
+					pgid: rec.pgid,
+					label: rec.label,
+					taskId: rec.taskId,
+					signal: "already_exited",
+					groupKilled: false,
+				});
+				continue;
+			}
+			const termRes = sendSignalSafe(rec, "SIGTERM");
+			if (!termRes.sent) {
+				if (termRes.unsafeReason) {
+					skippedUnsafe += 1;
+					outcomes.push({
+						pid: rec.pid,
+						pgid: rec.pgid,
+						label: rec.label,
+						taskId: rec.taskId,
+						signal: "skipped_unsafe",
+						groupKilled: false,
+						reason: termRes.unsafeReason,
+					});
+				} else {
+					outcomes.push({
+						pid: rec.pid,
+						pgid: rec.pgid,
+						label: rec.label,
+						taskId: rec.taskId,
+						signal: "already_exited",
+						groupKilled: termRes.groupKilled,
+					});
+				}
+				continue;
+			}
+			pendingTerm.push({ rec, groupKilled: termRes.groupKilled });
+		}
+
+		// 宽限期轮询：已退出的进程立即结算为 SIGTERM，超时仍存活者升级 SIGKILL
+		const stillPending = new Set(pendingTerm);
+		const deadline = Date.now() + graceMs;
+		while (stillPending.size > 0) {
+			for (const item of [...stillPending]) {
+				const alive = item.groupKilled
+					? isProcessGroupAliveNonZombie(item.rec.pgid, item.rec.pid)
+					: isProcessAliveNonZombie(item.rec.pid);
+				if (!alive) {
+					outcomes.push({
+						pid: item.rec.pid,
+						pgid: item.rec.pgid,
+						label: item.rec.label,
+						taskId: item.rec.taskId,
+						signal: "SIGTERM",
+						groupKilled: item.groupKilled,
+					});
+					stillPending.delete(item);
+				}
+			}
+			if (stillPending.size === 0 || Date.now() >= deadline) break;
+			const waitMs = Math.min(pollMs, Math.max(1, deadline - Date.now()));
+			sleepSync(waitMs);
+		}
+
+		// 宽限期满仍存活的进程组升级 SIGKILL 强杀
+		for (const item of stillPending) {
+			const killRes = sendSignalSafe(item.rec, "SIGKILL");
+			outcomes.push({
+				pid: item.rec.pid,
+				pgid: item.rec.pgid,
+				label: item.rec.label,
+				taskId: item.rec.taskId,
+				signal: "SIGKILL",
+				groupKilled: killRes.groupKilled || item.groupKilled,
+			});
+		}
+
+		// 写回剩余未匹配的活跃进程
+		if (existsSync(stateDir(this.root))) {
+			try {
+				withLock(this.root, () => {
+					const latest = this.readStore();
+					const handledPids = new Set(targets.map((t) => t.pid));
+					const nextRecords = latest.records.filter((r) => !handledPids.has(r.pid));
+					this.writeStore(nextRecords);
+				});
+			} catch {
+				/* 清理阶段写回失败不掩盖结果 */
+			}
+			if (outcomes.length > 0) {
+				logEvent(this.root, {
+					type: "process_group_cleanup",
+					reason: opts.reason ?? "cleanup",
+					...(opts.taskId ? { taskId: opts.taskId } : {}),
+					cleanedCount: outcomes.length,
+					skippedUnsafe,
+					sigkillCount: outcomes.filter((o) => o.signal === "SIGKILL").length,
+				});
+			}
+		}
+
+		const remaining = existsSync(this.filePath()) ? this.readStore().records : untouched;
+		return {
+			ok: true,
+			cleaned: outcomes,
+			remaining,
+			skippedUnsafe,
+		};
+	}
+}
+
+/** 便捷入口：按 -pgid 执行 SIGTERM -> 宽限期 -> SIGKILL 级联回收指定项目的登记子进程。 */
+export function cleanupTrackedProcesses(root: string, opts: CleanupProcessOptions = {}): CleanupProcessResult {
+	return new ProcessGroupTracker(root).cleanup(opts);
+}
+
+/** 为 SIGINT / SIGTERM / SIGHUP 安装进程组回收钩子，返回卸载函数。 */
+export function installProcessCleanupHooks(
+	root: string,
+	opts?: {
+		graceMs?: number;
+		signals?: NodeJS.Signals[];
+		onCleaned?: (sig: NodeJS.Signals, res: CleanupProcessResult) => void;
+	},
+): () => void {
+	const signals: NodeJS.Signals[] = opts?.signals ?? ["SIGINT", "SIGTERM", "SIGHUP"];
+	const handlers = new Map<NodeJS.Signals, () => void>();
+	for (const sig of signals) {
+		const fn = () => {
+			const res = cleanupTrackedProcesses(root, {
+				graceMs: opts?.graceMs ?? 500,
+				reason: `signal:${sig}`,
+			});
+			opts?.onCleaned?.(sig, res);
+		};
+		handlers.set(sig, fn);
+		process.on(sig, fn);
+	}
+	return () => {
+		for (const [sig, fn] of handlers) {
+			process.off(sig, fn);
+		}
+		handlers.clear();
+	};
+}
+
+// ----------------------------------------------------------------------------
+// Issue #44 (NW-24): 软暂停状态读写 setPausedState / isPausedState
+// ----------------------------------------------------------------------------
+
+export interface PausedState {
+	paused: boolean;
+	reason: string;
+	updatedAt: string;
+	pausedAt?: string;
+	resumedAt?: string;
+	pid?: number;
+}
+
+export function pausedStatePath(root: string): string {
+	return join(stateDir(root), "paused.json");
+}
+
+export function readPausedState(root: string): PausedState | null {
+	const rec = readJson<PausedState>(pausedStatePath(root));
+	if (!rec || typeof rec.paused !== "boolean") return null;
+	return rec;
+}
+
+/** 写入软暂停或恢复标记（供 nuwa_stop 软暂停与 bin/nuwa-autonomous 优雅挂起/即时恢复共享）。 */
+export function setPausedState(root: string, paused: boolean, reason = ""): PausedState {
+	const cleanReason = normOneLine(reason || (paused ? "manual pause" : "manual resume"), 240);
+	const ts = nowIso();
+	const state = withLock(root, () => {
+		const prev = readPausedState(root);
+		const next: PausedState = {
+			paused: Boolean(paused),
+			reason: cleanReason,
+			updatedAt: ts,
+			...(paused
+				? { pausedAt: ts, ...(prev?.resumedAt ? { resumedAt: prev.resumedAt } : {}) }
+				: { ...(prev?.pausedAt ? { pausedAt: prev.pausedAt } : {}), resumedAt: ts }),
+			pid: process.pid,
+		};
+		atomicWrite(pausedStatePath(root), JSON.stringify(next, null, 2));
+		return next;
+	});
+	logEvent(root, {
+		type: paused ? "pause_enabled" : "pause_resumed",
+		paused: state.paused,
+		reason: state.reason,
+	});
+	return state;
+}
+
+/** 纯只读检查项目当前是否处于软暂停挂起状态。 */
+export function isPausedState(root: string): boolean {
+	try {
+		const rec = readPausedState(root);
+		return rec?.paused === true;
+	} catch {
+		return false;
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Issue #46 (NW-26): 子代理心跳与超时看门狗 SubagentWatchdog
+// ----------------------------------------------------------------------------
+
+export const DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS = 300_000; // 300s 无输出空闲阈值
+export const DEFAULT_SUBAGENT_HARD_TIMEOUT_MS = 900_000; // 900s 单任务硬超时
+export const DEFAULT_SUBAGENT_MAX_CONCURRENCY = 4;
+
+export type SubagentTaskStatus = "running" | "completed" | "failed" | "timeout" | "cancelled";
+
+export interface SubagentWatchdogEntry {
+	taskId: string;
+	agent: string;
+	intentId?: string;
+	pid?: number;
+	pgid?: number;
+	status: SubagentTaskStatus;
+	startedAt: number;
+	lastReqAt: number;
+	lastOutputAt: number;
+	endedAt?: number;
+	idleTimeoutMs: number;
+	hardTimeoutMs: number;
+	timeoutKind?: "idle_no_output" | "hard_timeout";
+	timeoutReason?: string;
+}
+
+export interface SubagentWatchdogConfig {
+	idleTimeoutMs?: number;
+	hardTimeoutMs?: number;
+	maxConcurrency?: number;
+	cleanupGraceMs?: number;
+}
+
+export interface StartSubagentTaskInput {
+	taskId: string;
+	agent?: string;
+	intentId?: string;
+	pid?: number;
+	pgid?: number;
+	label?: string;
+	command?: string;
+	nowMs?: number;
+	idleTimeoutMs?: number;
+	hardTimeoutMs?: number;
+}
+
+export interface WatchdogTimeoutEvent {
+	taskId: string;
+	agent: string;
+	intentId?: string;
+	timeoutKind: "idle_no_output" | "hard_timeout";
+	reason: string;
+	idleMs: number;
+	elapsedMs: number;
+	cleanup: CleanupProcessResult;
+}
+
+export interface WatchdogSweepResult {
+	checkedAt: number;
+	timedOut: WatchdogTimeoutEvent[];
+	runningCount: number;
+	availableSlots: number;
+}
+
+interface WatchdogStore {
+	schema: number;
+	updatedAt: string;
+	tasks: Record<string, SubagentWatchdogEntry>;
+}
+
+export function subagentWatchdogPath(root: string): string {
+	return join(stateDir(root), "subagent-watchdog.json");
+}
+
+function readWatchdogMsFromEnv(msKey: string, secKey: string, fallbackMs: number): number {
+	const msRaw = process.env[msKey]?.trim();
+	if (msRaw) {
+		const n = Number(msRaw);
+		if (Number.isFinite(n) && n > 0) return Math.floor(n);
+	}
+	const secRaw = process.env[secKey]?.trim();
+	if (secRaw) {
+		const n = Number(secRaw);
+		if (Number.isFinite(n) && n > 0) return Math.floor(n * 1000);
+	}
+	return fallbackMs;
+}
+
+/**
+ * 子代理心跳与超时看门狗（Issue #46 / NW-26）：
+ * 持久化追踪运行中子代理任务的 startedAt / lastReqAt / lastOutputAt；
+ * 超过无输出空闲阈值（默认 300s）或单任务硬超时（默认 900s）时主动触发终止（联动 ProcessGroupTracker），
+ * 将任务标为 timeout 并释放并发槽位。
+ */
+export class SubagentWatchdog {
+	readonly root: string;
+	readonly idleTimeoutMs: number;
+	readonly hardTimeoutMs: number;
+	readonly maxConcurrency: number;
+	readonly cleanupGraceMs: number;
+	readonly tracker: ProcessGroupTracker;
+
+	constructor(root: string, config: SubagentWatchdogConfig = {}) {
+		this.root = resolve(root);
+		this.idleTimeoutMs =
+			typeof config.idleTimeoutMs === "number" && Number.isFinite(config.idleTimeoutMs) && config.idleTimeoutMs > 0
+				? Math.floor(config.idleTimeoutMs)
+				: readWatchdogMsFromEnv("NUWA_SUBAGENT_IDLE_TIMEOUT_MS", "NUWA_SUBAGENT_IDLE_TIMEOUT_S", DEFAULT_SUBAGENT_IDLE_TIMEOUT_MS);
+		this.hardTimeoutMs =
+			typeof config.hardTimeoutMs === "number" && Number.isFinite(config.hardTimeoutMs) && config.hardTimeoutMs > 0
+				? Math.floor(config.hardTimeoutMs)
+				: readWatchdogMsFromEnv("NUWA_SUBAGENT_HARD_TIMEOUT_MS", "NUWA_SUBAGENT_HARD_TIMEOUT_S", DEFAULT_SUBAGENT_HARD_TIMEOUT_MS);
+		const envConc = Number(process.env.NUWA_SUBAGENT_MAX_CONCURRENCY ?? DEFAULT_SUBAGENT_MAX_CONCURRENCY);
+		this.maxConcurrency =
+			typeof config.maxConcurrency === "number" && Number.isFinite(config.maxConcurrency) && config.maxConcurrency >= 1
+				? Math.floor(config.maxConcurrency)
+				: Number.isFinite(envConc) && envConc >= 1
+					? Math.floor(envConc)
+					: DEFAULT_SUBAGENT_MAX_CONCURRENCY;
+		this.cleanupGraceMs =
+			typeof config.cleanupGraceMs === "number" && Number.isFinite(config.cleanupGraceMs) && config.cleanupGraceMs >= 0
+				? Math.floor(config.cleanupGraceMs)
+				: 1500;
+		this.tracker = new ProcessGroupTracker(this.root);
+	}
+
+	filePath(): string {
+		return subagentWatchdogPath(this.root);
+	}
+
+	private readStore(): WatchdogStore {
+		const raw = readJson<WatchdogStore>(this.filePath());
+		if (raw && raw.tasks && typeof raw.tasks === "object") {
+			return raw;
+		}
+		return { schema: 1, updatedAt: nowIso(), tasks: {} };
+	}
+
+	private writeStore(tasks: Record<string, SubagentWatchdogEntry>): void {
+		const payload: WatchdogStore = {
+			schema: 1,
+			updatedAt: nowIso(),
+			tasks,
+		};
+		atomicWrite(this.filePath(), JSON.stringify(payload, null, 2));
+	}
+
+	startTask(input: StartSubagentTaskInput): SubagentWatchdogEntry {
+		const taskId = normOneLine(input.taskId, 96);
+		if (!taskId) throw new Error("taskId 不能为空");
+		const nowMs = typeof input.nowMs === "number" && Number.isFinite(input.nowMs) ? Math.floor(input.nowMs) : Date.now();
+		const idleTimeoutMs =
+			typeof input.idleTimeoutMs === "number" && Number.isFinite(input.idleTimeoutMs) && input.idleTimeoutMs > 0
+				? Math.floor(input.idleTimeoutMs)
+				: this.idleTimeoutMs;
+		const hardTimeoutMs =
+			typeof input.hardTimeoutMs === "number" && Number.isFinite(input.hardTimeoutMs) && input.hardTimeoutMs > 0
+				? Math.floor(input.hardTimeoutMs)
+				: this.hardTimeoutMs;
+
+		let trackedPgid = input.pgid;
+		if (typeof input.pid === "number" && Number.isInteger(input.pid) && input.pid > 1) {
+			const rec = this.tracker.register({
+				pid: input.pid,
+				pgid: input.pgid,
+				label: input.label ?? input.agent ?? "subagent",
+				taskId,
+				command: input.command,
+			});
+			trackedPgid = rec.pgid;
+		}
+
+		const entry: SubagentWatchdogEntry = {
+			taskId,
+			agent: normOneLine(input.agent ?? "subagent", 64) || "subagent",
+			...(input.intentId ? { intentId: normOneLine(input.intentId, 64) } : {}),
+			...(typeof input.pid === "number" ? { pid: input.pid } : {}),
+			...(typeof trackedPgid === "number" ? { pgid: trackedPgid } : {}),
+			status: "running",
+			startedAt: nowMs,
+			lastReqAt: nowMs,
+			lastOutputAt: nowMs,
+			idleTimeoutMs,
+			hardTimeoutMs,
+		};
+
+		withLock(this.root, () => {
+			const store = this.readStore();
+			store.tasks[taskId] = entry;
+			this.writeStore(store.tasks);
+		});
+		logEvent(this.root, {
+			type: "subagent_started",
+			taskId: entry.taskId,
+			agent: entry.agent,
+			...(entry.intentId ? { intentId: entry.intentId } : {}),
+			...(entry.pid ? { pid: entry.pid, pgid: entry.pgid } : {}),
+			idleTimeoutMs: entry.idleTimeoutMs,
+			hardTimeoutMs: entry.hardTimeoutMs,
+		});
+		return entry;
+	}
+
+	heartbeat(
+		taskId: string,
+		opts?: { reqAt?: number; outputAt?: number; hasOutput?: boolean; nowMs?: number },
+	): SubagentWatchdogEntry | null {
+		if (!existsSync(this.filePath())) return null;
+		const nowMs = typeof opts?.nowMs === "number" && Number.isFinite(opts.nowMs) ? Math.floor(opts.nowMs) : Date.now();
+		return withLock(this.root, () => {
+			const store = this.readStore();
+			const entry = store.tasks[taskId];
+			if (!entry || entry.status !== "running") return null;
+			const reqAt = typeof opts?.reqAt === "number" && Number.isFinite(opts.reqAt) ? Math.floor(opts.reqAt) : nowMs;
+			entry.lastReqAt = Math.max(entry.lastReqAt, reqAt);
+			if (typeof opts?.outputAt === "number" && Number.isFinite(opts.outputAt)) {
+				entry.lastOutputAt = Math.max(entry.lastOutputAt, Math.floor(opts.outputAt));
+			} else if (opts?.hasOutput !== false) {
+				entry.lastOutputAt = Math.max(entry.lastOutputAt, nowMs);
+			}
+			store.tasks[taskId] = entry;
+			this.writeStore(store.tasks);
+			return entry;
+		});
+	}
+
+	recordRequest(taskId: string, nowMs = Date.now()): SubagentWatchdogEntry | null {
+		return this.heartbeat(taskId, { reqAt: nowMs, hasOutput: false, nowMs });
+	}
+
+	recordOutput(taskId: string, nowMs = Date.now()): SubagentWatchdogEntry | null {
+		return this.heartbeat(taskId, { reqAt: nowMs, outputAt: nowMs, hasOutput: true, nowMs });
+	}
+
+	completeTask(
+		taskId: string,
+		status: "completed" | "failed" | "cancelled" = "completed",
+		nowMs = Date.now(),
+		opts?: { cleanupProcesses?: boolean; graceMs?: number },
+	): SubagentWatchdogEntry | null {
+		if (!existsSync(this.filePath())) return null;
+		const updated = withLock(this.root, () => {
+			const store = this.readStore();
+			const entry = store.tasks[taskId];
+			if (!entry) return null;
+			entry.status = status;
+			entry.endedAt = nowMs;
+			store.tasks[taskId] = entry;
+			this.writeStore(store.tasks);
+			return entry;
+		});
+		if (!updated) return null;
+		if (opts?.cleanupProcesses !== false && (status === "cancelled" || this.tracker.list({ taskId }).length > 0)) {
+			this.tracker.cleanup({
+				taskId,
+				graceMs: opts?.graceMs ?? this.cleanupGraceMs,
+				reason: `subagent_${status}:${taskId}`,
+			});
+		}
+		return updated;
+	}
+
+	getTask(taskId: string): SubagentWatchdogEntry | null {
+		const store = this.readStore();
+		return store.tasks[taskId] ?? null;
+	}
+
+	listTasks(filter?: { status?: SubagentTaskStatus }): SubagentWatchdogEntry[] {
+		const store = this.readStore();
+		const all = Object.values(store.tasks);
+		if (!filter?.status) return all;
+		return all.filter((t) => t.status === filter.status);
+	}
+
+	activeCount(): number {
+		return this.listTasks({ status: "running" }).length;
+	}
+
+	availableSlots(): number {
+		return Math.max(0, this.maxConcurrency - this.activeCount());
+	}
+
+	/** 巡检运行中任务：触发无输出空闲超时或单任务硬超时即联动 ProcessGroupTracker 终止并标为 timeout，释放并发槽位。 */
+	checkTimeouts(nowMs = Date.now(), opts?: { graceMs?: number; dryRun?: boolean }): WatchdogSweepResult {
+		const store = this.readStore();
+		const timedOut: WatchdogTimeoutEvent[] = [];
+		const graceMs =
+			typeof opts?.graceMs === "number" && Number.isFinite(opts.graceMs) && opts.graceMs >= 0
+				? Math.floor(opts.graceMs)
+				: this.cleanupGraceMs;
+
+		const candidates: Array<{
+			entry: SubagentWatchdogEntry;
+			timeoutKind: "idle_no_output" | "hard_timeout";
+			reason: string;
+			idleMs: number;
+			elapsedMs: number;
+		}> = [];
+
+		for (const entry of Object.values(store.tasks)) {
+			if (entry.status !== "running") continue;
+			const elapsedMs = Math.max(0, nowMs - entry.startedAt);
+			const idleMs = Math.max(0, nowMs - entry.lastOutputAt);
+			if (elapsedMs >= entry.hardTimeoutMs) {
+				candidates.push({
+					entry,
+					timeoutKind: "hard_timeout",
+					reason: `子代理任务 ${entry.taskId} (${entry.agent}) 触发单任务硬超时 (${Math.round(elapsedMs / 1000)}s >= ${Math.round(entry.hardTimeoutMs / 1000)}s)`,
+					idleMs,
+					elapsedMs,
+				});
+			} else if (idleMs >= entry.idleTimeoutMs) {
+				candidates.push({
+					entry,
+					timeoutKind: "idle_no_output",
+					reason: `子代理任务 ${entry.taskId} (${entry.agent}) 触发无输出空闲超时 (${Math.round(idleMs / 1000)}s >= ${Math.round(entry.idleTimeoutMs / 1000)}s)`,
+					idleMs,
+					elapsedMs,
+				});
+			}
+		}
+
+		for (const c of candidates) {
+			const cleanup = this.tracker.cleanup({
+				taskId: c.entry.taskId,
+				graceMs,
+				reason: `watchdog:${c.timeoutKind}:${c.entry.taskId}`,
+				dryRun: opts?.dryRun,
+			});
+			timedOut.push({
+				taskId: c.entry.taskId,
+				agent: c.entry.agent,
+				intentId: c.entry.intentId,
+				timeoutKind: c.timeoutKind,
+				reason: c.reason,
+				idleMs: c.idleMs,
+				elapsedMs: c.elapsedMs,
+				cleanup,
+			});
+		}
+
+		if (candidates.length > 0 && !opts?.dryRun) {
+			withLock(this.root, () => {
+				const latest = this.readStore();
+				for (const c of candidates) {
+					const cur = latest.tasks[c.entry.taskId];
+					if (!cur || cur.status !== "running") continue;
+					cur.status = "timeout";
+					cur.endedAt = nowMs;
+					cur.timeoutKind = c.timeoutKind;
+					cur.timeoutReason = c.reason;
+					latest.tasks[c.entry.taskId] = cur;
+				}
+				this.writeStore(latest.tasks);
+			});
+			for (const ev of timedOut) {
+				logEvent(this.root, {
+					type: "subagent_timeout",
+					taskId: ev.taskId,
+					agent: ev.agent,
+					...(ev.intentId ? { intentId: ev.intentId } : {}),
+					timeoutKind: ev.timeoutKind,
+					idleMs: ev.idleMs,
+					elapsedMs: ev.elapsedMs,
+					reason: ev.reason,
+					cleanedProcesses: ev.cleanup.cleaned.length,
+				});
+			}
+		}
+
+		const runningCount = this.activeCount();
+		return {
+			checkedAt: nowMs,
+			timedOut,
+			runningCount,
+			availableSlots: Math.max(0, this.maxConcurrency - runningCount),
+		};
+	}
+
+	startPolling(intervalMs = 5000, onTimeout?: (res: WatchdogSweepResult) => void): () => void {
+		const ms = Math.max(50, Math.floor(intervalMs));
+		const timer = setInterval(() => {
+			try {
+				const res = this.checkTimeouts();
+				if (res.timedOut.length > 0) {
+					onTimeout?.(res);
+				}
+			} catch {
+				/* 看门狗巡检异常不崩溃主进程 */
+			}
+		}, ms);
+		timer.unref?.();
+		return () => clearInterval(timer);
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Issue #47 (NW-27): 易失 /tmp 告警与工作区完整性校验 verifyWorkspaceIntegrity
+// ----------------------------------------------------------------------------
+
+export type WorkspaceWarningCode =
+	| "NUWA_VOLATILE_TMP_WORKSPACE"
+	| "NUWA_WORKSPACE_MISSING"
+	| "NUWA_GIT_METADATA_MISSING"
+	| "NUWA_STATE_DIR_MISSING";
+
+export interface WorkspaceWarning {
+	code: WorkspaceWarningCode;
+	severity: "warn" | "error";
+	path: string;
+	message: string;
+	suggestedRoot?: string;
+}
+
+export interface WorkspaceIntegrityOptions {
+	expectGit?: boolean;
+	recordBaseline?: boolean;
+	allowTmp?: boolean;
+	forceTmpWarning?: boolean;
+	env?: Record<string, string | undefined>;
+}
+
+export interface WorkspaceIntegrityReport {
+	ok: boolean;
+	status: "ok" | "warn" | "corrupted";
+	root: string;
+	exists: boolean;
+	hasNuwaDir: boolean;
+	hasStateFile: boolean;
+	isVolatileTmp: boolean;
+	gitExpected: boolean;
+	gitPresent: boolean;
+	gitHeadValid: boolean;
+	warnings: WorkspaceWarning[];
+	checkedAt: string;
+}
+
+interface WorkspaceMetaRecord {
+	schema: number;
+	root: string;
+	hadGit: boolean;
+	firstSeenAt: string;
+	updatedAt: string;
+}
+
+function isSubpathOrEqual(candidate: string, base: string): boolean {
+	const c = resolve(candidate);
+	const b = resolve(base);
+	if (c === b) return true;
+	const prefix = b.endsWith("/") ? b : `${b}/`;
+	return c.startsWith(prefix);
+}
+
+/** 判断路径是否位于易失临时目录（/tmp、/private/tmp、/var/tmp 或 os.tmpdir()）。 */
+export function isVolatileTempPath(dirPath: string): boolean {
+	const raw = String(dirPath ?? "").trim();
+	if (!raw) return false;
+	const candidates = new Set<string>([resolve(raw)]);
+	try {
+		candidates.add(realpathSync(raw));
+	} catch {
+		/* 目录可能尚不存在或已丢失 */
+	}
+	const tmpBases = new Set<string>([
+		resolve("/tmp"),
+		resolve("/private/tmp"),
+		resolve("/var/tmp"),
+		resolve("/private/var/tmp"),
+		resolve(tmpdir()),
+	]);
+	try {
+		tmpBases.add(realpathSync(tmpdir()));
+	} catch {
+		/* ignore */
+	}
+	for (const cand of candidates) {
+		for (const base of tmpBases) {
+			if (isSubpathOrEqual(cand, base)) return true;
+		}
+	}
+	return false;
+}
+
+/** 判断当前是否处于单测或显式允许 /tmp 工作区的环境，避免告警污染或破坏测试。 */
+export function isTestRuntimeEnv(env: Record<string, string | undefined> = process.env): boolean {
+	const allowTmp = (env.NUWA_ALLOW_TMP_WORKSPACE ?? "").trim().toLowerCase();
+	if (allowTmp === "1" || allowTmp === "true") return true;
+	const nodeEnv = (env.NODE_ENV ?? "").trim().toLowerCase();
+	if (nodeEnv === "test") return true;
+	if ((env.BUN_TEST ?? "").trim() === "1") return true;
+	if (env.VITEST || env.JEST_WORKER_ID || env.NUWA_TEST_MODE === "1") return true;
+	if (process.argv.some((a) => /(?:^|[\\/])test\b|\.test\.[jt]sx?$/i.test(a))) return true;
+	return false;
+}
+
+/** 检测传入生产工作区是否位于易失 /tmp 目录并返回结构化警告（单测或显式允许时静默返回 null）。 */
+export function checkWorkspaceTempWarning(
+	root: string,
+	opts?: { allowTmp?: boolean; forceCheck?: boolean; env?: Record<string, string | undefined> },
+): WorkspaceWarning | null {
+	if (!root || !root.trim()) return null;
+	if (!isVolatileTempPath(root)) return null;
+	if (opts?.allowTmp) return null;
+	const env = opts?.env ?? process.env;
+	if (!opts?.forceCheck && isTestRuntimeEnv(env)) return null;
+	const suggestedRoot = resolveDefaultWorkspacesDir(env);
+	return {
+		code: "NUWA_VOLATILE_TMP_WORKSPACE",
+		severity: "warn",
+		path: resolve(root),
+		suggestedRoot,
+		message: `工作区位于易失临时目录 (${resolve(root)})，长跑或系统清理可能导致状态与 .git 丢失；建议迁移至持久化目录 ${suggestedRoot} 或配置 NUWA_STATE_DIR`,
+	};
+}
+
+function workspaceMetaPath(root: string): string {
+	return join(stateDir(root), "workspace-meta.json");
+}
+
+function inspectGitMetadata(root: string): { gitPresent: boolean; gitHeadValid: boolean } {
+	const gitEntry = join(root, ".git");
+	if (!existsSync(gitEntry)) {
+		return { gitPresent: false, gitHeadValid: false };
+	}
+	try {
+		const st = statSync(gitEntry);
+		if (st.isDirectory()) {
+			return { gitPresent: true, gitHeadValid: existsSync(join(gitEntry, "HEAD")) };
+		}
+		if (st.isFile()) {
+			// Git worktree / submodule 的 .git 指针文件：gitdir: <path>
+			const content = readFileSync(gitEntry, "utf8").trim();
+			const m = /^gitdir:\s*(.+)$/im.exec(content);
+			if (!m?.[1]) return { gitPresent: true, gitHeadValid: false };
+			const gitDir = resolve(root, m[1].trim());
+			return { gitPresent: true, gitHeadValid: existsSync(join(gitDir, "HEAD")) };
+		}
+	} catch {
+		return { gitPresent: true, gitHeadValid: false };
+	}
+	return { gitPresent: false, gitHeadValid: false };
+}
+
+/**
+ * 校验工作区目录与 .git 元数据完好性（Issue #47 / NW-27）。
+ * - 启动时可传 `recordBaseline: true` 记录 `hadGit` 基线；
+ * - 每轮结算再次调用即可第一时间检出工作区被清理或 `.git` 丢失/损坏并返回明确告警状态。
+ */
+export function verifyWorkspaceIntegrity(
+	root: string,
+	opts: WorkspaceIntegrityOptions = {},
+): WorkspaceIntegrityReport {
+	const normRoot = resolve(root || process.cwd());
+	const checkedAt = nowIso();
+	const warnings: WorkspaceWarning[] = [];
+	const isVolatileTmp = isVolatileTempPath(normRoot);
+
+	let exists = false;
+	try {
+		exists = existsSync(normRoot) && statSync(normRoot).isDirectory();
+	} catch {
+		exists = false;
+	}
+
+	const hasNuwaDir = exists && existsSync(stateDir(normRoot));
+	const hasStateFile = exists && existsSync(statePath(normRoot));
+	const meta = hasNuwaDir ? readJson<WorkspaceMetaRecord>(workspaceMetaPath(normRoot)) : null;
+	const { gitPresent, gitHeadValid } = exists
+		? inspectGitMetadata(normRoot)
+		: { gitPresent: false, gitHeadValid: false };
+
+	if (exists && opts.recordBaseline && hasNuwaDir) {
+		try {
+			const hadGit = Boolean(meta?.hadGit || gitPresent || opts.expectGit);
+			const nextMeta: WorkspaceMetaRecord = {
+				schema: 1,
+				root: normRoot,
+				hadGit,
+				firstSeenAt: meta?.firstSeenAt ?? checkedAt,
+				updatedAt: checkedAt,
+			};
+			atomicWrite(workspaceMetaPath(normRoot), JSON.stringify(nextMeta, null, 2));
+		} catch {
+			/* 记录基线失败不中断主流程 */
+		}
+	}
+
+	const gitExpected = Boolean(opts.expectGit || meta?.hadGit || gitPresent);
+
+	if (!exists) {
+		warnings.push({
+			code: "NUWA_WORKSPACE_MISSING",
+			severity: "error",
+			path: normRoot,
+			suggestedRoot: resolveDefaultWorkspacesDir(opts.env),
+			message: `工作区目录已丢失或不存在: ${normRoot}`,
+		});
+	} else if (gitExpected && (!gitPresent || !gitHeadValid)) {
+		warnings.push({
+			code: "NUWA_GIT_METADATA_MISSING",
+			severity: "error",
+			path: join(normRoot, ".git"),
+			suggestedRoot: resolveDefaultWorkspacesDir(opts.env),
+			message: !gitPresent
+				? `工作区 .git 元数据丢失（预期为 Git 仓库）: ${normRoot}`
+				: `工作区 .git 元数据损坏（缺少有效 HEAD）: ${normRoot}`,
+		});
+	}
+
+	const tmpWarn = checkWorkspaceTempWarning(normRoot, {
+		allowTmp: opts.allowTmp,
+		forceCheck: opts.forceTmpWarning,
+		env: opts.env,
+	});
+	if (tmpWarn) {
+		warnings.push(tmpWarn);
+	}
+
+	const hasError = warnings.some((w) => w.severity === "error");
+	const status: "ok" | "warn" | "corrupted" = hasError ? "corrupted" : warnings.length > 0 ? "warn" : "ok";
+
+	if (hasError && hasNuwaDir) {
+		logEvent(normRoot, {
+			type: "workspace_integrity_alert",
+			status,
+			root: normRoot,
+			warnings: warnings.map((w) => ({ code: w.code, severity: w.severity, message: w.message })),
+		});
+	}
+
+	return {
+		ok: !hasError,
+		status,
+		root: normRoot,
+		exists,
+		hasNuwaDir,
+		hasStateFile,
+		isVolatileTmp,
+		gitExpected,
+		gitPresent,
+		gitHeadValid,
+		warnings,
+		checkedAt,
+	};
 }
