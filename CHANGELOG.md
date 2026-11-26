@@ -2,12 +2,12 @@
 
 ## 7.0.0 — 2026-11-26
 
-单核合一收敛、SQLite WAL 默认转正、5+1 专精特种小队、KB 2.0 混合语义治理、原生 CDP 页面借壳加签差分、多跳攻击链能力合成与 L3 真实进程树靶场大版本：在严格保持 12 个 `nuwa_*` 工具名称与全部历史导出 100% 向后兼容的前提下，将 `omp/nuwa.ts` 从 3,990 行瘦身至 `< 700` 行，消除 `omp` 与 `MCP` 双核分叉，全面打通六大 v7 核心引擎与第 8 道阶段门禁 `g7_v7.sh`。
+单核合一收敛、SQLite WAL 默认转正、5+1 专精特种小队、KB 2.0 混合语义治理、原生 CDP 页面借壳加签差分、多跳攻击链能力合成与 L3 真实进程树靶场大版本：在严格保持 12 个 `nuwa_*` 工具名称与全部历史导出 100% 向后兼容的前提下，将 `omp/nuwa.ts` 从 3,990 行瘦身至 932 行（`< 1,000` 行红线），消除 `omp` 与 `MCP` 双核分叉，全面打通六大 v7 核心引擎与第 8 道阶段门禁 `g7_v7.sh`。
 
 ### 六大核心跃升与架构收敛
 
 - **单核合一与主入口极致瘦身（`core/engine.ts` + `omp/dispatch-bridge.ts` + `omp/nuwa.ts` + `core/mcp-server.ts`）**：
-  - 新增宿主无关单一权威执行引擎 `NuwaUnifiedEngine`（`core/engine.ts`），统一承载全部 12 个 `nuwa_*` 工具、28 个 `/nuwa` 斜杠子命令及 `#53/#54/#55` 终态防复活/防降级、反自证校准结算、只读零写盘与出口代理掩码守卫；`omp/nuwa.ts`（`< 700` 行，严格 `< 1,000` 行红线）与 `core/mcp-server.ts`（`NuwaCoreEngine`）全面委托单核执行，彻底终结双写分叉。
+  - 新增宿主无关单一权威执行引擎 `NuwaUnifiedEngine`（`core/engine.ts`，3,002 行），统一承载全部 12 个 `nuwa_*` 工具、28 个 `/nuwa` 斜杠子命令及 `#53/#54/#55` 终态防复活/防降级、反自证校准结算、只读零写盘与出口代理掩码守卫；`omp/nuwa.ts`（932 行，严格 `< 1,000` 行红线）与 `core/mcp-server.ts`（579 行，`NuwaCoreEngine`）全面委托单核执行，彻底终结双写分叉。
   - 新增零私有全局态异步派单桥接引擎 `omp/dispatch-bridge.ts`（`DispatchBridgeStore`），完整处理 `omp 18.16.0` `async.state === "running"` 乱序派单竞态、4 MiB `taskFile` 读取与占位符替换、`eval` 词法安全占位符展开与注释剥离平衡解析，以及 `SubagentWatchdog` 一对一精准回收。
 - **SQLite WAL 默认后端转正与双核心不变量（`omp/sqlite-store.ts` + `omp/storage.ts`）**：
   - `resolveStorageBackend` 在未设置 `NUWA_STORAGE_BACKEND` 时默认转正返回 `"sqlite"`，并完整保留显式 `"sqlite" | "json" | "dual"` 切换能力。

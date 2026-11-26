@@ -1,36 +1,67 @@
-# 测试与阶段门禁验收记录（v7.0.0）
+# 测试与阶段门禁验收记录（v7.0.0 最终封版报告）
 
 日期：2026-11-26  
-环境：Linux 工作区，Bun 运行时，Python 3.12，TypeScript 严格模式（`tsc -p tsconfig.json --noEmit` 全仓零错误），本机 Headless Chrome + 本地 TCP SOCKS5h 微靶场，零外部网络依赖、零付费 API 成本。
+封版基线：基于 `main@bc9f9f9`（`bc9f9f9a6cd4a2184485ac3bda0adafb614bdbec`）经双路异构 Boost 终审与全量本地 CI 矩阵独立验收定稿。  
+环境：Linux 工作区，Bun 运行时，Python 3.12，TypeScript 严格模式（`/opt/q4-relay/node_modules/.bin/tsc -p tsconfig.json --noEmit` 全仓零错误），本机 Headless Chrome + 本地 TCP SOCKS5h 微靶场，零外部网络依赖、零付费 API 成本。
 
-> 说明：本文档记录 Wave 2 总装集成与 `g0..g7` 阶段门禁实测基线；Phase 4 全量本地 CI 矩阵终审数据将在审查闭环后最终归档定稿。
+---
 
-## 一、架构硬指标与静态契约校验
+## 一、架构收敛硬指标与静态契约校验
 
-- **版本单一事实来源**：`python3 tests/version_check.py --require-install-echo` → `version_check: OK (7.0.0)`
-- **v2 原生契约与全仓严格类型检查**：`NUWA_REQUIRE_TSC=1 python3 tests/contract_check.py --v2-only` → **`12/12` 通过**（含离线 `bun build`、`tsc -p tsconfig.json --noEmit` 零错误、`RUNTIME_OK:7.0.0:tools=12`）
-- **单核合一与代码行数红线**：
-  - `omp/nuwa.ts`：**`< 1,000` 行**（全面委托 `core/engine.ts` 与 `omp/dispatch-bridge.ts`，全量保留 v4–v7 符号重导出）
-  - `omp/graph.ts`：**`< 2,500` 行**（单向无环三层图架构）
-  - `core/mcp-server.ts`：全面委托 `NuwaUnifiedEngine`，彻底消除双核分叉
-- **KB 2.0 规模与专精小队模板**：
-  - `kb/build-kb.ts` 自动摄入 `kb/seed-v7-pack.json`：**`kb_items >= 520` 条**
-  - `agents/` 5+1 专精特种小队模板：**6/6 全部就位**（`fujiang.md`、`nuwa-verifier.md`、`nuwa-scout.md`、`nuwa-spa-reverser.md`、`nuwa-auth-breaker.md`、`nuwa-code-auditor.md`）
+- **版本单一事实来源**：
+  - `python3 tests/version_check.py --require-install-echo` → `version_check: OK (7.0.0)`
+- **全仓严格类型检查与双代契约**：
+  - `/opt/q4-relay/node_modules/.bin/tsc -p tsconfig.json --noEmit` → **0 错误**（`2.49s`）
+  - `python3 tests/contract_check.py` → **`contract(v2): 12/12 通过`** + **`contract(v1): 13/13 一致`**（含离线 `bun build`、`RUNTIME_OK:7.0.0:tools=12`）
+- **单核合一与代码行数红线（精确封版统计）**：
+  - `omp/nuwa.ts`：**`932` 行**（严格 `< 1,000` 行硬红线，全面委托 `core/engine.ts` 与 `omp/dispatch-bridge.ts`）
+  - `omp/graph.ts`：**`2,439` 行**（严格 `< 2,500` 行硬红线，单向无环三层图架构）
+  - `core/mcp-server.ts`：**`579` 行**（`NuwaCoreEngine extends NuwaUnifiedEngine`，彻底消除双核分叉）
+  - `core/engine.ts`：**`3,002` 行**（单一权威执行核，统一承载 12 个 `nuwa_*` 工具与 28 个 `/nuwa` 子命令）
+  - **向后兼容符号重导出**：相对 `9f0c6dc` 基线的全部 **275 个旧版运行时导出 0 缺失**（现共导出 **382** 个符号）
+- **KB 2.0 规模与专精特种小队模板**：
+  - `kb/build-kb.ts` 自动幂等摄入 `kb/seed-v7-pack.json`：**`kbItems = 535` 条**（`>= 520` 硬门禁，其中 `card=324, cve=171, technique=40`，`totalRecords=1,324`）
+  - `agents/` 5+1 专精特种小队模板：**`6/6` 全部就位**（`fujiang.md`、`nuwa-verifier.md`、`nuwa-scout.md`、`nuwa-spa-reverser.md`、`nuwa-auth-breaker.md`、`nuwa-code-auditor.md`）
 
-## 二、v7.0 核心测试套件矩阵
+---
 
-| 套件 | 覆盖范围 | 状态 |
-|---|---|---|
-| `tests/v7_cdp_bridge.test.ts` | 真实 Headless Chrome 直连 CDP WebSocket、实时 Fetch/XHR 脱敏入 `TrafficRecorder` + 认证态入 `SessionVault`、越界外连 `Fetch.failRequest` 阻断、页面借壳动态 HMAC 加签 BOLA 检出与进程目录零残留 | PASS |
-| `tests/v7_chain_composer.test.ts` | 前置-后置能力抽取、2～4 跳防环合成、只读 `TrafficStep[]` 变量提取编译、三跳审批导出链/OOB 链实锤与第 `k` 跳 403 中断 `brokenAtStep` 精准定界及零凭据泄露 | PASS |
-| `tests/v7_squad_kb2.test.ts` | 5+1 专精小队画像分类、反自证战绩联合路由、`seed-v7-pack.json` 幂等融合（`>= 520` 条）、中英同义混合语义检索 `hybridKbSearch` 与蒸馏经验 `quarantined`/`promoted` 治理 | PASS |
-| `tests/v7_core_unify_l3.test.ts` | `NuwaUnifiedEngine` 12 工具与终态防复活/防降级守卫、`DispatchBridgeStore` 异步乱序/eval/taskFile 词法展开、真实 TCP SOCKS5h 协议握手与 L3 三场景进程树实跑 | PASS |
-| `tests/v7_e2e_integration.test.ts` | Wave 2 单核统一路由（`omp` ↔ `MCP`）、SQLite WAL 默认转正与遗留 JSON 只读零写入、KB 2.0 + 5+1 小队 + 攻击链闭环、`/nuwa cdp|chains|squad` 零写盘脱敏与 `install.sh` 隔离沙盒部署验收 | PASS |
-| `tests/v6_issues53_54_55_regression.test.ts` | Issue #53/#54 & PR #55 异步派单竞态、SOCKS5h 隔离与终态只读零写盘全量回归 | PASS |
+## 二、全量本地 CI 矩阵（替代 GitHub Actions 等价验收）
 
-## 三、L1 / L2 / L3 三层靶场与八道阶段门禁（`g0`..`g7`）
+### 1. 三存储后端全仓单元测试矩阵（`./run-tests.sh`）
 
-- **L1 十场景合成靶场（`benchmarks/run-eval.ts`）**：**10/10 PASS**（`falsePositiveCount = 0`、`vaultLeakCount = 0`）
-- **L2 五场景有状态靶场（`benchmarks/run-l2-eval.ts`）**：**5/5 PASS**（`recallRate = 1`、`falsePositiveRate = 0`、`vaultLeakCount = 0`、`calibrationBrier <= 0.25`）
-- **L3 三场景真实进程树靶场（`benchmarks/l3-live/run-l3-eval.ts`）**：**3/3 PASS**（`allPassed = true`、`socks5HandshakeCount > 0`、`modelApiErrors = 0`、`vaultLeakCount = 0`）
-- **阶段门禁套件（`tests/gates/run.sh`）**：`g0_baseline`、`g1_r1`、`g2_r2r7`、`g3_v4`、`g4_v5`、`g5_v51`、`g6_v6`、`g7_v7` **八道门禁全部通过**。
+全仓共 **35 个测试文件 / 492 个测试用例 / 11,336 次 `expect()` 断言**：
+
+| 存储后端模式 | 环境变量配置 | 通过 / 失败 | `expect()` 断言数 | 实测耗时 | 结论 |
+|---|---|---|---|---|---|
+| **默认 SQLite WAL（转正默认）** | 未设置 `NUWA_STORAGE_BACKEND`（自动解析 `"sqlite"`） | **492 pass / 0 fail** | 11,336 | `184.49s` | PASS |
+| **显式 JSON 兼容模式** | `NUWA_STORAGE_BACKEND=json` | **492 pass / 0 fail** | 11,336 | `132.15s` | PASS |
+| **显式 Dual 双写对账模式** | `NUWA_STORAGE_BACKEND=dual` | **492 pass / 0 fail** | 11,336 | `171.56s` | PASS |
+
+### 2. 严格模式八道阶段门禁（`g0`..`g7`）与全套 `./tests/run.sh`
+
+- **严格模式八道阶段门禁**：
+  - 命令：`NUWA_REQUIRE_GATES=1 NUWA_REQUIRE_V1_SAPPER=1 NUWA_REQUIRE_TSC=1 bash tests/gates/run.sh`
+  - 结果：`g0_baseline`、`g1_r1`、`g2_r2r7`、`g3_v4`、`g4_v5`、`g5_v51`、`g6_v6`、`g7_v7` **`8/8` 全绿通过**（总耗时 `350.98s`）
+  - 其中第 8 道门禁 `g7_v7.sh`：6 个 v7 测试套件 **`59 pass / 0 fail / 6,132 expect()`**，`kbItems = 535 >= 520`，`6/6` 小队模板齐备
+- **GitHub Actions 等价全套流水线（`./tests/run.sh`）**：
+  - 覆盖 `contract(v1/v2)`、`shell`、`kb`、`chaos`、`concurrency`、`e2e`、`r1*`、`crash`、`guard`、`r2r7`、`omp` 等全部 **27 个阶段** → **`fails=0` 全绿通过**（`1,058.20s`）
+
+### 3. L1 / L2 / L3 三层评测靶场实测指标
+
+| 靶场层级 | 执行入口 | 场景通过率 | 关键实测精度与安全指标 | 结论 |
+|---|---|---|---|---|
+| **L1 离线确定性十场景靶场** | `benchmarks/run-eval.ts` | **10 / 10** | `passAt1 = 1`、`falsePositiveCount = 0`、`vaultLeakCount = 0` | PASS |
+| **L2 有状态五场景合成靶场** | `benchmarks/run-l2-eval.ts --deterministic --json` | **5 / 5** | `recall = 1`、`fp = 0`、`leaks = 0`、`brier = 0.0084`（`<= 0.25`）、`ece = 0.0887` | PASS |
+| **L3 真实进程树与 SOCKS5h 靶场** | `benchmarks/l3-live/run-l3-eval.ts --json` | **3 / 3** | `socks5Handshakes = 6`、`socks5DomainReqs = 6`、`modelErrors = 0`、`leaks = 0` | PASS |
+
+---
+
+## 三、双路 Boost 异构终审与隔离临床沙盒专项验收
+
+- **44 路径只读零写盘与防篡改矩阵**：
+  - 在遗留仅有 `.nuwa/state.json`（无 `nuwa.db`）且附带语法损坏 `.nuwa/autoexec.json` 的目录中，连续执行 11 次 `omp` 只读工具、29 条 `/nuwa` 只读斜杠命令（含 `cdp`、`chains`、`squad`、`scope show|list`、`session LIST`、`oob LIST`、越界 `cdp capture`）及 3 次 MCP JSON-RPC 只读调用：**`violationCount = 0`、`slashErrorCount = 0`、`nuwaDbExists = false`**（绝不自动创建 `nuwa.db` / `-wal` / `-shm`，绝不回写磁盘）。
+  - 在默认 `"sqlite"` 模式下发生状态写入时，同步维护 `.nuwa/state.json` 兼容快照，且二进制扫密确认 `nuwa.db`、`state.json`、`journal.jsonl`、`traffic/index.jsonl`、`exec-ledger.jsonl` 全链路凭据零明文泄露。
+- **隔离沙盒安装、体检与回滚验收**：
+  - 独立 `/tmp` 沙盒执行 `install.sh --force-agents --clean-kb`：35/35 模块、`core/engine.ts`、6 个小队模板、`kb.db`（`535` 条）一次部署成功；
+  - `nuwa-autonomous doctor --json` 返回 `ok = true, criticalPassed = 3/3`（`v7ModulesMissing = []`, `squadMissing = []`）；
+  - `nuwa-mcp --version` 返回 `nuwa-mcp 7.0.0 (mcp 2024-11-05)`；`install.sh --rollback` 无损回滚验证通过。
