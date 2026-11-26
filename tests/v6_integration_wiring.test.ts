@@ -1334,5 +1334,67 @@ process.exit(0);
 
 		if (prevBackend === undefined) delete process.env.NUWA_STORAGE_BACKEND;
 	});
+
+	test("tsconfig.json 全仓覆盖 core 与 benchmarks 类型声明且共享 cwd 下 ops/coding 缺省 mode 的 resume 精准命中", async () => {
+		const repoRoot = resolve(import.meta.dir, "..");
+		const tsconfig = JSON.parse(readFileSync(join(repoRoot, "tsconfig.json"), "utf8")) as {
+			include?: string[];
+		};
+		expect(tsconfig.include).toContain("omp/**/*.ts");
+		expect(tsconfig.include).toContain("omp/**/*.d.ts");
+		expect(tsconfig.include).toContain("kb/**/*.ts");
+		expect(tsconfig.include).toContain("core/**/*.ts");
+		expect(tsconfig.include).toContain("benchmarks/**/*.ts");
+
+		const envDts = readFileSync(join(repoRoot, "omp/env.d.ts"), "utf8");
+		expect(envDts).toContain('declare module "node:util"');
+		expect(envDts).toContain("interface ReadableStream");
+		expect(envDts).toContain("stdin: NodeJS.ReadableStream;");
+
+		// 共享 cwd（tmpdir）下初始化非 URL 服务标识 ops 项目后，省略 mode 与 root 仅传 target+resume 必须精准恢复原项目
+		const sharedCwd = tmpdir();
+		const hShared = setupHarness(sharedCwd, "sess-shared-ops");
+		const initOps = await hShared.call("nuwa_init", {
+			target: "billing-core-svc",
+			mode: "ops",
+			goal: "共享工作区 ops 恢复测试",
+		});
+		expect(initOps.isError).toBeFalsy();
+		const opsRoot = initOps.details.root as string;
+		expect(opsRoot).toContain("billing-core-svc-0-");
+
+		const resumeOps = await hShared.call("nuwa_init", {
+			target: "billing-core-svc",
+			resume: true,
+		});
+		expect(resumeOps.isError).toBeFalsy();
+		expect(resumeOps.details.root).toBe(opsRoot);
+		expect(nuwaMod.loadState(opsRoot)?.project.mode).toBe("ops");
+
+		// NuwaCoreEngine 同理验证 coding 模式共享 cwd 缺省 mode 恢复
+		const mcpAgentHome = makeWorkspace("nuwa-mcp-shared-home-");
+		setEnvTemp("PI_AGENT_HOME", mcpAgentHome);
+		const mcpEngine = new NuwaCoreEngine({
+			cwd: sharedCwd,
+			sessionId: "sess-mcp-shared-coding",
+			agentHome: mcpAgentHome,
+		});
+		const mcpInit = await mcpEngine.callTool("nuwa_init", {
+			target: "checkout-api-svc",
+			mode: "coding",
+			goal: "共享工作区 coding 恢复测试",
+		});
+		expect(mcpInit.isError).toBe(false);
+		const codingRoot = mcpInit.details?.root as string;
+		expect(codingRoot).toContain("checkout-api-svc-0-");
+
+		const mcpResume = await mcpEngine.callTool("nuwa_init", {
+			target: "checkout-api-svc",
+			resume: true,
+		});
+		expect(mcpResume.isError).toBe(false);
+		expect(mcpResume.details?.root).toBe(codingRoot);
+		expect(nuwaMod.loadState(codingRoot)?.project.mode).toBe("coding");
+	});
 });
 

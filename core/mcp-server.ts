@@ -454,17 +454,25 @@ export class NuwaCoreEngine {
 				}
 			}
 			if (!probeRoot && resume && !explicitRawMode && targetArg) {
-				const localCand = findLocalRoot(this.cwd, sid) ?? (hasProjectState(resolve(this.cwd)) ? resolve(this.cwd) : null);
-				if (localCand) {
+				const envProj = process.env.NUWA_PROJECT?.trim();
+				const ptr = readSessionPointer(sid);
+				const candList = [
+					findLocalRoot(this.cwd, sid),
+					hasProjectState(resolve(this.cwd)) ? resolve(this.cwd) : null,
+					envProj && hasProjectState(resolve(envProj)) ? resolve(envProj) : null,
+					ptr?.root ? resolve(ptr.root) : null,
+				];
+				for (const localCand of candList) {
+					if (!localCand) continue;
 					const localSt = loadState(localCand);
-					if (localSt) {
-						try {
-							if (localSt.project.url === normalizeTargetForMode(targetArg, localSt.project.mode).url) {
-								probeRoot = localCand;
-							}
-						} catch {
-							/* 非匹配目标则按常规流程校验 */
+					if (!localSt) continue;
+					try {
+						if (localSt.project.url === normalizeTargetForMode(targetArg, localSt.project.mode).url) {
+							probeRoot = localCand;
+							break;
 						}
+					} catch {
+						/* 非匹配目标则按常规流程校验 */
 					}
 				}
 			}
@@ -2068,9 +2076,18 @@ export async function startStdioMcpServer(opts?: StartStdioMcpServerOptions): Pr
 				chain.then(() => rejectDone(err), rejectDone);
 			};
 			const cleanupListeners = () => {
-				input.off("data", onData);
-				input.off("end", onEnd);
-				input.off("error", onError);
+				const compat = input as NodeJS.ReadableStream & {
+					removeListener?: (event: string, listener: (...args: any[]) => void) => unknown;
+				};
+				if (typeof input.off === "function") {
+					input.off("data", onData);
+					input.off("end", onEnd);
+					input.off("error", onError);
+				} else if (typeof compat.removeListener === "function") {
+					compat.removeListener("data", onData);
+					compat.removeListener("end", onEnd);
+					compat.removeListener("error", onError);
+				}
 			};
 
 			input.on("data", onData);

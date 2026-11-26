@@ -16,7 +16,9 @@
   "include": [
     "omp/**/*.ts",
     "omp/**/*.d.ts",
-    "kb/**/*.ts"
+    "kb/**/*.ts",
+    "core/**/*.ts",
+    "benchmarks/**/*.ts"
   ],
   "exclude": [
     "archive/**",

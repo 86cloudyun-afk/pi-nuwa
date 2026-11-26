@@ -949,10 +949,17 @@ function openReadonlyWalIsolatedSnapshot(dbFile: string): Database {
 	const snapDb = join(snapDir, "nuwa.db");
 	try {
 		copyFileSync(dbFile, snapDb);
+		chmodSync(snapDb, 0o600);
 		const walSrc = `${dbFile}-wal`;
-		if (existsSync(walSrc)) copyFileSync(walSrc, `${snapDb}-wal`);
+		if (existsSync(walSrc)) {
+			copyFileSync(walSrc, `${snapDb}-wal`);
+			chmodSync(`${snapDb}-wal`, 0o600);
+		}
 		const shmSrc = `${dbFile}-shm`;
-		if (existsSync(shmSrc)) copyFileSync(shmSrc, `${snapDb}-shm`);
+		if (existsSync(shmSrc)) {
+			copyFileSync(shmSrc, `${snapDb}-shm`);
+			chmodSync(`${snapDb}-shm`, 0o600);
+		}
 		const rwSnap = new Database(snapDb, { readwrite: true });
 		try {
 			rwSnap.exec("PRAGMA busy_timeout = 3000;");

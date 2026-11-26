@@ -45,6 +45,35 @@ NUWA_V2_TOOLS = (
 )
 
 
+def find_tsc_bin(repo_root: Path) -> str | None:
+    """探测本地可用 tsc 编译器（优先显式环境变量、PATH、本地 node_modules 与常见系统目录）。"""
+    explicit = os.environ.get("NUWA_TSC_BIN", "").strip()
+    if explicit and Path(explicit).is_file() and os.access(explicit, os.X_OK):
+        return explicit
+    in_path = shutil.which("tsc")
+    if in_path:
+        return in_path
+    local_tsc = repo_root / "node_modules" / ".bin" / "tsc"
+    if local_tsc.is_file() and os.access(local_tsc, os.X_OK):
+        return str(local_tsc)
+    for static_cand in (
+        Path("/usr/local/lib/node_modules/typescript/bin/tsc"),
+        Path.home() / ".bun/install/global/node_modules/.bin/tsc",
+    ):
+        try:
+            if static_cand.is_file() and os.access(static_cand, os.X_OK):
+                return str(static_cand)
+        except OSError:
+            pass
+    try:
+        for cand in sorted(Path("/opt").glob("*/node_modules/.bin/tsc")):
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return str(cand)
+    except OSError:
+        pass
+    return None
+
+
 def make_bin(tmp: Path, target: Path) -> Path:
     d = tmp / f"bin-{target.stem}"
     d.mkdir(parents=True, exist_ok=True)
@@ -253,6 +282,56 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
             "ok": bld_ok,
             "detail": bld_detail[:200],
         })
+
+        # 全仓 tsconfig.json include 完整性与静态类型检查（覆盖 omp/kb/core/benchmarks）
+        try:
+            tsconfig_data = json.loads((repo_root / "tsconfig.json").read_text(encoding="utf-8"))
+            includes = tsconfig_data.get("include") if isinstance(tsconfig_data, dict) else []
+            required_includes = ["omp/**/*.ts", "omp/**/*.d.ts", "kb/**/*.ts", "core/**/*.ts", "benchmarks/**/*.ts"]
+            missing_includes = [inc for inc in required_includes if not isinstance(includes, list) or inc not in includes]
+        except Exception as exc:
+            missing_includes = [f"tsconfig.json invalid: {exc}"]
+
+        if missing_includes:
+            results.append({
+                "name": "v6_tsc_typecheck",
+                "ok": False,
+                "detail": f"tsconfig include 缺失: {missing_includes}"[:200],
+            })
+        else:
+            tsc_bin = find_tsc_bin(repo_root)
+            if tsc_bin:
+                tsc_proc = subprocess.run(
+                    [tsc_bin, "-p", str(repo_root / "tsconfig.json")],
+                    cwd=str(repo_root),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                tsc_ok = tsc_proc.returncode == 0
+                tsc_detail = (
+                    f"tsc -p tsconfig.json ok ({tsc_bin})"
+                    if tsc_ok
+                    else (tsc_proc.stdout.strip() or tsc_proc.stderr.strip() or f"rc={tsc_proc.returncode}")
+                )
+                results.append({
+                    "name": "v6_tsc_typecheck",
+                    "ok": tsc_ok,
+                    "detail": tsc_detail[:200],
+                })
+            elif os.environ.get("NUWA_REQUIRE_TSC") == "1":
+                results.append({
+                    "name": "v6_tsc_typecheck",
+                    "ok": False,
+                    "detail": "tsc not found (NUWA_REQUIRE_TSC=1)",
+                })
+            else:
+                results.append({
+                    "name": "v6_tsc_typecheck",
+                    "ok": True,
+                    "detail": "tsconfig include ok (SKIP: tsc not installed)",
+                })
 
         omp_dir = str((repo_root / "omp").resolve())
         smoke_js = """

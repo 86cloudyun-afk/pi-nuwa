@@ -1,22 +1,22 @@
 # 测试与阶段门禁验收记录（v6.0.0）
 
 日期：2026-11-26  
-环境：Linux 工作区，Bun 1.4.4，Python 3，离线零外部网络依赖、零模型 API 成本。
+环境：Linux 工作区，Bun 1.4.4，Python 3，TypeScript 7.0.2（`tsc -p tsconfig.json` 全仓零错误），离线零外部网络依赖、零模型 API 成本。
 
 ## 一、本地全量 CI 终审总览（`./tests/run.sh`）
 
-终审执行命令：`NUWA_REQUIRE_GATES=1 NUWA_REQUIRE_V1_SAPPER=1 ./tests/run.sh`  
-全套总耗时：**746.88s**，退出码：**0（全部通过）**。
+终审执行命令：`NUWA_REQUIRE_GATES=1 NUWA_REQUIRE_V1_SAPPER=1 NUWA_REQUIRE_TSC=1 ./tests/run.sh`  
+全套总耗时：**779.25s**，退出码：**0（全部通过）**。
 
 - **版本与架构约束**：
   - `python3 tests/version_check.py --require-install-echo`：`version_check: OK (6.0.0)`
-  - 巨石无环拆解：`omp/graph.ts` **2,364 行**（`< 2,500` 行硬红线；`omp/graph-planner.ts` 2,664 行、`omp/graph-commands.ts` 1,222 行）
+  - 巨石无环拆解：`omp/graph.ts` **2,377 行**（`< 2,500` 行硬红线；`omp/graph-planner.ts` 2,663 行、`omp/graph-commands.ts` 1,223 行）
   - 独立 MCP 服务：`bin/nuwa-mcp --version` 输出 `nuwa-mcp 6.0.0 (mcp 2024-11-05)`
 - **双端静态与运行时契约**：
-  - `contract(v2)`：**11/11 通过**（12 工具名称与签名不变、子模块零运行时 `./nuwa` 循环依赖、离线 `bun build` 通过、异步插件加载 `RUNTIME_OK:6.0.0:tools=12`）
+  - `contract(v2)`：**12/12 通过**（12 工具名称与签名不变、子模块零运行时 `./nuwa` 循环依赖、全仓 `tsc -p tsconfig.json` 覆盖 `omp`/`kb`/`core`/`benchmarks` 零错误通过、离线 `bun build` 通过、异步插件加载 `RUNTIME_OK:6.0.0:tools=12`）
   - `contract(v1)`：**13/13 一致**（`real='sapper 1.0.0'`）
 - **Bun 全量隔离单测（`--isolate` / `./run-tests.sh`）**：
-  - **29 个测试文件合计 416 pass / 0 fail（5,019 `expect()` assertions）**（独立 `./run-tests.sh` 复验 61.49s）：`unit` 45/45、`omp` 128/128、`isolation` 12/12、`v3..v6` 231/231
+  - **29 个测试文件合计 432 pass / 0 fail（5,169 `expect()` assertions）**（独立 `./run-tests.sh` 复验 55.19s）：`unit` 45/45（85 assertions）、`omp` 128/128（817 assertions）、`isolation` 12/12（33 assertions）、`v3..v6` 247/247（4,234 assertions）
 - **Python 协议 / 混沌 / 并发 / E2E / R1–R7 套件**：
   - `shell` 15、`kb` 5（宿主缺省 `~/.nuwa/kb.db` 跳过 2 项；独立便携库在 `v4_kb_memory` 与 `install.sh` 沙盒中 100% 全通）、`chaos` 8、`concurrency` 5、`e2e` 4、`r1core` 41、`r1dispatch` 3、`r1run` 4、`r1multi` 1、`guard` 18、`r2r7` 29 全部通过；`crash_matrix` **16 runs OK**
 
@@ -24,9 +24,9 @@
 
 | 存储后端模式 | 覆盖套件数 | 用例通过数 | 断言数（`expect()`） | 耗时 | 核心验证点 | 状态 |
 |---|---:|---:|---:|---:|---|---|
-| 默认模式（`json`） | 29 文件 | **416 pass / 0 fail** | 5,019 | 61.49s | 全量历史与 v6 新增套件隔离单测 | PASS |
-| `NUWA_STORAGE_BACKEND=sqlite` | 8 文件 | **110 pass / 0 fail** | 1,291 | 41.91s | `omp_nuwa`、`nuwa_v3_core`、`v51_nuwa_e2e_integration` 及 5 套 `v6_*`：WAL 并发写、纯只读打开零写盘（无 `-wal/-shm` 副作用）、活跃 WAL 实时读取与血缘探测 | PASS |
-| `NUWA_STORAGE_BACKEND=dual` | 1 文件 | **8 pass / 0 fail** | 141 | 5.75s | `v6_integration_wiring` JSON + SQLite 双写一致性与全链路接线 | PASS |
+| 默认模式（`json`） | 29 文件 | **432 pass / 0 fail** | 5,169 | 55.19s | 全量历史与 v6 修缮回归隔离单测 | PASS |
+| `NUWA_STORAGE_BACKEND=sqlite` | 29 文件 | **432 pass / 0 fail** | 5,169 | 80.82s | 全仓 29 套隔离单测切换 SQLite WAL 权威存储：WAL 并发写、纯只读零写盘快照（含 `-wal` 缺 `-shm` 隔离重放）、活跃 WAL 实时读取、血缘探测与校准/时间线纯 SQLite 闭环 | PASS |
+| `NUWA_STORAGE_BACKEND=dual` | 29 文件 | **432 pass / 0 fail** | 5,169 | 76.64s | 全仓 29 套隔离单测切换 JSON + SQLite 双写模式：双端一致落盘、原子并发锁协同与全链路接线 | PASS |
 
 ## 三、v6.0 新增与核心测试套件明细
 
@@ -43,7 +43,7 @@
 
 ### 1. L1 十场景合成靶场（`benchmarks/run-eval.ts --deterministic --json`）
 
-- **场景通过率**：**10/10**（`wallTimeMs = 303`，总耗时 `0.68s`）
+- **场景通过率**：**10/10**（`wallTimeMs = 733`，CLI 总耗时 `0.74s`）
 - **核心指标**：`passAt1Rate = 1`、`falsePositiveCount = 0`、`verifierCatchRate = 1`、`vaultLeakCount = 0` — **OVERALL PASS**
 
 ### 2. L2 五场景有状态全链路靶场（`benchmarks/run-l2-eval.ts --deterministic --json`）
@@ -53,7 +53,7 @@
 - **`t3-blind-ssrf-oob`**：自主 OOB Canary 规划播撒 + 本机回路收集器节流轮询 + 双盲独立 Canary 二次确认 — **PASS**
 - **`t4-hybrid-sourcemap-chain`**：公开 `.js.map` 虚拟源码提取桥接 + `replayTrafficSequence` 两步 `stepToken` 提取重放 + 黑盒发现反向源码定位 — **PASS**
 - **`t5-hardened-zero-vuln`**：全加固 RBAC 服务零误报排除 + 信念收敛转向评估 + `11` 轮（`<= 15`）快速收敛至 `sealed_negative` — **PASS**
-- **L2 汇总指标与五大硬门禁**（`wallTimeMs = 3790`，总耗时 `4.20s`）：
+- **L2 汇总指标与五大硬门禁**（`wallTimeMs = 4893`，CLI 总耗时 `3.88s`）：
   - `recallRate = 1`（硬门禁 `=== 1.0`）
   - `falsePositiveRate = 0`（硬门禁 `=== 0`）
   - `vaultLeakCount = 0`（硬门禁 `=== 0`）
@@ -67,15 +67,15 @@
 
 | 门禁 | 结果 | 实测详情 |
 |---|---|---|
-| `g0_baseline` | PASS | 基础契约与历史兼容基线 |
-| `g1_r1` | PASS | 日志、锁与恢复核心门禁 |
-| `g2_r2r7` | PASS | 预算、证据与策略门禁 |
-| `g3_v4` | PASS | v4 原生扩展、血缘、KB 与沙盒门禁（77 pass） |
-| `g4_v5` | PASS | v5 会话差分、Sidecar/Egress、OOB、假设图与 L1 10 场景靶场门禁（21 pass + L1 10/10） |
-| `g5_v51` | PASS | v5.1 三元组去重、封盘、派单守卫、看门狗与全工具范围护栏门禁（63 pass） |
-| `g6_v6` | PASS | v6.0 版本一致性、离线构建、`omp/graph.ts < 2500` 行、`nuwa-mcp`、51 pass（963 `expect()`）与 L2 五场景硬门禁 |
+| `g0_baseline` | PASS | 基础契约与历史兼容基线（`contract(v2)` 12/12 + `contract(v1)` 13/13） |
+| `g1_r1` | PASS | 日志、锁与恢复核心门禁（`r1core` 41、`r1dispatch` 3、`r1run` 4、`r1multi` 1、`crash_matrix` 16 runs） |
+| `g2_r2r7` | PASS | 预算、证据与策略门禁（29 pass） |
+| `g3_v4` | PASS | v4 原生扩展、血缘、KB 与沙盒门禁（77 pass / 1,295 `expect()`） |
+| `g4_v5` | PASS | v5 会话差分、Sidecar/Egress、OOB、假设图与 L1 10 场景靶场门禁（21 pass / 284 `expect()` + L1 10/10） |
+| `g5_v51` | PASS | v5.1 三元组去重、封盘、派单守卫、看门狗与全工具范围护栏门禁（63 pass / 932 `expect()`） |
+| `g6_v6` | PASS | v6.0 版本一致性、`tsc -p tsconfig.json` 全仓零错误、离线构建、`omp/graph.ts` 2,377 行（`< 2500`）、`nuwa-mcp 6.0.0`、67 pass（1,113 `expect()`）与 L2 五场景硬门禁 |
 
 ### 2. 隔离沙盒部署验收（`install.sh`）
 
-- **测试环境**：`/tmp` 独立隔离沙盒 + stub `omp/18.16.0`（耗时 `4.61s`）
-- **验收结果**：**5/5 部署测试全部通过**——`30/30` 扩展模块与 `$AGENT_HOME/nuwa-core/bin/nuwa-mcp`（`6.0.0`）完整就位、`Bun.plugin` 异步加载回显 `SMOKE_OK 6.0.0 tools=12`、便携知识库 `kb.db`（394 条）初始化与 `doctor` 健康体检全部通过。
+- **测试环境**：`/tmp` 独立隔离沙盒 + stub `omp/18.16.0`（耗时 `2.72s`）
+- **验收结果**：**5/5 部署测试全部通过**——`30/30` 扩展模块与 `$AGENT_HOME/nuwa-core/bin/nuwa-mcp`（`6.0.0`）完整就位、`Bun.plugin` 异步加载回显 `SMOKE_OK 6.0.0 tools=12`、便携知识库 `kb.db`（394 条，card=36，cve=74）初始化与 `doctor` 健康体检全部通过。

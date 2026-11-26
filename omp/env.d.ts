@@ -1,8 +1,8 @@
 /**
- * 女娲 v4.0 离线环境与宿主扩展自包含类型声明。
+ * 女娲 v6.0 离线环境与宿主扩展自包含类型声明。
  *
  * 目标：无需任何外置 `node_modules`、`@types/node` 或 `@types/bun`，
- * 即可离线完成 `omp/*.ts` 与 `kb/*.ts` 的严格类型检查与 `bun build` 静态构建。
+ * 即可离线完成 `omp/*.ts`、`kb/*.ts`、`core/*.ts` 与 `benchmarks/*.ts` 的严格类型检查与 `bun build` 静态构建。
  */
 
 interface ImportMeta {
@@ -21,6 +21,16 @@ declare namespace NodeJS {
 	}
 	interface ProcessEnv {
 		[key: string]: string | undefined;
+	}
+	interface ReadableStream {
+		readable?: boolean;
+		on(event: string, listener: (...args: any[]) => void): this;
+		once(event: string, listener: (...args: any[]) => void): this;
+		off(event: string, listener: (...args: any[]) => void): this;
+		pause(): this;
+		resume(): this;
+		setEncoding?(encoding: string): this;
+		destroy?(error?: Error): this;
 	}
 	interface WriteStream {
 		write(chunk: string | Uint8Array): boolean;
@@ -61,6 +71,7 @@ declare var process: {
 	kill(pid: number, signal?: string | number): boolean;
 	on(event: string, listener: (...args: any[]) => void): unknown;
 	off(event: string, listener: (...args: any[]) => void): unknown;
+	stdin: NodeJS.ReadableStream;
 	stdout: NodeJS.WriteStream;
 	stderr: NodeJS.WriteStream;
 };
@@ -470,6 +481,10 @@ declare module "node:child_process" {
 declare module "node:timers" {
 	export function setInterval(callback: (...args: any[]) => void, ms?: number): { unref(): void; ref(): void };
 	export function clearInterval(handle: unknown): void;
+}
+
+declare module "node:util" {
+	export function format(format?: unknown, ...param: unknown[]): string;
 }
 
 declare function setInterval(callback: (...args: any[]) => void, ms?: number): { unref?(): void; ref?(): void } & number;

@@ -781,18 +781,26 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					}
 				}
 				if (!probeRoot && p.resume && !explicitMode && p.target) {
-					const localCand = findLocalRoot(ctx.cwd, sid) ?? (hasProjectState(resolve(ctx.cwd)) ? resolve(ctx.cwd) : null);
-					if (localCand) {
+					const envProj = process.env.NUWA_PROJECT?.trim();
+					const ptr = readSessionPointer(sid);
+					const candList = [
+						findLocalRoot(ctx.cwd, sid),
+						hasProjectState(resolve(ctx.cwd)) ? resolve(ctx.cwd) : null,
+						envProj && hasProjectState(resolve(envProj)) ? resolve(envProj) : null,
+						ptr?.root ? resolve(ptr.root) : null,
+					];
+					for (const localCand of candList) {
+						if (!localCand) continue;
 						const localSt = loadState(localCand);
-						if (localSt) {
-							const localMode = localSt.project.mode;
-							try {
-								if (localSt.project.url === normalizeTargetForMode(p.target, localMode).url) {
-									probeRoot = localCand;
-								}
-							} catch {
-								/* 非匹配目标则按常规流程校验 */
+						if (!localSt) continue;
+						const localMode = localSt.project.mode;
+						try {
+							if (localSt.project.url === normalizeTargetForMode(p.target, localMode).url) {
+								probeRoot = localCand;
+								break;
 							}
+						} catch {
+							/* 非匹配目标则按常规流程校验 */
 						}
 					}
 				}

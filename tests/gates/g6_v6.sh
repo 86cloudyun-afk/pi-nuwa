@@ -9,7 +9,7 @@ fail=0
 echo "[g6] 1/5 版本单一事实来源与 install.sh 动态回显校验"
 python3 tests/version_check.py --require-install-echo || fail=1
 
-echo "[g6] 2/5 契约与全量离线静态构建校验"
+echo "[g6] 2/5 契约、全仓 TypeScript 静态类型检查与离线静态构建校验"
 python3 tests/contract_check.py --v2-only || fail=1
 
 echo "[g6] 3/5 omp/graph.ts 巨石拆解行数门禁 (< 2500 行) 与无环导入校验"
