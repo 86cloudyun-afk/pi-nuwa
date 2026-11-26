@@ -1113,3 +1113,306 @@ describe("靶机 C：中断定界靶机（第 2 跳 403 / Soft-404 精准定界�
 		expect(fpFilteredRes.candidateFact).toBeUndefined();
 	});
 });
+
+describe("Boost 异构审查 5 项 P1 反例精准回归门禁", () => {
+	test("P1-1: 合成链端点敏感查询参数脱敏 + authHeaders Cookie 键值拆分脱敏 + Set-Cookie 动态回显零泄露", async () => {
+		const root = makeTempWorkspace("nuwa-v7-p1-secrets-");
+		const scope = makeLoopbackScope();
+
+		const URL_TOKEN_SECRET = "url_query_secret_tok_332211";
+		const COOKIE_SID_SECRET = "cookie_secret_leak_val_887766";
+		const SET_COOKIE_FRESH_SECRET = "fresh_setcookie_secret_554433";
+
+		// 1a. 验证 targetKey / endpoint 含敏感查询参数时，extractFactCapabilities 与 synthesizeAttackChains 零明文残留
+		const fWithSecretUrl: Fact = {
+			id: "fp1_1",
+			kind: "endpoint",
+			title: "前端泄露内部路由线索",
+			detail: `暴露 /api/step1?token=${URL_TOKEN_SECRET}&page=1`,
+			targetKey: `/api/step1?token=${URL_TOKEN_SECRET}&page=1`,
+			createdAt: "2026-11-26T05:00:00Z",
+		};
+		const fDownstream: Fact = {
+			id: "fp1_2",
+			kind: "endpoint",
+			title: "内部导出接口拿敏感业务数据",
+			detail: "调用 /api/export 导出敏感业务数据",
+			targetKey: "/api/export",
+			createdAt: "2026-11-26T05:01:00Z",
+			agentResult: {
+				capabilities: {
+					provides: ["cap:admin_export_endpoint"],
+					requires: ["cap:leaked_route"],
+					endpoint: "/api/export",
+				},
+			},
+		};
+		const st = makeBaseState("http://127.0.0.1:19999", [fWithSecretUrl, fDownstream], scope);
+		const caps1 = extractFactCapabilities(fWithSecretUrl);
+		expect(JSON.stringify(caps1)).not.toContain(URL_TOKEN_SECRET);
+		const chains = synthesizeAttackChains(st);
+		expect(chains.length).toBeGreaterThan(0);
+		expect(JSON.stringify(chains)).not.toContain(URL_TOKEN_SECRET);
+
+		// 1b & 1c. 启动本地测试服务：第 1 跳下发 Set-Cookie，第 2 跳将传入 Cookie 值与第 1 跳 Set-Cookie 值裸回显到 JSON 非敏感字段名中
+		const echoServer = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req: Request) {
+				const u = new URL(req.url);
+				if (u.pathname === "/hop1") {
+					return new Response(JSON.stringify({ ok: true, next: "/hop2" }), {
+						status: 200,
+						headers: {
+							"Content-Type": "application/json",
+							"Set-Cookie": `fresh_sid=${SET_COOKIE_FRESH_SECRET}; Path=/; HttpOnly`,
+						},
+					});
+				}
+				if (u.pathname === "/hop2") {
+					const ck = req.headers.get("cookie") ?? "";
+					return Response.json(
+						{
+							ok: true,
+							records: [
+								{ note: `echo_cookie=${ck}`, item: "enterprise-data-row-1" },
+								{ note: `bare_vals=${COOKIE_SID_SECRET}|${SET_COOKIE_FRESH_SECRET}`, item: "enterprise-data-row-2" },
+							],
+						},
+						{ status: 200 },
+					);
+				}
+				return Response.json({ error: "404" }, { status: 404 });
+			},
+		});
+
+		try {
+			const cookieChain: AttackChainSpec = {
+				...chains[0]!,
+				steps: [
+					{ ...chains[0]!.steps[0]!, endpoint: "/hop1", extractVariables: [], templateParams: [] },
+					{
+						...chains[0]!.steps[1]!,
+						endpoint: "/hop2",
+						requires: ["cap:leaked_route"],
+						extractVariables: [],
+						templateParams: [],
+					},
+				],
+			};
+			const cookieRes = await executeAttackChainVerification(cookieChain, root, scope, {
+				baseUrl: `http://127.0.0.1:${echoServer.port}`,
+				authHeaders: { Cookie: `sid=${COOKIE_SID_SECRET}; theme=dark` },
+			});
+			expect(cookieRes.verified).toBe(true);
+			const resStr = JSON.stringify(cookieRes);
+			expect(resStr).not.toContain(COOKIE_SID_SECRET);
+			expect(resStr).not.toContain(SET_COOKIE_FRESH_SECRET);
+
+			const trafficDisk = readFileSync(join(root, ".nuwa", "traffic", "index.jsonl"), "utf8");
+			expect(trafficDisk).not.toContain(COOKIE_SID_SECRET);
+			expect(trafficDisk).not.toContain(SET_COOKIE_FRESH_SECRET);
+		} finally {
+			echoServer.stop(true);
+		}
+	});
+
+	test("P1-2 & P1-4: OOB 缺核验源拒绝盲报 + 历史命中基线去重防误报 + callbackTemplate 含查询模板零双问号展开", async () => {
+		const root = makeTempWorkspace("nuwa-v7-p1-oob-");
+		const scope = makeLoopbackScope();
+
+		let lastReceivedCallbackParam = "";
+		let lastReceivedQuery = "";
+		let shouldTriggerRealOob = false;
+
+		const tplServer = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req: Request) {
+				const u = new URL(req.url);
+				if (u.pathname === "/api/cfg") {
+					return Response.json({
+						callbackTemplate: "/api/dispatch?antiReplayToken={{antiReplayToken}}&callback={{callback}}",
+					});
+				}
+				if (u.pathname === "/api/nonce") {
+					return Response.json({ antiReplayToken: "once_tok_p1_test_9988" });
+				}
+				if (u.pathname === "/api/dispatch") {
+					lastReceivedQuery = u.search;
+					lastReceivedCallbackParam = u.searchParams.get("callback") ?? "";
+					if (shouldTriggerRealOob && lastReceivedCallbackParam.startsWith("http://127.0.0.1:")) {
+						await fetch(lastReceivedCallbackParam);
+					}
+					return Response.json({
+						ok: true,
+						records: [{ status: "dispatched_mock_response_over_64_bytes_padding_1234567890" }],
+					});
+				}
+				return Response.json({ error: "not found" }, { status: 404 });
+			},
+		});
+
+		try {
+			const tplBase = `http://127.0.0.1:${tplServer.port}`;
+			// 注意第 1 跳 Fact 自带真实 output JSON（含查询模板），复现 P1-4 jsonPath 提取含查询串场景
+			const facts: Fact[] = [
+				{
+					id: "fo1",
+					kind: "endpoint",
+					title: "配置接口泄露回调端点模板",
+					detail: "公开配置 /api/cfg",
+					targetKey: "/api/cfg",
+					output: JSON.stringify({
+						callbackTemplate: "/api/dispatch?antiReplayToken={{antiReplayToken}}&callback={{callback}}",
+					}),
+					createdAt: "2026-11-26T05:10:00Z",
+				},
+				{
+					id: "fo2",
+					kind: "endpoint",
+					title: "提取一次性 antiReplayToken",
+					detail: "令牌端点 /api/nonce",
+					targetKey: "/api/nonce",
+					createdAt: "2026-11-26T05:11:00Z",
+				},
+				{
+					id: "fo3",
+					kind: "endpoint",
+					title: "触发仅限本机 127.0.0.1 的 OOB 回调接收器",
+					detail: "使用配置泄露的回调端点模板携带一次性 antiReplayToken 触发本机 127.0.0.1 OOB 回调接收器",
+					createdAt: "2026-11-26T05:12:00Z",
+				},
+			];
+			const st = makeBaseState(tplBase, facts, scope);
+			const chain = synthesizeAttackChains(st).find((c) => c.depth === 3)!;
+			expect(chain).toBeDefined();
+
+			// 2a. 传入 oobCallbackUrl 但未提供 verifyOobHit/oobPollUrl，且服务端 0 次回调：严禁盲报 verified: true
+			shouldTriggerRealOob = false;
+			const noVerifierRes = await executeAttackChainVerification(chain, root, scope, {
+				baseUrl: tplBase,
+				oobCallbackUrl: `${oobReceiverBaseUrl}/oob/callback`,
+			});
+			expect(noVerifierRes.verified).toBe(false);
+			expect(noVerifierRes.failureKind).toBe("oob_not_triggered");
+			expect(noVerifierRes.candidateFact).toBeUndefined();
+
+			// P1-4 校验：服务端收到的查询串无双问号，且 callback 参数已完整展开为真实 http://127.0.0.1:...（不含 {{callback}} 字面量）
+			expect((lastReceivedQuery.match(/\?/g) ?? []).length).toBe(1);
+			expect(lastReceivedCallbackParam).toStartWith(`${oobReceiverBaseUrl}/oob/callback`);
+			expect(lastReceivedCallbackParam).not.toContain("{{");
+
+			// 2b. OOB 接收器预先存在 1 条历史陈旧记录，本次服务端不发回调（shouldTriggerRealOob = false）：严禁因历史记录误报
+			oobCapturedHits.length = 0;
+			oobCapturedHits.push({
+				id: "stale_hit_0",
+				path: "/oob/callback",
+				query: "?stale=1",
+				timestamp: "2026-11-25T00:00:00.000Z",
+			});
+			const stalePollRes = await executeAttackChainVerification(chain, root, scope, {
+				baseUrl: tplBase,
+				oobCallbackUrl: `${oobReceiverBaseUrl}/oob/callback`,
+				oobPollUrl: `${oobReceiverBaseUrl}/oob/events`,
+			});
+			expect(stalePollRes.verified).toBe(false);
+			expect(stalePollRes.oobConfirmed).toBe(false);
+			expect(stalePollRes.failureKind).toBe("oob_not_triggered");
+			expect(oobCapturedHits).toHaveLength(1);
+
+			// 开启真实 OOB 回调后，增量命中 + 关联 __nuwa_cid 验证通过
+			shouldTriggerRealOob = true;
+			const freshHitRes = await executeAttackChainVerification(chain, root, scope, {
+				baseUrl: tplBase,
+				oobCallbackUrl: `${oobReceiverBaseUrl}/oob/callback`,
+				oobPollUrl: `${oobReceiverBaseUrl}/oob/events`,
+			});
+			expect(freshHitRes.verified).toBe(true);
+			expect(freshHitRes.oobConfirmed).toBe(true);
+			expect(oobCapturedHits).toHaveLength(2);
+		} finally {
+			tplServer.stop(true);
+		}
+	});
+
+	test("P1-3 & P1-5: 打穿时信念图正向提权回退生效 + OpenAPI {itemId} 路径不误转且缺失变量精准归因当前步", async () => {
+		const root = makeTempWorkspace("nuwa-v7-p1-belief-blame-");
+		const scope = makeLoopbackScope();
+
+		// P1-3: 验证 verified === true 且 applyBeliefUpdate === true 时，beliefPropagation 真实生效并提升终局节点后验
+		upsertSessionRole(root, { role: "low", bearer: LOW_PRIV_BEARER_SECRET });
+		const factsA: Fact[] = [
+			{
+				id: "fb_1",
+				kind: "endpoint",
+				title: "前端 SourceMap 泄露内部审批路由",
+				detail: "暴露 /assets/app.bundle.js.map",
+				targetKey: "/assets/app.bundle.js.map",
+				createdAt: "2026-11-26T05:20:00Z",
+			},
+			{
+				id: "fb_2",
+				kind: "endpoint",
+				title: "普通低权凭据越权读取审批单中的 exportTicket",
+				detail: "越权读取审批单中的 exportTicket",
+				createdAt: "2026-11-26T05:21:00Z",
+			},
+			{
+				id: "fb_3",
+				kind: "endpoint",
+				title: "内部导出接口凭 exportTicket 导出敏感业务数据",
+				detail: "导出 /api/internal/export",
+				targetKey: "/api/internal/export",
+				createdAt: "2026-11-26T05:22:00Z",
+			},
+		];
+		const stA = makeBaseState(baseUrlA, factsA, scope);
+		stA.project.activeRoles = ["low"];
+		const graphA = initBeliefGraphFromState(stA);
+		const fb3NodeId = resolveBeliefNodeId(graphA, "fb_3", "fact")!;
+		const posteriorBefore = graphA.nodes[fb3NodeId]!.posterior;
+
+		const chainA = synthesizeAttackChains(stA).find((c) => c.depth === 3)!;
+		const hitRes = await executeAttackChainVerification(chainA, root, scope, {
+			baseUrl: baseUrlA,
+			state: stA,
+			beliefGraph: graphA,
+			applyBeliefUpdate: true,
+			candidateFactId: "f_brand_new_unregistered",
+		});
+		expect(hitRes.verified).toBe(true);
+		expect(hitRes.beliefPropagation).toBeDefined();
+		expect(hitRes.beliefPropagation!.isBreakthrough).toBe(true);
+		expect(graphA.nodes[fb3NodeId]!.posterior).toBeGreaterThan(posteriorBefore);
+
+		// P1-5: ① 上游未产出的 OpenAPI 单花括号 /api/items/{itemId} 保持原样不误转为 {{itemId}}
+		const openApiChain: AttackChainSpec = {
+			...chainA,
+			steps: [
+				{ ...chainA.steps[0]!, endpoint: "/assets/app.bundle.js.map" },
+				{ ...chainA.steps[1]!, endpoint: "/api/items/{itemId}", extractVariables: [], templateParams: [] },
+			],
+			depth: 2,
+			factIds: ["fb_1", "fb_2"],
+		};
+		const compiledOpenApi = compileChainToTrafficSequence(openApiChain, baseUrlA);
+		expect(compiledOpenApi[1]!.url).toBe(`${baseUrlA}/api/items/{itemId}`);
+		expect(compiledOpenApi[1]!.url).not.toContain("{{itemId}}");
+
+		// P1-5: ② 当 step[1] 自身带有上游从未承诺提取的 {{unboundVar}} 时，brokenAtStep 精准归因 step[1] (fb_2) 而非误伤 step[0] (fb_1)
+		const unboundStepChain: AttackChainSpec = {
+			...openApiChain,
+			steps: [
+				{ ...chainA.steps[0]!, endpoint: "/assets/app.bundle.js.map", extractVariables: [] },
+				{ ...chainA.steps[1]!, endpoint: "/api/items/{{unboundVar}}", extractVariables: [], templateParams: [] },
+			],
+		};
+		const unboundRes = await executeAttackChainVerification(unboundStepChain, root, scope, {
+			baseUrl: baseUrlA,
+		});
+		expect(unboundRes.verified).toBe(false);
+		expect(unboundRes.brokenAtStep).toBe(1);
+		expect(unboundRes.brokenFactId).toBe("fb_2");
+	});
+});

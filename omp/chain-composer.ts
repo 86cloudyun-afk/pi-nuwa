@@ -17,7 +17,7 @@
  *
  * 约束：零外部第三方依赖，仅 `import type` 引用 `./types`，严禁运行时导入 `./nuwa`。
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import {
 	computeBodyHash,
@@ -457,6 +457,107 @@ function normalizeReadonlyMethod(raw: unknown): ReadonlyHttpMethod {
 	return "GET";
 }
 
+const SENSITIVE_QUERY_PARAM_KEY_RE =
+	/^(?:access_token|refresh_token|id_token|auth_token|api_key|apikey|api_token|csrf_token|xsrf_token|anti_replay_token|antiReplayToken|export_ticket|exportTicket|download_ticket|downloadTicket|token|secret|client_secret|password|passwd|pwd|auth|jwt|session|session_id|sid|csrf|xsrf|sig|signature|ticket|private_token|key|nonce)$/i;
+
+const COOKIE_ATTR_SKIP_SET = new Set([
+	"path",
+	"domain",
+	"expires",
+	"max-age",
+	"samesite",
+	"secure",
+	"httponly",
+	"priority",
+	"partitioned",
+	"version",
+]);
+
+const NON_SECRET_TRIVIAL_VALUES = new Set([
+	"1",
+	"0",
+	"true",
+	"false",
+	"null",
+	"none",
+	"lax",
+	"strict",
+	"dark",
+	"light",
+	"zh",
+	"en",
+	"cn",
+	"us",
+]);
+
+function sanitizeQueryParametersInPath(pathAndQuery: string): string {
+	const qIdx = pathAndQuery.indexOf("?");
+	if (qIdx < 0) return pathAndQuery;
+	const pathname = pathAndQuery.slice(0, qIdx);
+	const rawQuery = pathAndQuery.slice(qIdx + 1);
+	if (!rawQuery) return pathname;
+
+	// 逐段处理查询参数：保留 {{var}} / {var} 模板占位符，将静态敏感参数值强制脱敏为 [REDACTED]
+	const sanitizedParts = rawQuery.split("&").map((seg) => {
+		if (!seg) return seg;
+		const eq = seg.indexOf("=");
+		if (eq <= 0) return seg;
+		const rawKey = seg.slice(0, eq);
+		const rawVal = seg.slice(eq + 1);
+		let decodedKey = rawKey;
+		try {
+			decodedKey = decodeURIComponent(rawKey);
+		} catch {
+			/* ignore */
+		}
+		const trimmedVal = rawVal.trim();
+		// 保留合法模板占位符（如 {{exportTicket}} 或 %7B%7BexportTicket%7D%7D）
+		if (
+			trimmedVal === "" ||
+			trimmedVal === REDACTED_MARKER ||
+			/^(?:\{\{[a-zA-Z0-9_.-]+\}\}|\{[a-zA-Z0-9_.-]+\}|%7B%7B[a-zA-Z0-9_.-]+%7D%7D)$/i.test(trimmedVal)
+		) {
+			return seg;
+		}
+		if (
+			SENSITIVE_QUERY_PARAM_KEY_RE.test(decodedKey) ||
+			SENSITIVE_VAR_NAME_RE.test(decodedKey) ||
+			/^eyJ[A-Za-z0-9_-]{8,}\./.test(trimmedVal)
+		) {
+			return `${rawKey}=${REDACTED_MARKER}`;
+		}
+		return seg;
+	});
+	return `${pathname}?${sanitizedParts.join("&")}`;
+}
+
+function sanitizeEndpointLiteral(raw: string): string {
+	const trimmed = String(raw ?? "").trim();
+	if (!trimmed) return "";
+	if (/^https?:\/\//i.test(trimmed)) {
+		try {
+			const u = new URL(trimmed);
+			const hadUser = Boolean(u.username || u.password);
+			u.username = "";
+			u.password = "";
+			const cleanPathQuery = sanitizeQueryParametersInPath(`${u.pathname || "/"}${u.search || ""}`);
+			const hostPart = u.host;
+			const userPrefix = hadUser ? `${REDACTED_MARKER}:${REDACTED_MARKER}@` : "";
+			return `${u.protocol}//${userPrefix}${hostPart}${cleanPathQuery}`;
+		} catch {
+			return redactTrafficUrl(trimmed);
+		}
+	}
+	return sanitizeQueryParametersInPath(trimmed);
+}
+
+function stripQueryFromEndpoint(endpoint: string | undefined): string | undefined {
+	if (!endpoint) return undefined;
+	const sanitized = sanitizeEndpointLiteral(endpoint);
+	const qIdx = sanitized.indexOf("?");
+	return qIdx >= 0 ? sanitized.slice(0, qIdx) : sanitized;
+}
+
 function cleanRouteCandidate(raw: string): string | null {
 	let s = String(raw ?? "").trim();
 	if (!s) return null;
@@ -475,7 +576,7 @@ function cleanRouteCandidate(raw: string): string | null {
 	if (NON_HTTP_FS_PATH_PREFIX_RE.test(s)) return null;
 	if (/^\/(?:1\.1|1\.0|2\.0|2)\b/.test(s)) return null;
 	if (s.length > 240) return null;
-	return s;
+	return sanitizeQueryParametersInPath(s);
 }
 
 function extractEndpointsFromFact(fact: Fact, blob: string): {
@@ -689,22 +790,32 @@ export function extractFactCapabilities(fact: Fact): FactCapabilities {
 	let explicitEndpoint: string | undefined;
 	let explicitMethod: ReadonlyHttpMethod | undefined;
 
+	let hasExplicitProvides = false;
+	let hasExplicitRequires = false;
+
 	if (rawExplicit && typeof rawExplicit === "object") {
 		if (Array.isArray(rawExplicit.provides)) {
+			hasExplicitProvides = true;
 			for (const p of rawExplicit.provides) {
 				const s = String(p ?? "").trim();
 				if (s.startsWith("cap:")) provides.push(s as CapabilityTag);
 			}
 		}
 		if (Array.isArray(rawExplicit.requires)) {
+			hasExplicitRequires = true;
 			for (const r of rawExplicit.requires) {
 				const s = String(r ?? "").trim();
 				if (s.startsWith("cap:")) requires.push(s as CapabilityTag);
 			}
 		}
 		if (typeof rawExplicit.endpoint === "string") {
-			const cleanEp = cleanRouteCandidate(rawExplicit.endpoint);
-			if (cleanEp) explicitEndpoint = cleanEp;
+			const rawEpStr = rawExplicit.endpoint.trim();
+			if (/^https?:\/\//i.test(rawEpStr)) {
+				explicitEndpoint = sanitizeEndpointLiteral(rawEpStr);
+			} else {
+				const cleanEp = cleanRouteCandidate(rawEpStr);
+				if (cleanEp) explicitEndpoint = cleanEp;
+			}
 		}
 		if (typeof rawExplicit.method === "string") {
 			explicitMethod = normalizeReadonlyMethod(rawExplicit.method);
@@ -817,42 +928,49 @@ export function extractFactCapabilities(fact: Fact): FactCapabilities {
 
 	// 3d. 终局内部导出接口
 	if (isExportEndpoint && !provides.includes("cap:ticket_or_token_leak")) {
-		provides.push("cap:admin_export_endpoint");
-		if (
-			isTicketLeak ||
-			/\bticket\b|\bexportTicket\b|票据|一次性/i.test(semanticText) ||
-			Boolean(primaryEndpoint && /ticket/i.test(primaryEndpoint))
-		) {
-			requires.push("cap:ticket_or_token_leak");
-		} else {
-			requires.push("cap:admin_token");
+		if (!hasExplicitProvides) {
+			provides.push("cap:admin_export_endpoint");
+		}
+		if (!hasExplicitRequires) {
+			if (
+				isTicketLeak ||
+				/\bticket\b|\bexportTicket\b|票据|一次性/i.test(semanticText) ||
+				Boolean(primaryEndpoint && /ticket/i.test(primaryEndpoint))
+			) {
+				requires.push("cap:ticket_or_token_leak");
+			} else {
+				requires.push("cap:admin_token");
+			}
 		}
 	}
 
 	// 3e. URL Sink 与 OOB 通道验证
-	if (isUrlSink && !isConfigLeak) {
-		provides.push("cap:url_sink");
-	}
-	if (isOobChannel) {
-		provides.push("cap:oob_channel");
-		if (!provides.includes("cap:url_sink") && !isConfigLeak) {
+	if (!hasExplicitProvides) {
+		if (isUrlSink && !isConfigLeak) {
 			provides.push("cap:url_sink");
+		}
+		if (isOobChannel) {
+			provides.push("cap:oob_channel");
+			if (!provides.includes("cap:url_sink") && !isConfigLeak) {
+				provides.push("cap:url_sink");
+			}
 		}
 	}
 
 	// 3f. 推导中间跳与终局跳的 requires 前置条件
 	if (
+		!hasExplicitRequires &&
 		fact.kind !== "cred" &&
 		!isSourceMapOrRouteLeak &&
 		!isConfigLeak
 	) {
-		// 若该事实涉及内部/隐藏审批或未公开路由（且不是静态公开配置），需要前置泄露路由能力
+		// 若该事实缺少自身静态入口路径，或涉及内部/隐藏路由，需要前置泄露路由能力
 		if (
 			!isExportEndpoint &&
-			(INTERNAL_OR_HIDDEN_ROUTE_RE.test(semanticText) ||
+			(!primaryEndpoint ||
+				INTERNAL_OR_HIDDEN_ROUTE_RE.test(semanticText) ||
 				Boolean(primaryEndpoint && /^\/(?:api\/)?(?:internal|private|approvals?)\b/i.test(primaryEndpoint)))
 		) {
-			// 对于纯提取 antiReplayToken 的独立端点，仅当其明确位于内部隐藏路由或未给静态路径时才要求 cap:leaked_route
 			const isStandaloneTokenIssuer =
 				provides.includes("cap:csrf_or_nonce") &&
 				Boolean(primaryEndpoint) &&
@@ -1375,12 +1493,16 @@ function buildChainSpecFromSequence(
 		const rawStepTitle = oneLine(node.fact.title, 120) || node.fact.id;
 		const safeStepTitle = redactTrafficBody(rawStepTitle, { maxChars: 120 }) || node.fact.id;
 
+		const safeEndpoint = node.caps.primaryEndpoint
+			? sanitizeEndpointLiteral(node.caps.primaryEndpoint)
+			: undefined;
+
 		return {
 			stepIndex: idx,
 			factId: node.fact.id,
 			factKind: node.fact.kind,
 			title: safeStepTitle,
-			...(node.caps.primaryEndpoint ? { endpoint: node.caps.primaryEndpoint } : {}),
+			...(safeEndpoint ? { endpoint: safeEndpoint } : {}),
 			method: node.caps.method,
 			provides: [...node.caps.provides],
 			requires: [...node.caps.requires],
@@ -1411,9 +1533,9 @@ function buildChainSpecFromSequence(
 		Math.pow(Math.max(1, estimatedCost), 0.55);
 	const utilityScore = Number((Number.isFinite(rawUtility) ? Math.max(0, rawUtility) : 0).toFixed(4));
 
-	// 同链语义签名：基于每跳关键能力与目标端点归一化，消除同端点重复 Fact 造成的冗余链
+	// 同链语义签名：仅基于纯路径（剥离查询参数）与每跳关键能力归一化，杜绝查询参数泄露并消除同端点冗余链
 	const semanticParts = steps.map(
-		(s) => `${s.endpoint ?? s.factId}:${[...s.activeCapabilities].sort().join("+")}`,
+		(s) => `${stripQueryFromEndpoint(s.endpoint) ?? s.factId}:${[...s.activeCapabilities].sort().join("+")}`,
 	);
 	const semanticSignature = semanticParts.join(" -> ");
 	const id = `chain:${sha1Short(`${factIds.join(">")}|${semanticSignature}`, 12)}`;
@@ -1605,9 +1727,14 @@ export function compileChainToTrafficSequence(
 
 		// 解析步骤目标 URL
 		let rawEndpoint = step.endpoint?.trim() ?? "";
-		// 将单花括号路径参数（如 /approvals/{id}）规范化为双花括号（若存在对应上游变量）
-		rawEndpoint = rawEndpoint.replace(/\{([a-zA-Z0-9_.-]+)\}/g, (_m, name: string) =>
-			producedBeforeStep.has(name) || name === "oobCallbackUrl" ? `{{${name}}}` : `{{${name}}}`,
+		// 仅当单花括号变量确实由前序步骤产出（或属于受控 OOB 回调变量）时，才将其规范化为双花括号 {{name}}，保留无关 OpenAPI 路径段原貌
+		rawEndpoint = rawEndpoint.replace(/(?<!\{)\{([a-zA-Z0-9_.-]+)\}(?!\})/g, (fullMatch, name: string) =>
+			producedBeforeStep.has(name) ||
+			name === "oobCallbackUrl" ||
+			name === "callbackUrl" ||
+			name === "callback"
+				? `{{${name}}}`
+				: fullMatch,
 		);
 
 		let stepUrl: string;
@@ -1661,13 +1788,23 @@ export function compileChainToTrafficSequence(
 			}
 		}
 
-		// 绑定 OOB 回调接收 URL 模板参数
+		// 绑定 OOB 回调接收 URL 模板参数（当显式传入 oobCallbackUrl 或未禁用 OOB 模板注入时自动挂载）
 		if (
 			step.provides.includes("cap:url_sink") ||
 			step.provides.includes("cap:oob_channel") ||
 			step.templateParams.some((p) => p.varName === "oobCallbackUrl")
 		) {
-			if (!/\{\{\s*(?:oobCallbackUrl|callbackUrl|callback)\s*\}\}/.test(stepUrl)) {
+			if (
+				opts?.oobCallbackUrl !== undefined &&
+				!/\{\{\s*(?:oobCallbackUrl|callbackUrl|callback)\s*\}\}/.test(stepUrl)
+			) {
+				stepUrl = appendQueryTemplateIfMissing(stepUrl, "callback", "oobCallbackUrl");
+				stepUrl = appendQueryTemplateIfMissing(stepUrl, "callbackUrl", "oobCallbackUrl");
+			} else if (
+				opts?.oobCallbackUrl === undefined &&
+				!/[?&](?:callback|callbackUrl|oobCallbackUrl|url|target)=/i.test(stepUrl) &&
+				!/\{\{\s*(?:oobCallbackUrl|callbackUrl|callback)\s*\}\}/.test(stepUrl)
+			) {
 				stepUrl = appendQueryTemplateIfMissing(stepUrl, "callback", "oobCallbackUrl");
 				stepUrl = appendQueryTemplateIfMissing(stepUrl, "callbackUrl", "oobCallbackUrl");
 			}
@@ -1834,12 +1971,22 @@ export function applyChainResultToBeliefGraph(
 	state: NuwaState,
 	opts?: { applyToState?: boolean },
 ): BeliefPropagationResult | null {
-	const targetFactId = result.verified
-		? result.candidateFact?.id ?? result.stepTraces[result.stepTraces.length - 1]?.factId
-		: result.brokenFactId;
-	if (!targetFactId) return null;
+	const candidateRefs: string[] = [];
+	if (result.verified) {
+		if (result.candidateFact?.id) candidateRefs.push(result.candidateFact.id);
+		for (let i = result.stepTraces.length - 1; i >= 0; i--) {
+			const fid = result.stepTraces[i]?.factId;
+			if (fid && !candidateRefs.includes(fid)) candidateRefs.push(fid);
+		}
+	} else if (result.brokenFactId) {
+		candidateRefs.push(result.brokenFactId);
+	}
 
-	const resolvedNodeId = resolveBeliefNodeId(graph, targetFactId, "fact") ?? resolveBeliefNodeId(graph, targetFactId);
+	let resolvedNodeId: string | undefined;
+	for (const ref of candidateRefs) {
+		resolvedNodeId = resolveBeliefNodeId(graph, ref, "fact") ?? resolveBeliefNodeId(graph, ref);
+		if (resolvedNodeId) break;
+	}
 	if (!resolvedNodeId) return null;
 
 	return propagateBeliefUpdate(graph, state, {
@@ -1880,26 +2027,61 @@ export async function executeAttackChainVerification(
 	}
 
 	const collectedSecrets = new Set<string>();
+	let recorderRef: TrafficRecorder | undefined;
+
 	const registerSecret = (val: string | undefined) => {
 		const trimmed = String(val ?? "").trim();
-		if (trimmed.length >= 4 && trimmed !== REDACTED_MARKER) {
+		if (
+			trimmed.length >= 3 &&
+			trimmed !== REDACTED_MARKER &&
+			!NON_SECRET_TRIVIAL_VALUES.has(trimmed.toLowerCase())
+		) {
 			collectedSecrets.add(trimmed);
-			const bare = trimmed.replace(/^(?:Bearer|Basic|Token|JWT)\s+/i, "").trim();
-			if (bare.length >= 4) collectedSecrets.add(bare);
+			recorderRef?.registerTransientSecret(trimmed);
+			const bare = trimmed.replace(/^(?:Bearer|Basic|Token|JWT|Digest)\s+/i, "").trim();
+			if (bare.length >= 3 && !NON_SECRET_TRIVIAL_VALUES.has(bare.toLowerCase())) {
+				collectedSecrets.add(bare);
+				recorderRef?.registerTransientSecret(bare);
+			}
+		}
+	};
+
+	const registerCookieHeaderSecrets = (rawCookieHeader: string | undefined) => {
+		if (!rawCookieHeader) return;
+		for (const line of String(rawCookieHeader).split(/\r?\n/)) {
+			for (const part of line.split(";")) {
+				const seg = part.trim();
+				if (!seg) continue;
+				const eq = seg.indexOf("=");
+				if (eq <= 0) continue;
+				const ck = seg.slice(0, eq).trim();
+				const cv = seg.slice(eq + 1).trim();
+				if (!ck || !cv || COOKIE_ATTR_SKIP_SET.has(ck.toLowerCase())) continue;
+				if (!NON_SECRET_TRIVIAL_VALUES.has(cv.toLowerCase())) {
+					registerSecret(cv);
+				}
+			}
+		}
+	};
+
+	const registerHeaderMapSecrets = (hdrs: Record<string, string> | undefined) => {
+		if (!hdrs) return;
+		for (const [hk, hv] of Object.entries(hdrs)) {
+			if (!hv) continue;
+			const lowerHk = hk.trim().toLowerCase();
+			if (lowerHk === "cookie" || lowerHk === "set-cookie") {
+				registerCookieHeaderSecrets(hv);
+			} else if (SENSITIVE_VAR_NAME_RE.test(hk)) {
+				registerSecret(hv);
+			}
 		}
 	};
 
 	for (const s of opts?.extraSecrets ?? []) registerSecret(s);
-	if (opts?.authHeaders) {
-		for (const [hk, hv] of Object.entries(opts.authHeaders)) {
-			if (SENSITIVE_VAR_NAME_RE.test(hk)) registerSecret(hv);
-		}
-	}
+	registerHeaderMapSecrets(opts?.authHeaders);
 	if (opts?.roleHeaders) {
 		for (const hdrMap of Object.values(opts.roleHeaders)) {
-			for (const [hk, hv] of Object.entries(hdrMap ?? {})) {
-				if (SENSITIVE_VAR_NAME_RE.test(hk)) registerSecret(hv);
-			}
+			registerHeaderMapSecrets(hdrMap);
 		}
 	}
 	if (opts?.initialCookies) {
@@ -1917,6 +2099,7 @@ export async function executeAttackChainVerification(
 			vault: resolvedVault,
 			extraSecrets: [...collectedSecrets],
 		});
+	recorderRef = recorder;
 	for (const sec of collectedSecrets) {
 		recorder.registerTransientSecret(sec);
 	}
@@ -1991,6 +2174,8 @@ export async function executeAttackChainVerification(
 	// 2. 校验可选受控 OOB 回调接收器与轮询端点安全性（严格锁死本机 127.0.0.1 或授权 Scope/oobDomains）
 	const currentVars: Record<string, string> = { ...(opts?.initialVars ?? {}) };
 	let currentCookies: Record<string, string> = { ...(opts?.initialCookies ?? {}) };
+	// 为每次验证生成唯一一次性关联 Canary 参数，防止历史陈旧 OOB 记录导致假阳性
+	const oobCorrelationToken = `nuwa_cid_${randomBytes(6).toString("hex")}`;
 
 	if (opts?.oobCallbackUrl) {
 		const oobCheck = validateControlledOobEndpoint(opts.oobCallbackUrl, scope, "OOB 回调接收器");
@@ -2008,9 +2193,14 @@ export async function executeAttackChainVerification(
 				oobConfirmed: false,
 			});
 		}
-		currentVars.oobCallbackUrl = oobCheck.parsed.toString();
-		currentVars.callbackUrl = oobCheck.parsed.toString();
-		currentVars.callback = oobCheck.parsed.toString();
+		const correlatedCbUrl = new URL(oobCheck.parsed.toString());
+		if (!correlatedCbUrl.searchParams.has("__nuwa_cid")) {
+			correlatedCbUrl.searchParams.set("__nuwa_cid", oobCorrelationToken);
+		}
+		const encodedCbHref = encodeURIComponent(correlatedCbUrl.toString());
+		currentVars.oobCallbackUrl = encodedCbHref;
+		currentVars.callbackUrl = encodedCbHref;
+		currentVars.callback = encodedCbHref;
 	}
 
 	if (opts?.oobPollUrl) {
@@ -2095,14 +2285,7 @@ export async function executeAttackChainVerification(
 
 	const guardedFetchFn: TrafficFetchFn = async (url, init) => {
 		const reqMethod = normalizeReadonlyMethod(init?.method);
-		if (init?.headers) {
-			for (const [hk, hv] of Object.entries(init.headers)) {
-				if (SENSITIVE_VAR_NAME_RE.test(hk)) {
-					registerSecret(hv);
-					recorder.registerTransientSecret(hv.replace(/^(?:Bearer|Basic|Token|JWT)\s+/i, "").trim());
-				}
-			}
-		}
+		registerHeaderMapSecrets(init?.headers);
 		const resp = await rawFetcher(url, {
 			...init,
 			method: reqMethod,
@@ -2110,22 +2293,46 @@ export async function executeAttackChainVerification(
 		});
 		if (resp.headers) {
 			const hdrs = resp.headers as {
+				getSetCookie?: () => string[];
 				forEach?: (cb: (v: string, k: string) => void) => void;
+				get?: (name: string) => string | null;
 			};
+			if (typeof hdrs.getSetCookie === "function") {
+				try {
+					for (const sc of hdrs.getSetCookie()) {
+						registerCookieHeaderSecrets(sc);
+					}
+				} catch {
+					/* ignore */
+				}
+			}
 			if (typeof hdrs.forEach === "function") {
 				hdrs.forEach((hv, hk) => {
-					if (hk.toLowerCase() !== "set-cookie" && SENSITIVE_VAR_NAME_RE.test(hk)) {
-						registerSecret(hv);
-						recorder.registerTransientSecret(hv.trim());
+					const lowerHk = hk.toLowerCase();
+					if (lowerHk === "set-cookie" || lowerHk === "cookie") {
+						registerCookieHeaderSecrets(hv);
+					} else if (SENSITIVE_VAR_NAME_RE.test(hk)) {
+						registerSecret(hv.trim());
 					}
 				});
-			} else if (typeof resp.headers === "object") {
+			} else if (typeof resp.headers === "object" && !("get" in resp.headers && typeof hdrs.get === "function")) {
 				for (const [hk, hv] of Object.entries(resp.headers as Record<string, unknown>)) {
-					if (hk.toLowerCase() !== "set-cookie" && SENSITIVE_VAR_NAME_RE.test(hk) && typeof hv === "string") {
-						registerSecret(hv);
-						recorder.registerTransientSecret(hv.trim());
+					const lowerHk = hk.toLowerCase();
+					if (lowerHk === "set-cookie" || lowerHk === "cookie") {
+						if (Array.isArray(hv)) {
+							for (const item of hv) {
+								if (typeof item === "string") registerCookieHeaderSecrets(item);
+							}
+						} else if (typeof hv === "string") {
+							registerCookieHeaderSecrets(hv);
+						}
+					} else if (SENSITIVE_VAR_NAME_RE.test(hk) && typeof hv === "string") {
+						registerSecret(hv.trim());
 					}
 				}
+			} else if (typeof hdrs.get === "function") {
+				const sc = hdrs.get("set-cookie");
+				if (sc) registerCookieHeaderSecrets(sc);
 			}
 		}
 		let cachedBody: string | undefined;
@@ -2140,7 +2347,6 @@ export async function executeAttackChainVerification(
 					extractSensitiveValuesFromJson(cachedBody, newlyFound);
 					for (const val of newlyFound) {
 						registerSecret(val);
-						recorder.registerTransientSecret(val);
 					}
 				}
 				return cachedBody;
@@ -2148,31 +2354,116 @@ export async function executeAttackChainVerification(
 		};
 	};
 
+	// 4b. 若提供了 oobPollUrl，在执行第 0 跳之前预采样历史命中基线计数与条目签名，严防历史记录造成误报
+	const parsePollSnapshot = (pollText: string): { count: number; itemSigs: Set<string> } => {
+		const sigs = new Set<string>();
+		let count = 0;
+		const parsedPoll = tryParseJsonFromText(pollText);
+		if (parsedPoll && typeof parsedPoll === "object") {
+			const obj = parsedPoll as Record<string, unknown>;
+			const hitsArr = Array.isArray(obj.hits)
+				? obj.hits
+				: Array.isArray(obj.events)
+					? obj.events
+					: Array.isArray(obj.data)
+						? obj.data
+						: Array.isArray(parsedPoll)
+							? (parsedPoll as unknown[])
+							: [];
+			for (const item of hitsArr) {
+				try {
+					sigs.add(typeof item === "string" ? item : JSON.stringify(item));
+				} catch {
+					/* ignore */
+				}
+			}
+			count = Math.max(hitsArr.length, Number(obj.count ?? 0) || 0);
+		}
+		return { count, itemSigs: sigs };
+	};
+
+	let oobBaselineCount = 0;
+	let oobBaselineSigs = new Set<string>();
+	if (opts?.oobPollUrl) {
+		try {
+			const preResp = await guardedFetchFn(opts.oobPollUrl, {
+				method: "GET",
+				headers: { Accept: "application/json, text/plain, */*" },
+				redirect: "manual",
+				signal: opts.signal,
+			});
+			const preText = await preResp.text();
+			if (preResp.status >= 200 && preResp.status < 300 && preText.trim()) {
+				const snap = parsePollSnapshot(preText);
+				oobBaselineCount = snap.count;
+				oobBaselineSigs = snap.itemSigs;
+			}
+		} catch {
+			oobBaselineCount = 0;
+			oobBaselineSigs = new Set<string>();
+		}
+	}
+
+	// 保存从动态路由模板（如 callbackTemplate 含 ?k={{v}}）剥离出的附加查询模板键值对
+	const extractedRouteQueryTemplates: Array<[string, string]> = [];
+
 	// 5. 逐跳有状态执行 replayTrafficSequence，遇阻立即精确定界熔断
 	const stepTraces: ChainStepTrace[] = [];
 	let lastStepReplay: ReplayStepResult | undefined;
 
 	for (let k = 0; k < trafficSteps.length; k++) {
-		const tStep = trafficSteps[k]!;
+		let tStep = trafficSteps[k]!;
 		const cStep = chain.steps[k]!;
 
-		// 5a. 检查本步必需的上游模板变量是否已就绪（若缺失则说明上一跳 k-1 未能提取出承诺的变量）
+		// 若本步使用了 {{leakedRoute}} 且上游提取的 callbackTemplate 带有自定义查询参数模板，安全合并入本步顶层 URL
+		if (tStep.url.includes("{{leakedRoute}}") && extractedRouteQueryTemplates.length > 0) {
+			let mergedUrl = tStep.url;
+			for (const [qk, qTplVal] of extractedRouteQueryTemplates) {
+				const normalizedTplVal = qTplVal.replace(/(?<!\{)\{([a-zA-Z0-9_.-]+)\}(?!\})/g, "{{$1}}");
+				const escapedKey = escapeRegexLiteral(qk);
+				if (!new RegExp(`[?&]${escapedKey}=`, "i").test(mergedUrl)) {
+					const sep = mergedUrl.includes("?") ? "&" : "?";
+					mergedUrl = `${mergedUrl}${sep}${encodeURIComponent(qk)}=${normalizedTplVal}`;
+				}
+			}
+			tStep = { ...tStep, url: mergedUrl };
+		}
+
+		// 5a. 检查本步必需的上游模板变量是否已就绪；精准归因到声明提取该变量但未产出的上游步骤 j，否则归因当前步 k
 		const neededVars = collectTemplatePlaceholders(tStep);
 		const missingVars = neededVars.filter(
 			(v) => currentVars[v] === undefined || String(currentVars[v]).trim() === "",
 		);
 		if (missingVars.length > 0) {
-			const blameIdx = Math.max(0, k - 1);
+			const primaryMissing = missingVars[0]!;
+			let producerStepIdx = -1;
+			for (let j = k - 1; j >= 0; j--) {
+				const prevExtracts = trafficSteps[j]?.extract;
+				if (prevExtracts && Object.prototype.hasOwnProperty.call(prevExtracts, primaryMissing)) {
+					producerStepIdx = j;
+					break;
+				}
+			}
+			const blameIdx = producerStepIdx >= 0 ? producerStepIdx : k;
 			const blameStep = chain.steps[blameIdx]!;
+			const rawMissingReason =
+				producerStepIdx >= 0
+					? `步骤 #${blameIdx + 1} (${blameStep.factId}) 未能从响应中提取下游必需变量 [${missingVars.join(", ")}]，已熔断后续步骤`
+					: `步骤 #${blameIdx + 1} (${blameStep.factId}) 缺少必需绑定变量 [${missingVars.join(", ")}]，无法构造探测请求`;
 			return finalizeFailure({
 				stepIndex: blameIdx,
 				factId: blameStep.factId,
-				failureKind: "missing_extracted_var",
-				rawReason: `步骤 #${blameIdx + 1} (${blameStep.factId}) 未能从响应中提取下游必需变量 [${missingVars.join(", ")}]，已熔断后续步骤`,
+				failureKind:
+					(primaryMissing === "oobCallbackUrl" || primaryMissing === "callbackUrl" || primaryMissing === "callback") &&
+					producerStepIdx < 0
+						? "oob_not_triggered"
+						: "missing_extracted_var",
+				rawReason: rawMissingReason,
 				obsType: "soft404_miss",
 				obsWeight: 1.2,
 				stepTraces,
 				currentVars,
+				...(primaryMissing === "oobCallbackUrl" ? { oobConfirmed: false } : {}),
 			});
 		}
 
@@ -2189,6 +2480,10 @@ export async function executeAttackChainVerification(
 		});
 
 		currentCookies = { ...currentCookies, ...replayRes.cookies };
+		for (const cv of Object.values(replayRes.cookies)) {
+			registerSecret(cv);
+		}
+
 		const stepRes = replayRes.steps[0];
 		if (!stepRes) {
 			return finalizeFailure({
@@ -2203,12 +2498,40 @@ export async function executeAttackChainVerification(
 		}
 		lastStepReplay = stepRes;
 
-		// 登记提取到的变量，并对敏感票据执行全链路脱敏注册
-		for (const [vk, vv] of Object.entries(stepRes.extracted)) {
+		// 登记提取到的变量：若提取到的路由变量附带查询模板（如 /api/dispatch?token={{antiReplayToken}}&cb={{callback}}），规范剥离查询模板防双 ? 与嵌套未展开
+		for (const [vk, rawVv] of Object.entries(stepRes.extracted)) {
+			let vv = rawVv;
+			if (vk === "leakedRoute" || /(?:route|path|endpoint|template)$/i.test(vk)) {
+				let candidatePath = vv.trim();
+				if (/^https?:\/\//i.test(candidatePath)) {
+					try {
+						const parsedU = new URL(candidatePath);
+						candidatePath = `${parsedU.pathname || "/"}${parsedU.search || ""}`;
+					} catch {
+						/* ignore */
+					}
+				}
+				const qPos = candidatePath.indexOf("?");
+				if (qPos >= 0) {
+					const purePathname = candidatePath.slice(0, qPos) || "/";
+					const rawQueryTpl = candidatePath.slice(qPos + 1);
+					for (const seg of rawQueryTpl.split("&")) {
+						const eq = seg.indexOf("=");
+						if (eq > 0) {
+							const qk = seg.slice(0, eq).trim();
+							const qv = seg.slice(eq + 1).trim();
+							if (qk && qv) {
+								extractedRouteQueryTemplates.push([qk, qv]);
+							}
+						}
+					}
+					vv = purePathname.startsWith("/") ? purePathname : `/${purePathname}`;
+				}
+			}
 			currentVars[vk] = vv;
 			if (SENSITIVE_VAR_NAME_RE.test(vk)) {
+				registerSecret(rawVv);
 				registerSecret(vv);
-				recorder.registerTransientSecret(vv);
 			}
 		}
 
@@ -2363,8 +2686,23 @@ export async function executeAttackChainVerification(
 	let oobConfirmed: boolean | undefined;
 	let oobEvidenceDetail = "";
 
-	if (isOobChain && (opts?.verifyOobHit || opts?.oobPollUrl)) {
+	if (isOobChain) {
 		oobConfirmed = false;
+		// 严禁 OOB 攻击链在未提供任何回调核验手段时回退普通响应长度检查造成盲报
+		if (!opts?.verifyOobHit && !opts?.oobPollUrl) {
+			return finalizeFailure({
+				stepIndex: finalIdx,
+				factId: finalChainStep.factId,
+				failureKind: "oob_not_triggered",
+				rawReason: `终局步骤 #${finalIdx + 1} (${finalChainStep.factId}) 属于 OOB 验证链但缺少回调核验源 (verifyOobHit / oobPollUrl)，拒绝无证据盲报`,
+				obsType: "soft404_miss",
+				obsWeight: 1.25,
+				stepTraces,
+				currentVars,
+				oobConfirmed: false,
+			});
+		}
+
 		if (opts.verifyOobHit) {
 			const hitRes = await opts.verifyOobHit({ chain, variables: { ...currentVars } });
 			oobConfirmed = Boolean(hitRes.hit);
@@ -2378,22 +2716,17 @@ export async function executeAttackChainVerification(
 			});
 			const pollText = await pollResp.text();
 			if (pollResp.status >= 200 && pollResp.status < 300 && pollText.trim()) {
-				const parsedPoll = tryParseJsonFromText(pollText);
-				if (parsedPoll && typeof parsedPoll === "object") {
-					const obj = parsedPoll as Record<string, unknown>;
-					const hitsArr = Array.isArray(obj.hits)
-						? obj.hits
-						: Array.isArray(obj.events)
-							? obj.events
-							: Array.isArray(obj.data)
-								? obj.data
-								: Array.isArray(parsedPoll)
-									? (parsedPoll as unknown[])
-									: [];
-					if (hitsArr.length > 0 || obj.hit === true || Number(obj.count ?? 0) > 0) {
-						oobConfirmed = true;
-						oobEvidenceDetail = pollText;
-					}
+				const postSnap = parsePollSnapshot(pollText);
+				const matchedCid = opts.oobCallbackUrl ? pollText.includes(oobCorrelationToken) : false;
+				let newItemCount = 0;
+				for (const sig of postSnap.itemSigs) {
+					if (!oobBaselineSigs.has(sig)) newItemCount++;
+				}
+				const countDelta = postSnap.count - oobBaselineCount;
+				// 必须匹配本次一次性关联标识 __nuwa_cid，或存在严格大于发包前基线的新增回调记录
+				if (matchedCid || newItemCount > 0 || countDelta > 0) {
+					oobConfirmed = true;
+					oobEvidenceDetail = pollText;
 				}
 			}
 		}
@@ -2403,7 +2736,7 @@ export async function executeAttackChainVerification(
 				stepIndex: finalIdx,
 				factId: finalChainStep.factId,
 				failureKind: "oob_not_triggered",
-				rawReason: `终局步骤 #${finalIdx + 1} (${finalChainStep.factId}) 未触发本机/授权 OOB 回调接收器命中，拒绝盲报`,
+				rawReason: `终局步骤 #${finalIdx + 1} (${finalChainStep.factId}) 未触发本机/授权 OOB 回调接收器新增命中，拒绝盲报`,
 				obsType: "soft404_miss",
 				obsWeight: 1.25,
 				stepTraces,
