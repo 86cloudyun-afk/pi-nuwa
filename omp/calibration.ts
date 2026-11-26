@@ -14,20 +14,23 @@
  *
  * 约束：严禁运行时导入 `./nuwa`，仅依赖 `./session-vault` 与 Node 内置模块，保持零循环依赖。
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
 	existsSync,
 	fsyncSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
+	statSync,
 	unlinkSync,
 	writeSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { maskSecretValue, redactVaultSecrets } from "./session-vault";
+import { NuwaSqliteStore, resolveStorageBackend, sqliteDbPath } from "./sqlite-store";
 
 export type CalibrationSettlementSource =
 	| "verifier-gate"
@@ -296,6 +299,7 @@ const INLINE_SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replacer: (...args: st
 ];
 
 const heldCalibLocks = new Set<string>();
+let calibLockSeq = 0;
 let predSeq = 0;
 
 function nowIso(): string {
@@ -357,8 +361,23 @@ function ensureSecureNuwaDir(root: string): string {
 	return dir;
 }
 
+function readCalibrationLockHolder(
+	lockFile: string,
+): { pid?: number; ts?: number; start?: string | null; nonce?: string } | null {
+	try {
+		const raw = readFileSync(lockFile, "utf8").trim();
+		if (!raw) return null;
+		const parsed = JSON.parse(raw) as { pid?: number; ts?: number; start?: string | null; nonce?: string };
+		return parsed && typeof parsed === "object" ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
 /**
- * 跨进程 + 同进程可重入校准账本文件锁，保证并发追加与防重结算临界区的严格原子性。
+ * 跨进程 + 同进程可重入校准账本文件锁：
+ * 使用临时文件 + fsync + linkSync 原子落锁、300ms 空锁宽限、独占 `.reclaim` 死锁二次核验及 nonce 释放校验，
+ * 保证并发追加与防重结算临界区的严格原子性。
  */
 function withCalibrationLock<T>(root: string, fn: () => T, timeoutMs = 8000): T {
 	ensureSecureNuwaDir(root);
@@ -369,65 +388,240 @@ function withCalibrationLock<T>(root: string, fn: () => T, timeoutMs = 8000): T 
 
 	const deadline = Date.now() + timeoutMs;
 	let backoff = 4;
+	const myNonce = `${process.pid}-${Date.now()}-${randomBytes(6).toString("hex")}`;
+	const lockPayload = JSON.stringify({
+		pid: process.pid,
+		ts: Date.now(),
+		start: procStartTime(process.pid),
+		nonce: myNonce,
+	});
+
 	for (;;) {
-		let fd = -1;
+		const tmp = `${lockFile}.tmp-${process.pid}-${calibLockSeq++}`;
+		let acquired = false;
+		let useFallback = false;
+		let tfd = -1;
 		try {
-			fd = openSync(lockFile, "wx", 0o600);
-			writeSync(
-				fd,
-				JSON.stringify({ pid: process.pid, ts: Date.now(), start: procStartTime(process.pid) }),
-			);
-			fsyncSync(fd);
-			closeSync(fd);
-			fd = -1;
-			break;
-		} catch (err) {
-			if (fd >= 0) {
+			tfd = openSync(tmp, "wx", 0o600);
+			writeSync(tfd, lockPayload);
+			fsyncSync(tfd);
+			closeSync(tfd);
+			tfd = -1;
+			try {
+				linkSync(tmp, lockFile);
+				acquired = true;
+			} catch (linkErr) {
+				const lcode = (linkErr as NodeJS.ErrnoException)?.code;
+				if (lcode === "EEXIST") {
+					acquired = false;
+				} else if (lcode === "EXDEV" || lcode === "EPERM" || lcode === "ENOSYS" || lcode === "EOPNOTSUPP") {
+					useFallback = true;
+				} else {
+					throw linkErr;
+				}
+			}
+		} finally {
+			if (tfd >= 0) {
 				try {
-					closeSync(fd);
+					closeSync(tfd);
 				} catch {
 					/* ignore */
 				}
 			}
-			const code = (err as NodeJS.ErrnoException)?.code;
-			if (code !== "EEXIST") throw err;
-
 			try {
-				const raw = readFileSync(lockFile, "utf8");
-				const meta = JSON.parse(raw) as { pid?: number; ts?: number; start?: string | null };
-				const dead =
-					!meta?.pid ||
-					!pidAlive(meta.pid) ||
-					Boolean(meta.start && procStartTime(meta.pid) && procStartTime(meta.pid) !== meta.start);
-				if (dead) {
+				unlinkSync(tmp);
+			} catch {
+				/* ignore */
+			}
+		}
+
+		if (useFallback) {
+			let fd = -1;
+			try {
+				fd = openSync(lockFile, "wx", 0o600);
+				writeSync(fd, lockPayload);
+				fsyncSync(fd);
+				closeSync(fd);
+				fd = -1;
+				acquired = true;
+			} catch (err) {
+				if (fd >= 0) {
+					try {
+						closeSync(fd);
+					} catch {
+						/* ignore */
+					}
 					try {
 						unlinkSync(lockFile);
 					} catch {
 						/* ignore */
 					}
+					throw err;
+				}
+				const code = (err as NodeJS.ErrnoException)?.code;
+				if (code !== "EEXIST") throw err;
+				acquired = false;
+			}
+		}
+
+		if (!acquired) {
+			const held = readCalibrationLockHolder(lockFile);
+			let emptyMtimeMs: number | null = null;
+			if (held) {
+				const heldPid = typeof held.pid === "number" ? held.pid : 0;
+				const heldStart = typeof held.start === "string" ? held.start : null;
+				const sameProcess = heldPid > 0 && pidAlive(heldPid) && (!heldStart || heldStart === procStartTime(heldPid));
+				if (sameProcess) {
+					if (Date.now() >= deadline) {
+						throw new CalibrationError("INVALID_INPUT", `获取校准账本锁超时 (${lockFile})`);
+					}
+					sleepSync(backoff);
+					backoff = Math.min(64, backoff * 2);
 					continue;
 				}
-			} catch {
-				// 锁文件可能正在写入中，短暂等待后重试
+			} else {
+				let recentlyCreated = false;
+				try {
+					emptyMtimeMs = statSync(lockFile).mtimeMs;
+					recentlyCreated = Date.now() - emptyMtimeMs < 300;
+				} catch {
+					emptyMtimeMs = null;
+					recentlyCreated = false;
+				}
+				if (recentlyCreated && Date.now() < deadline) {
+					sleepSync(backoff);
+					backoff = Math.min(32, backoff * 2);
+					continue;
+				}
 			}
 
+			const reclaimPath = `${lockFile}.reclaim`;
+			const reclaimTmp = `${lockFile}.reclaim.tmp-${process.pid}-${calibLockSeq++}`;
+			const reclaimNonce = `${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+			const reclaimPayload = JSON.stringify({
+				pid: process.pid,
+				ts: Date.now(),
+				start: procStartTime(process.pid),
+				nonce: reclaimNonce,
+			});
+			let reclaimAcquired = false;
+			let rfd = -1;
+			try {
+				rfd = openSync(reclaimTmp, "wx", 0o600);
+				writeSync(rfd, reclaimPayload);
+				fsyncSync(rfd);
+				closeSync(rfd);
+				rfd = -1;
+				try {
+					linkSync(reclaimTmp, reclaimPath);
+					reclaimAcquired = true;
+				} catch (rErr) {
+					const rc = (rErr as NodeJS.ErrnoException)?.code;
+					if (rc === "EXDEV" || rc === "EPERM" || rc === "ENOSYS" || rc === "EOPNOTSUPP") {
+						try {
+							const rfdFb = openSync(reclaimPath, "wx", 0o600);
+							writeSync(rfdFb, reclaimPayload);
+							fsyncSync(rfdFb);
+							closeSync(rfdFb);
+							reclaimAcquired = true;
+						} catch {
+							reclaimAcquired = false;
+						}
+					}
+				}
+			} catch {
+				reclaimAcquired = false;
+			} finally {
+				if (rfd >= 0) {
+					try {
+						closeSync(rfd);
+					} catch {
+						/* ignore */
+					}
+				}
+				try {
+					unlinkSync(reclaimTmp);
+				} catch {
+					/* ignore */
+				}
+			}
+
+			if (reclaimAcquired) {
+				try {
+					const nowHeld = readCalibrationLockHolder(lockFile);
+					let stillSameDead = false;
+					if (held && nowHeld) {
+						const sameHolder = held.nonce
+							? nowHeld.nonce === held.nonce
+							: !nowHeld.nonce && nowHeld.pid === held.pid && nowHeld.start === held.start;
+						const nowPid = typeof nowHeld.pid === "number" ? nowHeld.pid : 0;
+						const nowStart = typeof nowHeld.start === "string" ? nowHeld.start : null;
+						const nowAlive = nowPid > 0 && pidAlive(nowPid) && (!nowStart || nowStart === procStartTime(nowPid));
+						stillSameDead = sameHolder && !nowAlive;
+					} else if (!held && !nowHeld && emptyMtimeMs !== null) {
+						try {
+							stillSameDead = Math.abs(statSync(lockFile).mtimeMs - emptyMtimeMs) < 1;
+						} catch {
+							stillSameDead = false;
+						}
+					}
+					if (stillSameDead) {
+						try {
+							unlinkSync(lockFile);
+						} catch {
+							/* ignore */
+						}
+					}
+				} finally {
+					try {
+						const curReclaim = readCalibrationLockHolder(reclaimPath);
+						if (curReclaim?.nonce === reclaimNonce) unlinkSync(reclaimPath);
+					} catch {
+						/* ignore */
+					}
+				}
+			} else {
+				const oldReclaim = readCalibrationLockHolder(reclaimPath);
+				const oldDead = oldReclaim
+					? !oldReclaim.pid ||
+						!pidAlive(oldReclaim.pid) ||
+						Boolean(oldReclaim.start && oldReclaim.start !== procStartTime(oldReclaim.pid))
+					: (() => {
+							try {
+								return Date.now() - statSync(reclaimPath).mtimeMs >= 5000;
+							} catch {
+								return false;
+							}
+						})();
+				if (oldDead) {
+					try {
+						unlinkSync(reclaimPath);
+					} catch {
+						/* ignore */
+					}
+				} else {
+					sleepSync(Math.min(backoff, 16));
+				}
+			}
 			if (Date.now() >= deadline) {
 				throw new CalibrationError("INVALID_INPUT", `获取校准账本锁超时 (${lockFile})`);
 			}
-			sleepSync(backoff);
-			backoff = Math.min(64, backoff * 2);
+			continue;
 		}
-	}
 
-	heldCalibLocks.add(lockFile);
-	try {
-		return fn();
-	} finally {
-		heldCalibLocks.delete(lockFile);
+		heldCalibLocks.add(lockFile);
 		try {
-			unlinkSync(lockFile);
-		} catch {
-			/* ignore */
+			return fn();
+		} finally {
+			heldCalibLocks.delete(lockFile);
+			try {
+				const cur = readCalibrationLockHolder(lockFile);
+				if (cur?.nonce === myNonce) {
+					unlinkSync(lockFile);
+				}
+			} catch {
+				/* ignore */
+			}
 		}
 	}
 }
@@ -543,103 +737,239 @@ function validateNonNegativeNumber(val: unknown, fieldName: string): number {
 	return val;
 }
 
+function syncCalibrationRecordToSqlite(root: string, record: CalibrationRecord): void {
+	const backend = resolveStorageBackend(root);
+	if (backend !== "sqlite" && backend !== "dual" && !existsSync(sqliteDbPath(root))) return;
+	let store: NuwaSqliteStore | null = null;
+	try {
+		store = new NuwaSqliteStore(root);
+		store.upsertCalibrationRecord({
+			predictionId: record.predictionId,
+			intentId: record.intentId,
+			taskCategory: record.taskCategory,
+			modelId: record.modelId,
+			predictedConfidence: record.predictedConfidence,
+			estimatedTokens: record.estimatedTokens,
+			...(record.outcome !== undefined ? { outcome: record.outcome } : {}),
+			...(record.isFalsePositive !== undefined ? { isFalsePositive: record.isFalsePositive } : {}),
+			...(record.actualTokens !== undefined ? { actualTokens: record.actualTokens } : {}),
+			...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+			...(record.source !== undefined ? { source: record.source } : {}),
+			settled: record.settled,
+			createdAt: record.createdAt,
+			...(record.settledAt !== undefined ? { settledAt: record.settledAt } : {}),
+			...(record.note || record.settlementNote
+				? {
+						payload: {
+							...(record.note ? { note: record.note } : {}),
+							...(record.settlementNote ? { settlementNote: record.settlementNote } : {}),
+						},
+					}
+				: {}),
+		});
+	} catch {
+		/* SQLite 同步失败不中断 JSONL 账本主路径 */
+	} finally {
+		store?.close();
+	}
+}
+
 /**
- * 容错读取并折叠 `.nuwa/calibration.jsonl` 账本记录：
+ * 判断指定项目是否存在校准记录（兼容 `.nuwa/calibration.jsonl` 与纯 SQLite `.nuwa/nuwa.db` 的 `calibration_records` 表）。
+ */
+export function hasCalibrationRecords(root: string): boolean {
+	if (!root || typeof root !== "string" || !root.trim()) return false;
+	const jsonl = calibrationLedgerPath(root);
+	if (existsSync(jsonl)) return true;
+	const dbFile = sqliteDbPath(root);
+	if (!existsSync(dbFile)) return false;
+	let store: NuwaSqliteStore | null = null;
+	try {
+		store = new NuwaSqliteStore(root, { readonly: true });
+		return store.listCalibrationRecords({ limit: 1 }).length > 0;
+	} catch {
+		return false;
+	} finally {
+		store?.close();
+	}
+}
+
+/**
+ * 容错读取并折叠 `.nuwa/calibration.jsonl` 及 SQLite `calibration_records` 账本记录：
  * - 自动忽略空行、尾部异常截断损坏 JSON 行或非法篡改的自评结算行；
+ * - 严格在读取端复核 `ALLOWED_SETTLEMENT_SOURCES` 与数值语义不变量，防范绕过 API 篡改持久化表；
  * - 按登记顺序确定性返回全部 `CalibrationRecord`。
  */
 export function loadCalibrationRecords(root: string): CalibrationRecord[] {
 	const file = calibrationLedgerPath(root);
-	if (!existsSync(file)) return [];
+	const map = new Map<string, CalibrationRecord>();
 
-	let rawText = "";
-	try {
-		rawText = readFileSync(file, "utf8");
-	} catch {
-		return [];
+	if (existsSync(file)) {
+		let rawText = "";
+		try {
+			rawText = readFileSync(file, "utf8");
+		} catch {
+			rawText = "";
+		}
+		const lines = rawText.split("\n");
+
+		for (const rawLine of lines) {
+			const line = rawLine.trim();
+			if (!line) continue;
+
+			let parsed: Partial<StoredCalibrationEvent> | null = null;
+			try {
+				parsed = JSON.parse(line) as Partial<StoredCalibrationEvent>;
+			} catch {
+				// 容错跳过半截崩溃行或损坏 JSON 行
+				continue;
+			}
+			if (!parsed || typeof parsed !== "object") continue;
+
+			if (parsed.kind === "prediction") {
+				const pid = typeof parsed.predictionId === "string" ? parsed.predictionId.trim() : "";
+				const iid = typeof parsed.intentId === "string" ? parsed.intentId.trim() : "";
+				const mid = typeof parsed.modelId === "string" ? parsed.modelId.trim() : "";
+				const cat = parsed.taskCategory;
+				const conf = parsed.predictedConfidence;
+				const estTokens = parsed.estimatedTokens;
+				if (
+					!pid ||
+					!iid ||
+					!mid ||
+					!VALID_TASK_CATEGORIES.has(cat as CalibrationTaskCategory) ||
+					typeof conf !== "number" ||
+					!Number.isFinite(conf) ||
+					conf < 0 ||
+					conf > 1 ||
+					typeof estTokens !== "number" ||
+					!Number.isFinite(estTokens) ||
+					estTokens < 0
+				) {
+					continue;
+				}
+				if (map.has(pid)) continue;
+				map.set(pid, {
+					predictionId: pid,
+					intentId: iid,
+					taskCategory: cat as CalibrationTaskCategory,
+					modelId: mid,
+					predictedConfidence: conf,
+					estimatedTokens: estTokens,
+					createdAt: typeof parsed.createdAt === "string" && parsed.createdAt ? parsed.createdAt : "",
+					...(typeof parsed.note === "string" && parsed.note ? { note: parsed.note } : {}),
+					settled: false,
+				});
+			} else if (parsed.kind === "settlement") {
+				const pid = typeof parsed.predictionId === "string" ? parsed.predictionId.trim() : "";
+				if (!pid) continue;
+				const rec = map.get(pid);
+				// 忽略孤儿结算行、重复结算行或绕过 API 塞入磁盘的非授信自评行
+				if (!rec || rec.settled) continue;
+				if (!ALLOWED_SETTLEMENT_SOURCES.has(parsed.source as CalibrationSettlementSource)) continue;
+				if (parsed.outcome !== 0 && parsed.outcome !== 1) continue;
+				if (typeof parsed.isFalsePositive !== "boolean") continue;
+				if (parsed.isFalsePositive && parsed.outcome === 1) continue;
+				if (
+					typeof parsed.actualTokens !== "number" ||
+					!Number.isFinite(parsed.actualTokens) ||
+					parsed.actualTokens < 0 ||
+					typeof parsed.durationMs !== "number" ||
+					!Number.isFinite(parsed.durationMs) ||
+					parsed.durationMs < 0
+				) {
+					continue;
+				}
+
+				rec.settled = true;
+				rec.outcome = parsed.outcome;
+				rec.isFalsePositive = parsed.isFalsePositive;
+				rec.actualTokens = parsed.actualTokens;
+				rec.durationMs = parsed.durationMs;
+				rec.source = parsed.source as CalibrationSettlementSource;
+				rec.settledAt = typeof parsed.settledAt === "string" && parsed.settledAt ? parsed.settledAt : "";
+				if (typeof parsed.note === "string" && parsed.note) {
+					rec.settlementNote = parsed.note;
+				}
+			}
+		}
 	}
 
-	const map = new Map<string, CalibrationRecord>();
-	const lines = rawText.split("\n");
-
-	for (const rawLine of lines) {
-		const line = rawLine.trim();
-		if (!line) continue;
-
-		let parsed: Partial<StoredCalibrationEvent> | null = null;
+	const dbFile = sqliteDbPath(root);
+	if (existsSync(dbFile)) {
+		let store: NuwaSqliteStore | null = null;
 		try {
-			parsed = JSON.parse(line) as Partial<StoredCalibrationEvent>;
+			store = new NuwaSqliteStore(root, { readonly: true });
+			for (const row of store.listCalibrationRecords({ limit: 5000 })) {
+				const pid = typeof row.predictionId === "string" ? row.predictionId.trim() : "";
+				const iid = typeof row.intentId === "string" ? row.intentId.trim() : "";
+				const mid = typeof row.modelId === "string" ? row.modelId.trim() : "";
+				const cat = row.taskCategory as CalibrationTaskCategory;
+				const conf = row.predictedConfidence;
+				const estTokens = typeof row.estimatedTokens === "number" ? row.estimatedTokens : 0;
+				if (
+					!pid ||
+					!iid ||
+					!mid ||
+					!VALID_TASK_CATEGORIES.has(cat) ||
+					typeof conf !== "number" ||
+					!Number.isFinite(conf) ||
+					conf < 0 ||
+					conf > 1 ||
+					!Number.isFinite(estTokens) ||
+					estTokens < 0
+				) {
+					continue;
+				}
+				const payload = row.payload && typeof row.payload === "object" ? row.payload : {};
+				const note = typeof payload.note === "string" && payload.note ? payload.note : undefined;
+				const settlementNote =
+					typeof payload.settlementNote === "string" && payload.settlementNote ? payload.settlementNote : undefined;
+
+				let rec = map.get(pid);
+				if (!rec) {
+					rec = {
+						predictionId: pid,
+						intentId: iid,
+						taskCategory: cat,
+						modelId: mid,
+						predictedConfidence: conf,
+						estimatedTokens: estTokens,
+						createdAt: typeof row.createdAt === "string" ? row.createdAt : "",
+						...(note ? { note } : {}),
+						settled: false,
+					};
+					map.set(pid, rec);
+				}
+
+				if (
+					!rec.settled &&
+					row.settled &&
+					ALLOWED_SETTLEMENT_SOURCES.has(row.source as CalibrationSettlementSource) &&
+					(row.outcome === 0 || row.outcome === 1) &&
+					typeof row.isFalsePositive === "boolean" &&
+					!(row.isFalsePositive && row.outcome === 1) &&
+					typeof row.actualTokens === "number" &&
+					Number.isFinite(row.actualTokens) &&
+					row.actualTokens >= 0 &&
+					typeof row.durationMs === "number" &&
+					Number.isFinite(row.durationMs) &&
+					row.durationMs >= 0
+				) {
+					rec.settled = true;
+					rec.outcome = row.outcome;
+					rec.isFalsePositive = row.isFalsePositive;
+					rec.actualTokens = row.actualTokens;
+					rec.durationMs = row.durationMs;
+					rec.source = row.source as CalibrationSettlementSource;
+					rec.settledAt = typeof row.settledAt === "string" && row.settledAt ? row.settledAt : "";
+					if (settlementNote) rec.settlementNote = settlementNote;
+				}
+			}
 		} catch {
-			// 容错跳过半截崩溃行或损坏 JSON 行
-			continue;
-		}
-		if (!parsed || typeof parsed !== "object") continue;
-
-		if (parsed.kind === "prediction") {
-			const pid = typeof parsed.predictionId === "string" ? parsed.predictionId.trim() : "";
-			const iid = typeof parsed.intentId === "string" ? parsed.intentId.trim() : "";
-			const mid = typeof parsed.modelId === "string" ? parsed.modelId.trim() : "";
-			const cat = parsed.taskCategory;
-			const conf = parsed.predictedConfidence;
-			const estTokens = parsed.estimatedTokens;
-			if (
-				!pid ||
-				!iid ||
-				!mid ||
-				!VALID_TASK_CATEGORIES.has(cat as CalibrationTaskCategory) ||
-				typeof conf !== "number" ||
-				!Number.isFinite(conf) ||
-				conf < 0 ||
-				conf > 1 ||
-				typeof estTokens !== "number" ||
-				!Number.isFinite(estTokens) ||
-				estTokens < 0
-			) {
-				continue;
-			}
-			if (map.has(pid)) continue;
-			map.set(pid, {
-				predictionId: pid,
-				intentId: iid,
-				taskCategory: cat as CalibrationTaskCategory,
-				modelId: mid,
-				predictedConfidence: conf,
-				estimatedTokens: estTokens,
-				createdAt: typeof parsed.createdAt === "string" && parsed.createdAt ? parsed.createdAt : "",
-				...(typeof parsed.note === "string" && parsed.note ? { note: parsed.note } : {}),
-				settled: false,
-			});
-		} else if (parsed.kind === "settlement") {
-			const pid = typeof parsed.predictionId === "string" ? parsed.predictionId.trim() : "";
-			if (!pid) continue;
-			const rec = map.get(pid);
-			// 忽略孤儿结算行、重复结算行或绕过 API 塞入磁盘的非授信自评行
-			if (!rec || rec.settled) continue;
-			if (!ALLOWED_SETTLEMENT_SOURCES.has(parsed.source as CalibrationSettlementSource)) continue;
-			if (parsed.outcome !== 0 && parsed.outcome !== 1) continue;
-			if (typeof parsed.isFalsePositive !== "boolean") continue;
-			if (parsed.isFalsePositive && parsed.outcome === 1) continue;
-			if (
-				typeof parsed.actualTokens !== "number" ||
-				!Number.isFinite(parsed.actualTokens) ||
-				parsed.actualTokens < 0 ||
-				typeof parsed.durationMs !== "number" ||
-				!Number.isFinite(parsed.durationMs) ||
-				parsed.durationMs < 0
-			) {
-				continue;
-			}
-
-			rec.settled = true;
-			rec.outcome = parsed.outcome;
-			rec.isFalsePositive = parsed.isFalsePositive;
-			rec.actualTokens = parsed.actualTokens;
-			rec.durationMs = parsed.durationMs;
-			rec.source = parsed.source as CalibrationSettlementSource;
-			rec.settledAt = typeof parsed.settledAt === "string" && parsed.settledAt ? parsed.settledAt : "";
-			if (typeof parsed.note === "string" && parsed.note) {
-				rec.settlementNote = parsed.note;
-			}
+			/* 只读探测 SQLite 校准表异常时平滑保留 JSONL 读取结果 */
+		} finally {
+			store?.close();
 		}
 	}
 
@@ -696,7 +1026,7 @@ export function recordPrediction(root: string, input: CalibrationPredictionInput
 		};
 		appendJsonlEvent(calibrationLedgerPath(root), event);
 
-		return {
+		const rec: CalibrationRecord = {
 			predictionId,
 			intentId,
 			taskCategory,
@@ -707,6 +1037,8 @@ export function recordPrediction(root: string, input: CalibrationPredictionInput
 			...(cleanNote ? { note: cleanNote } : {}),
 			settled: false,
 		};
+		syncCalibrationRecordToSqlite(root, rec);
+		return rec;
 	});
 }
 
@@ -780,7 +1112,7 @@ export function settlePrediction(root: string, input: CalibrationSettlementInput
 		};
 		appendJsonlEvent(calibrationLedgerPath(root), event);
 
-		return {
+		const settledRec: CalibrationRecord = {
 			...target,
 			settled: true,
 			outcome: input.outcome,
@@ -791,6 +1123,8 @@ export function settlePrediction(root: string, input: CalibrationSettlementInput
 			settledAt,
 			...(cleanNote ? { settlementNote: cleanNote } : {}),
 		};
+		syncCalibrationRecordToSqlite(root, settledRec);
+		return settledRec;
 	});
 }
 

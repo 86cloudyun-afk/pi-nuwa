@@ -152,7 +152,7 @@ import {
 } from "./belief-search";
 import {
 	ALLOWED_SETTLEMENT_SOURCES, CalibrationError, VALID_TASK_CATEGORIES, calibrationLedgerPath,
-	computeCalibrationSummary, formatCalibrationReport, loadCalibrationRecords,
+	computeCalibrationSummary, formatCalibrationReport, hasCalibrationRecords, loadCalibrationRecords,
 	recommendAdaptiveModelRoute, recordPrediction, redactCalibrationText, safeSettlePrediction,
 	settlePrediction, validateSettlementSource,
 	type AdaptiveModelRouteDecision, type AdaptiveModelRouteInput, type CalibrationBinStat,
@@ -472,13 +472,14 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	const completeWatchdogOnTaskEnd = (
 		root: string,
 		evObj: Record<string, unknown>,
-		inputObj: Record<string, unknown>,
+		inputObj: Record<string, unknown> | null,
 		ctx: ExtensionContext,
 	): void => {
 		if (ctx.agent?.kind === "sub") return;
 		const wd = new SubagentWatchdog(root);
 		const running = wd.listTasks({ status: "running" });
 		if (running.length === 0) return;
+		const safeInput = inputObj && typeof inputObj === "object" ? inputObj : {};
 
 		const details =
 			evObj.details && typeof evObj.details === "object"
@@ -510,25 +511,26 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		pushStrId(details?.taskId);
 		pushArrIds(details?.spawnIds);
 		pushArrIds(details?.taskIds);
-		pushStrId(inputObj.spawnId);
-		pushStrId(inputObj.taskId);
-		pushArrIds(inputObj.tasks);
+		pushStrId(safeInput.spawnId);
+		pushStrId(safeInput.taskId);
+		pushArrIds(safeInput.tasks);
 
 		const matchedIds = new Set<string>();
 		for (const r of running) {
 			if (explicitIds.has(r.taskId)) matchedIds.add(r.taskId);
 		}
 
-		// 若宿主未回传 spawnId，则通过派单正文、intentId 或任务文本前缀精确配对本轮派生的子代理
+		// 若宿主未回传 spawnId，则通过精确派单正文或 intentId 严格配对对应子代理（严禁用短子串误释放并行同类任务）
 		if (matchedIds.size === 0) {
 			const taskTexts: string[] = [];
 			const addTaskText = (v: unknown) => {
 				if (typeof v === "string" && v.trim()) taskTexts.push(v.trim());
 			};
-			addTaskText(inputObj.task);
-			addTaskText(inputObj.prompt);
-			if (Array.isArray(inputObj.tasks)) {
-				for (const item of inputObj.tasks) {
+			const isBatchCall = Array.isArray(safeInput.tasks) && safeInput.tasks.length > 0;
+			addTaskText(safeInput.task);
+			addTaskText(safeInput.prompt);
+			if (Array.isArray(safeInput.tasks)) {
+				for (const item of safeInput.tasks) {
 					if (item && typeof item === "object") {
 						addTaskText((item as Record<string, unknown>).task);
 						addTaskText((item as Record<string, unknown>).prompt);
@@ -537,7 +539,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			}
 
 			const intentIds = new Set<string>();
-			if (typeof inputObj.intentId === "string" && inputObj.intentId.trim()) intentIds.add(inputObj.intentId.trim());
+			if (typeof safeInput.intentId === "string" && safeInput.intentId.trim()) intentIds.add(safeInput.intentId.trim());
 			if (typeof details?.intentId === "string" && details.intentId.trim()) intentIds.add(details.intentId.trim());
 			for (const txt of taskTexts) {
 				for (const m of txt.matchAll(/\[女娲派单\s+(i\d{3,})\]/g)) {
@@ -546,28 +548,41 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			}
 
 			const normRoot = resolve(root);
-			for (const [sidKey, sp] of activeSpawns.entries()) {
-				if (resolve(sp.root) !== normRoot) continue;
-				if (
-					taskTexts.some((txt) => txt === sp.rawTask || txt === sp.injectedTask || sp.injectedTask.includes(txt)) ||
-					(sp.intentId && intentIds.has(sp.intentId))
-				) {
-					matchedIds.add(sidKey);
+			// 1) 优先按显式/注入 intentId 精确匹配
+			if (intentIds.size > 0) {
+				for (const [sidKey, sp] of activeSpawns.entries()) {
+					if (resolve(sp.root) !== normRoot) continue;
+					if (sp.intentId && intentIds.has(sp.intentId)) {
+						matchedIds.add(sidKey);
+					}
+				}
+				if (matchedIds.size === 0) {
+					for (const r of running) {
+						if (r.intentId && intentIds.has(r.intentId)) matchedIds.add(r.taskId);
+					}
 				}
 			}
 
-			if (matchedIds.size === 0 && intentIds.size > 0) {
-				for (const r of running) {
-					if (r.intentId && intentIds.has(r.intentId)) matchedIds.add(r.taskId);
+			// 2) 若无 intentId 命中，按完整文本严格相等匹配；每条 taskText 至多认领一条尚未配对的最早同源 spawn
+			if (matchedIds.size === 0 && taskTexts.length > 0) {
+				for (const txt of taskTexts) {
+					for (const [sidKey, sp] of activeSpawns.entries()) {
+						if (resolve(sp.root) !== normRoot || matchedIds.has(sidKey)) continue;
+						if (txt === sp.rawTask || txt === sp.injectedTask) {
+							matchedIds.add(sidKey);
+							if (!isBatchCall) break;
+						}
+					}
+					if (!isBatchCall && matchedIds.size > 0) break;
 				}
 			}
 
 			if (matchedIds.size === 0) {
 				const agentArg =
-					typeof inputObj.agent === "string"
-						? inputObj.agent.trim()
-						: typeof inputObj.agentName === "string"
-							? inputObj.agentName.trim()
+					typeof safeInput.agent === "string"
+						? safeInput.agent.trim()
+						: typeof safeInput.agentName === "string"
+							? safeInput.agentName.trim()
 							: "";
 				if (agentArg) {
 					const byAgent = running.filter((r) => r.agent === agentArg);
@@ -724,7 +739,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		parameters: z.object({
 			target: z.string().optional().describe("目标 URL、host:port 或本地目录/服务标识（coding/ops）"),
 			goal: z.string().optional().describe("目标描述"),
-			mode: z.enum(["ctf", "pentest", "audit", "coding", "ops"]).default("ctf").describe("任务模式，决定阶段种子与完成证据类型"),
+			mode: z.enum(["ctf", "pentest", "audit", "coding", "ops"]).optional().describe("任务模式，决定阶段种子与完成证据类型（未指定时默认沿用已有项目 mode，新建项目默认 ctf）"),
 			root: z.string().optional().describe("项目目录，默认持久化工作区或当前 cwd"),
 			resume: z.boolean().default(false).describe("恢复已停止/软暂停的项目，保留 facts/intents"),
 			force: z.boolean().default(false).describe("覆盖现有项目（备份旧 state）"),
@@ -1299,7 +1314,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						});
 						if (!posGate.ok && posGate.falsePositive) {
 							fpGateResult = posGate;
-							if (!isFree && rawId && existsSync(calibrationLedgerPath(root))) {
+							if (!isFree && rawId && hasCalibrationRecords(root)) {
 								try {
 									for (const rec of loadCalibrationRecords(root)) {
 										if (!rec.settled && rec.intentId === rawId) {

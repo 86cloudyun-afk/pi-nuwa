@@ -20,6 +20,7 @@ import type { AssetNode, Fact, HypothesisNode, NuwaState } from "./types";
 import { partitionFactsByVerifyStage } from "./verifier-gate";
 import { computeBodyHash, extractHitEvidenceMetrics, readFactEvidenceLog } from "./evidence";
 import { redactVaultSecrets } from "./session-vault";
+import { NuwaSqliteStore, resolveStorageBackend, sqliteDbPath } from "./sqlite-store";
 import { atomicWrite, cell, journalPath, loadState } from "./storage";
 
 export interface FindingRuleMeta {
@@ -1006,8 +1007,26 @@ export function buildEpisodeTimelineData(
 			? Math.floor(opts.episode)
 			: undefined;
 
-	const rawJournal = readJsonlRecords<RawJournalLine>(journalPath(normRoot));
-	const rawLedger = readJsonlRecords<RawLedgerLine>(join(normRoot, ".nuwa", "exec-ledger.jsonl"));
+	let rawJournal = readJsonlRecords<RawJournalLine>(journalPath(normRoot));
+	let rawLedger = readJsonlRecords<RawLedgerLine>(join(normRoot, ".nuwa", "exec-ledger.jsonl"));
+	const backend = resolveStorageBackend(normRoot);
+	const dbFile = sqliteDbPath(normRoot);
+	if ((rawJournal.length === 0 || rawLedger.length === 0) && existsSync(dbFile) && (backend === "sqlite" || backend === "dual")) {
+		let store: NuwaSqliteStore | null = null;
+		try {
+			store = new NuwaSqliteStore(normRoot, { readonly: true });
+			if (rawJournal.length === 0) {
+				rawJournal = store.readJournalTail(5000) as RawJournalLine[];
+			}
+			if (rawLedger.length === 0) {
+				rawLedger = store.listExecLedger(2000) as unknown as RawLedgerLine[];
+			}
+		} catch {
+			/* 只读探测 SQLite 异常时平滑退回 */
+		} finally {
+			store?.close();
+		}
+	}
 
 	// 从 journal 提取 episode 跃迁边界
 	const boundaries: Array<{ tsMs: number; episode: number }> = [];

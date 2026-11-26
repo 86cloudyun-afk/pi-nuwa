@@ -605,7 +605,7 @@ function formatExperienceHints(db: Database, techKeys: string[], limit = 3): str
 				 ORDER BY (success_count - fail_count) DESC, success_count DESC, updated_at DESC
 				 LIMIT ?`,
 			)
-			.all(...uniq, limit) as ExperienceRecord[];
+			.all(...uniq, limit) as unknown as ExperienceRecord[];
 		if (!rows.length) return "";
 		const lines = rows.map((r) => {
 			const parts = [

@@ -76,6 +76,7 @@ import {
 	calibrationLedgerPath,
 	computeCalibrationSummary,
 	formatCalibrationReport,
+	hasCalibrationRecords,
 	loadCalibrationRecords,
 	recommendAdaptiveModelRoute,
 } from "./calibration";
@@ -354,7 +355,7 @@ export function buildDoctorSummary(foundRoot: string | null): string {
 		if (st) {
 			const cand = Object.values(st.facts).filter((f) => f.verifyStage === "candidate").length;
 			const hasDb = existsSync(sqliteDbPath(foundRoot));
-			const hasCalib = existsSync(calibrationLedgerPath(foundRoot));
+			const hasCalib = hasCalibrationRecords(foundRoot);
 			let roleCount = 0;
 			try {
 				roleCount = Object.keys(loadSessionVault(foundRoot).roles).length;

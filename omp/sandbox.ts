@@ -1798,7 +1798,7 @@ export async function startScopedEgressProxy(
 			if (lower === "proxy-connection" || lower === "proxy-authorization" || lower === "proxy-authenticate") {
 				continue;
 			}
-			if (v !== undefined) outHeaders[k] = v;
+			if (typeof v === "string" || Array.isArray(v)) outHeaders[k] = v;
 		}
 		outHeaders.host = req.headers.host ?? targetUrl.host;
 

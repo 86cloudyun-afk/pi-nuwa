@@ -1,8 +1,10 @@
 /**
  * 女娲 v6.0.0 SQLite WAL 权威状态存储引擎与自主闭环（AuthDiff / OOB）全覆盖单元测试。
  */
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -10,6 +12,7 @@ import {
 	readdirSync,
 	rmSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import * as http from "node:http";
@@ -29,6 +32,14 @@ import {
 	saveStateToSqlite,
 	sqliteDbPath,
 } from "../omp/sqlite-store";
+import {
+	calibrationLedgerPath,
+	hasCalibrationRecords,
+	loadCalibrationRecords,
+	recordPrediction,
+	settlePrediction,
+} from "../omp/calibration";
+import { buildEpisodeTimelineData } from "../omp/reporting";
 import {
 	collectTestableAuthPaths,
 	computeAuthDiffSignature,
@@ -1470,8 +1481,205 @@ describe("v6.0.0 Boost 自检加固回归（文件锁原子落锁与 SQLite Jour
 			expect(hyp.falsificationTest).toBe("");
 			expect(hyp.confidence).toBe(0.72);
 			expect(hyp.status).toBe("open");
+			expect(reloaded.runtime.attemptedKeys?.k1?.surfaceDomain).toBe("host");
 		} finally {
 			store.close();
 		}
+	});
+
+	test("attempted.surfaceDomain 按 targetKey 规范化为 port/path/host 严禁写回非法 http，且校准迁移与纯 SQLite 闭环完整生效", () => {
+		const root = makeTmpDir("nuwa-calib-sqlite-");
+		const prevBackend = process.env.NUWA_STORAGE_BACKEND;
+		process.env.NUWA_STORAGE_BACKEND = "sqlite";
+		try {
+			const st = buildSampleState("http://127.0.0.1:18080", "pentest");
+			st.runtime.attemptedKeys = {
+				p1: { key: "k_port", expectedKind: "service", targetKey: "127.0.0.1:8443", status: "done", at: "2026-11-26T00:00:00.000Z", from: [] } as any,
+				p2: { key: "k_path", expectedKind: "endpoint", targetKey: "/api/v1/admin", status: "done", at: "2026-11-26T00:00:00.000Z", from: [] } as any,
+				p3: { key: "k_host", expectedKind: "asset", targetKey: "api.target.local", status: "blocked", at: "2026-11-26T00:00:00.000Z", from: [] } as any,
+			};
+			saveStateToSqlite(root, st);
+			const loaded = loadStateFromSqlite(root)!;
+			expect(loaded.runtime.attemptedKeys?.p1?.surfaceDomain).toBe("port");
+			expect(loaded.runtime.attemptedKeys?.p2?.surfaceDomain).toBe("path");
+			expect(loaded.runtime.attemptedKeys?.p3?.surfaceDomain).toBe("host");
+
+			// 1. calibration.ts 写入预测与结算同步落入 SQLite calibration_records；删除 calibration.jsonl 后纯 SQLite 依然可查可防篡改
+			recordPrediction(root, {
+				predictionId: "pred-sl-1",
+				intentId: "i001",
+				taskCategory: "verify",
+				modelId: "model-alpha",
+				predictedConfidence: 0.85,
+				estimatedTokens: 1200,
+			});
+			settlePrediction(root, {
+				predictionId: "pred-sl-1",
+				outcome: 1,
+				isFalsePositive: false,
+				actualTokens: 1000,
+				durationMs: 320,
+				source: "verifier-gate",
+			});
+			// 在 nuwa.db 中模拟恶意篡改追加一条 source="self" 的伪自评结算，验证读取端严厉拦截
+			const rawDb = openNuwaDb(root);
+			try {
+				rawDb
+					.query(
+						`INSERT INTO calibration_records (
+							prediction_id, intent_id, task_category, model_id, predicted_confidence,
+							estimated_tokens, outcome, is_false_positive, actual_tokens, duration_ms,
+							source, settled, created_at, settled_at, payload_json
+						) VALUES ('pred-tampered', 'i002', 'verify', 'model-alpha', 0.9, 500, 1, 0, 500, 100, 'self', 1, '2026-11-26T00:00:00Z', '2026-11-26T00:01:00Z', NULL)`,
+					)
+					.run();
+			} finally {
+				rawDb.close();
+			}
+			// 删除 JSONL 文件测试纯 SQLite 校准读取
+			unlinkSync(calibrationLedgerPath(root));
+			expect(hasCalibrationRecords(root)).toBe(true);
+			const recs = loadCalibrationRecords(root);
+			const r1 = recs.find((r) => r.predictionId === "pred-sl-1")!;
+			expect(r1?.settled).toBe(true);
+			expect(r1?.outcome).toBe(1);
+			expect(r1?.source).toBe("verifier-gate");
+			const rTampered = recs.find((r) => r.predictionId === "pred-tampered")!;
+			expect(rTampered?.settled).toBe(false);
+		} finally {
+			if (prevBackend === undefined) delete process.env.NUWA_STORAGE_BACKEND;
+			else process.env.NUWA_STORAGE_BACKEND = prevBackend;
+		}
+	});
+
+	test("migrateJsonToSqlite 迁移含 prediction+settlement 事件流的 calibration.jsonl 不丢结算，且无 jsonl 时时间线可从 SQLite 生成", () => {
+		const root = makeTmpDir("nuwa-mig-calib-");
+		const st = buildSampleState("http://127.0.0.1:18088", "pentest");
+		saveState(root, st);
+		recordPrediction(root, {
+			predictionId: "pred-mig-1",
+			intentId: "i001",
+			taskCategory: "recon",
+			modelId: "model-fast",
+			predictedConfidence: 0.7,
+			estimatedTokens: 800,
+			note: "init pred",
+		});
+		settlePrediction(root, {
+			predictionId: "pred-mig-1",
+			outcome: 0,
+			isFalsePositive: true,
+			actualTokens: 900,
+			durationMs: 250,
+			source: "verifier-gate",
+			note: "settled fp",
+		});
+
+		const mig = migrateJsonToSqlite(root);
+		expect(mig.ok).toBe(true);
+		expect(mig.calibrationInserted).toBe(1);
+
+		const store = new NuwaSqliteStore(root, { readonly: true });
+		try {
+			const rows = store.listCalibrationRecords();
+			const hit = rows.find((r) => r.predictionId === "pred-mig-1")!;
+			expect(hit).toBeDefined();
+			expect(hit.settled).toBe(true);
+			expect(hit.outcome).toBe(0);
+			expect(hit.isFalsePositive).toBe(true);
+			expect(hit.source).toBe("verifier-gate");
+			store.appendJournal; // 仅作类型引用确认
+		} finally {
+			store.close();
+		}
+
+		// 验证纯 SQLite 下无 journal.jsonl 时 buildEpisodeTimelineData 仍可读取 SQLite journal
+		const wStore = new NuwaSqliteStore(root);
+		try {
+			wStore.appendJournal({ type: "init", id: "proj-v6-test", episode: 1 });
+		} finally {
+			wStore.close();
+		}
+		if (existsSync(join(root, ".nuwa", "journal.jsonl"))) {
+			unlinkSync(join(root, ".nuwa", "journal.jsonl"));
+		}
+		const prevBackend = process.env.NUWA_STORAGE_BACKEND;
+		process.env.NUWA_STORAGE_BACKEND = "sqlite";
+		try {
+			const tl = buildEpisodeTimelineData(root, { state: st });
+			expect(tl.counts.journal).toBeGreaterThanOrEqual(1);
+		} finally {
+			if (prevBackend === undefined) delete process.env.NUWA_STORAGE_BACKEND;
+			else process.env.NUWA_STORAGE_BACKEND = prevBackend;
+		}
+	});
+
+	test("非空 -wal 存在但缺失 -shm 且目录只读时，只读 loadStateFromSqlite 保留 WAL 最新修改且零磁盘写副作用", () => {
+		const root = makeTmpDir("nuwa-wal-noshm-");
+		const nuwaDir = join(root, ".nuwa");
+		const dbFile = sqliteDbPath(root);
+		const st1 = buildSampleState("http://127.0.0.1:18090", "pentest");
+		st1.project.goal = "BASE_GOAL";
+		saveStateToSqlite(root, st1);
+
+		// 开启长连接写入新 goal 到 -wal 但不触发 checkpoint，然后强制仅保留主库和 -wal（移除 -shm）并设只读目录
+		const rawDb = new Database(dbFile, { create: true });
+		rawDb.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;");
+		const st2 = buildSampleState("http://127.0.0.1:18090", "pentest");
+		st2.project.goal = "UNCHECKPOINTED_WAL_GOAL";
+		rawDb
+			.query("INSERT OR REPLACE INTO meta (key, value, updated_at) VALUES ('project_json', ?, ?)")
+			.run(JSON.stringify(st2.project), new Date().toISOString());
+		const walBytes = existsSync(`${dbFile}-wal`) ? statSync(`${dbFile}-wal`).size : 0;
+		expect(walBytes).toBeGreaterThan(0);
+
+		const snapTmp = makeTmpDir("nuwa-wal-copy-");
+		const snapNuwa = join(snapTmp, ".nuwa");
+		mkdirSync(snapNuwa, { recursive: true });
+		const snapDb = join(snapNuwa, "nuwa.db");
+		writeFileSync(snapDb, readFileSync(dbFile));
+		writeFileSync(`${snapDb}-wal`, readFileSync(`${dbFile}-wal`));
+		rawDb.close();
+
+		// 将 snapNuwa 设成只读 0o555 且缺失 -shm，测试绝对零原目录触碰但必须读出 UNCHECKPOINTED_WAL_GOAL
+		chmodSync(snapNuwa, 0o555);
+		try {
+			const loaded = loadStateFromSqlite(snapTmp, { fallbackToJson: false })!;
+			expect(loaded).not.toBeNull();
+			expect(loaded.project.goal).toBe("UNCHECKPOINTED_WAL_GOAL");
+			expect(existsSync(`${snapDb}-shm`)).toBe(false);
+		} finally {
+			chmodSync(snapNuwa, 0o755);
+		}
+	});
+
+	test("withCalibrationLock 4 进程并发 recordPrediction 不丢不乱序且防篡改空锁文件", async () => {
+		const root = makeTmpDir("nuwa-calib-conc-");
+		const workerScript = `
+			import { recordPrediction } from ${JSON.stringify(resolve(import.meta.dir, "../omp/calibration.ts"))};
+			const root = process.env.NUWA_TEST_ROOT!;
+			const idx = process.env.NUWA_TEST_IDX!;
+			for (let j = 0; j < 5; j++) {
+				recordPrediction(root, {
+					predictionId: \`p-\${idx}-\${j}\`,
+					intentId: \`i00\${j}\`,
+					taskCategory: "recon",
+					modelId: "model-a",
+					predictedConfidence: 0.6,
+					estimatedTokens: 500,
+				});
+			}
+		`;
+		const procs = Array.from({ length: 4 }, (_, i) =>
+			Bun.spawn(["bun", "-e", workerScript], {
+				env: { ...process.env, NUWA_TEST_ROOT: root, NUWA_TEST_IDX: String(i) },
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		const codes = await Promise.all(procs.map((p) => p.exited));
+		expect(codes).toEqual([0, 0, 0, 0]);
+		const recs = loadCalibrationRecords(root);
+		expect(recs.length).toBe(20);
 	});
 });

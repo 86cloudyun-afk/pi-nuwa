@@ -26,12 +26,15 @@ import {
 	appendFileSync,
 	chmodSync,
 	constants,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readFileSync,
 	readdirSync,
 	realpathSync,
 	renameSync,
+	rmSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
@@ -803,12 +806,73 @@ function checkExtensionInstallation(agentHome) {
 	};
 }
 
+function openReadonlySqliteMemorySnapDaemon(filePath) {
+	const raw = readFileSync(filePath);
+	const copy = new Uint8Array(raw.length);
+	copy.set(raw);
+	if (
+		copy.length >= 100 &&
+		Buffer.from(copy.subarray(0, 16)).toString("latin1") === "SQLite format 3\0" &&
+		copy[18] === 2 &&
+		copy[19] === 2
+	) {
+		copy[18] = 1;
+		copy[19] = 1;
+	}
+	return Database.deserialize(copy, { readonly: true });
+}
+
+function openReadonlyWalIsolatedSnapDaemon(filePath) {
+	const snapDir = mkdtempSync(join(tmpdir(), "nuwa-daemon-ro-"));
+	const snapDb = join(snapDir, "snap.db");
+	try {
+		copyFileSync(filePath, snapDb);
+		if (existsSync(`${filePath}-wal`)) copyFileSync(`${filePath}-wal`, `${snapDb}-wal`);
+		if (existsSync(`${filePath}-shm`)) copyFileSync(`${filePath}-shm`, `${snapDb}-shm`);
+		const rwSnap = new Database(snapDb, { readwrite: true });
+		try {
+			rwSnap.exec("PRAGMA busy_timeout = 3000;");
+			rwSnap.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+			rwSnap.exec("PRAGMA journal_mode = DELETE;");
+		} finally {
+			rwSnap.close();
+		}
+		return openReadonlySqliteMemorySnapDaemon(snapDb);
+	} finally {
+		try {
+			rmSync(snapDir, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
 function openReadonlyKbDb(filePath) {
+	const walFile = `${filePath}-wal`;
+	let walNonEmpty = false;
+	try {
+		walNonEmpty = existsSync(walFile) && statSync(walFile).size > 0;
+	} catch {
+		walNonEmpty = false;
+	}
+	if (!walNonEmpty || !existsSync(`${filePath}-shm`)) {
+		try {
+			const memDb = walNonEmpty
+				? openReadonlyWalIsolatedSnapDaemon(filePath)
+				: openReadonlySqliteMemorySnapDaemon(filePath);
+			memDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+			return memDb;
+		} catch {
+			/* ignore */
+		}
+	}
+
 	let roDb = null;
 	try {
 		roDb = new Database(filePath, { readonly: true });
 		try {
 			roDb.exec("PRAGMA busy_timeout = 3000;");
+			roDb.exec("PRAGMA query_only = ON;");
 		} catch {
 			/* ignore */
 		}
@@ -822,19 +886,10 @@ function openReadonlyKbDb(filePath) {
 		}
 	}
 
-	const fallbackDb = new Database(filePath);
-	try {
-		fallbackDb.exec("PRAGMA busy_timeout = 3000; PRAGMA query_only = ON;");
-		fallbackDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
-		return fallbackDb;
-	} catch (err) {
-		try {
-			fallbackDb.close();
-		} catch {
-			/* ignore */
-		}
-		throw err;
-	}
+	// 严格零磁盘写入降级：绝不对原路径以可写模式打开，转在隔离 tmp 目录重放 WAL 后内存只读打开
+	const isoDb = openReadonlyWalIsolatedSnapDaemon(filePath);
+	isoDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+	return isoDb;
 }
 
 function checkKnowledgeBase(agentHome, explicitPath, explicitAgentHome = false) {
@@ -1810,44 +1865,12 @@ function resolveStorageBackendDaemon(root) {
 	return "json";
 }
 
-function openReadonlySqliteMemorySnapshotDaemon(dbFile) {
-	const raw = readFileSync(dbFile);
-	const copy = new Uint8Array(raw.length);
-	copy.set(raw);
-	if (
-		copy.length >= 100 &&
-		Buffer.from(copy.subarray(0, 16)).toString("latin1") === "SQLite format 3\0" &&
-		copy[18] === 2 &&
-		copy[19] === 2
-	) {
-		copy[18] = 1;
-		copy[19] = 1;
-	}
-	return Database.deserialize(copy, { readonly: true });
-}
-
 function readSqliteStateDaemon(root) {
 	const dbFile = sqliteDbPathDaemon(root);
 	if (!existsSync(dbFile)) return null;
 	let db = null;
 	try {
-		const walFile = `${dbFile}-wal`;
-		let walNonEmpty = false;
-		try {
-			walNonEmpty = existsSync(walFile) && statSync(walFile).size > 0;
-		} catch {
-			walNonEmpty = false;
-		}
-		if (!walNonEmpty) {
-			try {
-				db = openReadonlySqliteMemorySnapshotDaemon(dbFile);
-			} catch {
-				db = null;
-			}
-		}
-		if (!db) {
-			db = openReadonlyKbDb(dbFile);
-		}
+		db = openReadonlyKbDb(dbFile);
 
 		const metaRows = db
 			.query("SELECT key, value FROM meta WHERE key IN ('project_json', 'runtime_json')")

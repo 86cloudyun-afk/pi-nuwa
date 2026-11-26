@@ -439,6 +439,7 @@ export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: numb
 
 		if (!acquired) {
 			const held = readJson<{ pid?: number; ts?: number; start?: string; nonce?: string }>(p);
+			let emptyMtimeMs: number | null = null;
 			if (held) {
 				const heldPid = typeof held.pid === "number" ? held.pid : 0;
 				const heldStart = typeof held.start === "string" ? held.start : null;
@@ -455,8 +456,10 @@ export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: numb
 				// 刚创建但尚未完成写入的极短窗口内暂缓抢占，避免误删并发写者锁文件
 				let recentlyCreated = false;
 				try {
-					recentlyCreated = Date.now() - statSync(p).mtimeMs < 300;
+					emptyMtimeMs = statSync(p).mtimeMs;
+					recentlyCreated = Date.now() - emptyMtimeMs < 300;
 				} catch {
+					emptyMtimeMs = null;
 					recentlyCreated = false;
 				}
 				if (recentlyCreated && Date.now() < deadline) {
@@ -465,10 +468,119 @@ export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: numb
 					continue;
 				}
 			}
+			// 使用一次性回收锁 + 二次核验，防止多进程同时判定死锁后误删首个恢复者刚建的新活锁
+			const reclaimPath = `${p}.reclaim`;
+			const reclaimTmp = `${p}.reclaim.tmp-${process.pid}-${lockFileSeq++}`;
+			const reclaimNonce = `${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+			const reclaimPayload = JSON.stringify({
+				pid: process.pid,
+				ts: Date.now(),
+				start: procStartTime(process.pid),
+				nonce: reclaimNonce,
+			});
+			let reclaimAcquired = false;
+			let rfd = -1;
 			try {
-				unlinkSync(p);
+				rfd = openSync(reclaimTmp, "wx", 0o600);
+				writeSync(rfd, reclaimPayload);
+				fsyncSync(rfd);
+				closeSync(rfd);
+				rfd = -1;
+				try {
+					linkSync(reclaimTmp, reclaimPath);
+					reclaimAcquired = true;
+				} catch (rErr) {
+					const rc = (rErr as NodeJS.ErrnoException)?.code;
+					if (rc === "EXDEV" || rc === "EPERM" || rc === "ENOSYS" || rc === "EOPNOTSUPP") {
+						try {
+							const rfdFb = openSync(reclaimPath, "wx", 0o600);
+							writeSync(rfdFb, reclaimPayload);
+							fsyncSync(rfdFb);
+							closeSync(rfdFb);
+							reclaimAcquired = true;
+						} catch {
+							reclaimAcquired = false;
+						}
+					}
+				}
 			} catch {
-				/* 被别的进程先回收，下一轮重试 */
+				reclaimAcquired = false;
+			} finally {
+				if (rfd >= 0) {
+					try {
+						closeSync(rfd);
+					} catch {
+						/* ignore */
+					}
+				}
+				try {
+					unlinkSync(reclaimTmp);
+				} catch {
+					/* ignore */
+				}
+			}
+
+			if (reclaimAcquired) {
+				try {
+					const nowHeld = readJson<{ pid?: number; ts?: number; start?: string; nonce?: string }>(p);
+					let stillSameDead = false;
+					if (held && nowHeld) {
+						const sameHolder = held.nonce
+							? nowHeld.nonce === held.nonce
+							: !nowHeld.nonce && nowHeld.pid === held.pid && nowHeld.start === held.start;
+						const nowPid = typeof nowHeld.pid === "number" ? nowHeld.pid : 0;
+						const nowStart = typeof nowHeld.start === "string" ? nowHeld.start : null;
+						const nowAlive = nowPid > 0 && pidAlive(nowPid) && (!nowStart || nowStart === procStartTime(nowPid));
+						stillSameDead = sameHolder && !nowAlive;
+					} else if (!held && !nowHeld && emptyMtimeMs !== null) {
+						try {
+							stillSameDead = Math.abs(statSync(p).mtimeMs - emptyMtimeMs) < 1;
+						} catch {
+							stillSameDead = false;
+						}
+					}
+					if (stillSameDead) {
+						try {
+							unlinkSync(p);
+						} catch {
+							/* 已被回收 */
+						}
+					}
+				} finally {
+					try {
+						const curReclaim = readJson<{ nonce?: string }>(reclaimPath);
+						if (curReclaim?.nonce === reclaimNonce) unlinkSync(reclaimPath);
+					} catch {
+						/* ignore */
+					}
+				}
+			} else {
+				// 检查是否存在崩溃残留的僵尸回收锁
+				const oldReclaim = readJson<{ pid?: number; ts?: number; start?: string }>(reclaimPath);
+				const oldDead = oldReclaim
+					? !oldReclaim.pid ||
+						!pidAlive(oldReclaim.pid) ||
+						Boolean(oldReclaim.start && oldReclaim.start !== procStartTime(oldReclaim.pid))
+					: (() => {
+							try {
+								return Date.now() - statSync(reclaimPath).mtimeMs >= 5000;
+							} catch {
+								return false;
+							}
+						})();
+				if (oldDead) {
+					try {
+						unlinkSync(reclaimPath);
+					} catch {
+						/* ignore */
+					}
+				} else {
+					sleepSync(Math.min(backoff, 16));
+				}
+			}
+			if (Date.now() >= deadline) {
+				const cur = readJson<{ pid?: number; ts?: number }>(p);
+				throw new Error(`state locked by pid ${cur?.pid ?? 0} (>${Date.now() - (cur?.ts ?? Date.now())}ms)`);
 			}
 			continue;
 		}
@@ -480,7 +592,7 @@ export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: numb
 			heldLocks.delete(p);
 			try {
 				const cur = readJson<{ nonce?: string }>(p);
-				if (!cur?.nonce || cur.nonce === myNonce) {
+				if (cur?.nonce === myNonce) {
 					unlinkSync(p);
 				}
 			} catch {

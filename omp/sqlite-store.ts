@@ -16,14 +16,17 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	copyFileSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	readFileSync,
 	readdirSync,
 	renameSync,
 	rmSync,
 	statSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
 	SCHEMA,
@@ -917,7 +920,7 @@ function hasNonEmptyWalSidecar(dbFile: string): boolean {
 
 /**
  * 零磁盘写副作用的内存只读快照打开：
- * 当 WAL 库已正常关闭（不存在非空 `-wal`）或缺失 `-shm` 时，直接在内存副本中将 WAL 版本头字节 (18,19) 降为 1，
+ * 当 WAL 库已正常关闭（不存在非空 `-wal`）时，直接在内存副本中将 WAL 版本头字节 (18,19) 降为 1，
  * 通过 `Database.deserialize(..., { readonly: true })` 纯内存只读加载，严禁在磁盘新建/修改 `-wal` 或 `-shm`。
  */
 function openReadonlyMemorySnapshot(dbFile: string): Database {
@@ -935,6 +938,67 @@ function openReadonlyMemorySnapshot(dbFile: string): Database {
 		copy[19] = 1;
 	}
 	return Database.deserialize(copy, { readonly: true });
+}
+
+/**
+ * 在隔离临时目录安全重放未 checkpoint 的 `-wal` 后读入纯内存只读快照：
+ * 既 100% 保留 `-wal` 最新提交状态，又确保对原 `.nuwa` 目录零写操作、零新建 `-shm`/`-wal`。
+ */
+function openReadonlyWalIsolatedSnapshot(dbFile: string): Database {
+	const snapDir = mkdtempSync(join(tmpdir(), "nuwa-sqlite-ro-"));
+	const snapDb = join(snapDir, "nuwa.db");
+	try {
+		copyFileSync(dbFile, snapDb);
+		const walSrc = `${dbFile}-wal`;
+		if (existsSync(walSrc)) copyFileSync(walSrc, `${snapDb}-wal`);
+		const shmSrc = `${dbFile}-shm`;
+		if (existsSync(shmSrc)) copyFileSync(shmSrc, `${snapDb}-shm`);
+		const rwSnap = new Database(snapDb, { readwrite: true });
+		try {
+			rwSnap.exec("PRAGMA busy_timeout = 3000;");
+			rwSnap.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+			rwSnap.exec("PRAGMA journal_mode = DELETE;");
+		} finally {
+			rwSnap.close();
+		}
+		return openReadonlyMemorySnapshot(snapDb);
+	} finally {
+		try {
+			rmSync(snapDir, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** 供外部模块（如 lineage 探针）零原目录写入安全只读打开指定 SQLite 文件。 */
+export function openSqliteReadonlyZeroWrite(dbFile: string): Database {
+	if (!existsSync(dbFile)) {
+		throw new Error(`SQLITE_CANTOPEN: unable to open database file (${dbFile})`);
+	}
+	if (!hasNonEmptyWalSidecar(dbFile)) {
+		return openReadonlyMemorySnapshot(dbFile);
+	}
+	if (!existsSync(`${dbFile}-shm`)) {
+		return openReadonlyWalIsolatedSnapshot(dbFile);
+	}
+	let db: Database | null = null;
+	try {
+		db = new Database(dbFile, { readonly: true });
+		db.exec("PRAGMA busy_timeout = 3000;");
+		db.exec("PRAGMA query_only = ON;");
+		return db;
+	} catch (err) {
+		try {
+			db?.close();
+		} catch {
+			/* ignore */
+		}
+		if (isReadonlyCantOpenError(err)) {
+			return openReadonlyWalIsolatedSnapshot(dbFile);
+		}
+		throw err;
+	}
 }
 
 export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
@@ -959,11 +1023,13 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 			if (!existsSync(dbFile)) {
 				throw new Error(`SQLITE_CANTOPEN: unable to open database file (${dbFile})`);
 			}
-			// 无活跃非空 -wal 时直接走纯内存只读反序列化，确保 100% 零新建 -wal/-shm、零 mtime 变动
-			if (!hasNonEmptyWalSidecar(dbFile)) {
+			// 无活跃非空 -wal 或有 -wal 但缺 -shm 时直接走内存只读快照（隔离重放 WAL），确保 100% 零新建 -wal/-shm、零 mtime 变动
+			if (!hasNonEmptyWalSidecar(dbFile) || !existsSync(`${dbFile}-shm`)) {
 				let memDb: Database | null = null;
 				try {
-					memDb = openReadonlyMemorySnapshot(dbFile);
+					memDb = hasNonEmptyWalSidecar(dbFile)
+						? openReadonlyWalIsolatedSnapshot(dbFile)
+						: openReadonlyMemorySnapshot(dbFile);
 					configureAndInitDb(memDb, dbFile, true);
 					return memDb;
 				} catch (memErr) {
@@ -992,11 +1058,13 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 			} catch {
 				/* ignore */
 			}
-			// 存在非空 -wal 但极端缺失 -shm 导致 readonly 报 SQLITE_CANTOPEN 时：回退纯内存只读快照，严禁回退读写模式触碰磁盘
+			// 存在非空 -wal 但极端缺失 -shm 导致 readonly 报 SQLITE_CANTOPEN 时：在隔离临时目录重放 -wal 后转纯内存只读快照，严禁触碰原项目磁盘
 			if (readonly && isReadonlyCantOpenError(err) && existsSync(dbFile)) {
 				let fbDb: Database | null = null;
 				try {
-					fbDb = openReadonlyMemorySnapshot(dbFile);
+					fbDb = hasNonEmptyWalSidecar(dbFile)
+						? openReadonlyWalIsolatedSnapshot(dbFile)
+						: openReadonlyMemorySnapshot(dbFile);
 					configureAndInitDb(fbDb, dbFile, true);
 					return fbDb;
 				} catch (fbErr) {
@@ -1115,14 +1183,42 @@ function intentFromRow(row: Record<string, any>): Intent {
 	return intent;
 }
 
+function normalizeAttemptedSurfaceDomain(rawDomain: unknown, targetKey: unknown): SurfaceDomain {
+	if (rawDomain === "port" || rawDomain === "path" || rawDomain === "host") {
+		return rawDomain;
+	}
+	const key = String(targetKey ?? "").trim();
+	if (/^port:/i.test(key) || /^(?:[a-z0-9.-]+:)?\d{1,5}(?:\/(?:tcp|udp))?$/i.test(key)) {
+		return "port";
+	}
+	if (/^path:/i.test(key) || key.startsWith("/")) {
+		return "path";
+	}
+	if (/^https?:\/\//i.test(key)) {
+		try {
+			const u = new URL(key);
+			if (u.pathname && u.pathname !== "/") return "path";
+			if (u.search) return "path";
+		} catch {
+			/* ignore */
+		}
+	}
+	const slashIdx = key.indexOf("/");
+	if (slashIdx > 0 && !/^\d+\/(?:tcp|udp)$/i.test(key)) {
+		return "path";
+	}
+	return "host";
+}
+
 function attemptedFromRow(row: Record<string, any>): [string, AttemptedEntry] {
 	const extra = safeJsonParse<Record<string, unknown>>(row.extra_json, {});
+	const targetKey = String(row.target_key);
 	const entry: AttemptedEntry = {
 		...extra,
 		key: String(row.entry_key),
 		expectedKind: String(row.expected_kind) as FactKind,
-		targetKey: String(row.target_key),
-		surfaceDomain: String(row.surface_domain) as SurfaceDomain,
+		targetKey,
+		surfaceDomain: normalizeAttemptedSurfaceDomain(row.surface_domain, targetKey),
 		status: String(row.status) as "done" | "blocked",
 		at: String(row.at),
 		from: safeJsonParse<string[]>(row.from_json, []),
@@ -1539,12 +1635,13 @@ export class NuwaSqliteStore {
 			);
 			for (const [ak, entry] of attemptedEntries) {
 				const extra = extractExtraFields(entry as unknown as Record<string, unknown>, KNOWN_ATTEMPTED_KEYS);
+				const targetKey = typeof entry.targetKey === "string" ? entry.targetKey : "";
 				insAttempted.run(
 					ak,
 					typeof entry.key === "string" ? entry.key : ak,
 					entry.expectedKind ?? "note",
-					typeof entry.targetKey === "string" ? entry.targetKey : "",
-					entry.surfaceDomain ?? "http",
+					targetKey,
+					normalizeAttemptedSurfaceDomain(entry.surfaceDomain, targetKey),
 					entry.status ?? "done",
 					typeof entry.at === "string" && entry.at ? entry.at : ts,
 					JSON.stringify(entry.from ?? []),
@@ -1772,7 +1869,7 @@ export class NuwaSqliteStore {
 	/** 追加 journal 记录并返回自增序列号 `seq`（全量脱敏）。 */
 	appendJournal(rec: Record<string, unknown>, opts?: AppendJournalOptions): number {
 		const vault = safeLoadVault(this.root, opts?.vault);
-		const safeRec = redactUnknownForStorage({ ts: nowIso(), ...rec }, vault);
+		const safeRec = redactUnknownForStorage({ ts: nowIso(), ...rec }, vault) as Record<string, unknown>;
 		const ts = typeof safeRec.ts === "string" && safeRec.ts.trim() ? safeRec.ts : nowIso();
 		const type = typeof safeRec.type === "string" && safeRec.type.trim() ? safeRec.type : "event";
 		const payloadJson = JSON.stringify(safeRec);
@@ -2262,11 +2359,50 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 			runWithBusyRetry(() => execTx.immediate());
 		}
 
-		// 幂等迁移 calibration.jsonl（若存在）
+		// 幂等迁移 calibration.jsonl（按 prediction/settlement 事件折叠，防止重复 prediction_id 丢弃结算行）
 		let calibrationInserted = 0;
 		const calibFile = join(stateDir(normRoot), "calibration.jsonl");
 		const calibLines = readJsonlLinesSafe(calibFile);
 		if (calibLines.length > 0) {
+			const ALLOWED_SRC = new Set(["verifier-gate", "exec-ledger", "autoexec", "benchmark", "human"]);
+			const folded = new Map<string, Record<string, unknown>>();
+			const pendingSettlements = new Map<string, Record<string, unknown>>();
+			for (const { lineIndex, parsed } of calibLines) {
+				const safe = redactUnknownForStorage(parsed, vault) as Record<string, unknown>;
+				const pid =
+					typeof safe.predictionId === "string" && safe.predictionId.trim()
+						? safe.predictionId.trim()
+						: `mig-cal-${lineIndex}`;
+				if (safe.kind === "prediction") {
+					if (!folded.has(pid)) folded.set(pid, { ...safe, predictionId: pid, settled: false });
+				} else if (safe.kind === "settlement") {
+					const src = typeof safe.source === "string" ? safe.source : "";
+					const outcome = safe.outcome;
+					const isFp = safe.isFalsePositive;
+					if (!ALLOWED_SRC.has(src)) continue;
+					if (outcome !== 0 && outcome !== 1) continue;
+					if (typeof isFp !== "boolean" || (isFp && outcome === 1)) continue;
+					const cur = folded.get(pid);
+					if (cur && !cur.settled) {
+						folded.set(pid, {
+							...cur,
+							outcome,
+							isFalsePositive: isFp,
+							actualTokens: safe.actualTokens,
+							durationMs: safe.durationMs,
+							source: src,
+							settled: true,
+							settledAt: safe.settledAt,
+							...(typeof safe.note === "string" && safe.note ? { settlementNote: safe.note } : {}),
+						});
+					} else if (!cur) {
+						pendingSettlements.set(pid, safe);
+					}
+				} else if (!folded.has(pid)) {
+					folded.set(pid, { ...safe, predictionId: pid });
+				}
+			}
+
 			const calibTx = db.transaction(() => {
 				const ins = db.query(
 					`INSERT OR IGNORE INTO calibration_records (
@@ -2275,12 +2411,19 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 						source, settled, created_at, settled_at, payload_json
 					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				);
-				for (const { lineIndex, parsed } of calibLines) {
-					const safe = redactUnknownForStorage(parsed, vault);
-					const pid =
-						typeof safe.predictionId === "string" && safe.predictionId.trim()
-							? safe.predictionId.trim()
-							: `mig-cal-${lineIndex}`;
+				const updSettle = db.query(
+					`UPDATE calibration_records SET
+						outcome = ?, is_false_positive = ?, actual_tokens = ?, duration_ms = ?,
+						source = ?, settled = 1, settled_at = ?
+					 WHERE prediction_id = ? AND settled = 0`,
+				);
+				for (const [pid, safe] of folded.entries()) {
+					const isSettled = safe.settled === true || safe.outcome === 0 || safe.outcome === 1;
+					const payloadObj: Record<string, unknown> = {};
+					if (typeof safe.note === "string" && safe.note) payloadObj.note = safe.note;
+					if (typeof safe.settlementNote === "string" && safe.settlementNote) {
+						payloadObj.settlementNote = safe.settlementNote;
+					}
 					const res = ins.run(
 						pid,
 						typeof safe.intentId === "string" ? safe.intentId : null,
@@ -2293,12 +2436,35 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 						typeof safe.actualTokens === "number" ? safe.actualTokens : null,
 						typeof safe.durationMs === "number" ? safe.durationMs : null,
 						typeof safe.source === "string" ? safe.source : null,
-						safe.settled === true || safe.outcome !== undefined ? 1 : 0,
+						isSettled ? 1 : 0,
 						typeof safe.createdAt === "string" ? safe.createdAt : nowIso(),
 						typeof safe.settledAt === "string" ? safe.settledAt : null,
-						JSON.stringify(safe),
+						Object.keys(payloadObj).length > 0 ? JSON.stringify(payloadObj) : null,
 					);
-					if (Number(res.changes ?? 0) > 0) calibrationInserted += 1;
+					if (Number(res.changes ?? 0) > 0) {
+						calibrationInserted += 1;
+					} else if (isSettled) {
+						updSettle.run(
+							typeof safe.outcome === "number" ? safe.outcome : null,
+							typeof safe.isFalsePositive === "boolean" ? (safe.isFalsePositive ? 1 : 0) : null,
+							typeof safe.actualTokens === "number" ? safe.actualTokens : null,
+							typeof safe.durationMs === "number" ? safe.durationMs : null,
+							typeof safe.source === "string" ? safe.source : null,
+							typeof safe.settledAt === "string" ? safe.settledAt : nowIso(),
+							pid,
+						);
+					}
+				}
+				for (const [pid, safe] of pendingSettlements.entries()) {
+					updSettle.run(
+						typeof safe.outcome === "number" ? safe.outcome : null,
+						typeof safe.isFalsePositive === "boolean" ? (safe.isFalsePositive ? 1 : 0) : null,
+						typeof safe.actualTokens === "number" ? safe.actualTokens : null,
+						typeof safe.durationMs === "number" ? safe.durationMs : null,
+						typeof safe.source === "string" ? safe.source : null,
+						typeof safe.settledAt === "string" ? safe.settledAt : nowIso(),
+						pid,
+					);
 				}
 			});
 			runWithBusyRetry(() => calibTx.immediate());

@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as graphMod from "../omp/graph";
 import * as nuwaMod from "../omp/nuwa";
+import { NUWA_CORE_TOOLS } from "../core/protocol";
 import { NuwaCoreEngine } from "../core/mcp-server";
+import { deriveFromFacts } from "../omp/graph-planner";
+import { resolveLineageRoot } from "../omp/lineage";
 import { validateVerificationCommit } from "../omp/verifier-gate";
 import { openNuwaDb } from "../omp/sqlite-store";
 
@@ -1112,6 +1115,224 @@ process.exit(0);
 			requireVerifierWorker: true,
 		});
 		expect(emptyWorkerGate.ok).toBe(false);
+	});
+
+	test("真实 Zod default 解析语义下 nuwa_init 不将已有 coding/ops 项目的缺省 mode 覆盖为 ctf", async () => {
+		// 校验 core/protocol.ts 的 nuwa_init.mode 不再携带 default: "ctf"
+		const initProto = NUWA_CORE_TOOLS.find((t) => t.name === "nuwa_init");
+		expect((initProto?.inputSchema.properties.mode as Record<string, unknown> | undefined)?.default).toBeUndefined();
+
+		// 构造会真实执行 .default() 与 .optional() 的 Zod 解析器注册 omp/nuwa.ts
+		const ws = makeWorkspace("nuwa-zod-real-mode-");
+		const agentHome = makeWorkspace("nuwa-zod-real-home-");
+		setEnvTemp("PI_AGENT_HOME", agentHome);
+
+		type SchemaNode = { parse: (val: unknown) => unknown; defaultVal?: unknown; hasDefault?: boolean };
+		const makeType = (baseParse: (v: unknown) => unknown): any => {
+			const node: SchemaNode & Record<string, any> = {
+				parse: (v: unknown) => (v === undefined && node.hasDefault ? node.defaultVal : baseParse(v)),
+				optional: () => makeType((v) => (v === undefined ? undefined : node.parse(v))),
+				default: (d: unknown) => {
+					const next = makeType((v) => baseParse(v));
+					next.hasDefault = true;
+					next.defaultVal = d;
+					return next;
+				},
+				describe: () => node,
+			};
+			return node;
+		};
+		const realZod = {
+			string: () => makeType((v) => v),
+			number: () => makeType((v) => v),
+			boolean: () => makeType((v) => v),
+			any: () => makeType((v) => v),
+			unknown: () => makeType((v) => v),
+			record: () => makeType((v) => v),
+			union: () => makeType((v) => v),
+			enum: () => makeType((v) => v),
+			array: () => makeType((v) => v),
+			object: (shape: Record<string, any>) =>
+				makeType((raw: unknown) => {
+					const obj = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+					const out: Record<string, unknown> = {};
+					for (const [k, sc] of Object.entries(shape)) {
+						const parsed = sc.parse(obj[k]);
+						if (parsed !== undefined) out[k] = parsed;
+					}
+					return out;
+				}),
+		};
+
+		const tools = new Map<string, any>();
+		nuwaMod.default({
+			zod: realZod as any,
+			registerTool: (t: any) => tools.set(t.name, t),
+			registerCommand: () => {},
+			on: () => {},
+		} as any);
+		const ctx: any = {
+			cwd: ws,
+			agent: { kind: "main", id: "main-zod" },
+			sessionManager: { getSessionId: () => "sess-zod-real" },
+			ui: { setStatus() {}, setWidget() {}, notify() {}, theme: { fg: (_c: string, t: string) => t, bold: (t: string) => t } },
+		};
+		const callWithRealZod = async (name: string, rawParams: Record<string, unknown>) => {
+			const tool = tools.get(name)!;
+			const parsed = tool.parameters.parse(rawParams);
+			return tool.execute("z-1", parsed, undefined, undefined, ctx);
+		};
+
+		const initRes = await callWithRealZod("nuwa_init", { target: ws, mode: "coding", goal: "真实 Zod 默认值测试", root: ws });
+		expect(initRes.isError).toBeFalsy();
+		const resumeRes = await callWithRealZod("nuwa_init", { target: ws, resume: true });
+		expect(resumeRes.isError).toBeFalsy();
+		expect(nuwaMod.loadState(ws)?.project.mode).toBe("coding");
+	});
+
+	test("多进程 withLock 遇到死亡 PID 遗留锁时通过独占回收锁协调，绝不误删先恢复者刚建的新活锁", async () => {
+		const ws = makeWorkspace("nuwa-lock-reclaim-race-");
+		mkdirSync(join(ws, ".nuwa"), { recursive: true });
+		const counterFile = join(ws, ".nuwa", "counter.json");
+		writeFileSync(counterFile, JSON.stringify({ count: 0, concurrentViolations: 0 }), "utf8");
+
+		// 写入一个已死亡 PID 的陈旧 state.lock，诱发 4 个进程同时触发死锁恢复竞争
+		const lockFile = join(ws, ".nuwa", "state.lock");
+		writeFileSync(
+			lockFile,
+			JSON.stringify({ pid: 99999991, ts: Date.now() - 60_000, start: "1", nonce: "dead-nonce-0" }),
+			"utf8",
+		);
+
+		const workerCode = `
+			import { readFileSync, writeFileSync } from "node:fs";
+			import { withLock } from ${JSON.stringify(resolve(import.meta.dir, "../omp/storage.ts"))};
+			const ws = process.env.NUWA_TEST_WS!;
+			const counterFile = process.env.NUWA_TEST_CNT!;
+			withLock(ws, () => {
+				const before = JSON.parse(readFileSync(counterFile, "utf8"));
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 80);
+				const after = JSON.parse(readFileSync(counterFile, "utf8"));
+				if (after.count !== before.count) {
+					after.concurrentViolations += 1;
+				}
+				after.count += 1;
+				writeFileSync(counterFile, JSON.stringify(after), "utf8");
+			});
+		`;
+		const procs = Array.from({ length: 4 }, () =>
+			Bun.spawn(["bun", "-e", workerCode], {
+				env: { ...process.env, NUWA_TEST_WS: ws, NUWA_TEST_CNT: counterFile },
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		const codes = await Promise.all(procs.map((p) => p.exited));
+		expect(codes).toEqual([0, 0, 0, 0]);
+		const finalCounter = JSON.parse(readFileSync(counterFile, "utf8")) as {
+			count: number;
+			concurrentViolations: number;
+		};
+		expect(finalCounter.concurrentViolations).toBe(0);
+		expect(finalCounter.count).toBe(4);
+	});
+
+	test("executeCommitWithGates 重复提交已 confirmed/rejected 事实时不降级覆盖状态，且 deriveFromFacts 真实同步 assets", async () => {
+		const ws = makeWorkspace("nuwa-dup-confirmed-");
+		const h = setupHarness(ws, "s-dup-confirmed");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18290", mode: "pentest", root: ws });
+
+		const st0 = nuwaMod.loadState(ws)!;
+		const expRes = deriveFromFacts(st0);
+		// 为当前状态追加一个含内网 IP 与 SAN 的服务事实，验证 deriveFromFacts 内部 syncAssetsFromFacts 正常同步不抛 ReferenceError
+		expect(Array.isArray(expRes.added)).toBe(true);
+		st0.facts.f_san = {
+			id: "f_san",
+			kind: "service",
+			title: "发现后端管理节点与 SAN",
+			detail: "内网跳板 10.20.30.40 且存在 SAN: admin.internal.example",
+			createdAt: new Date().toISOString(),
+			meta: { san: ["admin.internal.example"], ports: [8080] },
+		};
+		deriveFromFacts(st0);
+		expect(Object.keys(st0.assets ?? {}).length).toBeGreaterThanOrEqual(2);
+
+		// 构造一个与 commitIntent key 一致的已 confirmed vuln 事实，再次以候选级提交命中 duplicate=true，严禁降级为 candidate/verified=false
+		const st1 = nuwaMod.loadState(ws)!;
+		const intentId = Object.keys(st1.intents)[0]!;
+		const intent = st1.intents[intentId]!;
+		const title = "确认 SQL 注入漏洞";
+		const factKey = nuwaMod.sha(`${st1.project.id}|${intent.id}|${intent.attempts}|vuln|${title}`);
+		st1.facts.f_confirmed = {
+			id: "f_confirmed",
+			kind: "vuln",
+			title,
+			detail: "confirmed sqli",
+			key: factKey,
+			createdAt: new Date().toISOString(),
+			verified: true,
+			verifyStage: "confirmed",
+			evidenceSeq: 12,
+		};
+		nuwaMod.saveState(ws, st1);
+
+		const dupRes = graphMod.executeCommitWithGates(
+			ws,
+			{
+				id: intentId,
+				kind: "vuln",
+				title,
+				detail: "repeat finding",
+				command: "curl -sS http://127.0.0.1:18290/q?id=1",
+				output: "SQL syntax error near id=1",
+			},
+			false,
+		);
+		const after = nuwaMod.loadState(ws)!;
+		expect(dupRes.verifyStageOut).toBe("confirmed");
+		expect(after.facts.f_confirmed?.verifyStage).toBe("confirmed");
+		expect(after.facts.f_confirmed?.verified).toBe(true);
+	});
+
+	test("SubagentWatchdog 并发子代理严格匹配任务正文不误释放前缀重合任务，且 null input 容错 + 纯 SQLite 血缘识别", async () => {
+		const ws = makeWorkspace("nuwa-wd-prefix-race-");
+		const prevBackend = process.env.NUWA_STORAGE_BACKEND;
+		setEnvTemp("NUWA_STORAGE_BACKEND", "sqlite");
+		const h = setupHarness(ws, "s-wd-prefix");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18295", mode: "pentest", root: ws });
+
+		// 移除兼容导出的 state.json 构造纯 SQLite 无 state.json 场景，验证 resolveLineageRoot 仍可准确探测项目根目录
+		const compatJson = join(ws, ".nuwa", "state.json");
+		if (existsSync(compatJson)) unlinkSync(compatJson);
+		expect(existsSync(compatJson)).toBe(false);
+		expect(resolveLineageRoot(h.ctx, process.env.PI_AGENT_HOME)).toBe(resolve(ws));
+
+		const onSpawn = h.hooks.get("before_subagent_spawn")![0]!;
+		const onEnd = h.hooks.get("tool_execution_end")![0]!;
+
+		const tShort = "probe /api endpoint status";
+		const tLong = "probe /api/v2/admin sensitive endpoint";
+		const sp1 = onSpawn({ agent: "fujiang", task: tShort }, h.ctx) as { spawnId: string };
+		const sp2 = onSpawn({ agent: "fujiang", task: tLong }, h.ctx) as { spawnId: string };
+		expect(new nuwaMod.SubagentWatchdog(ws).activeCount()).toBe(2);
+
+		// 第 1 个任务以 rawTask 完成（不传 spawnId），绝不能因 sp2.injectedTask 包含子串而提前释放 sp2
+		onEnd(
+			{ toolName: "task", input: { agent: "fujiang", task: tShort }, result: { stdout: "done 1" } },
+			h.ctx,
+		);
+		const wdMid = new nuwaMod.SubagentWatchdog(ws);
+		expect(wdMid.activeCount()).toBe(1);
+		expect(wdMid.getTask(sp1.spawnId)?.status).toBe("completed");
+		expect(wdMid.getTask(sp2.spawnId)?.status).toBe("running");
+
+		// 第 2 个任务完成时宿主传入 input: null（仅留单个运行任务兜底），不得崩溃且正确释放最后一个槽位
+		onEnd({ toolName: "task", input: null, result: { stdout: "done 2" } }, h.ctx);
+		const wdDone = new nuwaMod.SubagentWatchdog(ws);
+		expect(wdDone.activeCount()).toBe(0);
+		expect(wdDone.getTask(sp2.spawnId)?.status).toBe("completed");
+
+		if (prevBackend === undefined) delete process.env.NUWA_STORAGE_BACKEND;
 	});
 });
 

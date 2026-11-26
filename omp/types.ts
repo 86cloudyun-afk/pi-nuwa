@@ -223,6 +223,8 @@ export interface Intent {
 	prunedReason?: string;
 	/** v6.0 关联的事前校准预测记录 ID（供机械核验源对账结算）。 */
 	predictionId?: string;
+	/** v6.0 标记该意图是否已完成反自证机械对账结算。 */
+	calibrationSettled?: boolean;
 }
 
 /** v5.0 多资产与跳板可达拓扑节点。 */

@@ -122,7 +122,7 @@ import {
 	type ArchiveSearchQuery,
 	type WriteEpisodeArchiveResult,
 } from "../omp/reporting";
-import { calibrationLedgerPath, loadCalibrationRecords, safeSettlePrediction } from "../omp/calibration";
+import { hasCalibrationRecords, loadCalibrationRecords, safeSettlePrediction } from "../omp/calibration";
 import {
 	JSONRPC_ERROR_CODES,
 	JSONRPC_VERSION,
@@ -981,7 +981,7 @@ export class NuwaCoreEngine {
 					});
 					if (!posGate.ok && posGate.falsePositive) {
 						fpGateResult = posGate;
-						if (!isFree && rawId && existsSync(calibrationLedgerPath(root))) {
+						if (!isFree && rawId && hasCalibrationRecords(root)) {
 							try {
 								for (const rec of loadCalibrationRecords(root)) {
 									if (!rec.settled && rec.intentId === rawId) {

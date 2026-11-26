@@ -25,10 +25,20 @@ declare namespace NodeJS {
 	interface WriteStream {
 		write(chunk: string | Uint8Array): boolean;
 	}
+	type Signals = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGUSR1" | "SIGUSR2" | (string & {});
+}
+
+interface URLSearchParams {
+	keys(): IterableIterator<string>;
+	values(): IterableIterator<string>;
+	entries(): IterableIterator<[string, string]>;
 }
 
 interface Buffer extends Uint8Array {
 	toString(encoding?: string, start?: number, end?: number): string;
+	indexOf(value: string | number | Uint8Array, byteOffset?: number, encoding?: string): number;
+	subarray(begin?: number, end?: number): Buffer;
+	swap16(): Buffer;
 }
 
 declare var Buffer: {
@@ -43,11 +53,14 @@ declare var process: {
 	env: NodeJS.ProcessEnv;
 	argv: string[];
 	pid: number;
+	ppid: number;
 	platform: string;
 	arch: string;
 	cwd(): string;
 	exit(code?: number): never;
 	kill(pid: number, signal?: string | number): boolean;
+	on(event: string, listener: (...args: any[]) => void): unknown;
+	off(event: string, listener: (...args: any[]) => void): unknown;
 	stdout: NodeJS.WriteStream;
 	stderr: NodeJS.WriteStream;
 };
@@ -79,6 +92,23 @@ declare namespace Bun {
 			): void;
 		}): void | Promise<void>;
 	}): void;
+	interface SpawnSubprocess {
+		readonly stdin?: unknown;
+		readonly stdout: ReadableStream<Uint8Array>;
+		readonly stderr: ReadableStream<Uint8Array>;
+		readonly exited: Promise<number>;
+		kill(exitCode?: number): void;
+	}
+	function spawn(
+		cmd: string[],
+		options?: {
+			cwd?: string;
+			env?: Record<string, string | undefined>;
+			stdin?: unknown;
+			stdout?: "pipe" | "inherit" | "ignore";
+			stderr?: "pipe" | "inherit" | "ignore";
+		},
+	): SpawnSubprocess;
 	const version: string;
 	const main: string;
 }
@@ -92,14 +122,22 @@ declare module "bun:sqlite" {
 		finalize(): void;
 	}
 
+	export interface TransactionFn<TArgs extends unknown[], TReturn> {
+		(...args: TArgs): TReturn;
+		deferred(...args: TArgs): TReturn;
+		immediate(...args: TArgs): TReturn;
+		exclusive(...args: TArgs): TReturn;
+	}
+
 	export class Database {
 		readonly filename: string;
+		static deserialize(data: Uint8Array, options?: { readonly?: boolean; strict?: boolean }): Database;
 		constructor(filename?: string, options?: { readonly?: boolean; create?: boolean; readwrite?: boolean; strict?: boolean });
 		exec(sql: string): this;
 		run(sql: string, ...params: unknown[]): { changes: number; lastInsertRowid: number | bigint };
 		query<TReturn = Record<string, unknown>, TParams extends unknown[] = unknown[]>(sql: string): Statement<TReturn, TParams>;
 		prepare<TReturn = Record<string, unknown>, TParams extends unknown[] = unknown[]>(sql: string): Statement<TReturn, TParams>;
-		transaction<TArgs extends unknown[], TReturn>(fn: (...args: TArgs) => TReturn): (...args: TArgs) => TReturn;
+		transaction<TArgs extends unknown[], TReturn>(fn: (...args: TArgs) => TReturn): TransactionFn<TArgs, TReturn>;
 		close(throwOnError?: boolean): void;
 	}
 }
@@ -115,6 +153,10 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		string(): ZodTypeLike<string>;
 		number(): ZodTypeLike<number>;
 		boolean(): ZodTypeLike<boolean>;
+		any(): ZodTypeLike<any>;
+		unknown(): ZodTypeLike<unknown>;
+		record<K extends string = string, V = any>(keySchema?: ZodTypeLike<K>, valueSchema?: ZodTypeLike<V>): ZodTypeLike<Record<K, V>>;
+		union<T extends readonly ZodTypeLike<any>[]>(options: T): ZodTypeLike<T[number] extends ZodTypeLike<infer U> ? U : any>;
 		enum<const T extends readonly [string, ...string[]]>(values: T): ZodTypeLike<T[number]>;
 		array<T>(schema: ZodTypeLike<T>): ZodTypeLike<T[]>;
 		object<T extends Record<string, ZodTypeLike<any>>>(
@@ -233,6 +275,14 @@ declare module "node:fs" {
 	export function rmSync(path: string, options?: { recursive?: boolean; force?: boolean }): void;
 	export function chmodSync(path: string, mode: number): void;
 	export function openSync(path: string, flags: string | number, mode?: number): number;
+	export function linkSync(existingPath: string, newPath: string): void;
+	export function accessSync(path: string, mode?: number): void;
+	export const constants: {
+		F_OK: number;
+		R_OK: number;
+		W_OK: number;
+		X_OK: number;
+	};
 	export function writeSync(fd: number, buffer: string | Uint8Array): number;
 	export function readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
 	export function fsyncSync(fd: number): void;
@@ -251,6 +301,17 @@ declare module "node:path" {
 	export function extname(path: string): string;
 	export function relative(from: string, to: string): string;
 	export function isAbsolute(path: string): boolean;
+	export const posix: {
+		sep: string;
+		join(...paths: string[]): string;
+		resolve(...paths: string[]): string;
+		dirname(path: string): string;
+		basename(path: string, suffix?: string): string;
+		extname(path: string): string;
+		normalize(path: string): string;
+		relative(from: string, to: string): string;
+		isAbsolute(path: string): boolean;
+	};
 }
 
 declare module "node:os" {
@@ -262,17 +323,123 @@ declare module "node:os" {
 
 declare module "node:crypto" {
 	export interface Hash {
-		update(data: string | Uint8Array): this;
+		update(data: string | Uint8Array, inputEncoding?: string): this;
 		digest(encoding: "hex" | "base64" | "base64url"): string;
 		digest(): Buffer;
 	}
 	export function createHash(algorithm: string): Hash;
 	export function randomUUID(): string;
+	export function randomBytes(size: number): Buffer;
 }
 
 declare module "node:zlib" {
 	export function gzipSync(buf: string | Uint8Array): Buffer;
 	export function gunzipSync(buf: Uint8Array): Buffer;
+}
+
+declare module "node:dns/promises" {
+	export interface LookupAddress {
+		address: string;
+		family: number;
+	}
+	export function lookup(hostname: string, options: { all: true; verbatim?: boolean }): Promise<LookupAddress[]>;
+	export function lookup(hostname: string, options?: { family?: number; verbatim?: boolean }): Promise<LookupAddress>;
+}
+
+declare module "node:net" {
+	export interface Socket {
+		destroyed: boolean;
+		remoteAddress?: string;
+		remotePort?: number;
+		write(chunk: string | Uint8Array, cb?: (err?: Error | null) => void): boolean;
+		end(chunk?: string | Uint8Array): this;
+		destroy(error?: Error): this;
+		pause(): this;
+		resume(): this;
+		pipe<T>(dest: T): T;
+		setTimeout(timeout: number, callback?: () => void): this;
+		on(event: string, listener: (...args: any[]) => void): this;
+		once(event: string, listener: (...args: any[]) => void): this;
+		off(event: string, listener: (...args: any[]) => void): this;
+	}
+	export interface Server {
+		listen(port?: number, host?: string, cb?: () => void): this;
+		close(cb?: (err?: Error) => void): this;
+		address(): { address: string; family: string; port: number } | string | null;
+		on(event: string, listener: (...args: any[]) => void): this;
+		once(event: string, listener: (...args: any[]) => void): this;
+		off(event: string, listener: (...args: any[]) => void): this;
+	}
+	export function createServer(connectionListener?: (socket: Socket) => void): Server;
+	export function connect(options: { port: number; host?: string }, connectionListener?: () => void): Socket;
+	export function isIP(input: string): number;
+}
+
+declare module "node:http" {
+	import type { Socket } from "node:net";
+	export type OutgoingHttpHeaders = Record<string, string | string[] | number | undefined>;
+	export interface RequestOptions {
+		protocol?: string;
+		host?: string;
+		hostname?: string;
+		port?: number | string;
+		method?: string;
+		path?: string;
+		headers?: OutgoingHttpHeaders;
+		timeout?: number;
+		rejectUnauthorized?: boolean;
+		servername?: string;
+		[key: string]: unknown;
+	}
+	export interface IncomingMessage {
+		method?: string;
+		url?: string;
+		headers: Record<string, string | string[] | undefined>;
+		statusCode?: number;
+		socket?: Socket;
+		destroyed?: boolean;
+		on(event: string, listener: (...args: any[]) => void): this;
+		once(event: string, listener: (...args: any[]) => void): this;
+		off(event: string, listener: (...args: any[]) => void): this;
+		destroy(error?: Error): this;
+		pause(): this;
+		resume(): this;
+	}
+	export interface ServerResponse {
+		statusCode: number;
+		headersSent: boolean;
+		shouldKeepAlive?: boolean;
+		writableEnded?: boolean;
+		setHeader(name: string, value: string | string[]): this;
+		writeHead(statusCode: number, headers?: Record<string, string | string[]>): this;
+		write(chunk: string | Uint8Array): boolean;
+		end(chunk?: string | Uint8Array | (() => void), cb?: () => void): this;
+		on(event: string, listener: (...args: any[]) => void): this;
+		pipe<T>(dest: T): T;
+	}
+	export interface ClientRequest {
+		write(chunk: string | Uint8Array): boolean;
+		end(chunk?: string | Uint8Array): this;
+		destroy(error?: Error): this;
+		setTimeout(timeout: number, cb?: () => void): this;
+		on(event: string, listener: (...args: any[]) => void): this;
+	}
+	export interface Server {
+		listen(port?: number, host?: string, cb?: () => void): this;
+		close(cb?: (err?: Error) => void): this;
+		address(): { address: string; family: string; port: number } | string | null;
+		on(event: string, listener: (...args: any[]) => void): this;
+		once(event: string, listener: (...args: any[]) => void): this;
+		off(event: string, listener: (...args: any[]) => void): this;
+	}
+	export function createServer(listener?: (req: IncomingMessage, res: ServerResponse) => void): Server;
+	export function request(options: RequestOptions, cb?: (res: IncomingMessage) => void): ClientRequest;
+}
+
+declare module "node:https" {
+	import type { ClientRequest, IncomingMessage, RequestOptions as HttpRequestOptions } from "node:http";
+	export type RequestOptions = HttpRequestOptions;
+	export function request(options: RequestOptions, cb?: (res: IncomingMessage) => void): ClientRequest;
 }
 
 declare module "node:child_process" {
@@ -304,5 +471,7 @@ declare module "node:timers" {
 	export function setInterval(callback: (...args: any[]) => void, ms?: number): { unref(): void; ref(): void };
 	export function clearInterval(handle: unknown): void;
 }
+
+declare function setInterval(callback: (...args: any[]) => void, ms?: number): { unref?(): void; ref?(): void } & number;
 
 type BufferEncoding = "ascii" | "utf8" | "utf-8" | "utf16le" | "ucs2" | "ucs-2" | "base64" | "base64url" | "latin1" | "binary" | "hex";

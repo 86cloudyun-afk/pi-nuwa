@@ -28,10 +28,12 @@ import { Database } from "bun:sqlite";
 import type { Phase } from "./types";
 import {
 	calibrationLedgerPath,
+	hasCalibrationRecords,
 	loadCalibrationRecords,
 	recommendAdaptiveModelRoute,
 	type CalibrationTaskCategory,
 } from "./calibration";
+import { openSqliteReadonlyZeroWrite } from "./sqlite-store";
 
 export const DEFAULT_SUBAGENT_MODEL = "gemini-4-neon-xhigh";
 export const ALLOWED_SUBAGENT_MODELS: readonly string[] = [
@@ -226,21 +228,7 @@ function inspectRootState(root: string): RootStateMeta {
 	if (existsSync(dbFile)) {
 		let db: Database | null = null;
 		try {
-			const walFile = `${dbFile}-wal`;
-			const hasWal = existsSync(walFile) && statSync(walFile).size > 0;
-			if (hasWal) {
-				db = new Database(dbFile, { readonly: true });
-			} else {
-				const raw = readFileSync(dbFile);
-				if (raw.byteLength < 100) return { exists: false };
-				const copy = new Uint8Array(raw.byteLength);
-				copy.set(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
-				if (copy[18] === 2 && copy[19] === 2) {
-					copy[18] = 1;
-					copy[19] = 1;
-				}
-				db = Database.deserialize(copy, { readonly: true });
-			}
+			db = openSqliteReadonlyZeroWrite(dbFile);
 			const row = db.query("SELECT value FROM meta WHERE key = 'project_json'").get() as { value?: string } | null;
 			if (row?.value) {
 				const proj = JSON.parse(row.value) as { status?: string; ownerSessionId?: string };
@@ -916,7 +904,7 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 				),
 			),
 		];
-		if (pool.length >= 2 && existsSync(calibrationLedgerPath(input.root))) {
+		if (pool.length >= 2 && hasCalibrationRecords(input.root)) {
 			try {
 				const records = loadCalibrationRecords(input.root);
 				if (records.some((r) => r.settled)) {

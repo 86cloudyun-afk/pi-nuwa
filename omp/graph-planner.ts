@@ -10,6 +10,7 @@ import {
 	type AttemptedEntry,
 	type AutoPlanResult,
 	type Cfg,
+	type ExpansionResult,
 	type Fact,
 	type FactKind,
 	type FrontierItem,
@@ -50,7 +51,7 @@ import {
 	type KbLookupKind,
 } from "./kb";
 import { loadSessionVault } from "./session-vault";
-import { synthesizeCrossFactHypotheses } from "./hypothesis";
+import { syncAssetsFromFacts, synthesizeCrossFactHypotheses } from "./hypothesis";
 import { resolveReportPhaseTransition } from "./reincarnate";
 import {
 	computeBetaPosterior,
@@ -243,13 +244,11 @@ export function normalizeTargetKey(raw: string, defaultHost?: string): string {
 				(u.protocol === "https:" && u.port === "443");
 			const portSuffix = isDefaultPort ? "" : `:${u.port}`;
 			const pq = normPathAndQuery(`${u.pathname}${u.search}`);
-			if (pq !== "/" || body.endsWith("/") && explicitDomain === "path") {
-				if (pq !== "/") {
-					if (defaultHost && host === defaultHost.toLowerCase() && isDefaultPort) {
-						return pq;
-					}
-					return `${host}${portSuffix}${pq}`;
+			if (pq !== "/") {
+				if (defaultHost && host === defaultHost.toLowerCase() && isDefaultPort) {
+					return pq;
 				}
+				return `${host}${portSuffix}${pq}`;
 			}
 			return `${host}${portSuffix}`;
 		} catch {
@@ -2250,7 +2249,7 @@ export function deriveFromFacts(
 					`exp:${f.id}`,
 					"exploit",
 					`利用验证 ${normOneLine(f.title, 60)}`,
-					`目标: 把已确认漏洞 ${f.id} 推到可复现的利用结果（读敏感数据 / 命令执行 / 越权访问）。\n已知证据:\n  命令: ${normOneLine(f.command, 200)}\n  回显: ${normOneLine(f.output, 300)}\n要求: 给出可重复的最小利用命令与回显；拿到 flag 立即 nuwa_flag。\n换路: 被 WAF 拦 → 编码/分块/换 payload；仍失败 → commit(blocked) 写清拦截特征。`,
+					`目标: 把已确认漏洞 ${f.id} 推到可复现的利用结果（读敏感数据 / 命令执行 / 越权访问）。\n已知证据:\n  命令: ${normOneLine(f.command ?? "", 200)}\n  回显: ${normOneLine(f.output ?? "", 300)}\n要求: 给出可重复的最小利用命令与回显；拿到 flag 立即 nuwa_flag。\n换路: 被 WAF 拦 → 编码/分块/换 payload；仍失败 → commit(blocked) 写清拦截特征。`,
 					92,
 					[f.id],
 					{ expectedKind: "vuln", hint: `exp:${f.id}` },

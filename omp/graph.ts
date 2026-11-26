@@ -106,7 +106,7 @@ import {
 	pruneLowYieldSubtree,
 } from "./belief-search";
 import {
-	calibrationLedgerPath,
+	hasCalibrationRecords,
 	loadCalibrationRecords,
 	safeSettlePrediction,
 } from "./calibration";
@@ -126,6 +126,7 @@ import {
 	compactFacts,
 	compactIntents,
 	computeRepeatRatio,
+	type ConvergenceAdvice,
 	countNovelFacts,
 	deriveFromFacts,
 	expandGraph,
@@ -805,9 +806,10 @@ export function commitIntent(
 		st.runtime.lastBlockedCommitsDelta = 0;
 		st.runtime.lastBlockedIntentsDelta = 0;
 		if (existing) {
+			const terminalStage = existing.verifyStage === "confirmed" || existing.verifyStage === "rejected";
 			if (input.meta && !existing.meta) existing.meta = input.meta;
-			if (input.verified !== undefined) existing.verified = input.verified;
-			if (input.verifyStage !== undefined && !existing.verifyStage) existing.verifyStage = input.verifyStage;
+			if (!terminalStage && input.verified !== undefined) existing.verified = input.verified;
+			if (!terminalStage && input.verifyStage !== undefined && !existing.verifyStage) existing.verifyStage = input.verifyStage;
 			if (input.evidenceRef && !existing.evidenceRef) existing.evidenceRef = input.evidenceRef;
 			if (input.agentResult && !existing.agentResult) existing.agentResult = input.agentResult;
 			return {
@@ -903,9 +905,10 @@ export function commitIntent(
 	const key = sha(`${st.project.id}|${intent.id}|${intent.attempts}|${kind}|${normOneLine(title, 80)}`);
 	const existing = Object.values(st.facts).find((f) => f.key === key);
 	if (existing) {
+		const terminalStage = existing.verifyStage === "confirmed" || existing.verifyStage === "rejected";
 		if (input.meta && !existing.meta) existing.meta = input.meta;
-		if (input.verified !== undefined) existing.verified = input.verified;
-		if (input.verifyStage !== undefined && !existing.verifyStage) existing.verifyStage = input.verifyStage;
+		if (!terminalStage && input.verified !== undefined) existing.verified = input.verified;
+		if (!terminalStage && input.verifyStage !== undefined && !existing.verifyStage) existing.verifyStage = input.verifyStage;
 		if (input.evidenceRef && !existing.evidenceRef) existing.evidenceRef = input.evidenceRef;
 		if (input.agentResult && !existing.agentResult) existing.agentResult = input.agentResult;
 		intent.status = "done";
@@ -1481,7 +1484,7 @@ function settleCalibrationForCommit(
 		note?: string;
 	},
 ): void {
-	if (!existsSync(calibrationLedgerPath(root))) return;
+	if (!hasCalibrationRecords(root)) return;
 	let records;
 	try {
 		records = loadCalibrationRecords(root);
@@ -1785,20 +1788,26 @@ export function executeCommitWithGates(
 				}
 			}
 		} else if (stageCand && r.fact) {
-			r.fact.verifyStage = "candidate";
-			r.fact.evidenceSeq = getLatestLedgerSeq(root);
-			verifyStageOut = "candidate";
-			const vSpec = buildDoubleBlindVerifyIntentSpec(s, r.fact);
-			if (vSpec) {
-				const vAdded = appendIntentSpecs(s, [vSpec]);
-				verifyIntentId = vAdded[0];
-				if (verifyIntentId) {
-					logEvent(root, { type: "verify_spawn", candidateFact: r.fact.id, verifyIntent: verifyIntentId, key: vSpec.key });
+			if (r.fact.verifyStage === "confirmed" || r.fact.verifyStage === "rejected") {
+				verifyStageOut = r.fact.verifyStage;
+			} else {
+				r.fact.verifyStage = "candidate";
+				r.fact.evidenceSeq = getLatestLedgerSeq(root);
+				verifyStageOut = "candidate";
+				const vSpec = buildDoubleBlindVerifyIntentSpec(s, r.fact);
+				if (vSpec) {
+					const vAdded = appendIntentSpecs(s, [vSpec]);
+					verifyIntentId = vAdded[0];
+					if (verifyIntentId) {
+						logEvent(root, { type: "verify_spawn", candidateFact: r.fact.id, verifyIntent: verifyIntentId, key: vSpec.key });
+					}
 				}
+				extraLines.push(
+					`候选漏洞暂存: ${r.fact.id} verifyStage=candidate${verifyIntentId ? ` → 已自动派发独立双盲复验意图 ${verifyIntentId} (推荐 agent="nuwa-verifier")` : ""}`,
+				);
 			}
-			extraLines.push(
-				`候选漏洞暂存: ${r.fact.id} verifyStage=candidate${verifyIntentId ? ` → 已自动派发独立双盲复验意图 ${verifyIntentId} (推荐 agent="nuwa-verifier")` : ""}`,
-			);
+		} else if (!verifyStageOut && r.fact?.verifyStage) {
+			verifyStageOut = r.fact.verifyStage;
 		}
 
 		if (!p.blocked && r.fact && ["service", "asset", "endpoint", "loot", "vuln"].includes(r.fact.kind)) {

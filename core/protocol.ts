@@ -185,8 +185,7 @@ export const NUWA_CORE_TOOLS: readonly McpToolDefinition[] = [
 				mode: {
 					type: "string",
 					enum: MODE_ENUM,
-					default: "ctf",
-					description: "任务模式，决定阶段种子与完成证据类型",
+					description: "任务模式，决定阶段种子与完成证据类型（未指定时默认沿用已有项目 mode，新建项目默认 ctf）",
 				},
 				root: {
 					type: "string",
