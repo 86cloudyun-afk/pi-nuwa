@@ -23,7 +23,21 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+import { Database } from "bun:sqlite";
 import type { Phase } from "./types";
+import {
+	calibrationLedgerPath,
+	loadCalibrationRecords,
+	recommendAdaptiveModelRoute,
+	type CalibrationTaskCategory,
+} from "./calibration";
+
+export const DEFAULT_SUBAGENT_MODEL = "gemini-4-neon-xhigh";
+export const ALLOWED_SUBAGENT_MODELS: readonly string[] = [
+	"gemini-4-hydrogen-xhigh",
+	"gemini-4-neon-xhigh",
+	"gemini-4-carbon-high",
+];
 
 export interface ActiveSessionInfo {
 	sessionId: string;
@@ -96,6 +110,10 @@ export interface SubagentModelRouteInput {
 	deepModel?: string;
 	/** 显式传入独立复验模型（覆盖环境变量 NUWA_MODEL_VERIFY）。 */
 	verifyModel?: string;
+	/** 可选项目根目录：存在已结算校准账本时启用自适应模型路由降权优选。 */
+	root?: string;
+	/** 可选候选模型白名单（与 fast/deep/verify 合并作为自适应路由允许集合）。 */
+	allowedModels?: readonly string[];
 }
 
 interface MemoryLineageStore {
@@ -193,14 +211,41 @@ interface RootStateMeta {
 
 function inspectRootState(root: string): RootStateMeta {
 	const p = stateFileOf(root);
-	if (!existsSync(p)) return { exists: false };
-	const parsed = readJsonSafe<{ project?: { status?: string; ownerSessionId?: string } }>(p);
-	if (!parsed || typeof parsed !== "object") return { exists: false };
-	return {
-		exists: true,
-		status: typeof parsed.project?.status === "string" ? parsed.project.status : undefined,
-		ownerSessionId: typeof parsed.project?.ownerSessionId === "string" ? parsed.project.ownerSessionId : undefined,
-	};
+	if (existsSync(p)) {
+		const parsed = readJsonSafe<{ project?: { status?: string; ownerSessionId?: string } }>(p);
+		if (parsed && typeof parsed === "object") {
+			return {
+				exists: true,
+				status: typeof parsed.project?.status === "string" ? parsed.project.status : undefined,
+				ownerSessionId: typeof parsed.project?.ownerSessionId === "string" ? parsed.project.ownerSessionId : undefined,
+			};
+		}
+	}
+	const dbFile = join(resolve(root), ".nuwa", "nuwa.db");
+	if (existsSync(dbFile)) {
+		let db: Database | null = null;
+		try {
+			db = new Database(dbFile, { readonly: true });
+			const row = db.query("SELECT project_json FROM nuwa_meta WHERE id = 1").get() as { project_json?: string } | null;
+			if (row?.project_json) {
+				const proj = JSON.parse(row.project_json) as { status?: string; ownerSessionId?: string };
+				return {
+					exists: true,
+					status: typeof proj?.status === "string" ? proj.status : undefined,
+					ownerSessionId: typeof proj?.ownerSessionId === "string" ? proj.ownerSessionId : undefined,
+				};
+			}
+		} catch {
+			/* ignore readonly sqlite probe failure */
+		} finally {
+			try {
+				db?.close();
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+	return { exists: false };
 }
 
 /** 判断项目根目录是否包含处于活跃态（或未显式终止）的 .nuwa/state.json。 */
@@ -766,6 +811,48 @@ function cleanModelName(value: string | undefined): string | undefined {
  * - recon / surface 走 fastModel；
  * - 全未配置时返回 undefined，保持宿主默认模型配置。
  */
+/**
+ * 根据子代理角色、阶段与意图 Key 推断校准任务类别。
+ */
+export function inferCalibrationTaskCategory(input: {
+	agent?: string;
+	phase?: Phase | string;
+	intentKey?: string;
+	intentKeys?: readonly string[];
+	hasPendingVerify?: boolean;
+}): CalibrationTaskCategory {
+	const agentName = (input.agent ?? "").trim().toLowerCase();
+	const phase = (input.phase ?? "").trim().toLowerCase();
+	const keys = [
+		...(input.intentKeys ?? []),
+		...(input.intentKey ? [input.intentKey] : []),
+	].map((k) => String(k ?? "").trim().toLowerCase());
+
+	if (
+		agentName === "nuwa-verifier" ||
+		Boolean(input.hasPendingVerify) ||
+		keys.some((k) => /(?:^|:)verify-vuln:/i.test(k) || k.startsWith("verify:"))
+	) {
+		return "verify";
+	}
+	if (keys.some((k) => /auth|session|bola|bfla|idor|jwt|login/i.test(k))) {
+		return "auth";
+	}
+	if (keys.some((k) => /spa|js|bundle|sourcemap|frontend/i.test(k))) {
+		return "js-audit";
+	}
+	if (keys.some((k) => /hybrid|whitebox|sast|code|audit/i.test(k))) {
+		return "whitebox";
+	}
+	if (phase === "exploit" || phase === "post" || phase === "vuln") {
+		return "exploit";
+	}
+	if (phase === "recon" || phase === "surface") {
+		return "recon";
+	}
+	return "general";
+}
+
 export function routeSubagentModel(input: SubagentModelRouteInput = {}): string | undefined {
 	const fastModel = cleanModelName(input.fastModel ?? process.env.NUWA_MODEL_FAST);
 	const deepModel = cleanModelName(input.deepModel ?? process.env.NUWA_MODEL_DEEP);
@@ -787,28 +874,51 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 		Boolean(input.hasPendingVerify) ||
 		keys.some((k) => /(?:^|:)verify-vuln:/i.test(k) || k.startsWith("verify:"));
 
+	let baseModel: string | undefined;
 	if (isVerifyTask) {
-		return verifyModel ?? deepModel;
+		baseModel = verifyModel ?? deepModel;
+	} else {
+		const isReflectTask = Boolean(input.hasReflect) || keys.some((k) => k.startsWith("reflect:"));
+		if (phase === "vuln" || phase === "exploit" || isReflectTask) {
+			baseModel = deepModel;
+		} else if (phase === "recon" || phase === "surface") {
+			baseModel = fastModel;
+		} else if (phase === "post") {
+			baseModel = deepModel ?? fastModel;
+		} else if (phase === "report") {
+			baseModel = fastModel ?? deepModel;
+		}
 	}
 
-	const isReflectTask = Boolean(input.hasReflect) || keys.some((k) => k.startsWith("reflect:"));
-	if (phase === "vuln" || phase === "exploit" || isReflectTask) {
-		return deepModel;
+	if (!baseModel) return undefined;
+
+	// v6.0 校准驱动自适应模型路由：当提供 root 且存在多候选模型与历史校准样本时自动降权高误报模型
+	if (input.root && (process.env.NUWA_CALIBRATION ?? "1").trim() !== "0") {
+		const pool = [
+			...new Set(
+				[baseModel, fastModel, deepModel, verifyModel, ...(input.allowedModels ?? [])].filter(
+					(m): m is string => Boolean(m && m.trim()),
+				),
+			),
+		];
+		if (pool.length >= 2 && existsSync(calibrationLedgerPath(input.root))) {
+			try {
+				const records = loadCalibrationRecords(input.root);
+				if (records.some((r) => r.settled)) {
+					const decision = recommendAdaptiveModelRoute(records, {
+						allowedModels: pool,
+						defaultModel: baseModel,
+						taskCategory: inferCalibrationTaskCategory(input),
+					});
+					return decision.recommendedModel;
+				}
+			} catch {
+				/* 回退基准路由模型 */
+			}
+		}
 	}
 
-	if (phase === "recon" || phase === "surface") {
-		return fastModel;
-	}
-
-	if (phase === "post") {
-		return deepModel ?? fastModel;
-	}
-
-	if (phase === "report") {
-		return fastModel ?? deepModel;
-	}
-
-	return undefined;
+	return baseModel;
 }
 
 // ============================================================================

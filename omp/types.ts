@@ -1,12 +1,13 @@
 /**
- * 女娲 v5.x 共享类型定义。
+ * 女娲 v6.0 共享类型定义。
  *
  * 汇总核心状态机、范围护栏、证据账本、多领域 Profile、会话保险箱、
- * 双盲复验闸门、零信任沙盒、封盘终态、表面分域去重与世代轮转的公共类型，
+ * 双盲复验闸门、零信任沙盒、封盘终态、表面分域去重、信念图搜索、
+ * 机械对账校准核、SQLite WAL 存储与世代轮转的公共类型，
  * 供各子模块 `import type` 使用，并由 `omp/nuwa.ts` 完整 re-export 以保持 100% 向后兼容。
  */
 
-export const NUWA_VERSION = "5.1.0";
+export const NUWA_VERSION = "6.0.0";
 export const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
 export type ProfileMode = "ctf" | "pentest" | "audit" | "coding" | "ops";
@@ -172,6 +173,10 @@ export interface Fact {
 	evidenceRef?: string;
 	/** v5.1 子代理结构化回包解析结果（#51）。 */
 	agentResult?: Record<string, unknown>;
+	/** v6.0 动静协同反向定位源码文件与行号锚点（如 src/routes/admin.ts:42）。 */
+	sourceAnchor?: string;
+	/** v6.0 是否已完成反自证机械对账结算。 */
+	calibrationSettled?: boolean;
 }
 
 export interface Intent {
@@ -209,6 +214,15 @@ export interface Intent {
 	/** v5.1 规范化三元组去重键 (expectedKind, targetKey, hintHash)（#43）。 */
 	dedupKey?: string;
 	hintHash?: string;
+	/** v6.0 Beta 信念分布先验/后验参数与预期信息增益（VoI）。 */
+	beliefAlpha?: number;
+	beliefBeta?: number;
+	beliefPosterior?: number;
+	expectedVoi?: number;
+	/** v6.0 低收益/证伪子树自动剪枝原因。 */
+	prunedReason?: string;
+	/** v6.0 关联的事前校准预测记录 ID（供机械核验源对账结算）。 */
+	predictionId?: string;
 }
 
 /** v5.0 多资产与跳板可达拓扑节点。 */
@@ -341,6 +355,16 @@ export interface Runtime {
 	reportWritten?: boolean;
 	/** v5.1 跨压缩保留的已尝试 (kind, surfaceDomain, targetKey) 登记表（#21, #45）。 */
 	attemptedKeys?: Record<string, AttemptedEntry>;
+	/** v6.0 当前生效的状态存储后端（json / sqlite / dual）。 */
+	storageBackend?: "json" | "sqlite" | "dual";
+	/** v6.0 最近一次自动触发 AuthDiff 矩阵的时间戳（ms）。 */
+	lastAutoAuthDiffAt?: number;
+	/** v6.0 最近一次自动触发 OOB 回调轮询的时间戳（ms）。 */
+	lastAutoOobPollAt?: number;
+	/** v6.0 累计已完成机械结算的校准预测条数。 */
+	calibrationSettledCount?: number;
+	/** v6.0 最近一次信念图搜索转向建议动作。 */
+	lastSearchPivotAction?: string;
 }
 
 export interface NuwaState {
@@ -399,6 +423,14 @@ export interface Cfg {
 	maxCostUsd?: number;
 	/** v5.1 blocked targetKey 冷却窗口毫秒数（默认 300_000，#43）。 */
 	blockedCooldownMs?: number;
+	/** v6.0 状态存储后端（默认按 NUWA_STORAGE_BACKEND 自动解析）。 */
+	storageBackend?: "json" | "sqlite" | "dual";
+	/** v6.0 是否启用 AuthDiff / OOB 自主闭环驱动（默认 true）。 */
+	enableAutoLoops?: boolean;
+	/** v6.0 是否启用信念图启发式前沿排序与证伪剪枝（默认 true）。 */
+	enableBeliefSearch?: boolean;
+	/** v6.0 是否启用机械对账校准核与自适应模型路由（默认 true）。 */
+	enableCalibration?: boolean;
 }
 
 export interface Seed {

@@ -43,6 +43,18 @@ import { defaultScopeForTarget } from "./scope";
 import { resolveKbPath } from "./kb";
 import { loadAutoRules } from "./autoexec";
 import { parseJournalTail, type JournalEntry } from "./ui";
+import {
+	NuwaSqliteStore,
+	appendJournalSqlite,
+	loadStateFromSqlite,
+	migrateJsonToSqlite,
+	resolveStorageBackend,
+	saveStateToSqlite,
+	sqliteDbPath,
+	type StorageBackend,
+} from "./sqlite-store";
+
+export { resolveStorageBackend, sqliteDbPath, type StorageBackend };
 
 export const SCHEMA = 1;
 
@@ -163,6 +175,10 @@ export function readCfg(): Cfg {
 		maxAttempts: num("NUWA_MAX_ATTEMPTS", 3, 1),
 		autoBudgetMs: num("NUWA_AUTO_BUDGET_MS", 90_000, 100),
 		autoConcurrency: num("NUWA_AUTO_CONCURRENCY", 1, 1),
+		storageBackend: resolveStorageBackend(),
+		enableAutoLoops: (process.env.NUWA_AUTO_LOOPS ?? "1").trim() !== "0",
+		enableBeliefSearch: (process.env.NUWA_BELIEF_SEARCH ?? "1").trim() !== "0",
+		enableCalibration: (process.env.NUWA_CALIBRATION ?? "1").trim() !== "0",
 	};
 }
 
@@ -437,14 +453,37 @@ export function journalAppend(root: string, rec: Record<string, unknown>): void 
 	} catch {
 		/* 日志失败不阻塞主流程 */
 	}
+	try {
+		const backend = resolveStorageBackend(root);
+		if (backend === "sqlite" || backend === "dual") {
+			appendJournalSqlite(root, rec);
+		}
+	} catch {
+		/* SQLite journal 写入异常不阻塞主流程 */
+	}
 }
 
 export function logEvent(root: string, rec: Record<string, unknown>): void {
 	journalAppend(root, { type: "event", ...rec });
 }
 
-/** 读 journal 尾部；超过 2MB 只取末尾，避免长跑项目每次刷新全量解析。 */
+/** 读 journal 尾部；超过 2MB 只取末尾，避免长跑项目每次刷新全量解析；SQLite 模式下兼容回退。 */
 export function readJournalTail(root: string, limit = 200): JournalEntry[] {
+	const backend = resolveStorageBackend(root);
+	if ((backend === "sqlite" || backend === "dual") && existsSync(sqliteDbPath(root))) {
+		let store: NuwaSqliteStore | null = null;
+		try {
+			store = new NuwaSqliteStore(root, { readonly: true });
+			const entries = store.readJournalTail(limit);
+			if (entries.length > 0 || !existsSync(journalPath(root))) {
+				return entries;
+			}
+		} catch {
+			/* 回退读取 journal.jsonl */
+		} finally {
+			store?.close();
+		}
+	}
 	try {
 		const raw = readFileSync(journalPath(root), "utf8");
 		return parseJournalTail(raw.length > 2_000_000 ? raw.slice(-2_000_000) : raw, limit);
@@ -665,7 +704,8 @@ export function normalizeState(st: NuwaState): NuwaState {
 	return st;
 }
 
-export function loadState(root: string): NuwaState | null {
+/** 纯 JSON 状态加载（供 sqlite-store 迁移与坏库回退无环调用，亦作为 json 模式的底层实现）。 */
+export function loadStateJsonOnly(root: string): NuwaState | null {
 	const direct = readJson<NuwaState>(statePath(root));
 	if (direct && direct.schema === SCHEMA && direct.project) return normalizeState(direct);
 	const recovered = recoverFromJournal(root);
@@ -679,6 +719,19 @@ export function loadState(root: string): NuwaState | null {
 	return recovered ? normalizeState(recovered) : null;
 }
 
+export function loadState(root: string): NuwaState | null {
+	const backend = resolveStorageBackend(root);
+	if (backend === "sqlite" || backend === "dual") {
+		try {
+			const fromSql = loadStateFromSqlite(root, { fallbackToJson: true });
+			if (fromSql) return normalizeState(fromSql);
+		} catch {
+			/* 坏库或未建库时回退存量 JSON 兼容读取 */
+		}
+	}
+	return loadStateJsonOnly(root);
+}
+
 const SNAPSHOT_KEY_REASONS = new Set(["init", "flag", "complete", "stop", "reincarnate"]);
 const STATE_WARN_BYTES = 2 * 1024 * 1024;
 
@@ -687,8 +740,8 @@ export interface SaveStateOptions {
 	reason?: string;
 }
 
-/** 原子写盘 + 增量快照（每 10 次或关键里程碑写 .json.gz 快照，超 2MB 记告警日志）。 */
-export function saveState(root: string, state: NuwaState, opts?: SaveStateOptions): void {
+/** 纯 JSON 原子写盘 + 增量快照。 */
+export function saveStateJsonOnly(root: string, state: NuwaState, opts?: SaveStateOptions): void {
 	state.project.updatedAt = nowIso();
 	state.runtime.saveCount = (state.runtime.saveCount ?? 0) + 1;
 	const preliminary = JSON.stringify(state, null, 2);
@@ -713,6 +766,45 @@ export function saveState(root: string, state: NuwaState, opts?: SaveStateOption
 	atomicWrite(statePath(root), body);
 	if (finalBytes > STATE_WARN_BYTES) {
 		logEvent(root, { type: "state_size_warn", bytes: finalBytes, limit: STATE_WARN_BYTES });
+	}
+}
+
+/** 原子写盘 + 增量快照；当启用 `NUWA_STORAGE_BACKEND=sqlite|dual` 时写入 SQLite WAL 权威库并同步保留兼容导出。 */
+export function saveState(root: string, state: NuwaState, opts?: SaveStateOptions): void {
+	const backend = resolveStorageBackend(root);
+	state.runtime.storageBackend = backend;
+	if (backend === "sqlite" || backend === "dual") {
+		const dbFile = sqliteDbPath(root);
+		const hadDb = existsSync(dbFile) && (() => {
+			try {
+				return statSync(dbFile).size > 0;
+			} catch {
+				return false;
+			}
+		})();
+		if (!hadDb && existsSync(statePath(root))) {
+			try {
+				migrateJsonToSqlite(root);
+			} catch {
+				/* 首次建库迁移失败时直接由后续 saveStateToSqlite 写入最新状态 */
+			}
+		}
+		saveStateJsonOnly(root, state, opts);
+		saveStateToSqlite(root, state);
+		return;
+	}
+	saveStateJsonOnly(root, state, opts);
+}
+
+/** 判断指定目录是否存在有效状态存储（.nuwa/state.json 或非空 .nuwa/nuwa.db）。 */
+export function hasProjectState(dir: string): boolean {
+	if (existsSync(statePath(dir))) return true;
+	const dbFile = sqliteDbPath(dir);
+	if (!existsSync(dbFile)) return false;
+	try {
+		return statSync(dbFile).size > 0;
+	} catch {
+		return false;
 	}
 }
 
@@ -750,12 +842,28 @@ function sessionPointerPath(sessionId: string): string {
 
 function stateOwner(dir: string): string | undefined {
 	const raw = readJson<{ project?: { ownerSessionId?: string } }>(statePath(dir));
-	return raw?.project?.ownerSessionId;
+	if (raw?.project?.ownerSessionId !== undefined) return raw.project.ownerSessionId;
+	if (existsSync(sqliteDbPath(dir))) {
+		try {
+			return loadStateFromSqlite(dir)?.project?.ownerSessionId;
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
 }
 
 function stateUrl(dir: string): string | undefined {
 	const raw = readJson<{ project?: { url?: string } }>(statePath(dir));
-	return raw?.project?.url;
+	if (raw?.project?.url !== undefined) return raw.project.url;
+	if (existsSync(sqliteDbPath(dir))) {
+		try {
+			return loadStateFromSqlite(dir)?.project?.url;
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
 }
 
 function safeTargetUrl(raw: string, mode: Mode = "ctf"): string {
@@ -780,7 +888,7 @@ function sameTarget(dir: string, targetUrl: string): boolean {
 
 export function readSessionPointer(sessionId: string): { root?: string; sessionId?: string } | null {
 	const ptr = readJson<{ root?: string; sessionId?: string }>(sessionPointerPath(sessionId));
-	if (!ptr?.root || !existsSync(statePath(ptr.root))) return null;
+	if (!ptr?.root || !hasProjectState(ptr.root)) return null;
 	if (ptr.sessionId && ptr.sessionId !== sessionId) return null;
 	return ptr;
 }
@@ -791,10 +899,10 @@ export function defaultProjectRoot(cwd: string, target: string, sessionId: strin
 	const local = findLocalRoot(cwd, sessionId, want);
 	if (local) return local;
 	const env = process.env.NUWA_PROJECT;
-	if (env && existsSync(statePath(resolve(env))) && sameTarget(resolve(env), want)) return resolve(env);
+	if (env && hasProjectState(resolve(env)) && sameTarget(resolve(env), want)) return resolve(env);
 	if (!isSharedCwd(cwd)) {
 		const base = resolve(cwd);
-		if (existsSync(statePath(base)) && !sameTarget(base, want)) {
+		if (hasProjectState(base) && !sameTarget(base, want)) {
 			const t = normalizeTargetForMode(target, mode);
 			return join(base, ".nuwa-tasks", `${slug(t.host)}-${t.port}-${sha(sessionId || "default", 8)}`);
 		}
@@ -823,7 +931,7 @@ export function writePointer(root: string, sessionId: string): void {
 
 /** 具名会话只接管自己 owner 的 state；共享 cwd 的无 owner 旧 state 一律跳过。 */
 function rootForSession(dir: string, sessionId: string): "use" | "skip" | "reject" {
-	if (!existsSync(statePath(dir))) return "skip";
+	if (!hasProjectState(dir)) return "skip";
 	if (!sessionId) return "use";
 	const owner = stateOwner(dir);
 	if (owner) return owner === sessionId ? "use" : "reject";
@@ -848,7 +956,7 @@ export function findRoot(cwd: string, sessionId = "", target = ""): string | nul
 		d = up;
 	}
 	const env = process.env.NUWA_PROJECT;
-	if (env && existsSync(statePath(resolve(env))) && sameTarget(resolve(env), want)) return resolve(env);
+	if (env && hasProjectState(resolve(env)) && sameTarget(resolve(env), want)) return resolve(env);
 	if (sessionId) {
 		const ptr = readSessionPointer(sessionId);
 		if (!ptr?.root) return null;
@@ -857,7 +965,7 @@ export function findRoot(cwd: string, sessionId = "", target = ""): string | nul
 		return sameTarget(root, want) ? root : null;
 	}
 	const legacy = readJson<{ root?: string; sessionId?: string }>(pointerFilePath());
-	if (legacy?.root && existsSync(statePath(legacy.root))) {
+	if (legacy?.root && hasProjectState(legacy.root)) {
 		const root = resolve(legacy.root);
 		if (usableRoot(cwd, root) && sameTarget(root, want)) return root;
 	}

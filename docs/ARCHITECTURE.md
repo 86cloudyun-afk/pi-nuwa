@@ -1,43 +1,59 @@
-# 架构设计：女娲 v4.0 原生全自主运行时
+# 架构设计：女娲 v6.0.0 认知安全评估与跨宿主原生引擎
 
 ## 1. 架构总览
 
-女娲 v4.0 采用**纯 `omp` 进程内模块化原生扩展 + 极薄外层无头换血守护器**的双层架构，彻底消除了早期 v1 四层外部脚本拼接（已归档至 `archive/v1/`）带来的状态分裂与环境耦合。
+女娲 v6.0.0 采用 **宿主无关核心协议层（`core/`）+ 模块化无环 `omp` 原生运行时（30 个 TS 模块）+ 外层无头换血守护器（`bin/nuwa-autonomous`）** 的三层解耦架构：既能在 `omp` 会话内零开销原生运行，也能通过 `bin/nuwa-mcp`（JSON-RPC 2.0 over stdio）向 Claude Code、Cursor、Codex 等任意 MCP 宿主提供完全一致的 12 个 `nuwa_*` 工具、证据门禁与安全护栏。
 
-```text
-bin/nuwa-autonomous (外层守护：跨世代接力 / 指数退避恢复 / 模型与沙盒策略透传 / doctor 体检)
-  └── omp 会话进程 (加载 ~/.omp/agent/extensions/nuwa-omp/index.ts)
-        ├── 组装与事件层: omp/nuwa.ts (12 个 nuwa_* 工具 + /nuwa 命令 + 6 类事件钩子)
-        ├── 图与规划层:   omp/graph.ts + omp/profiles.ts + omp/reincarnate.ts
-        ├── 状态存储层:   omp/storage.ts + omp/types.ts (withLock + 原子写 + 增量 .json.gz 快照)
-        ├── 血缘与护栏层: omp/lineage.ts + omp/scope.ts + omp/sandbox.ts
-        ├── 证据与复验层: omp/evidence.ts + omp/verifier-gate.ts + omp/session-vault.ts
-        ├── 侦察与感知层: omp/autoexec.ts + omp/browser-recon.ts
-        └── 知识与进化层: omp/kb.ts + kb/{schema.sql, seed-*.json, build-kb.ts}
+```mermaid
+flowchart TD
+    HostOMP["omp 原生宿主 (omp/nuwa.ts)"] --> GraphFacade["图门面与结案编排层 (omp/graph.ts)"]
+    HostMCP["跨宿主 MCP 客户端"] --> MCPServer["MCP Stdio 服务端 (bin/nuwa-mcp + core/mcp-server.ts)"]
+    MCPServer --> CoreProto["协议与 Schema 契约 (core/protocol.ts)"]
+    MCPServer --> GraphFacade
+
+    GraphFacade --> GraphCmd["命令工作流与只读视图层 (omp/graph-commands.ts)"]
+    GraphCmd --> GraphPlan["规划去重与信念前沿层 (omp/graph-planner.ts)"]
+    GraphFacade --> GraphPlan
+
+    GraphPlan --> Belief["不确定性信念与 VoI 搜索 (omp/belief-search.ts)"]
+    GraphFacade --> Calib["反自证机械校准核 (omp/calibration.ts)"]
+    GraphFacade --> AutoLoops["自主 AuthDiff / OOB 闭环 (omp/auto-loops.ts)"]
+    GraphCmd --> Traffic["脱敏流量重放与契约变异 (omp/traffic-workbench.ts)"]
+    GraphCmd --> Hybrid["多语言黑白盒混合审计 (omp/hybrid-audit.ts)"]
+    GraphFacade --> Storage["双模存储与锁底座 (omp/storage.ts + omp/sqlite-store.ts)"]
+    GraphPlan --> Storage
 ```
 
-**硬性模块依赖约束**：所有子模块仅单向引用 `./types` 或下层基础模块，**严禁运行时反向 `import "./nuwa"`**，且入口文件保持纯静态无后缀 ESM 导入（零 `createRequire`、零顶层 `await import`），确保在 `omp` 异步 `Bun.plugin` 加载器与离线 `bun build` 下 100% 稳定运行。
+### 硬性架构约束
+1. **12 工具不变量**：严格保持 `nuwa_init`、`nuwa_plan`、`nuwa_frontier`、`nuwa_claim`、`nuwa_commit`、`nuwa_flag`、`nuwa_complete`、`nuwa_status`、`nuwa_report`、`nuwa_expand`、`nuwa_stop`、`nuwa_kb` 12 个核心工具名称 100% 不变。
+2. **单向无环模块图（DAG）**：除总装入口 `omp/nuwa.ts` 外，其余所有 `omp/*.ts` 子模块严禁运行时 `import "./nuwa"`；`omp/graph.ts` 拆解为 `graph-planner.ts -> graph-commands.ts -> graph.ts` 单向依赖链，主文件严格控制在 `< 2,500` 行。
+3. **零外部运行时依赖**：纯 Bun / Node.js 标准内置模块（`bun:sqlite`、`node:fs`、`node:crypto`、`node:http` 等），离线 `bun build` 100% 静态可编译。
+4. **全链路零明文凭据泄露**：所有事实、SQLite 表、FTS5 索引、校准账本、流量记录、SARIF 报告与 PoC 证据包均强制脱敏。
 
-## 2. 六大闭环机制
+---
 
-### 2.1 永动续跑与跨世代换血（`session_stop` + `reincarnate.ts`）
-- `omp` 对 `continue: true` 设有硬上限（8 次），而 `decision: "block"` 不计入该上限。`session_stop` 在目标未达成前持续返回 `{ decision: "block", reason: directive }` 驱动下一轮。
-- 在无头守护模式（`NUWA_HEADLESS_DAEMON=1`）下，当单代 token 或轮次触及阈值时，`session_stop` 自动中止并释放在途自动批，生成 ≤1500 字结构化交接摘要写入 `.nuwa/state.json` 后返回 `undefined` 优雅退出，由 `bin/nuwa-autonomous` 拉起全新上下文的第 `G+1` 代会话无缝接力。
+## 2. v6.0 六大核心子系统
 
-### 2.2 主从会话血缘与全工具面安全护栏（`lineage.ts` + `scope.ts` + `sandbox.ts`）
-- 主代理在 `nuwa_init`、`/nuwa`、`session_start` 注册活跃会话，并在 `before_subagent_spawn`（及 `task` 调用前）将父子血缘原子持久化至 `<agentHome>/cache/nuwa-lineage.json`，同时通过 `routeSubagentModel` 按角色（`fujiang` / `nuwa-verifier`）与阶段动态分配 `fast`/`deep`/`verify` 模型。
-- 子代理即便运行于独立 `subSessionId`，`tool_call` 与 `tool_execution_end` 也能经 `resolveLineageRoot` 100% 还原父项目根，强制执行 `N-001..N-009` 全工具面范围护栏（覆盖 `bash`/`read`/`browser`/`web_search`/`eval`/`write`）及零信任只读 Docker 沙盒校验。
+### 2.1 双模状态存储与 SQLite WAL 全文检索（`storage.ts` + `sqlite-store.ts`）
+- 支持通过 `NUWA_STORAGE_BACKEND=json|sqlite|dual` 切换存储策略：
+  - `json`（默认）：100% 兼容轻量文件锁与增量 `.json.gz` 快照，只读路径严格零磁盘写操作；
+  - `sqlite` / `dual`：启用 `bun:sqlite` WAL 模式与 `busy_timeout`，初始化 10 张规范表（含 FTS5 虚拟表），支持 4 路并发写入无锁争用超时、`queryFactsByText` 中英文/路径/CVE 混合全文检索、坏库自动诊断回退或隔离重建，并同步维护 `state.json` 兼容视图。
 
-### 2.3 纯净证据账本与候选漏洞双盲复验（`evidence.ts` + `verifier-gate.ts`）
-- `tool_execution_end` 经 `isTrustedEvidenceEvent` 严格过滤，拒绝 `task`/`eval`/`todo`/`think`/`ask` 等编排工具输出进入 `.nuwa/exec-ledger.jsonl`，从源头阻断子代理口头幻觉污染账本。
-- 非自动批提交的 `vuln` 默认标记为 `verifyStage="candidate"`，并自动派生 P96 `verify-vuln:<fid>` 意图，引导独立审查子代理 `nuwa-verifier` 执行正负对照实验；未升格为 `confirmed` 前，`nuwa_complete` 通过 `filterConfirmedProofs` 拒绝收口结案。
+### 2.2 贝叶斯信念图与预期信息增益（VoI）搜索（`belief-search.ts` + `graph-planner.ts`）
+- 每个事实、意图与假设映射为共轭 Beta 分布节点 $(\alpha, \beta)$，实时计算后验均值 $\mu = \frac{\alpha}{\alpha+\beta}$、二元香农熵 $H(\mu)$ 与一步预期熵减（VoI）。
+- `frontierList` 融合便携知识库历史胜率与 `rankFrontierByBelief`：当出现 `.js.map` 源码泄露、获取 `cred` 或双盲确认漏洞等 `breakthrough_signal` 时，瞬时拉升关联攻击链优先级；当双盲复验驳回（`verifier_reject`）或遭遇 WAF 硬拦截时，通过 `propagateBeliefUpdate` 与 `pruneLowYieldSubtree` 级联衰减并剪枝下游低收益分支。
 
-### 2.4 Soft-404 去噪、工具链升档与 SPA 表面感知（`autoexec.ts` + `browser-recon.ts`）
-- 自动批探测前先请求随机不存在路径建立 Soft-404 基线（状态码 + 体积容差 + 标题签名），并对 `.git/HEAD`、`.env`、`openapi.json` 做内容语义指纹校验与密钥脱敏，彻底消除单页应用假 200 误报。
-- 根据 `st.project.toolchain` 自动将轻量探针升档至 `nmap`、`ffuf -ac`、`katana` 及非破坏性 `nuclei`；针对前端 SPA 自动调用 `runSpaRecon`（Playwright 只读拦截或静态同源 JS Bundle 解析）提取隐藏 API 路由并同轮派生端点审计意图。
+### 2.3 反自证机械对账校准核与自适应模型路由（`calibration.ts` + `lineage.ts`）
+- **反自证红线**：`validateSettlementSource` 机械拒绝 `self`、`model`、`agent` 等一切自评来源（抛出 `SELF_CERTIFICATION_FORBIDDEN`）；`verifyStage="candidate"` 暂存阶段严禁提前结算。
+- **事前登记 → 机械结算**：`before_subagent_spawn` 基于信念后验向 `.nuwa/calibration.jsonl` 登记预测，仅在 `evaluatePositiveEvidenceGate` 拦截假阳性、双盲复验 `verify-vuln:<fid>` 裁决或 `exec-ledger` 实锤核验时由机械源单次结算。
+- **自适应路由**：`routeSubagentModel` 在满足最小已结算样本门槛后联动 `recommendAdaptiveModelRoute`，基于 Brier Score、10-bin ECE、误报率与千 Token ROI 在 `allowedModels` 白名单内自动降权高误报模型。
 
-### 2.5 多角色会话保险箱（`session-vault.ts`）
-- 以 `0o700` 目录与 `0o600` 文件权限将多角色 Cookie / Bearer / 凭据存储于 `.nuwa/sessions/vault.json`；`nuwa_commit(kind="cred")` 自动收纳角色并对全部落盘事实与报告执行 `redactVaultSecrets` 掩码脱敏；`nuwa_claim` 在鉴权类意图上自动物化 `/tmp/nuwa/<projectId>/sessions/<role>.headers` 供零明文差分重放。
+### 2.4 自主 AuthDiff 与 OOB 评估闭环（`auto-loops.ts` + `graph.ts`）
+- 批处理周期收尾自动调用 `runPostBatchAutonomousLoops`：满足多角色或新 `cred` 且未处冷却窗时自动执行只读多角色鉴权差分并将高置信越权存为 `candidate` 派发双盲复验；配置 `scope.oobDomains` 时自动为盲态高危面签发去重 Canary 并按 30s 节流轮询回收证据。
 
-### 2.6 便携知识库与跨项目自进化记忆（`kb.ts` + `kb/*`）
-- 随仓提供完整 SQLite FTS5 Schema 与安全基线种子，全量采用 `?` 参数化绑定防注入查询；每次项目通过 `nuwa_complete` 验收后，`distillProjectExperience` 自动剥离靶标敏感信息将技术栈成败规律写回 `experience` 表，供后续同类项目在 `frontierList` 中通过 UCB1 公式动态提权高胜率路径。
+### 2.5 结构化流量工作台与黑白盒混合审计（`traffic-workbench.ts` + `hybrid-audit.ts`）
+- `TrafficRecorder` 全自动擦除敏感头、Cookie、URL 查询/Fragment 令牌与正文密钥；`replayTrafficSequence` 支持跨步 Cookie Jar 与动态变量提取替换，跨 Origin `30x` 自动剥离认证头并强拦截越界重定向；`runStructuredMutations` 在并发 `<= 8` 硬约束下执行五类只读契约差分并过滤 Soft-404。
+- `extractCodeAttackSurface` / `extractFromSourceMap` 多语言静态提取路由鉴权与四类危险汇点，经 `bridgeWhiteboxToBlackboxIntents` 生成合规只读黑盒核验意图，并由 `correlateBlackboxFindingToSource` 完成黑盒实锤到源码文件行号的双向闭环。
+
+### 2.6 独立核心协议与跨宿主 MCP Server（`core/protocol.ts` + `core/mcp-server.ts` + `bin/nuwa-mcp`）
+- `NuwaCoreEngine` 封装完整的状态机、证据核验、假阳性门禁与报告导出能力，不依赖任何特定宿主 UI；`bin/nuwa-mcp` 同时支持标准 `Content-Length` 头帧与换行分隔 JSON-RPC 2.0 帧，零污染 stdout 日志通道。

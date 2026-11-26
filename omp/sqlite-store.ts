@@ -29,7 +29,7 @@ import {
 	SCHEMA,
 	atomicWrite,
 	journalPath,
-	loadState,
+	loadStateJsonOnly,
 	normalizeState,
 	nowIso,
 	stateDir,
@@ -1972,7 +1972,7 @@ export function loadStateFromSqlite(root: string, opts?: LoadSqliteStateOptions)
 		if (corruptErr) {
 			if (opts?.fallbackToJson) {
 				opts.onCorruptWarning?.(corruptErr.message, corruptErr);
-				return loadState(normRoot);
+				return loadStateJsonOnly(normRoot);
 			}
 			throw corruptErr;
 		}
@@ -2079,7 +2079,7 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 		let hypothesesCount = 0;
 
 		const existing = store.loadState();
-		const jsonState = loadState(normRoot);
+		const jsonState = loadStateJsonOnly(normRoot);
 
 		if (jsonState) {
 			if (!existing || opts?.force === true) {

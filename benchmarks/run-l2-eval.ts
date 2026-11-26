@@ -23,6 +23,36 @@ import { generateOobCanary, pollOobCallbacks } from "../omp/oob";
 import { defaultScopeForTarget } from "../omp/scope";
 import { clearSessionVault, upsertSessionRole } from "../omp/session-vault";
 import { loadState, saveState, withLock } from "../omp/storage";
+import { queryFactsByText, saveStateToSqlite, sqliteDbPath } from "../omp/sqlite-store";
+import {
+	planAutonomousOobProbes,
+	runAutonomousAuthDiff,
+	runAutonomousOobPoll,
+} from "../omp/auto-loops";
+import {
+	initBeliefGraphFromState,
+	propagateBeliefUpdate,
+	rankFrontierByBelief,
+	recommendSearchPivot,
+} from "../omp/belief-search";
+import {
+	calibrationLedgerPath,
+	computeCalibrationSummary,
+	loadCalibrationRecords,
+	recordPrediction,
+	type CalibrationRecord,
+} from "../omp/calibration";
+import {
+	TrafficRecorder,
+	replayTrafficSequence,
+	runStructuredMutations,
+} from "../omp/traffic-workbench";
+import {
+	bridgeWhiteboxToBlackboxIntents,
+	correlateBlackboxFindingToSource,
+	extractCodeAttackSurface,
+	extractFromSourceMap,
+} from "../omp/hybrid-audit";
 import {
 	L2_SCENARIO_SPECS,
 	L2_SYNTHETIC_TOKENS,
@@ -54,6 +84,7 @@ export interface L2HardGates {
 	zeroFalsePositiveGate: boolean;
 	zeroVaultLeakGate: boolean;
 	hardenedConvergenceGate: boolean;
+	calibrationGate: boolean;
 	allPassed: boolean;
 }
 
@@ -68,6 +99,8 @@ export interface L2ScorecardMetrics {
 	falsePositiveRate: number;
 	vaultLeakCount: number;
 	hardenedSealTurns: number;
+	calibrationBrier: number;
+	calibrationEce: number;
 	wallTimeMs: number;
 }
 
@@ -91,6 +124,7 @@ const FIXED_EVAL_TS = "2026-11-26T00:00:00.000Z";
 interface L2EvalEnv {
 	makeWorkspace: (prefix: string) => string;
 	trackProjectId: (projectId: string) => void;
+	collectCalibration: (records: readonly CalibrationRecord[]) => void;
 }
 
 function assertOk(cond: unknown, msg: string): void {
@@ -128,6 +162,14 @@ async function commitAndConfirmFinding(opts: {
 }): Promise<{ factId: string; turnsDelta: number }> {
 	const { engine, root, intentId, title, detail, candidateCmd, candidateOutput, verifyCmd, verifyOutput } = opts;
 
+	recordPrediction(root, {
+		intentId,
+		taskCategory: "exploit",
+		modelId: "nuwa-l2-eval",
+		predictedConfidence: 0.92,
+		estimatedTokens: 1200,
+		note: title,
+	});
 	const claim1 = await engine.callTool("nuwa_claim", { id: intentId, worker: "fujiang" });
 	assertOk(!claim1.isError, `认领意图 ${intentId} 失败: ${claim1.content[0]?.text ?? ""}`);
 
@@ -268,6 +310,24 @@ async function exportReportsAndAuditSecrets(
 		}
 	}
 
+	// v6.0 同步验证 SQLite WAL 权威库落盘与 FTS5 检索，并将新引擎落盘文件纳入零明文泄露扫描
+	const stForDb = loadState(root);
+	if (stForDb) {
+		saveStateToSqlite(root, stForDb);
+		assertOk(existsSync(sqliteDbPath(root)), "SQLite 权威库 nuwa.db 应成功落盘");
+		const ftsHits = queryFactsByText(root, "http", { limit: 5 });
+		assertOk(Array.isArray(ftsHits), "SQLite FTS5 全文检索应正常返回");
+		textsToScan.push(JSON.stringify(ftsHits));
+	}
+	const calibFile = calibrationLedgerPath(root);
+	if (existsSync(calibFile)) {
+		textsToScan.push(readFileSync(calibFile, "utf8"));
+	}
+	const trafficIndex = join(root, ".nuwa", "traffic", "index.jsonl");
+	if (existsSync(trafficIndex)) {
+		textsToScan.push(readFileSync(trafficIndex, "utf8"));
+	}
+
 	let vaultLeaks = 0;
 	for (const body of textsToScan) {
 		for (const secret of secretsToAudit) {
@@ -320,7 +380,7 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 		upsertSessionRole(root, { role: "user_bob", bearer: tokJson.roles.member_bob });
 		upsertSessionRole(root, { role: "admin", bearer: tokJson.roles.tenant_admin });
 
-		// 3. 运行多角色鉴权差分矩阵（水平 BOLA + 垂直 BFLA）
+		// 3. 运行多角色鉴权差分矩阵与 v6.0 自主 AuthDiff 闭环 + 流量工作台脱敏录制/只读变异
 		const diffRes = await runAuthDiffMatrix(
 			srv.baseUrl,
 			["/api/v1/projects/1001", "/api/v1/admin/tenant-quotas"],
@@ -328,6 +388,35 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 			scope,
 		);
 		assertOk(diffRes.findings.length >= 2, `鉴权差分矩阵应检出水平与垂直越权，实际=${diffRes.findings.length}`);
+
+		const autoDiff = await runAutonomousAuthDiff(loadState(root)!, root, scope, {
+			paths: ["/api/v1/projects/1001", "/api/v1/admin/tenant-quotas"],
+			force: true,
+		});
+		assertOk(autoDiff.triggered && autoDiff.highConfidenceFindings.length >= 2, "自主 AuthDiff 闭环应自动检出越权");
+
+		const t1Recorder = new TrafficRecorder(root);
+		t1Recorder.record({
+			method: "GET",
+			url: `${srv.baseUrl}/api/v1/projects/1001`,
+			requestHeaders: { Authorization: `Bearer ${tokJson.roles.member_bob}` },
+			status: 200,
+			responseHeaders: { "content-type": "application/json" },
+			responseBody: '{"projectId":"prj-1001","owner":"alice"}',
+			role: "user_bob",
+		});
+		assertOk(t1Recorder.list().length === 1, "TrafficRecorder 应成功录制脱敏流量");
+
+		const mutRes = await runStructuredMutations(
+			{
+				method: "GET",
+				url: `${srv.baseUrl}/api/v1/admin/tenant-quotas`,
+				headers: { Authorization: `Bearer ${tokJson.roles.tenant_admin}` },
+			},
+			scope,
+			{ modes: ["auth_strip"], recorder: t1Recorder },
+		);
+		assertOk(mutRes.cases.length >= 1, "结构化只读变异探针应完成 auth_strip 校验");
 
 		// 4. 在 NuwaCoreEngine 中规划、认领、双盲复验入账两条真实权限配置缺陷
 		const planRes = await engine.callTool("nuwa_plan", {
@@ -405,6 +494,7 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 			L2_SYNTHETIC_TOKENS.t1Bob,
 			L2_SYNTHETIC_TOKENS.t1Admin,
 		]);
+		env.collectCalibration(loadCalibrationRecords(root));
 		clearSessionVault(root, stInit.project.id);
 
 		const stFinal = loadState(root)!;
@@ -508,6 +598,14 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 		const addedIds = (planRes.details?.added as string[] | undefined) ?? [];
 		assertOk(addedIds.length === 2, "应规划 2 条验证意图");
 
+		recordPrediction(root, {
+			intentId: addedIds[0]!,
+			taskCategory: "recon",
+			modelId: "nuwa-l2-eval",
+			predictedConfidence: 0.15,
+			estimatedTokens: 600,
+			note: "soft404-decoy-probe",
+		});
 		await engine.callTool("nuwa_claim", { id: addedIds[0]!, worker: "fujiang" });
 		const downgradedCommit = await engine.callTool("nuwa_commit", {
 			id: addedIds[0]!,
@@ -559,6 +657,7 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 		assertOk(compRes.details?.ok === true, "t2 应完成正向收口");
 
 		const audit = await exportReportsAndAuditSecrets(engine, root, [t2VaultSecret]);
+		env.collectCalibration(loadCalibrationRecords(root));
 		clearSessionVault(root, stInit.project.id);
 
 		const stFinal = loadState(root)!;
@@ -617,6 +716,21 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 		});
 		const intentId = ((planRes.details?.added as string[] | undefined) ?? [])[0]!;
 		assertOk(Boolean(intentId), "应规划 OOB 验证意图");
+
+		// 0. 验证 v6.0 自主 OOB Canary 规划与节流轮询闭环
+		const autoOobPlan = planAutonomousOobProbes(loadState(root)!, root, scope, { domain: "oob.l2.local" });
+		assertOk(autoOobPlan.enabled && autoOobPlan.planned.length >= 1, "自主 OOB 规划应自动识别异步回调高危面");
+		const autoCanary = autoOobPlan.planned[0]!.canary;
+		await fetch(`${srv.baseUrl}/api/v1/integrations/health-callback`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ callbackUrl: `${srv.collectorUrl}/callback/${autoCanary.token}?canary=${encodeURIComponent(autoCanary.fqdn)}` }),
+		});
+		const autoOobPoll = await runAutonomousOobPoll(loadState(root)!, root, scope, {
+			pollUrl: `${srv.collectorUrl}/oob/poll?canary=${encodeURIComponent(autoCanary.token)}`,
+			force: true,
+		});
+		assertOk(autoOobPoll.polled && autoOobPoll.evidenceFacts.length >= 1, "自主 OOB 轮询应自动产出回连实锤证据");
 
 		// 1. 生成唯一 Canary 标识 -> 触发本机回路异步健康检查 -> 从本机收集器轮询确认
 		const canary1 = generateOobCanary(root, {
@@ -690,6 +804,7 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 		assertOk(compRes.details?.ok === true, "t3 应完成正向收口");
 
 		const audit = await exportReportsAndAuditSecrets(engine, root, [t3VaultSecret]);
+		env.collectCalibration(loadCalibrationRecords(root));
 		clearSessionVault(root, stInit.project.id);
 
 		const stFinal = loadState(root)!;
@@ -734,8 +849,12 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 		const mapMatch = /\/\/#\s*sourceMappingURL=(\S+)/.exec(bundleJs);
 		assertOk(Boolean(mapMatch?.[1]), "前端构建产物应包含 sourceMappingURL 注释");
 
-		// 2. 解析公开 .js.map 源码映射提取多步表单参数与未配置鉴权的内部快照路由
-		const mapJson = (await (await fetch(`${srv.baseUrl}${mapMatch![1]}`)).json()) as {
+		// 2. 解析公开 .js.map 源码映射（串联 v6.0 hybrid-audit 提取虚拟源码与攻击面桥接）
+		const rawMapText = await (await fetch(`${srv.baseUrl}${mapMatch![1]}`)).text();
+		const codeSurface = extractFromSourceMap(rawMapText);
+		const wbBridge = bridgeWhiteboxToBlackboxIntents(codeSurface, srv.baseUrl);
+		assertOk(codeSurface.scannedFiles >= 1 && wbBridge !== null, "hybrid-audit 应成功解析 SourceMap 虚拟源码树");
+		const mapJson = JSON.parse(rawMapText) as {
 			sourcesContent?: string[];
 		};
 		const joinedSrc = (mapJson.sourcesContent ?? []).join("\n");
@@ -760,6 +879,31 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 			body: JSON.stringify({ stepToken: "invalid", includeConfigMeta: true }),
 		});
 		assertOk(directRes.status === 428, "未持有效 stepToken 应返回 428");
+
+		const t4Scope = stInit.project.scope ?? defaultScopeForTarget(srv.baseUrl, "pentest");
+		const t4Recorder = new TrafficRecorder(root);
+		const seqReplay = await replayTrafficSequence(
+			[
+				{
+					id: "step1-ticket",
+					method: "POST",
+					url: `${srv.baseUrl}${step1Route}`,
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ department: deptMatch![1], ticketCode: codeMatch![1] }),
+					extract: { stepToken: { jsonPath: "stepToken" } },
+				},
+				{
+					id: "step2-snapshot",
+					method: "POST",
+					url: `${srv.baseUrl}${hiddenRoute}`,
+					headers: { "Content-Type": "application/json" },
+					body: '{"stepToken":"{{stepToken}}","includeConfigMeta":true}',
+				},
+			],
+			t4Scope,
+			{ recorder: t4Recorder },
+		);
+		assertOk(seqReplay.ok && seqReplay.steps.length === 2 && seqReplay.steps[1]?.status === 200, "replayTrafficSequence 应成功提取 stepToken 并完成两步重放");
 
 		const step1Res = await fetch(`${srv.baseUrl}${step1Route}`, {
 			method: "POST",
@@ -819,10 +963,25 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 			verifyOutput: snapVerifyText,
 		});
 
+		// 验证信念跃迁重排与黑盒实锤->白盒源码反向关联
+		const stMidT4 = loadState(root)!;
+		const bGraphT4 = initBeliefGraphFromState(stMidT4);
+		const firstFactId = Object.keys(stMidT4.facts)[0];
+		if (firstFactId) {
+			propagateBeliefUpdate(bGraphT4, stMidT4, { nodeId: firstFactId, observation: "breakthrough_signal" });
+			rankFrontierByBelief(stMidT4, undefined, { graph: bGraphT4 });
+		}
+		const confirmedT4 = Object.values(stMidT4.facts).find((f) => f.verifyStage === "confirmed");
+		if (confirmedT4) {
+			const corr = correlateBlackboxFindingToSource(confirmedT4, codeSurface);
+			assertOk(corr !== null, "correlateBlackboxFindingToSource 应完成反向源码定位评估");
+		}
+
 		const compRes = await engine.callTool("nuwa_complete", {});
 		assertOk(compRes.details?.ok === true, "t4 应完成正向收口");
 
 		const audit = await exportReportsAndAuditSecrets(engine, root, [t4VaultSecret]);
+		env.collectCalibration(loadCalibrationRecords(root));
 		clearSessionVault(root, stInit.project.id);
 
 		const stFinal = loadState(root)!;
@@ -912,6 +1071,14 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 		});
 		const checkIds = (planVuln.details?.added as string[] | undefined) ?? [];
 		for (const cid of checkIds) {
+			recordPrediction(root, {
+				intentId: cid,
+				taskCategory: "auth",
+				modelId: "nuwa-l2-eval",
+				predictedConfidence: 0.08,
+				estimatedTokens: 700,
+				note: "hardened-rbac-check",
+			});
 			await engine.callTool("nuwa_claim", { id: cid, worker: "fujiang" });
 			await engine.callTool("nuwa_commit", {
 				id: cid,
@@ -921,7 +1088,9 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 			tickTurn(root, 1);
 		}
 
-		// 4. 验证无实锤证据时普通 nuwa_complete 被拒绝，随即执行合法负向封盘 (sealed_negative)
+		// 4. 验证信念搜索引擎收敛转向评估与普通 nuwa_complete 被拒后执行合法负向封盘 (sealed_negative)
+		const pivotT5 = recommendSearchPivot(loadState(root)!);
+		assertOk(pivotT5.excludedSurface.length >= 2, "信念收敛引擎应汇总已排除的受保护路由表面");
 		const prematureComplete = await engine.callTool("nuwa_complete", {});
 		assertOk(prematureComplete.details?.ok === false, "零漏洞状态下请求正向完成必须被门禁拒绝");
 		tickTurn(root, 1);
@@ -953,6 +1122,7 @@ const SCENARIO_EVALUATORS: Record<L2ScenarioId, ScenarioEvaluator> = {
 			L2_SYNTHETIC_TOKENS.t5Bob,
 			L2_SYNTHETIC_TOKENS.t5Admin,
 		]);
+		env.collectCalibration(loadCalibrationRecords(root));
 		clearSessionVault(root, stInit.project.id);
 
 		const stFinal = loadState(root)!;
@@ -993,6 +1163,7 @@ export async function runL2BenchmarkSuite(opts?: RunL2BenchmarkOptions): Promise
 
 	const tmpDirs: string[] = [];
 	const trackedProjectIds: string[] = [];
+	const allCalibrationRecords: CalibrationRecord[] = [];
 	const prevAgentHome = process.env.PI_AGENT_HOME;
 	const prevNuwaProject = process.env.NUWA_PROJECT;
 	const sandboxHome = mkdtempSync(join(tmpdir(), "nuwa-l2-agent-home-"));
@@ -1008,6 +1179,9 @@ export async function runL2BenchmarkSuite(opts?: RunL2BenchmarkOptions): Promise
 		},
 		trackProjectId: (id: string) => {
 			if (id) trackedProjectIds.push(id);
+		},
+		collectCalibration: (records: readonly CalibrationRecord[]) => {
+			for (const r of records) allCalibrationRecords.push(r);
 		},
 	};
 
@@ -1092,17 +1266,24 @@ export async function runL2BenchmarkSuite(opts?: RunL2BenchmarkOptions): Promise
 		? hardenedResult.terminalStatus === "sealed_negative" && hardenedSealTurns > 0 && hardenedSealTurns <= 15
 		: true;
 
+	const calibSummary = computeCalibrationSummary(allCalibrationRecords);
+	const calibrationBrier = Number(calibSummary.global.brierScore.toFixed(4));
+	const calibrationEce = Number(calibSummary.global.ece.toFixed(4));
+	const calibrationGateOk = calibSummary.global.settledCount > 0 && calibrationBrier <= 0.25;
+
 	const gates: L2HardGates = {
 		recallGate: recallRate === 1.0,
 		zeroFalsePositiveGate: falsePositiveRate === 0,
 		zeroVaultLeakGate: vaultLeakCount === 0,
 		hardenedConvergenceGate: hardenedConvergenceOk,
+		calibrationGate: calibrationGateOk,
 		allPassed:
 			passedScenarios === totalScenarios &&
 			recallRate === 1.0 &&
 			falsePositiveRate === 0 &&
 			vaultLeakCount === 0 &&
-			hardenedConvergenceOk,
+			hardenedConvergenceOk &&
+			calibrationGateOk,
 	};
 
 	const metrics: L2ScorecardMetrics = {
@@ -1116,6 +1297,8 @@ export async function runL2BenchmarkSuite(opts?: RunL2BenchmarkOptions): Promise
 		falsePositiveRate,
 		vaultLeakCount,
 		hardenedSealTurns,
+		calibrationBrier,
+		calibrationEce,
 		wallTimeMs,
 	};
 
@@ -1151,8 +1334,8 @@ function formatL2ScorecardTable(summary: L2BenchmarkSummary): string {
 	const g = summary.gates;
 	lines.push(
 		"------------------------------------------------------------------------------------------",
-		`Metrics : passed=${m.passedScenarios}/${m.totalScenarios} | recallRate=${m.recallRate.toFixed(2)} (${m.truePositiveCount}/${m.expectedTotalFindings}) | falsePositiveRate=${m.falsePositiveRate.toFixed(2)} | vaultLeakCount=${m.vaultLeakCount} | hardenedSealTurns=${m.hardenedSealTurns} | wall=${m.wallTimeMs}ms`,
-		`Gates   : recall=${g.recallGate ? "PASS" : "FAIL"} | zeroFP=${g.zeroFalsePositiveGate ? "PASS" : "FAIL"} | zeroLeak=${g.zeroVaultLeakGate ? "PASS" : "FAIL"} | hardenedTurns<=15=${g.hardenedConvergenceGate ? "PASS" : "FAIL"} => OVERALL=${g.allPassed ? "PASS" : "FAIL"}`,
+		`Metrics : passed=${m.passedScenarios}/${m.totalScenarios} | recallRate=${m.recallRate.toFixed(2)} (${m.truePositiveCount}/${m.expectedTotalFindings}) | falsePositiveRate=${m.falsePositiveRate.toFixed(2)} | vaultLeakCount=${m.vaultLeakCount} | hardenedSealTurns=${m.hardenedSealTurns} | brier=${m.calibrationBrier.toFixed(4)} | ece=${m.calibrationEce.toFixed(4)} | wall=${m.wallTimeMs}ms`,
+		`Gates   : recall=${g.recallGate ? "PASS" : "FAIL"} | zeroFP=${g.zeroFalsePositiveGate ? "PASS" : "FAIL"} | zeroLeak=${g.zeroVaultLeakGate ? "PASS" : "FAIL"} | hardenedTurns<=15=${g.hardenedConvergenceGate ? "PASS" : "FAIL"} | calibBrier<=0.25=${g.calibrationGate ? "PASS" : "FAIL"} => OVERALL=${g.allPassed ? "PASS" : "FAIL"}`,
 	);
 	return lines.join("\n");
 }

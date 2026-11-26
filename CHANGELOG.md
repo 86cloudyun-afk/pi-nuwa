@@ -1,5 +1,27 @@
 # Changelog
 
+## 6.0.0 — 2026-11-26
+
+下一代自主认知安全引擎、架构解耦与跨宿主协议标准化大版本：在 100% 保持 12 个 `nuwa_*` 核心工具名称与既有契约零破坏的前提下，完成巨石 `omp/graph.ts` 无环三层拆解，全面交付 **SQLite WAL 权威状态存储与全文检索引擎**、**自主 AuthDiff/OOB 闭环驱动**、**贝叶斯信念与预期信息增益（VoI）前沿搜索引擎**、**反自证机械对账校准核与自适应模型路由**、**结构化 HTTP 流量工作台与只读契约变异器**、**多语言黑白盒混合审计双向桥接**、**独立核心协议层与跨宿主 MCP Server（`bin/nuwa-mcp`）**，以及 **L2 离线合成五场景微基准与校准硬门禁**。
+
+### 六大核心引擎与架构升级
+
+- **巨石图引擎无环拆解与全量兼容门面（`omp/graph.ts` + `omp/graph-planner.ts` + `omp/graph-commands.ts`）**：
+  - 将原 5,141 行 `omp/graph.ts` 按职责单向无环拆解为 `omp/graph-planner.ts`（表面分域三元组去重、6 阶段种子、信念前沿排序、收敛与封盘推荐）、`omp/graph-commands.ts`（斜杠命令工作流、环境体检、状态看板渲染及 5 个 v6.0 新增只读视图命令）与 `omp/graph.ts`（核心状态结案、双盲复验门禁、纪律策略与自主闭环编排，瘦身至 ~2,310 行 `< 2,500` 行红线），并通过 `omp/graph.ts` 与 `omp/nuwa.ts` 完整重导出全部符号，实现历史调用零破坏。
+- **SQLite WAL 权威状态存储与 FTS5 历史检索引擎（`omp/sqlite-store.ts` + `omp/storage.ts`）**：
+  - 支持通过 `NUWA_STORAGE_BACKEND=json|sqlite|dual` 平滑切换存储后端；启用 `sqlite` 时以 `bun:sqlite` WAL 模式 10 张规范表承载项目元数据、事实、意图、资产、假设、校准记录、脱敏流量与事件日志，支持 4 路并发无锁超时写入、坏库自动诊断隔离/回退、`queryFactsByText` 中英文/路径/CVE 混合全文检索，并自动维护 `state.json` 兼容快照导出；未开启时保持 100% 原 JSON 行为与只读零写盘保证。
+- **自主安全评估闭环引擎（`omp/auto-loops.ts` + `omp/graph.ts` + `omp/autoexec.ts`）**：
+  - `executeAutoBatchCycle` 收尾自动衔接 `runPostBatchAutonomousLoops`：当 `SessionVault` 具备多角色或新收纳 `cred` 事实时，经 `shouldAutoTriggerAuthDiff` 冷却防重判定后自动执行 `runAutonomousAuthDiff` 检出 BOLA/BFLA/未授权访问并暂存 `candidate` 派发双盲复验；当 `ScopePolicy.oobDomains` 配置授权域名时，自动执行 `planAutonomousOobProbes` 为盲 SSRF/XXE/SSTI/反序列化高危面签发唯一去重 Canary，并以默认 30s 节流执行 `runAutonomousOobPoll` 回收回连实锤。
+- **不确定性感知信念图与预期信息增益（VoI）前沿搜索（`omp/belief-search.ts` + `omp/graph-planner.ts`）**：
+  - 基于共轭 Beta 后验（`alpha / (alpha + beta)`）、二元香农熵、一步预期熵减与 UCB1 探索项构建 `BeliefGraph`（持久化于 `.nuwa/belief-graph.json`）；`frontierList` 融合 `rankFrontierByBelief`，在发现 `.js.map` 源码映射、`cred` 凭据或确认漏洞等跃迁信号时瞬时提权关联攻击链，在双盲复验 `rejected` 或 WAF 阻断时通过 `propagateBeliefUpdate` 与 `pruneLowYieldSubtree` 级联衰减剪枝低收益子树，并由 `recommendSearchPivot` 辅助收敛与 `sealed_negative` 负向封盘决策。
+- **反自证机械对账校准核与自适应模型路由（`omp/calibration.ts` + `omp/lineage.ts` + `omp/nuwa.ts`）**：
+  - 严格贯彻反自证铁律（`SELF_CERTIFICATION_FORBIDDEN`）：严禁任何 `self`/`model`/`agent` 自评结算来源，且对 `verifyStage="candidate"` 候选事实绝不提前结算；`before_subagent_spawn` 按意图信念后验登记事前预测（`.nuwa/calibration.jsonl`），仅由 `verifier-gate`（假阳性拦截 / 双盲复验裁决）与 `exec-ledger`（账本核验实锤 / 受阻结案）等授信机械源执行单次不可篡改结算；实时计算 Brier Score、10-bin ECE、误报率与 ROI，并在 `routeSubagentModel` 中联动 `recommendAdaptiveModelRoute` 自动降权高误报模型（含冷启动样本保护与严格白名单边界）。
+- **结构化 HTTP 流量工作台与黑白盒混合审计桥接（`omp/traffic-workbench.ts` + `omp/hybrid-audit.ts`）**：
+  - `TrafficRecorder` 以 `0o600` 权限全字段脱敏录制 HTTP 流量（覆盖 Header/Cookie/Query/Fragment/JSON 正文凭据擦除，只读检索零写盘）；`replayTrafficSequence` 支持多步登录 Cookie Jar、JSON/Header/Regex 变量提取与 `{{var}}` 替换及跨源重定向剥离敏感头；`runStructuredMutations` 提供并发 `<= 8` 的五类纯只读契约探针（`auth_strip`/`idor_step`/`method_tamper`/`content_type`/`param_type` + Soft-404 去噪）。
+  - `extractCodeAttackSurface` 与 `extractFromSourceMap` 零外部 AST 依赖静态解析 TypeScript/JavaScript/Next.js/Express/Fastify/Hono/Python(FastAPI/Flask/Django)/Go(Gin/Echo/Chi/net-http) 路由、鉴权中间件与四类高危代码汇点，通过 `bridgeWhiteboxToBlackboxIntents` 生成合规只读黑盒核验意图，并通过 `correlateBlackboxFindingToSource` 将黑盒发现反向定位于源码行号锚点。
+- **独立核心协议、跨宿主 MCP Server 与 L2 微基准硬门禁（`core/*` + `bin/nuwa-mcp` + `benchmarks/run-l2-eval.ts` + `tests/gates/g6_v6.sh`）**：
+  - 新增 `core/protocol.ts` 与 `core/mcp-server.ts`（`NuwaCoreEngine`），通过 `bin/nuwa-mcp` 提供标准 JSON-RPC 2.0 over stdio（兼容 `Content-Length` 与 NDJSON 帧，`protocolVersion="2024-11-05"`），使 Claude Code、Cursor、Codex 等任意 MCP 宿主原生共享同一套 12 个 `nuwa_*` 工具与安全护栏；新增 `/nuwa belief|calibrate|traffic|hybrid|mcp` 5 个子命令；`install.sh` 一键部署 `$AGENT_HOME/nuwa-core/bin/nuwa-mcp`；新增 L2 五场景离线合成靶场（`recallRate=1.0`、`falsePositiveRate=0`、`vaultLeakCount=0`、`hardenedSealTurns<=15`、`calibrationBrier<=0.25`）与 `g6_v6.sh` 阶段门禁。
+
 ## 5.1.0 — 2026-11-26
 
 实战长程自治闭环与工程化深度加固大版本（Epic #20，子议题 #21–#52 / NW-01–NW-32，共 33 个 Issues 全部闭环）：在严格保持 12 个 `nuwa_*` 工具名称 100% 不变的前提下，彻底根治实战 208 轮跑批暴露的零新事实死循环、无封盘终态、出口未注入假阴性、假阳性未复核升格、模板化回包、批派单截断、只读诊断缺失、子代理超时卡死、残留孤儿进程组、`/tmp` 易失工作区丢失与跨运行时内联脚本越界等全部痛点。

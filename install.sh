@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pi-nuwa v5.0 安装器：一键部署 omp 原生扩展全模块、随仓便携知识库 kb.db、
-# 合规子代理模板（fujiang + nuwa-verifier）、nuwa-pentest skill 与无头守护器 nuwa-autonomous。
+# pi-nuwa v6.0 安装器：一键部署 omp 原生扩展全模块、独立核心与跨宿主 MCP Server (nuwa-mcp)、
+# 随仓便携知识库 kb.db、合规子代理模板（fujiang + nuwa-verifier）、nuwa-pentest skill 与无头守护器 nuwa-autonomous。
 #
 # 退出码：0 成功 / 1 依赖或自检缺失 / 2 参数错误 / 3 回滚失败
 set -euo pipefail
@@ -29,10 +29,18 @@ EXT_DIR="$AGENT_HOME/extensions/nuwa-omp"
 EXT_MODULES=(
   "omp/types.ts"
   "omp/storage.ts"
+  "omp/sqlite-store.ts"
   "omp/graph.ts"
+  "omp/graph-planner.ts"
+  "omp/graph-commands.ts"
   "omp/ui.ts"
   "omp/ui-native.ts"
   "omp/autoexec.ts"
+  "omp/auto-loops.ts"
+  "omp/belief-search.ts"
+  "omp/calibration.ts"
+  "omp/traffic-workbench.ts"
+  "omp/hybrid-audit.ts"
   "omp/browser-recon.ts"
   "omp/scope.ts"
   "omp/evidence.ts"
@@ -131,6 +139,9 @@ done
 [[ -f "$REPO_DIR/config/autoexec.example.json" ]] || die "仓库缺少 config/autoexec.example.json" 1
 [[ -f "$REPO_DIR/skills/nuwa-pentest/SKILL.md" ]] || die "仓库缺少 skills/nuwa-pentest/SKILL.md" 1
 [[ -f "$REPO_DIR/bin/nuwa-autonomous" ]] || die "仓库缺少 bin/nuwa-autonomous" 1
+[[ -f "$REPO_DIR/core/protocol.ts" ]] || die "仓库缺少 core/protocol.ts" 1
+[[ -f "$REPO_DIR/core/mcp-server.ts" ]] || die "仓库缺少 core/mcp-server.ts" 1
+[[ -f "$REPO_DIR/bin/nuwa-mcp" ]] || die "仓库缺少 bin/nuwa-mcp" 1
 
 # 从 omp/nuwa.ts 动态提取 VERSION（单一事实来源）
 INSTALLED_VER="$(sed -nE "s/^export[[:space:]]+const[[:space:]]+VERSION[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/p" "$REPO_DIR/omp/nuwa.ts" | head -n 1)"
@@ -177,6 +188,18 @@ for kbf in "${KB_FILES[@]}"; do
 done
 cp "$REPO_DIR/config/autoexec.example.json" "$EXT_DIR/config/autoexec.example.json" || die "autoexec.example.json 复制失败" 1
 say "  已安装 nuwa-omp v${INSTALLED_VER}（index.ts + ${#EXT_MODULES[@]} 个模块 + kb/ + config/，12 个 nuwa_* 工具）"
+
+# 部署 v6.0 独立核心协议层与跨宿主 MCP Server ($AGENT_HOME/nuwa-core)
+CORE_DIR="$AGENT_HOME/nuwa-core"
+rm -rf "$CORE_DIR"
+mkdir -p "$CORE_DIR/core" "$CORE_DIR/bin"
+cp "$REPO_DIR/core/protocol.ts" "$CORE_DIR/core/protocol.ts" || die "core/protocol.ts 复制失败" 1
+cp "$REPO_DIR/core/mcp-server.ts" "$CORE_DIR/core/mcp-server.ts" || die "core/mcp-server.ts 复制失败" 1
+cp "$REPO_DIR/bin/nuwa-mcp" "$CORE_DIR/bin/nuwa-mcp" || die "bin/nuwa-mcp 复制失败" 1
+chmod +x "$CORE_DIR/bin/nuwa-mcp"
+ln -sfn "$EXT_DIR" "$CORE_DIR/omp"
+ln -sfn "$EXT_DIR/index.ts" "$EXT_DIR/nuwa.ts"
+say "  已部署独立核心与跨宿主 MCP Server: $CORE_DIR/bin/nuwa-mcp"
 
 # v1 的 nuwa-loop 会与新运行时抢 session_stop/tool_call；默认退役，避免双跑。
 if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
@@ -245,6 +268,16 @@ else
   fi
 fi
 
+if [[ "$BIN_INSTALLED" -eq 1 ]]; then
+  MCP_BIN_TARGET="$BIN_DIR/nuwa-mcp"
+  cat > "$MCP_BIN_TARGET" <<EOF
+#!/usr/bin/env bash
+exec "$CORE_DIR/bin/nuwa-mcp" "\$@"
+EOF
+  chmod +x "$MCP_BIN_TARGET"
+  say "  $MCP_BIN_TARGET -> $CORE_DIR/bin/nuwa-mcp"
+fi
+
 # ---------------------------------------------------------------- 4. 旧入口退场
 say "[4/5] 处理旧 CLI 入口"
 if [[ -x "$SAPPER_HOME/bin/nuwa" && "$KEEP_LEGACY" -eq 0 ]]; then
@@ -271,7 +304,11 @@ for ag in "${AGENT_TEMPLATES[@]}"; do
 done
 if [[ "$BIN_INSTALLED" -eq 1 ]]; then
   [[ -x "$BIN_TARGET" ]] || die "守护器缺少可执行权限: $BIN_TARGET" 1
+  [[ -x "$BIN_DIR/nuwa-mcp" ]] || die "MCP 入口缺少可执行权限: $BIN_DIR/nuwa-mcp" 1
 fi
+MCP_SMOKE_VER="$(PI_AGENT_HOME="$AGENT_HOME" env -u BUN_OPTIONS "$CORE_DIR/bin/nuwa-mcp" --version 2>&1)" || die "nuwa-mcp 自检失败: $MCP_SMOKE_VER" 1
+[[ "$MCP_SMOKE_VER" == *"$INSTALLED_VER"* ]] || die "nuwa-mcp 版本不匹配: $MCP_SMOKE_VER != $INSTALLED_VER" 1
+say "  MCP Server 自检: $MCP_SMOKE_VER"
 extra="$(find -L "$AGENT_HOME/extensions" -maxdepth 1 -type d -name 'nuwa-*' ! -name 'nuwa-omp' -print 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$extra" -eq 0 ]] || die "extensions/ 下仍有 $extra 个旧 nuwa 扩展，会与 nuwa-omp 抢 session_stop；先移出再装" 1
 

@@ -1,48 +1,36 @@
-# 测试结果（1.2.1）
+# 测试与阶段门禁验收记录（v6.0.0）
 
-日期：2026-11-08
-环境：本机仓库布局，Python 3.14.7，bun 1.4.4，flock；真实 sapper 1.0.0 已装 `~/.local/bin/sapper`。
-原则：可离线、零模型成本；E2E 通过 `NUWA_ALLOW_FAKE_SAPPER=1` 使用替身。
+日期：2026-11-26
+环境：Linux 工作区，Bun 1.4.4，Python 3，离线零外部网络依赖、零模型 API 成本。
 
-## 一、套件
+## 一、v6.0 新增与核心测试矩阵
 
-| 套件 | 用例 | 结果 | 备注 |
-|---|---|---|---|
-| `unit.test.ts` | 42 | 42 pass | 含工具策略绕过面 |
-| `test_nuwa_shell.py` | 14 | 14 pass | CLI 契约 |
-| `test_chaos.py` | 8 | 8 pass | 坏图/锁/只读/SIGKILL |
-| `test_concurrency.py` | 5 | 5 pass | 单赢家/跨项目/锁清理 |
-| `test_e2e_deterministic.py` | 4 | 4 pass | 替身引擎 |
-| `test_r1_core.py` | 41 | 41 pass | journal 23 + 账本/事务 18 |
-| `test_r1_dispatch.py` | 3 | 3 pass | 预留/幂等 + marker 复用 |
-| `test_r1_run.py` | 4 | 4 pass | round 循环 + goal edge 回滚 + 合法完成保留 + 引擎缺失 |
-| `test_r1_multi.py` | 1 | 1 pass | 四项目并发 |
-| `test_r2_r7.py` | 29 | 29 pass | 公平/证据/指标/策略/插件/夜跑 |
-| `crash_matrix.py` | 16 runs | pass | fake 6 点 + real 4 点快速组 |
-| `test_guard.py` | 18 | 18 pass | 执行层提交闸门（含 fleet、dry-run、fact 放行） |
+| 套件 | 覆盖范围 | 状态 |
+|---|---|---|
+| `tests/v6_sqlite_autoloop.test.ts` | SQLite WAL 10 表初始化、JSON↔SQLite 往返迁移、FTS5 中英文/路径/CVE 检索、4 进程并发写压测、坏库隔离回退、零凭据泄露、自主 AuthDiff 与 OOB 节流闭环 | PASS |
+| `tests/v6_belief_calibration.test.ts` | Beta 后验与香农熵/VoI 边界、7 类观测传播、WAF/复验驳回级联剪枝、跃迁信号置顶、反自证拦截、Brier/10-bin ECE 对拍精度 `<= 1e-6`、自适应模型路由 | PASS |
+| `tests/v6_traffic_hybrid.test.ts` | `TrafficRecorder` 只读零写盘与 `0o600` 全字段脱敏、`replayTrafficSequence` 多步变量提取与跨源重定向护栏、五类只读契约变异并发 `<= 8`、多语言静态路由与 `.js.map` 双向桥接 | PASS |
+| `tests/v6_core_mcp_l2eval.test.ts` | `core/protocol.ts` 12 工具对齐、`core/mcp-server.ts` 双帧格式（Content-Length + NDJSON）与 `bin/nuwa-mcp` 真实子进程 stdio 联调、L2 五场景基准与硬门禁校验 | PASS |
+| `tests/v6_integration_wiring.test.ts` | v6.0 全链路总装接线：`NUWA_STORAGE_BACKEND=sqlite` 状态往返、`frontierList` 信念排序与双盲驳回剪枝、`before_subagent_spawn`→机械门禁反自证结算、批处理收尾自主闭环、5 个新 `/nuwa` 只读视图零写盘与 `omp/graph.ts` 拆解全量兼容导出 | PASS |
+| 存量 `v2`–`v5.1` 全部历史回归套件 | 20+ 套 TypeScript 与 Python 契约/回归测试（含 12 工具不变量、N-001..N-009 护栏、沙盒、会话仓、双盲复验、归档与守护器） | PASS |
 
-合计 **170 例 + 16 runs**。
+## 二、L2 离线合成微基准评分卡（`benchmarks/run-l2-eval.ts`）
 
-## 二、门禁
+- **`t1-spa-jwt-bola`**：SPA 静态清单提取 + 多角色自主鉴权差分（水平 BOLA + 垂直 BFLA）+ 流量录制变异 + 双盲确认 — **PASS**
+- **`t2-waf-soft404-trap`**：HTTP 429 `Retry-After` 识别 + Soft-404 诱饵假阳性自动降级与校准机械结算 + 真实诊断接口确认 — **PASS**
+- **`t3-blind-ssrf-oob`**：自主 OOB Canary 规划播撒 + 本机回路收集器节流轮询 + 双盲独立 Canary 二次确认 — **PASS**
+- **`t4-hybrid-sourcemap-chain`**：公开 `.js.map` 虚拟源码提取桥接 + `replayTrafficSequence` 两步 `stepToken` 提取重放 + 黑盒发现反向源码定位 — **PASS**
+- **`t5-hardened-zero-vuln`**：全加固 RBAC 服务零误报排除 + 信念收敛转向评估 + `<= 15` 轮快速收敛至 `sealed_negative` — **PASS**
+- **五大硬门禁**：`recallRate === 1.0`、`falsePositiveRate === 0`、`vaultLeakCount === 0`、`hardenedSealTurns <= 15`、`calibrationBrier <= 0.25` — **OVERALL PASS**
+
+## 三、阶段门禁（`tests/gates/run.sh`）
 
 | 门禁 | 结果 | 说明 |
 |---|---|---|
-| `g0_baseline` | pass | `contract_check` 13/13（真实 sapper 1.0.0） |
-| `g1_r1` | pass | 逐项聚合，任一套件失败都会非零 |
-| `g2_r2r7` | pass | 29 例 |
-
-`tests/run.sh` 最终 `EXIT=0`；全部套件与门禁通过。
-
-## 三、审计反例
-
-| 类 | 用例 |
-|---|---|
-| journal | 空代高水位、CURRENT 缺失不覆盖、未决事务代保护、recovery 摘要、20KB 单条记录、并发 append+compact、gen9/gen10 排序、坏 UTF-8、inflight 复活、ledger_settle 保护 |
-| 策略 | `..`、符号链接、多级祖先链接、`files[]`/`apply_patch` 正文、`&&`/`sh -c`/`$()`/反斜杠/`--store`/绝对路径、`budget/global.jsonl`、`cap.json`、`recovery.json` |
-| 事务 | `--key auto` 幂等、其他键冲突、`nuwa complete` 多 fact 与 kind 闸门、attempt 严格校验 |
-| 夜跑 | 类型异常、非有限数、非整数 samples、duration 一致性、`--expect-commit` |
-
-## 四、仍然缺的读数
-
-- real 崩溃组仍用替身注入点；真实 sapper 的 4 点崩溃注入需要固定 ref 的 CI 环境。
-- 72h soak 需要自托管 runner 实际执行；本机只验证入口与报告校验。
+| `g0_baseline` | PASS | 基础契约与历史兼容基线 |
+| `g1_r1` | PASS | 日志、锁与恢复核心门禁 |
+| `g2_r2r7` | PASS | 预算、证据与策略门禁 |
+| `g3_v4` | PASS | v4 原生扩展、血缘、KB 与沙盒门禁 |
+| `g4_v5` | PASS | v5 会话差分、Sidecar/Egress、OOB、假设图与 L1 10 场景靶场门禁 |
+| `g5_v51` | PASS | v5.1 三元组去重、封盘、派单守卫、看门狗与全工具范围护栏门禁 |
+| `g6_v6` | PASS | v6.0 版本一致性、离线构建、`omp/graph.ts < 2500` 行、`nuwa-mcp`、L2 基准与六大引擎全链路接线门禁 |

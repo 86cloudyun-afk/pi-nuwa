@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * bin/nuwa-autonomous — 女娲 v5.0 外层轻量无头守护器与环境健康体检工具。
+ * bin/nuwa-autonomous — 女娲 v6.0 外层轻量无头守护器与环境健康体检工具。
  *
  * 职责：
  * 1. 注入无头运行、世代轮转、沙盒隔离与动态模型分流环境变量
@@ -97,6 +97,17 @@ const V4_EXT_MODULES = [
 
 const V5_EXT_MODULES = ["auth-diff.ts", "oob.ts", "hypothesis.ts", "reporting.ts"];
 
+const V6_EXT_MODULES = [
+	"sqlite-store.ts",
+	"graph-planner.ts",
+	"graph-commands.ts",
+	"auto-loops.ts",
+	"belief-search.ts",
+	"calibration.ts",
+	"traffic-workbench.ts",
+	"hybrid-audit.ts",
+];
+
 const DOCTOR_PROBE_TOOLS = [
 	"curl",
 	"openssl",
@@ -114,7 +125,7 @@ const DOCTOR_PROBE_TOOLS = [
 
 const KB_TABLES = ["card", "cve", "poc", "technique", "kev", "epss", "experience"];
 
-const HELP_TEXT = `女娲 v5.0 外层无头守护器与环境自检工具 (nuwa-autonomous)
+const HELP_TEXT = `女娲 v6.0 外层无头守护器与环境自检工具 (nuwa-autonomous)
 
 用法:
   nuwa-autonomous --target <目标> [选项]
@@ -167,7 +178,7 @@ const HELP_TEXT = `女娲 v5.0 外层无头守护器与环境自检工具 (nuwa-
   PI_AGENT_HOME                指定 omp/pi agent 目录（默认自动探测 ~/.omp/agent 或 ~/.pi/agent）
 `;
 
-const DOCTOR_HELP_TEXT = `女娲 v5.0 环境自检子命令 (nuwa-autonomous doctor)
+const DOCTOR_HELP_TEXT = `女娲 v6.0 环境自检子命令 (nuwa-autonomous doctor)
 
 用法:
   nuwa-autonomous doctor [选项]
@@ -731,6 +742,16 @@ function checkExtensionInstallation(agentHome) {
 		}
 	}
 
+	const v6ModulesFound = [];
+	const v6ModulesMissing = [];
+	for (const mod of V6_EXT_MODULES) {
+		if (existsSync(join(extDir, mod))) {
+			v6ModulesFound.push(mod);
+		} else {
+			v6ModulesMissing.push(mod);
+		}
+	}
+
 	const conflicts = [];
 	if (existsSync(extRoot)) {
 		try {
@@ -770,6 +791,8 @@ function checkExtensionInstallation(agentHome) {
 		v4ModulesMissing,
 		v5ModulesFound,
 		v5ModulesMissing,
+		v6ModulesFound,
+		v6ModulesMissing,
 		conflicts,
 		...(reason ? { reason } : {}),
 	};

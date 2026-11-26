@@ -1,6 +1,20 @@
-# 女娲模式演进路线图（v0.3 → v5.0）
+# 女娲模式演进路线图（v0.3 → v6.0）
 
-## 当前里程碑：v5.0.0（2026-11-25 已交付）
+## 当前里程碑：v6.0.0（2026-11-26 已交付）
+
+- **图引擎巨石拆解与无环模块化**：将原 5,141 行 `omp/graph.ts` 拆解为 `omp/graph-planner.ts`、`omp/graph-commands.ts`、`omp/graph.ts`（`< 2,500` 行），维持 12 个 `nuwa_*` 工具名称与全量导出 100% 兼容。
+- **SQLite WAL 权威存储与全文检索（`omp/sqlite-store.ts`）**：支持 `NUWA_STORAGE_BACKEND=json|sqlite|dual`、10 张规范表与 FTS5 混合检索、4 路并发无锁超时写入、坏库自动诊断回退与 `state.json` 兼容快照导出。
+- **不确定性信念图与 VoI 前沿搜索（`omp/belief-search.ts`）**：共轭 Beta 后验 + 一步预期熵减（VoI）+ UCB1 排序、跃迁信号提权、双盲驳回/WAF 级联衰减剪枝与 `sealed_negative` 收敛转向推荐（`/nuwa belief`）。
+- **反自证机械校准核与自适应模型路由（`omp/calibration.ts`）**：事前预测登记 + 纯机械源（`verifier-gate` / `exec-ledger`）对账结算、硬拦截自评源、Brier/10-bin ECE/FPR/ROI 度量与冷启动保护白名单动态路由（`/nuwa calibrate`）。
+- **自主 AuthDiff / OOB 闭环驱动（`omp/auto-loops.ts`）**：自动批收尾冷却防重触发多角色只读鉴权差分与受 `scope.oobDomains` 门控的 Canary 自动签发及 30s 节流轮询。
+- **结构化流量工作台与黑白盒混合审计（`omp/traffic-workbench.ts` + `omp/hybrid-audit.ts`）**：`0o600` 零明文脱敏流量录制、多步变量提取重放、并发 `<= 8` 五类只读契约变异（`/nuwa traffic`），以及 TS/JS/Python/Go/`.js.map` 静态路由风险提取与黑白盒双向关联（`/nuwa hybrid`）。
+- **跨宿主 MCP Server 与 L2 微基准硬门禁（`core/*` + `bin/nuwa-mcp` + `benchmarks/run-l2-eval.ts`）**：标准 JSON-RPC 2.0 stdio MCP 服务端（`/nuwa mcp`）、L2 五场景合成靶场（召回率 1.0、0 误报、0 泄露、硬化收敛 `<= 15` 轮、`calibrationBrier <= 0.25`）与 `g6_v6.sh` 阶段门禁。
+
+## 历史里程碑：v5.1.0（2026-11-26 已交付）
+
+- **实战长程自治闭环与 33 项工程化加固（Epic #20，#21–#52）**：表面分域三元组去重、冷却抑制、`sealed_negative` 负向封盘、`noveltyStall` 语义停滞、免票据记账、严格零写入只读诊断、五项命中指标与假阳性复核门禁、6KB 批派单分片溢写、在途目标去重、多出口熔断池、浏览器挑战门确定性停机、进程组级联回收、子代理超时看门狗与跨运行时内联脚本范围护栏。
+
+## 历史里程碑：v5.0.0（2026-11-25 已交付）
 
 - **认证态攻击面闭环（Issue #16）**：`omp/session-vault.ts` 支持 JWT 过期解析、CSRF Cookie 镜像头与 `/nuwa session health` 过期巡检自动派生刷新意图；`omp/browser-recon.ts` 支持认证态 SPA 懒加载 Chunk 与同源 `.js.map` 接口发现；新增 `omp/auth-diff.ts`（`/nuwa authdiff`）确定性只读多角色鉴权差分矩阵（Auto-BOLA / BFLA + Soft-404 去噪）及认证态零明文头文件自动批执行。
 - **零信任常驻 Sidecar、抗 DNS 重绑定代理与一等 OOB（Issue #17）**：`omp/sandbox.ts` 扩展常驻只读 Sidecar 生命周期、精确容器内命令校验（`N-009`）与内置 HTTP/HTTPS `CONNECT` 抗 DNS 重绑定 Egress Proxy；`docker/Dockerfile.sandbox` 升级为 `base`/`lite`/`full` 多阶段无 root 镜像；新增 `omp/oob.ts`（`/nuwa oob`）受 `scope.oobDomains` 白名单门控的外带回调通道。

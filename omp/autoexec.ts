@@ -3484,3 +3484,29 @@ export async function runAutoBatchManaged(
 		...(loaded.error ? { ruleError: loaded.error } : {}),
 	};
 }
+
+
+// v6.0 自主安全评估闭环（Auto-AuthDiff & Auto-OOB）桥接重导出
+export {
+	DEFAULT_AUTHDIFF_COOLDOWN_MS,
+	DEFAULT_MAX_AUTH_PATHS,
+	DEFAULT_MAX_NEW_OOB_CANARIES,
+	DEFAULT_OOB_POLL_INTERVAL_MS,
+	collectTestableAuthPaths,
+	computeAuthDiffSignature,
+	planAutonomousOobProbes,
+	runAutonomousAuthDiff,
+	runAutonomousOobPoll,
+	shouldAutoTriggerAuthDiff,
+	type AutoAuthDiffTriggerDecision,
+	type AutoAuthDiffTriggerOptions,
+	type AutonomousAuthDiffResult,
+	type AutonomousOobPlanResult,
+	type AutonomousOobPollResult,
+	type CollectAuthPathsOptions,
+	type OobProbePlanItem,
+	type OobSurfaceCategory,
+	type PlanOobProbesOptions,
+	type RunAutonomousAuthDiffOptions,
+	type RunOobPollOptions,
+} from "./auto-loops";

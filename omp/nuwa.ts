@@ -1,5 +1,5 @@
 /**
- * nuwa-omp v5.1.0 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
+ * nuwa-omp v6.0.0 — 女娲模式：全自主安全评估与多领域执行引擎（纯 omp 原生组装入口）。
  *
  * 子模块分工：
  *   - `./types`         共享类型契约与常量
@@ -39,11 +39,11 @@ import {
 	isProcessAliveNonZombie, isSharedCwd, journalAppend, journalPath, loadState, lockPath, logEvent, migrateSapper, nextFactId, nextIntentId,
 	normOneLine, normalizeState, normalizeTarget, normalizeTargetForMode, nowIso, pausedStatePath,
 	pidAlive, processTrackerPath, readCfg, readJournalTail, readJson, readPausedState, readSessionPointer,
-	resolveDefaultWorkspacesDir, resolvePersistentStateDir, saveState, setPausedState, sha, slug,
+	hasProjectState, loadStateJsonOnly, resolveDefaultWorkspacesDir, resolvePersistentStateDir, resolveStorageBackend, saveState, saveStateJsonOnly, setPausedState, sha, slug, sqliteDbPath,
 	stateDir, statePath, subagentWatchdogPath, verifyWorkspaceIntegrity, withLock, writePointer,
 	type CleanupProcessOptions, type CleanupProcessResult, type PausedState, type SaveStateOptions,
 	type SubagentWatchdogConfig, type SubagentWatchdogEntry, type WatchdogSweepResult,
-	type WorkspaceIntegrityOptions, type WorkspaceIntegrityReport, type WorkspaceWarning,
+	type StorageBackend, type WorkspaceIntegrityOptions, type WorkspaceIntegrityReport, type WorkspaceWarning,
 } from "./storage";
 import {
 	SEEDS, addFallbackIntent, addIntent, appendIntentSpecs, applyAutoItemResult, applyEmptyGuard,
@@ -51,8 +51,8 @@ import {
 	buildIntentDedupKey, canDeriveCrossSurface, checkBashPolicy, checkTaskPolicy, checkWritePolicy,
 	claimAutoBatch, claimIntent, claimedFresh, collectPaths, commitFreeFact, commitIntent, compactFacts,
 	compactIntents, completeProject, computeRepeatRatio, deriveFromFacts, evidenceProblem,
-	executeAssetsCommand, executeAuthDiffWorkflow, executeAutoBatchCycle, executeCommitWithGates,
-	executeOobCommand, executeScopeCommand, executeSessionCommand, executeSessionHealthCommand,
+	attachBeliefGraphCache, beliefGraphPath, executeAssetsCommand, executeAuthDiffWorkflow, executeAutoBatchCycle, executeBeliefCommand, executeCalibrateCommand, executeCommitWithGates,
+	executeHybridCommand, executeMcpCommand, executeOobCommand, executeScopeCommand, executeSessionCommand, executeSessionHealthCommand, executeTrafficCommand, loadBeliefGraphReadOnly, loadOrInitBeliefGraph, runPostBatchAutonomousLoops, saveBeliefGraph,
 	expandGraph, extractEventOutput, extractIntentTargetKey, extractTarget, finalizeReportPhase,
 	formatScopeSummary, frontierList, getCompletionRejectAdvice, hasAttempted, inferExpectedKind,
 	inferSurfaceDomain, inspectGraph, isCompliantSandboxDockerCommand, isTargetInBlockedCooldown,
@@ -97,12 +97,12 @@ import {
 	DEFAULT_BATCH_MAX_BYTES, DispatchReceiptRegistry, InflightTargetRegistry, bindSubagentSpawn,
 	buildDispatchPacket, chunkBatchTasks, coalesceProbesByTarget, createDispatchReceiptRegistry,
 	injectResolvedTargetContext, normalizeDispatchTargetKey, readSpilledBatchTasks,
-	registerActiveSession, resolveLineageRoot, resolveTaskIntentContext, routeSubagentModel,
+	ALLOWED_SUBAGENT_MODELS, DEFAULT_SUBAGENT_MODEL, inferCalibrationTaskCategory, registerActiveSession, resolveLineageRoot, resolveTaskIntentContext, routeSubagentModel,
 	validateSubagentDispatch, type BatchTaskItem, type ChunkBatchOptions, type ChunkBatchResult,
 	type DispatchReceipt, type DispatchValidationResult, type SubagentDispatchPayload,
 } from "./lineage";
 import { distillProjectExperience, ensureBundledKb, kbLookupSafe } from "./kb";
-import { redactVaultSecrets } from "./session-vault";
+import { redactVaultSecrets, upsertSessionRole } from "./session-vault";
 import {
 	buildFalsePositiveNote, extractVerifyTargetFactId, isVerifyVulnIntentKey,
 	validateVerificationCommit, verifyPositiveConclusion,
@@ -120,7 +120,68 @@ import {
 	type ExportEpisodeTimelineOptions, type WriteEpisodeArchiveResult,
 } from "./reporting";
 
-export const VERSION = "5.1.0";
+import {
+	NuwaSqliteCorruptError, NuwaSqliteStore, SQLITE_SCHEMA_VERSION, appendJournalSqlite,
+	exportStateJsonCompat, loadStateFromSqlite, migrateJsonToSqlite, openNuwaDb, queryFactsByText,
+	saveStateToSqlite,
+	type AppendJournalOptions, type CalibrationRecordRow, type ExportCompatOptions,
+	type ExportCompatResult, type FactSearchHit, type LoadSqliteStateOptions, type MigrateJsonOptions,
+	type MigrateJsonResult, type OpenNuwaDbOptions, type QueryFactsOptions, type SaveSqliteStateOptions,
+	type TrafficEntryRow, type TrafficQueryFilter as SqliteTrafficQueryFilter,
+} from "./sqlite-store";
+import {
+	DEFAULT_AUTHDIFF_COOLDOWN_MS, DEFAULT_MAX_AUTH_PATHS, DEFAULT_MAX_NEW_OOB_CANARIES,
+	DEFAULT_OOB_POLL_INTERVAL_MS, collectTestableAuthPaths, computeAuthDiffSignature,
+	planAutonomousOobProbes, runAutonomousAuthDiff, runAutonomousOobPoll, shouldAutoTriggerAuthDiff,
+	type AutoAuthDiffTriggerDecision, type AutoAuthDiffTriggerOptions, type AutonomousAuthDiffResult,
+	type AutonomousOobPlanResult, type AutonomousOobPollResult, type CollectAuthPathsOptions,
+	type OobProbePlanItem, type OobSurfaceCategory, type PlanOobProbesOptions,
+	type RunAutonomousAuthDiffOptions, type RunOobPollOptions,
+} from "./auto-loops";
+import {
+	DEFAULT_NEGATIVE_SEAL_THRESHOLD, DEFAULT_PROPAGATION_DECAY, DEFAULT_PRUNE_THRESHOLD,
+	MAX_BETA_PARAM, MIN_BETA_PARAM, VALID_BELIEF_OBSERVATIONS, computeBetaPosterior,
+	computeExpectedInfoGain, computeNodeUncertainty, computeOneStepEntropyReduction,
+	initBeliefGraphFromState, propagateBeliefUpdate, pruneLowYieldSubtree, rankFrontierByBelief,
+	recommendSearchPivot, resolveBeliefNodeId, shannonBinaryEntropy, updateBeliefPosterior,
+	type BeliefGraph, type BeliefNode, type BeliefNodeKind, type BeliefObservation,
+	type BeliefObservationType, type BeliefPropagationEvent, type BeliefPropagationResult,
+	type PivotDirection, type PruneSubtreeOptions, type PruneSubtreeResult, type PruneSuggestion,
+	type RankFrontierOptions, type RankedFrontierItem, type SearchPivotOptions,
+	type SearchPivotRecommendation,
+} from "./belief-search";
+import {
+	ALLOWED_SETTLEMENT_SOURCES, CalibrationError, VALID_TASK_CATEGORIES, calibrationLedgerPath,
+	computeCalibrationSummary, formatCalibrationReport, loadCalibrationRecords,
+	recommendAdaptiveModelRoute, recordPrediction, redactCalibrationText, safeSettlePrediction,
+	settlePrediction, validateSettlementSource,
+	type AdaptiveModelRouteDecision, type AdaptiveModelRouteInput, type CalibrationBinStat,
+	type CalibrationDimensionMetrics, type CalibrationErrorCode, type CalibrationPredictionInput,
+	type CalibrationRecord, type CalibrationSettlementInput, type CalibrationSettlementSource,
+	type CalibrationSummary, type CalibrationTaskCategory, type ComputeCalibrationOptions,
+	type ModelCandidateEvaluation,
+} from "./calibration";
+import {
+	MAX_MUTATION_CONCURRENCY, REDACTED_MARKER, TrafficRecorder, redactTrafficBody,
+	redactTrafficHeaders, redactTrafficUrl, replayTrafficSequence, runStructuredMutations,
+	type MutationAnomaly, type MutationBaseRequest, type MutationCaseResult, type MutationMode,
+	type MutationProbeSummary, type ReplayStepResult, type ReplayTrafficOptions,
+	type ReplayTrafficResult, type StructuredMutationsOptions, type StructuredMutationsResult,
+	type TrafficEntry, type TrafficExtractorSpec, type TrafficFetchFn, type TrafficFetchResponseLike,
+	type TrafficQueryFilter, type TrafficRecordInput, type TrafficRecorderOptions,
+	type TrafficReplayStep,
+} from "./traffic-workbench";
+import {
+	bridgeWhiteboxToBlackboxIntents, correlateBlackboxFindingToSource, extractCodeAttackSurface,
+	extractFromSourceMap,
+	type BlackboxFindingLike, type CodeAttackSurface, type CodeSinkKind, type CodeSinkWarning,
+	type CodeSurfaceInput, type DetectedFramework, type ExtractSurfaceOptions, type ExtractedRoute,
+	type HybridHypothesisSpec, type HybridVerificationIntentSpec, type RouteRiskFlag,
+	type SourceCorrelationCandidate, type SourceCorrelationResult, type SupportedLanguage,
+	type VirtualSourceFile, type WhiteboxBridgeOptions, type WhiteboxBridgeResult,
+} from "./hybrid-audit";
+
+export const VERSION = "6.0.0";
 
 export {
 	DEFAULT_BATCH_MAX_BYTES, DispatchReceiptRegistry, EgressPoolManager, InflightTargetRegistry,
@@ -152,10 +213,10 @@ export {
 	normalizeDispatchTargetKey, normalizeState, normalizeTarget, normalizeTargetForMode,
 	normalizeTargetKey, normalizeTaskEgressUrl, nowIso, parseAgentResult, pausedStatePath, phaseIndex,
 	pickMode, pidAlive, planIntents, preflightEgressCheck, prepareNextGeneration, processTrackerPath, proofKinds, readCfg,
-	readFactEvidenceLog, readPausedState, readReincarnatePolicy, readSpilledBatchTasks, recordFlag,
+	readFactEvidenceLog, readPausedState, readReincarnatePolicy, readSpilledBatchTasks, recordFlag, recordToolExecution,
 	releaseAutoBatchRemaining, releaseStaleClaims, renderDetail, renderFullStatus, reportMarkdown,
 	resolveConfiguredEgressUrl, resolveDefaultWorkspacesDir, resolvePersistentStateDir,
-	resolveReportPhaseTransition, runSpaSurfaceWorkflow, sampleSoft404Baseline, saveFactEvidenceLog,
+	resolveReportPhaseTransition, routeSubagentModel, runSpaSurfaceWorkflow, sampleSoft404Baseline, saveFactEvidenceLog,
 	saveHumanSessionToVault, saveState, sealEngagement, searchArchiveIndexes, seedEpisode, seedPhase,
 	setPausedState, sha, shouldRecommendSeal, shouldReincarnate, sigOf, slug, stateDir, statePath,
 	statusBoard, stopReason, subagentWatchdogPath, tickNoveltyStall, validateDeliverableRealism,
@@ -179,6 +240,57 @@ export type {
 	SubagentDispatchPayload, SubagentWatchdogConfig, SubagentWatchdogEntry, SurfaceDomain,
 	ToolchainCaps, VerifyEvidenceInput, VerifyEvidenceResult, VerifyStage, WatchdogSweepResult,
 	WorkspaceIntegrityOptions, WorkspaceIntegrityReport, WorkspaceWarning, WriteEpisodeArchiveResult,
+};
+
+
+export {
+	ALLOWED_SETTLEMENT_SOURCES, ALLOWED_SUBAGENT_MODELS, CalibrationError,
+	DEFAULT_AUTHDIFF_COOLDOWN_MS, DEFAULT_MAX_AUTH_PATHS, DEFAULT_MAX_NEW_OOB_CANARIES,
+	DEFAULT_NEGATIVE_SEAL_THRESHOLD, DEFAULT_OOB_POLL_INTERVAL_MS, DEFAULT_PROPAGATION_DECAY,
+	DEFAULT_PRUNE_THRESHOLD, DEFAULT_SUBAGENT_MODEL, MAX_BETA_PARAM, MAX_MUTATION_CONCURRENCY,
+	MIN_BETA_PARAM, NuwaSqliteCorruptError, NuwaSqliteStore, REDACTED_MARKER, SQLITE_SCHEMA_VERSION,
+	TrafficRecorder, VALID_BELIEF_OBSERVATIONS, VALID_TASK_CATEGORIES, appendJournalSqlite,
+	attachBeliefGraphCache, beliefGraphPath, bridgeWhiteboxToBlackboxIntents, calibrationLedgerPath,
+	collectTestableAuthPaths, computeAuthDiffSignature, computeBetaPosterior,
+	computeCalibrationSummary, computeExpectedInfoGain, computeNodeUncertainty,
+	computeOneStepEntropyReduction, correlateBlackboxFindingToSource, executeBeliefCommand,
+	executeCalibrateCommand, executeHybridCommand, executeMcpCommand, executeTrafficCommand,
+	exportStateJsonCompat, extractCodeAttackSurface, extractFromSourceMap, formatCalibrationReport,
+	hasProjectState, inferCalibrationTaskCategory, initBeliefGraphFromState, loadBeliefGraphReadOnly,
+	loadCalibrationRecords, loadOrInitBeliefGraph, loadStateFromSqlite, loadStateJsonOnly,
+	migrateJsonToSqlite, openNuwaDb, planAutonomousOobProbes, propagateBeliefUpdate,
+	pruneLowYieldSubtree, queryFactsByText, rankFrontierByBelief, recommendAdaptiveModelRoute,
+	recommendSearchPivot, recordPrediction, redactCalibrationText, redactTrafficBody,
+	redactTrafficHeaders, redactTrafficUrl, replayTrafficSequence, resolveBeliefNodeId,
+	resolveStorageBackend, runAutonomousAuthDiff, runAutonomousOobPoll, runPostBatchAutonomousLoops,
+	runStructuredMutations, safeSettlePrediction, saveBeliefGraph, saveStateJsonOnly,
+	saveStateToSqlite, settlePrediction, shannonBinaryEntropy, shouldAutoTriggerAuthDiff,
+	sqliteDbPath, updateBeliefPosterior, upsertSessionRole, validateSettlementSource,
+};
+
+export type {
+	AdaptiveModelRouteDecision, AdaptiveModelRouteInput, AppendJournalOptions,
+	AutoAuthDiffTriggerDecision, AutoAuthDiffTriggerOptions, AutonomousAuthDiffResult,
+	AutonomousOobPlanResult, AutonomousOobPollResult, BeliefGraph, BeliefNode, BeliefNodeKind,
+	BeliefObservation, BeliefObservationType, BeliefPropagationEvent, BeliefPropagationResult,
+	BlackboxFindingLike, CalibrationBinStat, CalibrationDimensionMetrics, CalibrationErrorCode,
+	CalibrationPredictionInput, CalibrationRecord, CalibrationRecordRow, CalibrationSettlementInput,
+	CalibrationSettlementSource, CalibrationSummary, CalibrationTaskCategory, CodeAttackSurface,
+	CodeSinkKind, CodeSinkWarning, CodeSurfaceInput, CollectAuthPathsOptions,
+	ComputeCalibrationOptions, DetectedFramework, ExportCompatOptions, ExportCompatResult,
+	ExtractSurfaceOptions, ExtractedRoute, FactSearchHit, HybridHypothesisSpec,
+	HybridVerificationIntentSpec, LoadSqliteStateOptions, MigrateJsonOptions, MigrateJsonResult,
+	ModelCandidateEvaluation, MutationAnomaly, MutationBaseRequest, MutationCaseResult, MutationMode,
+	MutationProbeSummary, OobProbePlanItem, OobSurfaceCategory, OpenNuwaDbOptions, PivotDirection,
+	PlanOobProbesOptions, PruneSubtreeOptions, PruneSubtreeResult, PruneSuggestion,
+	QueryFactsOptions, RankFrontierOptions, RankedFrontierItem, ReplayStepResult,
+	ReplayTrafficOptions, ReplayTrafficResult, RouteRiskFlag, RunAutonomousAuthDiffOptions,
+	RunOobPollOptions, SaveSqliteStateOptions, SearchPivotOptions, SearchPivotRecommendation,
+	SourceCorrelationCandidate, SourceCorrelationResult, SqliteTrafficQueryFilter, StorageBackend,
+	StructuredMutationsOptions, StructuredMutationsResult, SupportedLanguage, TrafficEntry,
+	TrafficEntryRow, TrafficExtractorSpec, TrafficFetchFn, TrafficFetchResponseLike,
+	TrafficQueryFilter, TrafficRecordInput, TrafficRecorderOptions, TrafficReplayStep,
+	VirtualSourceFile, WhiteboxBridgeOptions, WhiteboxBridgeResult,
 };
 
 function sidOf(ctx: ExtensionContext): string {
@@ -1005,6 +1117,25 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						});
 						if (!posGate.ok && posGate.falsePositive) {
 							fpGateResult = posGate;
+							if (!isFree && rawId && existsSync(calibrationLedgerPath(root))) {
+								try {
+									for (const rec of loadCalibrationRecords(root)) {
+										if (!rec.settled && rec.intentId === rawId) {
+											safeSettlePrediction(root, {
+												predictionId: rec.predictionId,
+												outcome: 0,
+												isFalsePositive: true,
+												actualTokens: rec.estimatedTokens || Math.max(0, Number(pre.runtime.tokens ?? 0)),
+												durationMs: 0,
+												source: "verifier-gate",
+												note: `假阳性复核门禁拦截 (${posGate.matchedSignals.join(",")})`,
+											});
+										}
+									}
+								} catch {
+									/* ignore calibration settlement error */
+								}
+							}
 							logEvent(root, {
 								type: "false_positive_intercepted",
 								id: rawId || "free",
@@ -1726,6 +1857,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		"status", "board", "scope", "session", "authdiff", "oob", "assets",
 		"report", "doctor", "spa", "log", "why", "seal", "note", "inspect",
 		"query", "pause", "stop", "resume", "export",
+		"belief", "calibrate", "traffic", "hybrid", "mcp",
 	] as const;
 
 	pi.registerCommand?.("nuwa", {
@@ -1746,6 +1878,31 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const found = resolveRootWithLineage(ctx as ExtensionContext) ?? findRoot(ctx.cwd, sidOf(ctx as ExtensionContext));
 
 			if (arg === "doctor" || arg.startsWith("doctor ")) return notify(buildDoctorSummary(found));
+
+			if (arg === "belief" || arg.startsWith("belief ")) {
+				const r = executeBeliefCommand(found, arg.slice(6));
+				return notify(r.msg, r.level);
+			}
+			if (arg === "calibrate" || arg.startsWith("calibrate ")) {
+				const r = executeCalibrateCommand(found, arg.slice(9));
+				return notify(r.msg, r.level);
+			}
+			if (arg === "traffic" || arg.startsWith("traffic ")) {
+				const r = executeTrafficCommand(found, arg.slice(7));
+				return notify(r.msg, r.level);
+			}
+			if (arg === "hybrid" || arg.startsWith("hybrid ")) {
+				const r = executeHybridCommand(found, arg.slice(6));
+				if (arg.slice(6).trim().toLowerCase().startsWith("plan") && found) {
+					const stAfter = loadState(found);
+					if (stAfter) refreshUi(ctx as ExtensionContext, found, stAfter, true);
+				}
+				return notify(r.msg, r.level);
+			}
+			if (arg === "mcp" || arg.startsWith("mcp ")) {
+				const r = executeMcpCommand(found, arg.slice(3));
+				return notify(r.msg, r.level);
+			}
 
 			// /nuwa seal [reason] (#22)
 			if (arg === "seal" || arg.startsWith("seal ")) {
@@ -2371,7 +2528,36 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				intentKeys: routeCtx.intentKey ? [routeCtx.intentKey] : [],
 				hasPendingVerify: routeCtx.isVerify,
 				hasReflect: routeCtx.isReflect,
+				root,
 			});
+
+			// v6.0 反自证校准事前预测登记（基于意图信念后验，留待后续机械门禁对账结算）
+			if (routeCtx.intentId && (process.env.NUWA_CALIBRATION ?? "1").trim() !== "0") {
+				try {
+					const bGraph = loadOrInitBeliefGraph(root, st);
+					const bNodeId = resolveBeliefNodeId(bGraph, routeCtx.intentId, "intent");
+					const posterior = bNodeId && bGraph.nodes[bNodeId] ? bGraph.nodes[bNodeId]!.posterior : 0.5;
+					const effModelId =
+						routedModel ||
+						(typeof event?.model === "string" && event.model.trim() ? event.model.trim() : "host-default");
+					recordPrediction(root, {
+						predictionId: `pred-${spawnId}`,
+						intentId: routeCtx.intentId,
+						taskCategory: inferCalibrationTaskCategory({
+							agent: agentName,
+							phase: routeCtx.phase,
+							intentKey: routeCtx.intentKey,
+							hasPendingVerify: routeCtx.isVerify,
+						}),
+						modelId: effModelId,
+						predictedConfidence: Math.max(0.01, Math.min(0.99, Number(posterior.toFixed(4)))),
+						estimatedTokens: 4000,
+						note: `spawn:${agentName || "fujiang"}:${routeCtx.intentKey ?? routeCtx.intentId}`,
+					});
+				} catch {
+					/* 重复 spawnId 或只读异常不阻断子代理派生 */
+				}
+			}
 			if (routedModel) {
 				if (event && typeof event === "object" && !event.model) event.model = routedModel;
 				logEvent(root, {

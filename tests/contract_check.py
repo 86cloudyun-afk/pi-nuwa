@@ -98,8 +98,16 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
         "omp/nuwa.ts",
         "omp/types.ts",
         "omp/storage.ts",
+        "omp/sqlite-store.ts",
         "omp/graph.ts",
+        "omp/graph-planner.ts",
+        "omp/graph-commands.ts",
         "omp/autoexec.ts",
+        "omp/auto-loops.ts",
+        "omp/belief-search.ts",
+        "omp/calibration.ts",
+        "omp/traffic-workbench.ts",
+        "omp/hybrid-audit.ts",
         "omp/browser-recon.ts",
         "omp/scope.ts",
         "omp/evidence.ts",
@@ -117,6 +125,9 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
         "omp/ui.ts",
         "omp/ui-native.ts",
         "omp/env.d.ts",
+        "core/protocol.ts",
+        "core/mcp-server.ts",
+        "bin/nuwa-mcp",
         "tsconfig.json",
         "kb/schema.sql",
         "kb/seed-cards.json",
@@ -125,6 +136,7 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
         "kb/build-kb.ts",
         "benchmarks/targets.json",
         "benchmarks/run-eval.ts",
+        "benchmarks/run-l2-eval.ts",
         "agents/fujiang.md",
         "agents/nuwa-verifier.md",
         "config/autoexec.example.json",
@@ -215,10 +227,12 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
 
         with tempfile.TemporaryDirectory(prefix="nuwa-contract-build-") as build_dir:
             omp_entries = [str(p) for p in sorted((repo_root / "omp").glob("*.ts"))]
+            core_entries = [str(p) for p in sorted((repo_root / "core").glob("*.ts"))]
             build_cmd = [
                 bun_bin,
                 "build",
                 *omp_entries,
+                *core_entries,
                 str(repo_root / "kb" / "build-kb.ts"),
                 "--target",
                 "bun",
