@@ -571,6 +571,58 @@ describe("v6.0 SQLite WAL 权威状态存储引擎 (omp/sqlite-store.ts)", () =>
 		}
 		const corruptFiles = readdirSync(join(root, ".nuwa")).filter((f) => f.includes("nuwa.db.corrupt-"));
 		expect(corruptFiles.length).toBe(1);
+
+		// 5. 崩溃遗留 0 字节空文件 nuwa.db 也必须被识别为坏库并触发 fallbackToJson / quarantineCorrupt
+		const rootZero = makeTmpDir();
+		saveState(rootZero, structuredClone(st), { reason: "init" });
+		const zeroDbFile = sqliteDbPath(rootZero);
+		writeFileSync(zeroDbFile, "", "utf8");
+		expect(statSync(zeroDbFile).size).toBe(0);
+		expect(() => openNuwaDb(rootZero)).toThrow(NuwaSqliteCorruptError);
+		expect(() => loadStateFromSqlite(rootZero)).toThrow(NuwaSqliteCorruptError);
+		let zeroWarn = "";
+		const zeroFallback = loadStateFromSqlite(rootZero, {
+			fallbackToJson: true,
+			onCorruptWarning: (msg) => {
+				zeroWarn = msg;
+			},
+		});
+		expect(zeroWarn).toContain("0 字节");
+		expect(zeroFallback?.project.id).toBe("proj-v6-test");
+		const rebuiltFromZero = openNuwaDb(rootZero, { quarantineCorrupt: true });
+		try {
+			const qc = rebuiltFromZero.query("PRAGMA quick_check(1)").get() as Record<string, string>;
+			expect(String(Object.values(qc)[0]).toLowerCase()).toBe("ok");
+		} finally {
+			rebuiltFromZero.close();
+		}
+		expect(readdirSync(join(rootZero, ".nuwa")).some((f) => f.includes("nuwa.db.corrupt-"))).toBe(true);
+	});
+
+	test("纯只读查询零写事务验证（持排他写锁期间不阻塞、文件元数据零修改）", () => {
+		const root = makeTmpDir();
+		saveStateToSqlite(root, buildSampleState());
+
+		const dbFile = sqliteDbPath(root);
+		const statBefore = statSync(dbFile);
+
+		// 另一连接持有 BEGIN IMMEDIATE 排他写锁，证明 loadStateFromSqlite 与 queryFactsByText 纯只读绝不抢写锁
+		const writerDb = openNuwaDb(root);
+		try {
+			writerDb.exec("BEGIN IMMEDIATE;");
+			const loaded = loadStateFromSqlite(root);
+			expect(loaded?.project.id).toBe("proj-v6-test");
+			const hits = queryFactsByText(root, "CVE-2026-99999");
+			expect(hits.length).toBe(1);
+			expect(hits[0]?.fact.id).toBe("F2");
+			writerDb.exec("ROLLBACK;");
+		} finally {
+			writerDb.close();
+		}
+
+		const statAfter = statSync(dbFile);
+		expect(statAfter.mtimeMs).toBe(statBefore.mtimeMs);
+		expect(statAfter.size).toBe(statBefore.size);
 	});
 
 	test("SQLite WAL 4 路并发写入无锁超时（单进程 4 连接 + 4 真实并发子进程压测）", async () => {
@@ -694,13 +746,20 @@ describe("v6.0 SQLite WAL 权威状态存储引擎 (omp/sqlite-store.ts)", () =>
 		});
 
 		const st = buildSampleState();
+		const urlToken = "SecretAccessTok_88990011";
+		const urlUserPass = "DbUserPass_776655";
+		const privHeaderTok = "glpat-PrivateHeaderToken_554433";
+		const vaultHeaderTok = "hvs.VaultHeaderSecret_221100";
+		const csrfHeaderTok = "CsrfSecretToken_AABBCCDD";
+		const xsrfHeaderTok = "XsrfSecretToken_EEFFGGHH";
+
 		st.facts.F_SENS = {
 			id: "F_SENS",
 			kind: "cred",
 			title: `发现凭据 Authorization: Bearer ${vaultBearer}`,
 			detail: `Cookie: ${vaultCookie} | password=${vaultPass} | X-API-Key: ${inlineApiKey}`,
-			command: `curl -H "Authorization: Bearer ${vaultBearer}" http://127.0.0.1:18080/api`,
-			output: `Set-Cookie: ${vaultCookie}\nBearer ${vaultBearer}`,
+			command: `curl -H "Authorization: Bearer ${vaultBearer}" "https://alice:${urlUserPass}@api.example.com/v1/export?access_token=${urlToken}&role=admin#section1"`,
+			output: `Set-Cookie: ${vaultCookie}\nBearer ${vaultBearer}\nPrivate-Token: ${privHeaderTok}`,
 			createdAt: "2026-11-25T10:30:00.000Z",
 		};
 		saveStateToSqlite(root, st);
@@ -737,17 +796,24 @@ describe("v6.0 SQLite WAL 权威状态存储引擎 (omp/sqlite-store.ts)", () =>
 				id: "tr-sec-1",
 				ts: "2026-11-25T10:33:00.000Z",
 				method: "GET",
-				url: "http://127.0.0.1:18080/api/me",
-				host: "127.0.0.1",
-				path: "/api/me",
+				url: `https://alice:${urlUserPass}@api.example.com/api/me?access_token=${urlToken}&role=admin#top`,
+				host: "api.example.com",
+				path: `/api/me?access_token=${urlToken}&role=admin`,
 				status: 200,
 				requestHeaders: {
 					Authorization: `Bearer ${vaultBearer}`,
 					Cookie: vaultCookie,
 					"X-API-Key": inlineApiKey,
+					"Private-Token": privHeaderTok,
+					"X-Vault-Token": vaultHeaderTok,
+					"X-CSRF-Token": csrfHeaderTok,
+					"X-XSRF-Token": xsrfHeaderTok,
+					"Content-Type": "application/json",
+					Accept: "application/json",
 				},
 				responseHeaders: {
 					"Set-Cookie": vaultCookie,
+					"Access-Control-Allow-Origin": "https://api.example.com",
 				},
 				responseBodyPreview: `echo ${vaultBearer} and ${vaultPass}`,
 			});
@@ -768,15 +834,46 @@ describe("v6.0 SQLite WAL 权威状态存储引擎 (omp/sqlite-store.ts)", () =>
 			"VaultCookieSecretValue_XYZ12345",
 			vaultPass,
 			inlineApiKey,
+			urlToken,
+			urlUserPass,
+			privHeaderTok,
+			vaultHeaderTok,
+			csrfHeaderTok,
+			xsrfHeaderTok,
 		]) {
 			expect(combinedDisk).not.toContain(secret);
 		}
 
-		// 读回的对象也绝不含明文
+		// 读回的对象绝不含明文，同时 URL 参数边界 (&role=admin#section1) 与结构化非敏感字段毫发无损
 		const loaded = loadStateFromSqlite(root)!;
 		expect(JSON.stringify(loaded)).not.toContain(vaultBearer);
 		expect(JSON.stringify(loaded)).not.toContain(vaultPass);
 		expect(JSON.stringify(loaded)).not.toContain(inlineApiKey);
+		expect(loaded.facts.F_SENS?.command).toContain("&role=admin#section1");
+		expect(loaded.facts.F_SENS?.command).toContain("https://alice:");
+		expect(loaded.facts.F_SENS?.command).not.toContain(urlUserPass);
+		expect(loaded.facts.F_SENS?.command).not.toContain(urlToken);
+		// 确保 NuwaState 自身结构字段（ownerSessionId/targetKey/dedupKey/key）未被误脱敏
+		expect(loaded.project.ownerSessionId).toBe("sess-v6-owner");
+		expect(loaded.facts.F2?.targetKey).toBe("/api/orders/1001");
+		expect(loaded.intents.I1?.dedupKey).toBe("vuln|path|/api/orders/1001|abc");
+
+		const roStore = new NuwaSqliteStore(root, { readonly: true });
+		try {
+			const traffic = roStore.queryTrafficEntries({ limit: 5 });
+			expect(traffic.length).toBe(1);
+			const t0 = traffic[0]!;
+			expect(t0.url).toContain("&role=admin#top");
+			expect(t0.requestHeaders?.["Content-Type"]).toBe("application/json");
+			expect(t0.requestHeaders?.Accept).toBe("application/json");
+			expect(t0.responseHeaders?.["Access-Control-Allow-Origin"]).toBe("https://api.example.com");
+			expect(t0.requestHeaders?.["Private-Token"]).toContain("***");
+			expect(t0.requestHeaders?.["X-Vault-Token"]).toContain("***");
+			expect(t0.requestHeaders?.["X-CSRF-Token"]).toContain("***");
+			expect(t0.requestHeaders?.["X-XSRF-Token"]).toContain("***");
+		} finally {
+			roStore.close();
+		}
 	});
 });
 
@@ -891,10 +988,10 @@ describe("v6.0 AuthDiff 自主闭环驱动引擎 (omp/auto-loops.ts)", () => {
 
 		const scope = defaultScopeForTarget(srv.url, "pentest");
 		const state = buildSampleState(srv.url, "pentest");
-		// 仅保留干净事实：模拟通过新 cred 事实触发自动收纳 + 已有角色
+		// 混合存量小写 f005 + 大写 F2 与已有意图 i003，故意使 seq 落后，验证全仓标准小写 3 位零填充 ID 防冲撞与字典序对齐
 		state.facts = {
-			F1: {
-				id: "F1",
+			f005: {
+				id: "f005",
 				kind: "endpoint",
 				title: "发现核心业务与管理接口",
 				detail: "API 列表包含 /api/admin/config, /api/orders/1001, /api/v1/export/9001, /spa-fallback-route",
@@ -917,8 +1014,21 @@ describe("v6.0 AuthDiff 自主闭环驱动引擎 (omp/auto-loops.ts)", () => {
 				createdAt: "2026-11-25T10:01:00.000Z",
 			},
 		};
-		state.intents = {};
-		state.seq = { fact: 2, intent: 0 };
+		state.intents = {
+			i003: {
+				id: "i003",
+				phase: "recon",
+				key: "recon:http",
+				title: "初始 HTTP 探测",
+				detail: "已完成",
+				from: [],
+				status: "done",
+				priority: 90,
+				attempts: 1,
+				createdAt: "2026-11-25T09:59:00.000Z",
+			},
+		};
+		state.seq = { fact: 1, intent: 1 };
 
 		upsertSessionRole(root, { role: "admin", bearer: adminSecret });
 		upsertSessionRole(root, { role: "user_a", bearer: aliceSecret });
@@ -940,10 +1050,11 @@ describe("v6.0 AuthDiff 自主闭环驱动引擎 (omp/auto-loops.ts)", () => {
 		expect(kinds).toEqual(["horizontal_bola", "unauth_access", "vertical_bfla"]);
 		expect(run1.highConfidenceFindings.some((f) => f.path === "/spa-fallback-route")).toBe(false);
 
-		// 严格遵守双盲闸门：全部候选 vuln Fact 均为 candidate/verified=false，并生成 verify-vuln:<fid>
-		expect(run1.candidateFacts.length).toBe(3);
+		// 严格遵守双盲闸门与全仓 f001/i001 零填充 ID 规范：从 f006 / i004 递增且字典序一致
+		expect(run1.candidateFacts.map((f) => f.id)).toEqual(["f006", "f007", "f008"]);
 		expect(run1.verifyIntentSpecs.length).toBe(3);
 		for (const cf of run1.candidateFacts) {
+			expect(cf.id).toMatch(/^f\d{3,}$/);
 			expect(cf.kind).toBe("vuln");
 			expect(cf.verified).toBe(false);
 			expect(cf.verifyStage).toBe("candidate");
@@ -953,9 +1064,12 @@ describe("v6.0 AuthDiff 自主闭环驱动引擎 (omp/auto-loops.ts)", () => {
 			expect(matchSpec?.recommendedAgent).toBe("nuwa-verifier");
 			expect(matchSpec?.priority).toBe(96);
 		}
-		expect(
-			Object.values(state.intents).filter((i) => i.key.startsWith("verify-vuln:")).length,
-		).toBe(3);
+		const addedVerifyIntents = Object.values(state.intents)
+			.filter((i) => i.key.startsWith("verify-vuln:"))
+			.sort((a, b) => a.id.localeCompare(b.id));
+		expect(addedVerifyIntents.map((i) => i.id)).toEqual(["i004", "i005", "i006"]);
+		expect(state.seq.fact).toBe(8);
+		expect(state.seq.intent).toBe(6);
 
 		// 零凭据泄露验证（返回对象、state、持久化冷却文件均不含明文凭据）
 		const persistedLoopRaw = readFileSync(join(root, ".nuwa", "auto-loops-state.json"), "utf8");
@@ -1118,6 +1232,33 @@ describe("v6.0 OOB 自主播撒与节流轮询闭环 (omp/auto-loops.ts)", () =>
 		};
 
 		const t0 = 1_764_066_000_000;
+
+		// 0. 越界与非法 pollUrl 必须被 N-007 硬阻断（0 次网络发包）且绝不污染节流窗口
+		const blockedOutOfScope = await runAutonomousOobPoll(state, root, scope, {
+			pollUrl: "https://evil.out-of-scope.invalid/events",
+			authToken: secretPollToken,
+			minIntervalMs: 30_000,
+			nowMs: t0,
+			fetchFn: mockFetch,
+		});
+		expect(blockedOutOfScope.polled).toBe(false);
+		expect(blockedOutOfScope.throttled).toBe(false);
+		expect(blockedOutOfScope.error).toContain("N-007");
+		expect(fetchCalls).toBe(0);
+
+		const blockedInvalidUrl = await runAutonomousOobPoll(state, root, scope, {
+			pollUrl: "not-a-valid-url",
+			authToken: secretPollToken,
+			minIntervalMs: 30_000,
+			nowMs: t0,
+			fetchFn: mockFetch,
+		});
+		expect(blockedInvalidUrl.polled).toBe(false);
+		expect(blockedInvalidUrl.throttled).toBe(false);
+		expect(blockedInvalidUrl.error).toContain("N-007");
+		expect(fetchCalls).toBe(0);
+
+		// 同一时间戳 t0 立刻改用合法 pollUrl：不得被先前越界拦截锁死节流
 		const poll1 = await runAutonomousOobPoll(state, root, scope, {
 			pollUrl: "https://poll.oast.lab.test/events",
 			authToken: secretPollToken,
@@ -1135,6 +1276,7 @@ describe("v6.0 OOB 自主播撒与节流轮询闭环 (omp/auto-loops.ts)", () =>
 		expect(poll1.evidenceFacts.length).toBe(1);
 
 		const evFact = poll1.evidenceFacts[0]!;
+		expect(evFact.id).toBe("f011");
 		expect(evFact.kind).toBe("vuln");
 		expect(evFact.verified).toBe(true);
 		expect(evFact.verifyStage).toBe("confirmed");

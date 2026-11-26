@@ -286,14 +286,22 @@ function safeChmod600(filePath: string): void {
 const SENSITIVE_FIELD_KEY_RE =
 	/^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-session-token|api[-_]?key|auth[-_]?token|access[-_]?token|refresh[-_]?token|bearer|password|passwd|pwd|secret|client[-_]?secret|private[-_]?key|session[-_]?secret)$/i;
 
+/** 仅用于 HTTP 请求/响应头字典：排除标准非敏感头后再宽泛匹配敏感头名（与 session-vault.ts 对齐）。 */
+const STANDARD_NON_SENSITIVE_HTTP_HEADER_RE =
+	/^(?:accept(?:-[a-z0-9-]+)?|content-(?:type|length|encoding|language|disposition|range|security-policy|md5)|cache-control|pragma|expires|etag|last-modified|if-(?:match|none-match|modified-since|unmodified-since|range)|connection|keep-alive|transfer-encoding|upgrade(?:-insecure-requests)?|host|origin|referer|user-agent|date|server|vary|via|age|location|allow|range|te|trailer|dnt|priority|sec-[a-z0-9-]+|x-forwarded-(?:for|host|proto|port)|x-real-ip|x-request-id|x-correlation-id|x-trace-id|x-ratelimit-[a-z0-9-]+|x-frame-options|x-content-type-options|strict-transport-security|referrer-policy|permissions-policy|access-control-[a-z0-9-]+)$/i;
+const SENSITIVE_HTTP_HEADER_NAME_RE =
+	/(?:auth|token|key|secret|cookie|session|jwt|csrf|xsrf|pass|cred|sign|bearer|ticket|access)/i;
+
 const GENERIC_AUTH_HEADER_RE =
 	/\b(Authorization|Proxy-Authorization)\s*:\s*(Bearer|Basic|Token|JWT)\s+([A-Za-z0-9._~+/=-]{6,})/gi;
 const GENERIC_API_KEY_HEADER_RE =
-	/\b(X-API-Key|X-Auth-Token|X-Access-Token|X-Session-Token|Api-Key)\s*:\s*([^\s\r\n'",;]{6,})/gi;
+	/\b(X-API-Key|X-Auth-Token|X-Access-Token|X-Session-Token|Api-Key|Private-Token|X-Vault-Token|X-CSRF-Token|X-XSRF-Token|X-Gitlab-Token)\s*:\s*([^\s\r\n'",;]{4,})/gi;
 const GENERIC_COOKIE_HEADER_RE =
 	/\b(Cookie|Set-Cookie)\s*:\s*([^\r\n]+)/gi;
 const GENERIC_PASSWORD_KV_RE =
-	/\b(password|passwd|pwd|api_key|apikey|secret_key|client_secret|access_token|refresh_token)\s*([:=])\s*(["']?)([^\s\r\n"',;}{[\]]{4,})\3/gi;
+	/\b(password|passwd|pwd|api_key|apikey|secret_key|client_secret|access_token|refresh_token)\s*([:=])\s*(["']?)([^\s\r\n"',;}{[\]&#)>]{4,})\3/gi;
+const URL_USERINFO_RE =
+	/(\b(?:https?|ftp|sftp|ftps|ws|wss|redis|rediss|mysql|postgres(?:ql)?|mongodb(?:\+srv)?|amqp|amqps|socks(?:4a?|5h?)?):\/\/)([^\/\s:@?#]+)?:([^\/\s@?#]+)@/gi;
 const RAW_JWT_RE = /\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,})\b/g;
 const KNOWN_TOKEN_PREFIX_RE = /\b((?:sk-proj-|sk-live-|sk-|ghp_|gho_|ghu_|github_pat_|xoxb-|xoxp-|AKIA)[A-Za-z0-9_-]{10,})\b/g;
 
@@ -358,6 +366,12 @@ function redactGenericSecrets(text: string): string {
 		},
 	);
 
+	out = out.replace(URL_USERINFO_RE, (_m, scheme: string, user: string | undefined, pass: string) => {
+		const userPart = user ?? "";
+		if (alreadyMasked(pass)) return `${scheme}${userPart}:${pass}@`;
+		return `${scheme}${userPart}:${maskSecretValue(pass)}@`;
+	});
+
 	out = out.replace(RAW_JWT_RE, (jwt) => (alreadyMasked(jwt) ? jwt : maskSecretValue(jwt)));
 	out = out.replace(KNOWN_TOKEN_PREFIX_RE, (tok) => (alreadyMasked(tok) ? tok : maskSecretValue(tok)));
 
@@ -371,6 +385,13 @@ function redactTextForStorage(text: string | undefined, vault: SessionVault): st
 	return redactGenericSecrets(afterVault);
 }
 
+function isSensitiveHttpHeaderName(name: string): boolean {
+	const norm = name.trim();
+	if (!norm) return false;
+	if (STANDARD_NON_SENSITIVE_HTTP_HEADER_RE.test(norm)) return false;
+	return SENSITIVE_FIELD_KEY_RE.test(norm) || SENSITIVE_HTTP_HEADER_NAME_RE.test(norm);
+}
+
 function redactHeadersRecord(
 	headers: Record<string, string> | undefined,
 	vault: SessionVault,
@@ -379,7 +400,7 @@ function redactHeadersRecord(
 	const out: Record<string, string> = {};
 	for (const [k, v] of Object.entries(headers)) {
 		const cleanV = String(v ?? "");
-		if (SENSITIVE_FIELD_KEY_RE.test(k.trim())) {
+		if (isSensitiveHttpHeaderName(k)) {
 			if (k.trim().toLowerCase() === "cookie" || k.trim().toLowerCase() === "set-cookie") {
 				out[k] = maskCookieHeaderLine(redactVaultSecrets(cleanV, vault));
 			} else {
@@ -821,9 +842,27 @@ function quarantineCorruptDbFiles(dbFile: string): string {
 	return backupPath;
 }
 
+function hasTable(db: Database, name: string): boolean {
+	try {
+		const row = db
+			.query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?")
+			.get(name) as { name?: string } | null;
+		return Boolean(row?.name);
+	} catch {
+		return false;
+	}
+}
+
+function isReadonlyCantOpenError(err: unknown): boolean {
+	const msg = String(err instanceof Error ? err.message : err ?? "").toLowerCase();
+	return msg.includes("sqlite_cantopen") || msg.includes("unable to open database file");
+}
+
 function configureAndInitDb(db: Database, dbFile: string, readonly: boolean): void {
 	db.exec("PRAGMA busy_timeout = 5000;");
-	if (!readonly) {
+	if (readonly) {
+		db.exec("PRAGMA query_only = ON;");
+	} else {
 		runWithBusyRetry(() => {
 			const jmRow = db.query("PRAGMA journal_mode").get() as Record<string, unknown> | null;
 			const curMode = jmRow ? String(Object.values(jmRow)[0] ?? "").toLowerCase() : "";
@@ -835,7 +874,7 @@ function configureAndInitDb(db: Database, dbFile: string, readonly: boolean): vo
 	}
 	db.exec("PRAGMA foreign_keys = ON;");
 
-	// 快速完整性探测，及时发现损坏文件头或损坏页
+	// 快速完整性探测，及时发现损坏文件头或损坏页（只读安全，不触发写锁）
 	const qc = runWithBusyRetry(() => db.query("PRAGMA quick_check(1)").get() as Record<string, unknown> | null);
 	const qcVal = qc ? String(Object.values(qc)[0] ?? "").toLowerCase() : "";
 	if (qcVal && qcVal !== "ok") {
@@ -860,7 +899,9 @@ function configureAndInitDb(db: Database, dbFile: string, readonly: boolean): vo
 
 /**
  * 打开并初始化项目 SQLite 状态库（`<root>/.nuwa/nuwa.db`）。
- * 强制启用 WAL、busy_timeout=5000、synchronous=NORMAL、foreign_keys=ON 并校验库完整性。
+ * - 写模式强制启用 WAL、busy_timeout=5000、synchronous=NORMAL、foreign_keys=ON 并初始化 10 表结构；
+ * - 只读模式（`readonly: true`）绝不执行建表、写事务或元数据修改，无写锁争抢；
+ * - 遇到已存在但为 0 字节空文件或格式/页损坏文件时统一抛出 `NuwaSqliteCorruptError`。
  */
 export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 	const dbFile = sqliteDbPath(root);
@@ -869,7 +910,17 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 		mkdirSync(dirname(dbFile), { recursive: true });
 	}
 
+	const assertNotZeroByteCorrupt = (): void => {
+		if (existsSync(dbFile)) {
+			const st = statSync(dbFile);
+			if (st.size === 0) {
+				throw new NuwaSqliteCorruptError(dbFile, "数据库文件为 0 字节空文件（疑似崩溃截断或未完成初始化）");
+			}
+		}
+	};
+
 	const tryOpen = (): Database => {
+		assertNotZeroByteCorrupt();
 		let db: Database | null = null;
 		try {
 			db = readonly ? new Database(dbFile, { readonly: true }) : new Database(dbFile, { create: true });
@@ -880,6 +931,26 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 				db?.close();
 			} catch {
 				/* ignore */
+			}
+			// 兼容极少数外部 WAL 库缺失 -shm 导致纯 readonly 无法映射共享内存的场景：回退普通打开并立即锁定 query_only=ON
+			if (readonly && isReadonlyCantOpenError(err) && existsSync(dbFile)) {
+				let fbDb: Database | null = null;
+				try {
+					fbDb = new Database(dbFile);
+					configureAndInitDb(fbDb, dbFile, true);
+					return fbDb;
+				} catch (fbErr) {
+					try {
+						fbDb?.close();
+					} catch {
+						/* ignore */
+					}
+					if (fbErr instanceof NuwaSqliteCorruptError) throw fbErr;
+					if (isCorruptError(fbErr)) {
+						throw new NuwaSqliteCorruptError(dbFile, fbErr instanceof Error ? fbErr.message : String(fbErr));
+					}
+					throw fbErr;
+				}
 			}
 			if (err instanceof NuwaSqliteCorruptError) {
 				throw err;
@@ -1091,6 +1162,7 @@ function buildFactSnippet(fact: Fact, query: string): string {
 function queryFactsOnDb(db: Database, query: string, opts?: QueryFactsOptions): FactSearchHit[] {
 	const q = String(query ?? "").trim();
 	if (!q) return [];
+	if (!hasTable(db, "facts")) return [];
 	const limit = clampInt(opts?.limit, 20, 1, 100);
 
 	const filterClauses: string[] = [];
@@ -1113,7 +1185,7 @@ function queryFactsOnDb(db: Database, query: string, opts?: QueryFactsOptions): 
 
 	// 1. 优先执行 FTS5 词元检索（BM25 相关性排序）
 	const ftsExpr = buildSafeFtsMatchQuery(q);
-	if (ftsExpr) {
+	if (ftsExpr && hasTable(db, "facts_fts")) {
 		try {
 			const rows = db
 				.query(
@@ -1472,8 +1544,9 @@ export class NuwaSqliteStore {
 		runWithBusyRetry(() => tx.immediate());
 	}
 
-	/** 从 SQLite 完整重建 `NuwaState`；尚未写入项目元数据时返回 `null`。 */
+	/** 从 SQLite 完整重建 `NuwaState`；尚未写入项目元数据或缺表时返回 `null`。 */
 	loadState(): NuwaState | null {
+		if (!hasTable(this.db, "meta")) return null;
 		const metaRows = this.db.query("SELECT key, value FROM meta").all() as Array<{ key: string; value: string }>;
 		const meta = new Map<string, string>(metaRows.map((r) => [r.key, r.value]));
 		const projectRaw = meta.get("project_json");
@@ -1488,18 +1561,24 @@ export class NuwaSqliteStore {
 		const runtime = safeJsonParse<Runtime>(meta.get("runtime_json"), {} as Runtime);
 
 		const facts: Record<string, Fact> = {};
-		for (const r of this.db.query("SELECT * FROM facts").all() as Array<Record<string, any>>) {
-			const f = factFromRow(r);
-			facts[f.id] = f;
+		if (hasTable(this.db, "facts")) {
+			for (const r of this.db.query("SELECT * FROM facts").all() as Array<Record<string, any>>) {
+				const f = factFromRow(r);
+				facts[f.id] = f;
+			}
 		}
 
 		const intents: Record<string, Intent> = {};
-		for (const r of this.db.query("SELECT * FROM intents").all() as Array<Record<string, any>>) {
-			const it = intentFromRow(r);
-			intents[it.id] = it;
+		if (hasTable(this.db, "intents")) {
+			for (const r of this.db.query("SELECT * FROM intents").all() as Array<Record<string, any>>) {
+				const it = intentFromRow(r);
+				intents[it.id] = it;
+			}
 		}
 
-		const attemptedRows = this.db.query("SELECT * FROM attempted").all() as Array<Record<string, any>>;
+		const attemptedRows = hasTable(this.db, "attempted")
+			? (this.db.query("SELECT * FROM attempted").all() as Array<Record<string, any>>)
+			: [];
 		if (attemptedRows.length > 0 || meta.get("has_attempted_keys") === "1") {
 			const attemptedKeys: Record<string, AttemptedEntry> = {};
 			for (const r of attemptedRows) {
@@ -1519,7 +1598,9 @@ export class NuwaSqliteStore {
 			runtime,
 		};
 
-		const assetRows = this.db.query("SELECT * FROM assets").all() as Array<Record<string, any>>;
+		const assetRows = hasTable(this.db, "assets")
+			? (this.db.query("SELECT * FROM assets").all() as Array<Record<string, any>>)
+			: [];
 		if (assetRows.length > 0 || meta.get("has_assets") === "1") {
 			const assets: Record<string, AssetNode> = {};
 			for (const r of assetRows) {
@@ -1529,7 +1610,9 @@ export class NuwaSqliteStore {
 			state.assets = assets;
 		}
 
-		const hypRows = this.db.query("SELECT * FROM hypotheses").all() as Array<Record<string, any>>;
+		const hypRows = hasTable(this.db, "hypotheses")
+			? (this.db.query("SELECT * FROM hypotheses").all() as Array<Record<string, any>>)
+			: [];
 		if (hypRows.length > 0 || meta.get("has_hypotheses") === "1") {
 			const hypotheses: Record<string, HypothesisNode> = {};
 			for (const r of hypRows) {
@@ -1869,7 +1952,7 @@ export class NuwaSqliteStore {
 // 函数式便捷导出接口
 // ============================================================================
 
-/** 从 `.nuwa/nuwa.db` 读取完整 `NuwaState`；不存在返回 `null`，坏库按选项抛出带中文指引的异常或兜底回退 JSON。 */
+/** 从 `.nuwa/nuwa.db` 只读加载完整 `NuwaState`（零写事务、不抢写锁）；不存在返回 `null`，坏库按选项抛出诊断异常或回退 JSON。 */
 export function loadStateFromSqlite(root: string, opts?: LoadSqliteStateOptions): NuwaState | null {
 	const normRoot = resolve(root);
 	const dbFile = sqliteDbPath(normRoot);
@@ -1877,15 +1960,21 @@ export function loadStateFromSqlite(root: string, opts?: LoadSqliteStateOptions)
 
 	let store: NuwaSqliteStore | null = null;
 	try {
-		store = new NuwaSqliteStore(normRoot);
+		store = new NuwaSqliteStore(normRoot, { readonly: true });
 		return store.loadState();
 	} catch (err) {
-		if (err instanceof NuwaSqliteCorruptError) {
+		const corruptErr =
+			err instanceof NuwaSqliteCorruptError
+				? err
+				: isCorruptError(err)
+					? new NuwaSqliteCorruptError(dbFile, err instanceof Error ? err.message : String(err))
+					: null;
+		if (corruptErr) {
 			if (opts?.fallbackToJson) {
-				opts.onCorruptWarning?.(err.message, err);
+				opts.onCorruptWarning?.(corruptErr.message, corruptErr);
 				return loadState(normRoot);
 			}
-			throw err;
+			throw corruptErr;
 		}
 		throw err;
 	} finally {
@@ -1919,6 +2008,7 @@ export function appendJournalSqlite(
 
 /**
  * 全文检索历史 Facts（同时兼容传入项目根目录 `root`、已有 `Database` 或 `NuwaSqliteStore` 实例）。
+ * 传入项目根目录时采用纯只读连接（零写事务、不修改文件元数据、不争抢写锁）。
  */
 export function queryFactsByText(
 	rootOrDb: string | Database | NuwaSqliteStore,
@@ -1930,10 +2020,16 @@ export function queryFactsByText(
 	}
 	if (typeof rootOrDb === "string") {
 		const normRoot = resolve(rootOrDb);
-		if (!existsSync(sqliteDbPath(normRoot))) return [];
-		const store = new NuwaSqliteStore(normRoot);
+		const dbFile = sqliteDbPath(normRoot);
+		if (!existsSync(dbFile)) return [];
+		const store = new NuwaSqliteStore(normRoot, { readonly: true });
 		try {
 			return store.queryFactsByText(query, opts);
+		} catch (err) {
+			if (isCorruptError(err) && !(err instanceof NuwaSqliteCorruptError)) {
+				throw new NuwaSqliteCorruptError(dbFile, err instanceof Error ? err.message : String(err));
+			}
+			throw err;
 		} finally {
 			store.close();
 		}

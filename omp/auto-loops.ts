@@ -217,15 +217,15 @@ function resolveNowMs(value: number | undefined): number {
 function allocateNextFactId(state: NuwaState, usedIds: Set<string>): string {
 	let n = Number.isFinite(state.seq?.fact) ? Math.floor(state.seq.fact) : 0;
 	for (const id of Object.keys(state.facts ?? {})) {
-		const m = /^F(\d+)$/.exec(id);
+		const m = /^[fF](\d+)$/.exec(id);
 		if (m?.[1]) n = Math.max(n, Number(m[1]));
 	}
 	for (const id of usedIds) {
-		const m = /^F(\d+)$/.exec(id);
+		const m = /^[fF](\d+)$/.exec(id);
 		if (m?.[1]) n = Math.max(n, Number(m[1]));
 	}
 	n += 1;
-	const fid = `F${n}`;
+	const fid = `f${String(n).padStart(3, "0")}`;
 	usedIds.add(fid);
 	return fid;
 }
@@ -233,15 +233,15 @@ function allocateNextFactId(state: NuwaState, usedIds: Set<string>): string {
 function allocateNextIntentId(state: NuwaState, usedIds: Set<string>): string {
 	let n = Number.isFinite(state.seq?.intent) ? Math.floor(state.seq.intent) : 0;
 	for (const id of Object.keys(state.intents ?? {})) {
-		const m = /^I(\d+)$/.exec(id);
+		const m = /^[iI](\d+)$/.exec(id);
 		if (m?.[1]) n = Math.max(n, Number(m[1]));
 	}
 	for (const id of usedIds) {
-		const m = /^I(\d+)$/.exec(id);
+		const m = /^[iI](\d+)$/.exec(id);
 		if (m?.[1]) n = Math.max(n, Number(m[1]));
 	}
 	n += 1;
-	const iid = `I${n}`;
+	const iid = `i${String(n).padStart(3, "0")}`;
 	usedIds.add(iid);
 	return iid;
 }
@@ -927,20 +927,16 @@ export async function runAutonomousAuthDiff(
 	if (opts?.applyToState === true && (candidateFacts.length > 0 || verifyIntentSpecs.length > 0)) {
 		for (const f of candidateFacts) {
 			state.facts[f.id] = f;
-			const m = /^F(\d+)$/.exec(f.id);
+			const m = /^[fF](\d+)$/.exec(f.id);
 			if (m?.[1]) state.seq.fact = Math.max(state.seq.fact, Number(m[1]));
 		}
+		const appliedIntentIds = new Set<string>();
 		for (const spec of verifyIntentSpecs) {
 			const alreadyHas = Object.values(state.intents).some((i) => i.key === spec.key);
 			if (alreadyHas) continue;
-			const nextNum = Math.max(state.seq.intent, Object.keys(state.intents).length) + 1;
-			let iid = `I${nextNum}`;
-			let cursor = nextNum;
-			while (state.intents[iid]) {
-				cursor += 1;
-				iid = `I${cursor}`;
-			}
-			state.seq.intent = Math.max(state.seq.intent, cursor);
+			const iid = allocateNextIntentId(state, appliedIntentIds);
+			const m = /^[iI](\d+)$/.exec(iid);
+			if (m?.[1]) state.seq.intent = Math.max(state.seq.intent, Number(m[1]));
 			const targetFact = state.facts[spec.targetFactId];
 			state.intents[iid] = {
 				id: iid,
@@ -1420,11 +1416,6 @@ export async function runAutonomousOobPoll(
 	const authToken = opts?.authToken ?? process.env.NUWA_OOB_POLL_TOKEN;
 	const vault = loadSessionVault(normRoot);
 
-	// 记录本次轮询时间戳，确保失败/成功均纳入节流周期
-	loopState.oob.lastPollAtMs = nowMs;
-	loopState.oob.lastPollAt = new Date(nowMs).toISOString();
-	saveAutoLoopsState(normRoot, loopState);
-
 	const pollResult = await pollOobCallbacks(normRoot, {
 		pollUrl,
 		scope,
@@ -1434,9 +1425,17 @@ export async function runAutonomousOobPoll(
 	});
 
 	if (!pollResult.ok) {
-		const safeErr = redactVaultSecrets(scrubAuthToken(pollResult.error ?? "OOB 轮询失败", authToken), vault);
+		const rawErr = pollResult.error ?? "OOB 轮询失败";
+		const safeErr = redactVaultSecrets(scrubAuthToken(rawErr, authToken), vault);
+		// N-007 越界/非法 URL 前置拦截（零发包）绝不更新节流时间戳，防止错误配置锁死后续合法轮询
+		const blockedBeforeNetwork = /N-007|缺少可用的\s*fetch/i.test(rawErr);
+		if (!blockedBeforeNetwork) {
+			loopState.oob.lastPollAtMs = nowMs;
+			loopState.oob.lastPollAt = new Date(nowMs).toISOString();
+			saveAutoLoopsState(normRoot, loopState);
+		}
 		return {
-			polled: true,
+			polled: !blockedBeforeNetwork,
 			throttled: false,
 			error: safeErr,
 			pollResult,
@@ -1448,6 +1447,11 @@ export async function runAutonomousOobPoll(
 			verifyIntentSpecs: [],
 		};
 	}
+
+	// 实际完成有效网络轮询后记录节流时间戳
+	loopState.oob.lastPollAtMs = nowMs;
+	loopState.oob.lastPollAt = new Date(nowMs).toISOString();
+	saveAutoLoopsState(normRoot, loopState);
 
 	const reportedHitSet = new Set(loopState.oob.reportedHitIds);
 	const newHits: OobCallbackHit[] = [];
@@ -1558,16 +1562,17 @@ export async function runAutonomousOobPoll(
 	if (opts?.applyToState === true && evidenceFacts.length > 0) {
 		for (const f of evidenceFacts) {
 			state.facts[f.id] = f;
-			const m = /^F(\d+)$/.exec(f.id);
+			const m = /^[fF](\d+)$/.exec(f.id);
 			if (m?.[1]) state.seq.fact = Math.max(state.seq.fact, Number(m[1]));
 		}
+		const appliedIntentIds = new Set<string>();
 		for (const spec of verifyIntentSpecs) {
 			if (Object.values(state.intents).some((i) => i.key === spec.key)) continue;
-			let cursor = Math.max(state.seq.intent, Object.keys(state.intents).length) + 1;
-			while (state.intents[`I${cursor}`]) cursor += 1;
-			state.seq.intent = Math.max(state.seq.intent, cursor);
-			state.intents[`I${cursor}`] = {
-				id: `I${cursor}`,
+			const iid = allocateNextIntentId(state, appliedIntentIds);
+			const m = /^[iI](\d+)$/.exec(iid);
+			if (m?.[1]) state.seq.intent = Math.max(state.seq.intent, Number(m[1]));
+			state.intents[iid] = {
+				id: iid,
 				phase: spec.phase,
 				key: spec.key,
 				title: spec.title,
