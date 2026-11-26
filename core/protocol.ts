@@ -398,6 +398,11 @@ export const NUWA_CORE_TOOLS: readonly McpToolDefinition[] = [
 				},
 				baseline: {
 					description: "可选负向对照基线响应（401/404），用于假阳性门禁比对（#24）",
+					oneOf: [
+						{ type: "string" },
+						{ type: "object", additionalProperties: true },
+						{ type: "array", items: { type: "object", additionalProperties: true } },
+					],
 				},
 				auto_downgrade: {
 					type: "boolean",

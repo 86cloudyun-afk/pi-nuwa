@@ -11,6 +11,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { PassThrough } from "node:stream";
 import {
 	JSONRPC_ERROR_CODES,
 	NUWA_CORE_TOOLS,
@@ -29,8 +30,9 @@ import {
 	encodeMcpFrame,
 	extractNextMcpFrame,
 	handleMcpMessage,
+	startStdioMcpServer,
 } from "../core/mcp-server";
-import { L2_SCENARIO_SPECS } from "../benchmarks/l2-range/servers";
+import { L2_SCENARIO_SPECS, startL2ScenarioServer } from "../benchmarks/l2-range/servers";
 import { runL2BenchmarkSuite } from "../benchmarks/run-l2-eval";
 
 const REPO_ROOT = resolve(import.meta.dir, "..");
@@ -189,6 +191,137 @@ describe("core/mcp-server.ts 协议帧解析、错误边界与只读契约", () 
 		const afterStat = statSync(stFile);
 		expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs);
 		expect(afterStat.size).toBe(beforeStat.size);
+	});
+
+	test("含认证口令的 egress 代理零明文落盘与零响应泄露，且 autoStart/baseline Schema 完整", async () => {
+		const commitDef = getNuwaToolDefinition("nuwa_commit");
+		expect(Array.isArray(commitDef?.inputSchema.properties.baseline?.oneOf)).toBe(true);
+
+		const ws = makeTempDir("nuwa-mcp-egress-");
+		const agentHome = makeTempDir("nuwa-mcp-egress-home-");
+		const engine = new NuwaCoreEngine({
+			projectRoot: ws,
+			cwd: ws,
+			sessionId: "egress-mask-session",
+			agentHome,
+		});
+
+		const initRes = await engine.callTool("nuwa_init", {
+			target: "http://127.0.0.1:18888",
+			mode: "pentest",
+			autoStart: true,
+		});
+		expect(initRes.isError).toBe(false);
+		expect(initRes.details?.autoStartSkipped).toBe(true);
+
+		const proxySecret = "SuperSecretProxyPass98765";
+		const rawEgress = `socks5h://proxyuser:${proxySecret}@127.0.0.1:7890`;
+
+		const planRes = await engine.callTool("nuwa_plan", {
+			egress: rawEgress,
+			intents: [
+				{
+					phase: "surface",
+					title: "通过受控代理探测 /api/v1/health",
+					targetKey: "/api/v1/health",
+					expectedKind: "endpoint",
+					surfaceDomain: "path",
+				},
+			],
+			batch_tasks: [
+				{
+					id: "bt-1",
+					title: "批派发出口测试",
+					targetKey: "/api/v1/info",
+					task: "curl -sS http://127.0.0.1:18888/api/v1/info",
+				},
+			],
+		});
+		expect(planRes.isError).toBe(false);
+		const addedId = ((planRes.details?.added as string[]) ?? [])[0]!;
+		expect(addedId).toBeTruthy();
+
+		const claimRes = await engine.callTool("nuwa_claim", {
+			id: addedId,
+			egress: rawEgress,
+		});
+		expect(claimRes.isError).toBe(false);
+
+		const stateRaw = readFileSync(join(ws, ".nuwa", "state.json"), "utf8");
+		expect(stateRaw.includes(proxySecret)).toBe(false);
+		expect(JSON.stringify(planRes).includes(proxySecret)).toBe(false);
+		expect(JSON.stringify(claimRes).includes(proxySecret)).toBe(false);
+	});
+
+	test("Content-Length: 0 报 -32700、前置自定义头正常解析且单帧写出异常不锁死后续帧", async () => {
+		// 1) Content-Length: 0 绝不静默丢弃，必须标记 invalidHeaderError 触发 -32700
+		const clZeroBuf = Buffer.from("Content-Length: 0\r\n\r\n", "utf8");
+		const clZeroFrame = extractNextMcpFrame(clZeroBuf, false);
+		expect(clZeroFrame).not.toBeNull();
+		expect(clZeroFrame!.invalidHeaderError).toBeTruthy();
+
+		// 2) 自定义头在前 (X-Foo: bar) 的 Content-Length 帧不被误拆为 newline
+		const pingBody = JSON.stringify(createJsonRpcRequest(99, "ping"));
+		const customHdrBuf = Buffer.from(
+			`X-Foo: bar\r\nContent-Length: ${Buffer.byteLength(pingBody, "utf8")}\r\n\r\n${pingBody}`,
+			"utf8",
+		);
+		const customExtracted = extractNextMcpFrame(customHdrBuf, false);
+		expect(customExtracted).not.toBeNull();
+		expect(customExtracted!.framing).toBe("content-length");
+		expect(JSON.parse(customExtracted!.rawJson).id).toBe(99);
+
+		// 3) startStdioMcpServer 流式测试：Content-Length: 0 返回 -32700，且第 1 个正常请求写出抛错后第 2、3 个请求照常成功回写
+		const ws = makeTempDir("nuwa-mcp-stream-resilience-");
+		const agentHome = makeTempDir("nuwa-mcp-stream-home-");
+		const engine = new NuwaCoreEngine({ projectRoot: ws, cwd: ws, agentHome });
+		const input = new PassThrough();
+		const writtenFrames: string[] = [];
+		let writeCount = 0;
+
+		const serverPromise = startStdioMcpServer({
+			engine,
+			input,
+			output: {
+				write(chunk: string | Uint8Array): boolean {
+					writeCount += 1;
+					// 模拟第 2 次写出发生瞬时流错误，验证会话链不会锁死
+					if (writeCount === 2) {
+						throw new Error("Simulated transient EAGAIN write error");
+					}
+					writtenFrames.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+					return true;
+				},
+			},
+			errorOutput: {
+				write(): boolean {
+					return true;
+				},
+			},
+			redirectConsoleToStderr: false,
+		});
+
+		input.write("Content-Length: 0\r\n\r\n");
+		input.write(`${JSON.stringify(createJsonRpcRequest(1, "ping"))}\n`);
+		input.write(`${JSON.stringify(createJsonRpcRequest(2, "ping"))}\n`);
+		const req3 = JSON.stringify(createJsonRpcRequest(3, "ping"));
+		input.write(`X-Trace-Id: t-003\r\nContent-Length: ${Buffer.byteLength(req3, "utf8")}\r\n\r\n${req3}`);
+		input.end();
+
+		await serverPromise;
+
+		// writeCount === 1: Content-Length: 0 的 -32700 错误帧
+		// writeCount === 2: id=1 模拟写出抛错被捕获隔离
+		// writeCount === 3 & 4: id=2 与 id=3 正常恢复写出
+		expect(writtenFrames.length).toBe(3);
+		const errFrame = extractNextMcpFrame(Buffer.from(writtenFrames[0]!, "utf8"), true)!;
+		expect(JSON.parse(errFrame.rawJson).error.code).toBe(JSONRPC_ERROR_CODES.PARSE_ERROR);
+
+		expect(JSON.parse(writtenFrames[1]!.trim()).id).toBe(2);
+
+		const okFrame3 = extractNextMcpFrame(Buffer.from(writtenFrames[2]!, "utf8"), true)!;
+		expect(okFrame3.framing).toBe("content-length");
+		expect(JSON.parse(okFrame3.rawJson).id).toBe(3);
 	});
 });
 
@@ -431,5 +564,29 @@ describe("benchmarks/run-l2-eval.ts L2 五场景微基准全量验收与硬门�
 		expect(parsed.scenarios[0]!.id).toBe("t5-hardened-zero-vuln");
 		expect(parsed.scenarios[0]!.terminalStatus).toBe("sealed_negative");
 		expect(parsed.gates.allPassed).toBe(true);
+	});
+
+	test("t3-blind-ssrf-oob 严格限定仅允许回调本场景专属 collectorPort，拒绝其他本机端口", async () => {
+		const srv = startL2ScenarioServer("t3-blind-ssrf-oob");
+		try {
+			// 尝试回调目标服务自身或其他非 collector 的 127.0.0.1 端口，必须被 400 拦截
+			const wrongPortRes = await fetch(`${srv.baseUrl}/api/v1/integrations/health-callback`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ callbackUrl: `http://127.0.0.1:${srv.port}/healthz` }),
+			});
+			expect(wrongPortRes.status).toBe(400);
+
+			// 回调本场景专属 collectorPort 时放行并返回 202
+			const okRes = await fetch(`${srv.baseUrl}/api/v1/integrations/health-callback`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ callbackUrl: `${srv.collectorUrl}/callback/port-guard-ok` }),
+			});
+			expect(okRes.status).toBe(202);
+			expect(srv.getCollectorEvents().length).toBe(1);
+		} finally {
+			srv.stop();
+		}
 	});
 });

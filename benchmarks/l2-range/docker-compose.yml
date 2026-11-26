@@ -9,9 +9,10 @@ services:
       - ../../:/workspace:ro
     environment:
       L2_PORT_BASE: "18200"
+      L2_BIND_HOST: "0.0.0.0"
     command: ["bun", "benchmarks/l2-range/servers.ts"]
     ports:
-      - "127.0.0.1:18200-18204:18200-18204"
+      - "127.0.0.1:18200-18205:18200-18205"
     networks:
       - l2_isolated_loopback
     read_only: true

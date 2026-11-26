@@ -11,7 +11,7 @@
  *   - vaultLeakCount === 0        （Markdown/JSON/SARIF/PoC Bundle 零凭据明文泄露）
  *   - hardenedSealTurns <= 15     （全加固零缺陷服务快速收敛至 sealed_negative）
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NuwaCoreEngine } from "../core/mcp-server";
@@ -202,12 +202,20 @@ async function exportReportsAndAuditSecrets(
 	const mdRes = await engine.callTool("nuwa_report", { write: true, format: "md", bundle: true });
 	const jsonRes = await engine.callTool("nuwa_report", { write: true, format: "json" });
 	const sarifRes = await engine.callTool("nuwa_report", { write: true, format: "sarif" });
-	assertOk(!mdRes.isError && !jsonRes.isError && !sarifRes.isError, "报告导出调用不应报错");
+	const timelineRes = await engine.callTool("nuwa_report", { write: true, format: "timeline" });
+	assertOk(
+		!mdRes.isError && !jsonRes.isError && !sarifRes.isError && !timelineRes.isError,
+		"报告导出调用不应报错",
+	);
 
 	const sarifPath = join(root, ".nuwa", "REPORT.sarif.json");
 	const jsonPath = join(root, ".nuwa", "REPORT.json");
 	const mdPath = join(root, ".nuwa", "REPORT.md");
-	assertOk(existsSync(sarifPath) && existsSync(jsonPath) && existsSync(mdPath), "报告文件必须落盘");
+	const timelinePath = join(root, ".nuwa", "TIMELINE.md");
+	assertOk(
+		existsSync(sarifPath) && existsSync(jsonPath) && existsSync(mdPath) && existsSync(timelinePath),
+		"全部报告格式文件必须落盘",
+	);
 
 	const sarifRaw = readFileSync(sarifPath, "utf8");
 	const sarifParsed = JSON.parse(sarifRaw) as {
@@ -230,10 +238,21 @@ async function exportReportsAndAuditSecrets(
 		mdRes.content[0]?.text ?? "",
 		jsonRes.content[0]?.text ?? "",
 		sarifRes.content[0]?.text ?? "",
+		timelineRes.content[0]?.text ?? "",
 		readFileSync(mdPath, "utf8"),
 		readFileSync(jsonPath, "utf8"),
 		sarifRaw,
+		readFileSync(timelinePath, "utf8"),
 	];
+
+	const archiveDir = join(root, ".nuwa", "archive");
+	if (existsSync(archiveDir)) {
+		for (const fname of readdirSync(archiveDir)) {
+			if (/^episode-\d+\.(?:json|md)$/.test(fname)) {
+				textsToScan.push(readFileSync(join(archiveDir, fname), "utf8"));
+			}
+		}
+	}
 
 	const bundleDir = mdRes.details?.bundleDir as string | undefined;
 	if (bundleDir && existsSync(bundleDir)) {

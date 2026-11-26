@@ -423,6 +423,13 @@ export class NuwaCoreEngine {
 			const resume = Boolean(p.resume ?? false);
 			const force = Boolean(p.force ?? false);
 			const migrate = Boolean(p.migrate ?? false);
+			const autoStartRequested = p.autoStart === true;
+			const autoStartMeta = autoStartRequested
+				? {
+						autoStartSkipped: true,
+						autoStartNote: "MCP 独立协议服务不包含宿主 Shell 执行器，已跳过 autoStart 自动批，请通过 nuwa_frontier / nuwa_claim 驱动",
+					}
+				: {};
 			const targetArg = typeof p.target === "string" && p.target.trim() ? p.target.trim() : undefined;
 			const rawTarget =
 				targetArg ??
@@ -533,6 +540,7 @@ export class NuwaCoreEngine {
 				return toolText(`已恢复 ${resumed.project.id}\n\n${statusBoard(resumed, root)}`, {
 					root,
 					integrity: wsIntegrity.status,
+					...autoStartMeta,
 				});
 			}
 
@@ -542,7 +550,7 @@ export class NuwaCoreEngine {
 				return toolText(
 					`项目已存在: ${existing.project.id} status=${existing.project.status} phase=${existing.project.phase}\n` +
 						`用 nuwa_init(resume=true) 继续，或 nuwa_init(force=true) 重建（旧 state 自动备份）。\n\n${statusBoard(existing, root)}`,
-					{ root, existing: true },
+					{ root, existing: true, ...autoStartMeta },
 				);
 			}
 
@@ -571,11 +579,13 @@ export class NuwaCoreEngine {
 			this.bindSession(root, st.project.id);
 			logEvent(root, { type: "init", id: st.project.id, url: st.project.url, mode: st.project.mode });
 			const warnSuffix = tmpWarn ? `\n⚠ ${tmpWarn.message}` : "";
-			return toolText(`女娲已上膛: ${st.project.id}${warnSuffix}\n\n${statusBoard(st, root)}`, {
+			const autoStartSuffix = autoStartRequested ? `\nℹ ${autoStartMeta.autoStartNote}` : "";
+			return toolText(`女娲已上膛: ${st.project.id}${warnSuffix}${autoStartSuffix}\n\n${statusBoard(st, root)}`, {
 				root,
 				project: st.project.id,
 				integrity: wsIntegrity.status,
 				...(tmpWarn ? { workspaceWarning: tmpWarn } : {}),
+				...autoStartMeta,
 			});
 		} catch (e) {
 			return toolError(e);
@@ -683,13 +693,14 @@ export class NuwaCoreEngine {
 
 				const egressInput = typeof p.egress === "string" ? p.egress : resolveConfiguredEgressUrl();
 				const activeEgress = normalizeTaskEgressUrl(egressInput);
-				if (activeEgress) {
-					egressEnvOut = injectEgressEnv(activeEgress, {});
+				const safeEgress = activeEgress ? maskEgressUrl(activeEgress) : undefined;
+				if (safeEgress) {
+					egressEnvOut = injectEgressEnv(safeEgress, {});
 					for (const id of planRes.added) {
 						const created = s.intents[id];
 						if (created && !created.detail.includes("NUWA_EGRESS")) {
-							const curlArgs = buildCurlProxyArgs(activeEgress).join(" ");
-							created.detail = `${created.detail ? `${created.detail}\n` : ""}[出口注入] NUWA_EGRESS=${maskEgressUrl(activeEgress)} (curl 附加: ${curlArgs})`;
+							const curlArgs = buildCurlProxyArgs(safeEgress).join(" ");
+							created.detail = `${created.detail ? `${created.detail}\n` : ""}[出口注入] NUWA_EGRESS=${safeEgress} (curl 附加: ${curlArgs})`;
 						}
 					}
 				}
@@ -710,12 +721,12 @@ export class NuwaCoreEngine {
 							target: {
 								url: s.project.url,
 								host: s.project.host,
-								...(activeEgress ? { egress: activeEgress } : {}),
+								...(safeEgress ? { egress: safeEgress } : {}),
 							},
 						});
 						return {
 							...item,
-							task: activeEgress ? injectEgressIntoScript(pkt.task, activeEgress) : pkt.task,
+							task: safeEgress ? injectEgressIntoScript(pkt.task, safeEgress) : pkt.task,
 							targetKey: pkt.targetKey || item.targetKey,
 						};
 					});
@@ -785,6 +796,7 @@ export class NuwaCoreEngine {
 			let targetKey = "";
 			const egressInput = typeof p.egress === "string" ? p.egress : resolveConfiguredEgressUrl();
 			const activeEgress = normalizeTaskEgressUrl(egressInput);
+			const safeEgress = activeEgress ? maskEgressUrl(activeEgress) : undefined;
 			withLock(root, () => {
 				const s = loadState(root);
 				if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
@@ -794,12 +806,12 @@ export class NuwaCoreEngine {
 				const injected = injectResolvedTargetContext(r.packet, {
 					url: s.project.url,
 					host: s.project.host,
-					...(activeEgress ? { egress: maskEgressUrl(activeEgress) } : {}),
+					...(safeEgress ? { egress: safeEgress } : {}),
 				});
 				packet = injected.task;
-				if (activeEgress) {
-					const proxyArgs = buildCurlProxyArgs(activeEgress).join(" ");
-					packet += `\n\n[出口强制注入]: 已配置出口 ${maskEgressUrl(activeEgress)}；首步须对目标执行 Gate 探活（如统一 403/WAF 阻断立即报 egress_blocked 停止盲扫），所有 curl 须携带 ${proxyArgs}`;
+				if (safeEgress) {
+					const proxyArgs = buildCurlProxyArgs(safeEgress).join(" ");
+					packet += `\n\n[出口强制注入]: 已配置出口 ${safeEgress}；首步须对目标执行 Gate 探活（如统一 403/WAF 阻断立即报 egress_blocked 停止盲扫），所有 curl 须携带 ${proxyArgs}`;
 				}
 				stale = r.stale;
 				if (targetKey && !targetKey.startsWith("seed:")) {
@@ -1762,15 +1774,12 @@ export function extractNextMcpFrame(buf: Buffer, isEof = false): ExtractedFrame 
 	const working = offset > 0 ? buf.subarray(offset) : buf;
 	const firstByte = working[0]!;
 
-	// 非 '{' 且非 '[' 开头时，检测是否为 Content-Length / MIME 头帧（兼容附带 Content-Type 等多行头）
+	// 非 '{' 且非 '[' 开头时，检测是否为 Content-Length / HTTP MIME 头帧（兼容任意前置自定义头与半包等待）
 	if (firstByte !== 0x7b && firstByte !== 0x5b) {
-		const previewAscii = working.subarray(0, Math.min(working.length, 128)).toString("latin1");
+		const previewAscii = working.subarray(0, Math.min(working.length, 256)).toString("latin1");
+		const hasHeaderLine = /^[A-Za-z][A-Za-z0-9-]*\s*:/m.test(previewAscii) && /^[A-Za-z][A-Za-z0-9-]*\s*:/.test(previewAscii);
 		const looksLikeHeaderPrefix =
-			!isEof &&
-			working.length < 20 &&
-			("content-length:".startsWith(previewAscii.toLowerCase()) ||
-				"content-type:".startsWith(previewAscii.toLowerCase()));
-		const hasHeaderLine = /^(?:content-length|content-type)\s*:/i.test(previewAscii);
+			!isEof && working.length < 64 && /^[A-Za-z][A-Za-z0-9-]*[ \t]*:?$/.test(previewAscii);
 
 		if (hasHeaderLine || looksLikeHeaderPrefix) {
 			const crlfIdx = working.indexOf("\r\n\r\n");
@@ -1806,7 +1815,7 @@ export function extractNextMcpFrame(buf: Buffer, isEof = false): ExtractedFrame 
 				};
 			}
 			const bodyBytes = Number(match[1]);
-			if (!Number.isSafeInteger(bodyBytes) || bodyBytes < 0 || bodyBytes > MAX_MCP_FRAME_BYTES) {
+			if (!Number.isSafeInteger(bodyBytes) || bodyBytes <= 0 || bodyBytes > MAX_MCP_FRAME_BYTES) {
 				return {
 					rawJson: "",
 					framing: "content-length",
@@ -1833,15 +1842,31 @@ export function extractNextMcpFrame(buf: Buffer, isEof = false): ExtractedFrame 
 		}
 	}
 
-	// 按换行分隔 JSON-RPC（NDJSON）
+	// 按换行分隔 JSON-RPC（NDJSON），带最大单帧内存上限保护
 	const nlIdx = working.indexOf(0x0a);
 	if (nlIdx < 0) {
+		if (working.length > MAX_MCP_FRAME_BYTES) {
+			return {
+				rawJson: "",
+				framing: "newline",
+				consumedBytes: offset + working.length,
+				invalidHeaderError: `NDJSON frame exceeds maximum byte limit (${MAX_MCP_FRAME_BYTES})`,
+			};
+		}
 		if (!isEof) return null;
 		const tail = working.toString("utf8").replace(/\r$/, "").trim();
 		return {
 			rawJson: tail,
 			framing: "newline",
 			consumedBytes: offset + working.length,
+		};
+	}
+	if (nlIdx > MAX_MCP_FRAME_BYTES) {
+		return {
+			rawJson: "",
+			framing: "newline",
+			consumedBytes: offset + nlIdx + 1,
+			invalidHeaderError: `NDJSON frame exceeds maximum byte limit (${MAX_MCP_FRAME_BYTES})`,
 		};
 	}
 	const line = working.subarray(0, nlIdx).toString("utf8").replace(/\r$/, "").trim();
@@ -1926,30 +1951,34 @@ export async function startStdioMcpServer(opts?: StartStdioMcpServerOptions): Pr
 	let chain = Promise.resolve();
 
 	const dispatchFrame = (frame: ExtractedFrame): void => {
-		if (!frame.rawJson && !frame.invalidHeaderError) return;
+		if (frame.framing === "newline" && !frame.rawJson && !frame.invalidHeaderError) return;
 		chain = chain.then(async () => {
-			if (frame.invalidHeaderError) {
-				logDiag(`协议帧头异常: ${frame.invalidHeaderError}`);
-				const errResp = createJsonRpcError(
-					null,
-					JSONRPC_ERROR_CODES.PARSE_ERROR,
-					`Parse error: ${frame.invalidHeaderError}`,
-				);
-				rawWriteOut(encodeMcpFrame(errResp, frame.framing));
-				return;
-			}
-			let parsed: unknown;
 			try {
-				parsed = JSON.parse(frame.rawJson);
+				if (frame.invalidHeaderError) {
+					logDiag(`协议帧头异常: ${frame.invalidHeaderError}`);
+					const errResp = createJsonRpcError(
+						null,
+						JSONRPC_ERROR_CODES.PARSE_ERROR,
+						`Parse error: ${frame.invalidHeaderError}`,
+					);
+					rawWriteOut(encodeMcpFrame(errResp, frame.framing));
+					return;
+				}
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(frame.rawJson);
+				} catch (err) {
+					logDiag(`JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`);
+					const errResp = createJsonRpcError(null, JSONRPC_ERROR_CODES.PARSE_ERROR, "Parse error: invalid JSON");
+					rawWriteOut(encodeMcpFrame(errResp, frame.framing));
+					return;
+				}
+				const response = await handleMcpMessage(parsed, engine);
+				if (response !== null) {
+					rawWriteOut(encodeMcpFrame(response, frame.framing));
+				}
 			} catch (err) {
-				logDiag(`JSON 解析失败: ${err instanceof Error ? err.message : String(err)}`);
-				const errResp = createJsonRpcError(null, JSONRPC_ERROR_CODES.PARSE_ERROR, "Parse error: invalid JSON");
-				rawWriteOut(encodeMcpFrame(errResp, frame.framing));
-				return;
-			}
-			const response = await handleMcpMessage(parsed, engine);
-			if (response !== null) {
-				rawWriteOut(encodeMcpFrame(response, frame.framing));
+				logDiag(`单帧处理/写出异常（已隔离恢复，不影响后续帧）: ${err instanceof Error ? err.message : String(err)}`);
 			}
 		});
 	};

@@ -142,6 +142,12 @@ function extractBearerToken(req: Request): string {
 	return "";
 }
 
+/** 默认严格仅绑定宿主机回环 127.0.0.1；仅在容器隔离环境显式设置 L2_BIND_HOST 时覆盖绑定接口。 */
+function resolveL2BindHost(): string {
+	const envHost = (process.env.L2_BIND_HOST ?? "").trim();
+	return envHost || "127.0.0.1";
+}
+
 // ------------------------ 场景 1: t1-spa-jwt-bola ------------------------
 
 const T1_SPA_HTML = [
@@ -163,7 +169,7 @@ const T1_MANIFEST_JS = [
 
 function createT1Server(port = 0): L2ScenarioServerHandle {
 	const srv = Bun.serve({
-		hostname: "127.0.0.1",
+		hostname: resolveL2BindHost(),
 		port,
 		fetch(req: Request): Response {
 			const url = new URL(req.url);
@@ -248,7 +254,7 @@ const T2_SOFT404_HTML = [
 
 function createT2Server(port = 0): L2ScenarioServerHandle {
 	const srv = Bun.serve({
-		hostname: "127.0.0.1",
+		hostname: resolveL2BindHost(),
 		port,
 		fetch(req: Request): Response {
 			const url = new URL(req.url);
@@ -302,14 +308,15 @@ function createT2Server(port = 0): L2ScenarioServerHandle {
 
 // ------------------------ 场景 3: t3-blind-ssrf-oob ------------------------
 
-function createT3Server(port = 0): L2ScenarioServerHandle {
+function createT3Server(port = 0, collectorFixedPort = 0): L2ScenarioServerHandle {
 	const events: L2LoopbackOobEvent[] = [];
 	let seq = 0;
+	const bindHost = resolveL2BindHost();
 
 	// 本机 127.0.0.1 回调接收收集器（模拟离线 OOB 收集端）
 	const collector = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
+		hostname: bindHost,
+		port: collectorFixedPort,
 		fetch(req: Request): Response {
 			const url = new URL(req.url);
 			if (url.pathname === "/oob/poll") {
@@ -353,7 +360,7 @@ function createT3Server(port = 0): L2ScenarioServerHandle {
 	const collectorUrl = `http://127.0.0.1:${collectorPort}`;
 
 	const srv = Bun.serve({
-		hostname: "127.0.0.1",
+		hostname: bindHost,
 		port,
 		async fetch(req: Request): Promise<Response> {
 			const url = new URL(req.url);
@@ -384,12 +391,17 @@ function createT3Server(port = 0): L2ScenarioServerHandle {
 					return jsonResponse({ error: "malformed_callback_url" }, 400);
 				}
 
-				// 安全护栏：合成基准服务严格只允许向本机 127.0.0.1 发起异步回路请求
-				if (parsedCallback.protocol !== "http:" || parsedCallback.hostname !== "127.0.0.1") {
+				// 安全护栏：合成基准服务严格只允许向本机 127.0.0.1 的专属 collectorPort 发起无重定向回路请求
+				const targetPort = parsedCallback.port ? Number(parsedCallback.port) : 80;
+				if (
+					parsedCallback.protocol !== "http:" ||
+					parsedCallback.hostname !== "127.0.0.1" ||
+					targetPort !== collectorPort
+				) {
 					return jsonResponse(
 						{
-							error: "loopback_only_in_l2_benchmark",
-							message: "Synthetic benchmark restricts outbound callbacks strictly to http://127.0.0.1",
+							error: "loopback_collector_port_only_in_l2_benchmark",
+							message: `Synthetic benchmark restricts outbound callbacks strictly to http://127.0.0.1:${collectorPort}`,
 						},
 						400,
 					);
@@ -397,6 +409,8 @@ function createT3Server(port = 0): L2ScenarioServerHandle {
 
 				await fetch(parsedCallback.toString(), {
 					method: "GET",
+					redirect: "manual",
+					signal: AbortSignal.timeout(2000),
 					headers: { "X-L2-Health-Probe": "synthetic-async-check" },
 				}).catch(() => undefined);
 
@@ -469,7 +483,7 @@ const VALID_STEP_TOKEN = "stp_l2_verified_flow_2026";
 
 function createT4Server(port = 0): L2ScenarioServerHandle {
 	const srv = Bun.serve({
-		hostname: "127.0.0.1",
+		hostname: resolveL2BindHost(),
 		port,
 		async fetch(req: Request): Promise<Response> {
 			const url = new URL(req.url);
@@ -551,7 +565,7 @@ const T5_PUBLIC_JS = "// 合规加固静态脚本（不含 SourceMap 与内部�
 
 function createT5Server(port = 0): L2ScenarioServerHandle {
 	const srv = Bun.serve({
-		hostname: "127.0.0.1",
+		hostname: resolveL2BindHost(),
 		port,
 		fetch(req: Request): Response {
 			const url = new URL(req.url);
@@ -652,7 +666,7 @@ export function startL2RangeCluster(portBase?: number): L2RangeClusterHandle {
 	const servers: Record<L2ScenarioId, L2ScenarioServerHandle> = {
 		"t1-spa-jwt-bola": createT1Server(p(0)),
 		"t2-waf-soft404-trap": createT2Server(p(1)),
-		"t3-blind-ssrf-oob": createT3Server(p(2)),
+		"t3-blind-ssrf-oob": createT3Server(p(2), p(5)),
 		"t4-hybrid-sourcemap-chain": createT4Server(p(3)),
 		"t5-hardened-zero-vuln": createT5Server(p(4)),
 	};
