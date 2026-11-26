@@ -1097,7 +1097,8 @@ export function buildDirective(st: NuwaState, cfg: Cfg, root?: string): string {
 	const threshold = readNoveltyThreshold(cfg);
 	const conv = buildConvergenceAdvice(st, cfg, root);
 	const sealRec = shouldRecommendSeal(st, cfg, root);
-	const head = `[女娲 v${VERSION} · 永动续跑 第 ${rt.turns} 轮 · E${ep}] status=${p.status} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked}(commits=${rt.blockedCommits ?? counts.blocked}) facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}min stall=${rt.stall} noveltyStall=${noveltyStall} idle=${rt.idle} pressure=${Math.round(pressure * 100)}% expand=${rt.expansions ?? 0}`;
+	const effectiveStatus = rt.status === "sealed_negative" ? "sealed_negative" : p.status;
+	const head = `[女娲 v${VERSION} · 永动续跑 第 ${rt.turns} 轮 · E${ep}] status=${effectiveStatus} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked}(commits=${rt.blockedCommits ?? counts.blocked}) facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}min stall=${rt.stall} noveltyStall=${noveltyStall} idle=${rt.idle} pressure=${Math.round(pressure * 100)}% expand=${rt.expansions ?? 0}`;
 	const goal = `目标: ${p.url} (${p.mode}) — ${p.goal}`;
 	const hard = [
 		`本轮硬性动作（必须发生，禁止只输出说明文字）:`,

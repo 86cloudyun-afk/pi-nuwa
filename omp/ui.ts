@@ -144,6 +144,8 @@ export interface UiSnapshot {
 		pressure: number;
 		expansions: number;
 		startedAt: number;
+		tokens?: number;
+		totalTokens?: number;
 		blockedCommits: number;
 		repeatRatio: number;
 		status: string;
@@ -534,6 +536,8 @@ export function buildSnapshot(
 			pressure,
 			expansions: st.runtime.expansions ?? 0,
 			startedAt: st.runtime.startedAt,
+			tokens: st.runtime.tokens ?? 0,
+			totalTokens: (st.runtime.totalTokens ?? 0) + (st.runtime.tokens ?? 0),
 			blockedCommits,
 			repeatRatio,
 			status: st.runtime.status ?? effectiveStatus,

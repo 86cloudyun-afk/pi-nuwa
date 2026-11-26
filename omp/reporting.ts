@@ -293,6 +293,9 @@ export function renderStratifiedMarkdownReport(
 	if (rejectedVulns.length > 0) noteParts.push(`已驳回误报 ${rejectedVulns.length} 条`);
 	const noteSuffix = noteParts.length > 0 ? `（${noteParts.join("；")}）` : "";
 
+	const effectiveStatus = st.runtime?.status === "sealed_negative" ? "sealed_negative" : p.status;
+	const sealMeta = st.runtime?.sealMeta ?? p.sealMeta;
+
 	let conclusionLine: string;
 	if (flags.length > 0) {
 		const vulnAddon = confirmedVulns.length > 0 ? `；确认漏洞 ${confirmedVulns.length} 条` : "";
@@ -302,6 +305,8 @@ export function renderStratifiedMarkdownReport(
 	} else if (candidateVulns.length > 0) {
 		const rejAddon = rejectedVulns.length > 0 ? `；已驳回误报 ${rejectedVulns.length} 条` : "";
 		conclusionLine = `未取得可验收证据（当前仅有待复验候选漏洞 ${candidateVulns.length} 条，尚未通过双盲复验确认${rejAddon}）。`;
+	} else if (effectiveStatus === "sealed_negative" && sealMeta) {
+		conclusionLine = `负向封盘（sealed_negative）：${sealMeta.reason}${noteSuffix ? ` ${noteSuffix}` : ""}`;
 	} else if (rejectedVulns.length > 0) {
 		conclusionLine = `未取得可验收证据（已驳回误报 ${rejectedVulns.length} 条）。`;
 	} else {
@@ -311,8 +316,8 @@ export function renderStratifiedMarkdownReport(
 	const stats = computeCumulativeStats(st);
 	const metaLines: string[] = [
 		`- 目标: ${p.url}`,
-		`- 模式: ${p.mode} · 状态: ${p.status} · 阶段: ${p.phase}`,
-		`- 开始: ${p.createdAt} · 完成: ${p.completedAt ?? "-"}`,
+		`- 模式: ${p.mode} · 状态: ${effectiveStatus} · 阶段: ${p.phase}`,
+		`- 开始: ${p.createdAt} · 完成: ${p.completedAt ?? sealMeta?.sealedAt ?? "-"}`,
 		`- 目标描述: ${p.goal}`,
 	];
 	if (
@@ -382,6 +387,16 @@ export function renderStratifiedMarkdownReport(
 				const deps = h.requiredFacts?.length ? h.requiredFacts.join(",") : "-";
 				return `| ${h.id} | ${h.status} | ${cell(h.title, 80)} | ${h.expectedGain}/${h.estimatedCost} | ${cell(deps, 60)} | ${cell(h.falsificationTest, 100)} | ${cell(h.note, 100)} |`;
 			}),
+		);
+	}
+
+	if (effectiveStatus === "sealed_negative" && sealMeta) {
+		extraSections.push(
+			``,
+			`## 负向封盘说明（Sealed Negative）`,
+			`- 封盘时间: ${sealMeta.sealedAt}`,
+			`- 封盘依据: ${sealMeta.reason}`,
+			`- 已排除攻击面 (${sealMeta.excludedSurface.length}): ${sealMeta.excludedSurface.slice(0, 50).join(", ") || "无"}`,
 		);
 	}
 
@@ -638,6 +653,8 @@ export function buildJsonReport(st: NuwaState, root?: string): Record<string, un
 	}));
 
 	const stats = computeCumulativeStats(st);
+	const effectiveStatus = st.runtime?.status === "sealed_negative" ? "sealed_negative" : st.project.status;
+	const sealMeta = st.runtime?.sealMeta ?? st.project.sealMeta;
 
 	const report: Record<string, unknown> = {
 		schema: 1,
@@ -652,13 +669,16 @@ export function buildJsonReport(st: NuwaState, root?: string): Record<string, un
 			scheme: st.project.scheme,
 			goal: st.project.goal,
 			mode: st.project.mode,
-			status: st.project.status,
+			status: effectiveStatus,
 			phase: st.project.phase,
 			episode: st.project.episode ?? 1,
 			createdAt: st.project.createdAt,
 			updatedAt: st.project.updatedAt,
-			...(st.project.completedAt ? { completedAt: st.project.completedAt } : {}),
+			...(st.project.completedAt || sealMeta?.sealedAt
+				? { completedAt: st.project.completedAt ?? sealMeta?.sealedAt }
+				: {}),
 			...(st.project.stopReason ? { stopReason: st.project.stopReason } : {}),
+			...(sealMeta ? { sealMeta } : {}),
 		},
 		runtime: {
 			generation: stats.generation,

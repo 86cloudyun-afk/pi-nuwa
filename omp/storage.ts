@@ -2529,6 +2529,9 @@ interface WorkspaceMetaRecord {
 	hadGit: boolean;
 	firstSeenAt: string;
 	updatedAt: string;
+	migratedFrom?: string;
+	migratedAt?: string;
+	[key: string]: unknown;
 }
 
 function isSubpathOrEqual(candidate: string, base: string): boolean {
@@ -2597,7 +2600,7 @@ export function checkWorkspaceTempWarning(
 		severity: "warn",
 		path: resolve(root),
 		suggestedRoot,
-		message: `工作区位于易失临时目录 (${resolve(root)})，长跑或系统清理可能导致状态与 .git 丢失；建议迁移至持久化目录 ${suggestedRoot} 或配置 NUWA_STATE_DIR`,
+		message: `工作区位于易失临时目录 (${resolve(root)})，长跑或系统清理可能导致状态与 .git 丢失；建议迁移至持久化目录 ${suggestedRoot}（可在 nuwa-autonomous 追加 --migrate-workspace 自动迁出）或配置 NUWA_STATE_DIR`,
 	};
 }
 
@@ -2661,6 +2664,7 @@ export function verifyWorkspaceIntegrity(
 		try {
 			const hadGit = Boolean(meta?.hadGit || gitPresent || opts.expectGit);
 			const nextMeta: WorkspaceMetaRecord = {
+				...(meta && typeof meta === "object" ? meta : {}),
 				schema: 1,
 				root: normRoot,
 				hadGit,

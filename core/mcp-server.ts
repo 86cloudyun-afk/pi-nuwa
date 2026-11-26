@@ -143,6 +143,54 @@ import {
 } from "./protocol";
 
 const VALID_MODES = new Set<Mode>(["ctf", "pentest", "audit", "coding", "ops"]);
+
+function isTerminalProjectStateMcp(st: NuwaState | null | undefined): boolean {
+	if (!st) return false;
+	const ps = st.project?.status;
+	const rs = st.runtime?.status;
+	return ps === "sealed_negative" || rs === "sealed_negative" || ps === "completed" || rs === "completed";
+}
+
+function terminalStatusOfMcp(st: NuwaState): "sealed_negative" | "completed" {
+	return st.project?.status === "sealed_negative" || st.runtime?.status === "sealed_negative"
+		? "sealed_negative"
+		: "completed";
+}
+
+function syncTerminalReportsMcp(root: string, st: NuwaState, opts: { writeMd?: boolean } = {}): string {
+	const normRoot = resolve(root);
+	const nuwaDir = join(normRoot, ".nuwa");
+	const mdPath = join(nuwaDir, "REPORT.md");
+	const jsonPath = join(nuwaDir, "REPORT.json");
+	const sarifPath = join(nuwaDir, "REPORT.sarif.json");
+	let writtenMd = "";
+	try {
+		if (opts.writeMd || existsSync(mdPath)) {
+			const md = redactVaultSecrets(reportMarkdown(st, normRoot), normRoot);
+			atomicWrite(mdPath, md);
+			writtenMd = mdPath;
+		}
+		if (existsSync(jsonPath)) {
+			atomicWrite(jsonPath, `${JSON.stringify(buildJsonReport(st, normRoot), null, 2)}\n`);
+		}
+		if (existsSync(sarifPath)) {
+			atomicWrite(sarifPath, `${JSON.stringify(buildSarifReport(st, normRoot), null, 2)}\n`);
+		}
+		if (opts.writeMd || writtenMd) {
+			writeEpisodeArchiveIndex(normRoot, {
+				episode: st.project.episode ?? 1,
+				state: st,
+				summary:
+					terminalStatusOfMcp(st) === "sealed_negative"
+						? `负向封盘自动报告 (${st.project.sealMeta?.reason ?? "sealed_negative"})`
+						: "完成验收报告同步",
+			});
+		}
+	} catch {
+		/* 报告自动刷新失败不阻断封盘/验收返回 */
+	}
+	return writtenMd;
+}
 const VALID_PHASES = new Set<Phase>(["recon", "surface", "vuln", "exploit", "post", "report"]);
 const VALID_FACT_KINDS = new Set<FactKind>([
 	"target",
@@ -521,6 +569,14 @@ export class NuwaCoreEngine {
 			const scopeOverride = isPlainRecord(p.scope) ? (p.scope as Partial<ScopePolicy>) : undefined;
 			const existing = loadState(root);
 			if (existing?.project.ownerSessionId && existing.project.ownerSessionId !== sid && !force) {
+				if (resume && isTerminalProjectStateMcp(existing)) {
+					const termStatus = terminalStatusOfMcp(existing);
+					this.activeRoot = resolve(root);
+					return toolText(
+						`该项目已处于终态 (${termStatus}): ${existing.project.id}（属于其他会话 ${existing.project.ownerSessionId}，已降级为只读查看；如需接管重建请传 force=true）\n\n${statusBoard(existing, root)}`,
+						{ root, readonly: true, status: termStatus, sealed: termStatus === "sealed_negative" },
+					);
+				}
 				throw new Error("该项目属于其他会话；用 force=true 明确接管，避免跨任务污染");
 			}
 			if (existing && want && existing.project.url !== want && !force) {
@@ -555,6 +611,14 @@ export class NuwaCoreEngine {
 				const resumed = withLock(root, () => {
 					const s = loadState(root);
 					if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
+					if (isTerminalProjectStateMcp(s)) {
+						const termStatus = terminalStatusOfMcp(s);
+						s.project.ownerSessionId = sid;
+						saveState(root, s, {
+							reason: termStatus === "sealed_negative" ? "resume-sealed-noop" : "resume-completed-noop",
+						});
+						return s;
+					}
 					s.project.status = "active";
 					s.project.stopReason = undefined;
 					s.project.ownerSessionId = sid;
@@ -597,6 +661,20 @@ export class NuwaCoreEngine {
 				const wsIntegrity = verifyWorkspaceIntegrity(root, { recordBaseline: true });
 				writePointer(root, sid);
 				this.bindSession(root, resumed.project.id);
+				if (isTerminalProjectStateMcp(resumed)) {
+					const termStatus = terminalStatusOfMcp(resumed);
+					return toolText(
+						`项目已处于终态 (${termStatus}): ${resumed.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoard(resumed, root)}`,
+						{
+							root,
+							status: termStatus,
+							sealed: termStatus === "sealed_negative",
+							readonly: true,
+							integrity: wsIntegrity.status,
+							...autoStartMeta,
+						},
+					);
+				}
 				return toolText(`已恢复 ${resumed.project.id}\n\n${statusBoard(resumed, root)}`, {
 					root,
 					integrity: wsIntegrity.status,
@@ -1226,6 +1304,15 @@ export class NuwaCoreEngine {
 					excludedSurface,
 					coverage,
 				});
+				withLock(root, () => {
+					const post = loadState(root);
+					if (post) {
+						post.runtime.reportWritten = true;
+						saveState(root, post, { reason: "seal-report-flag" });
+					}
+				});
+				sealed.state.runtime.reportWritten = true;
+				const reportPath = syncTerminalReportsMcp(root, sealed.state, { writeMd: true });
 				cleanupTrackedProcesses(root, { reason: "nuwa_complete:seal" });
 				if (isPausedState(root)) setPausedState(root, false, "sealed_negative");
 				try {
@@ -1233,17 +1320,21 @@ export class NuwaCoreEngine {
 				} catch {
 					/* 蒸馏异常不阻断封盘 */
 				}
+				const reportHint = reportPath
+					? `已自动同步封盘报告: ${reportPath}（如需 json/sarif/bundle 可调 nuwa_report）`
+					: `调 nuwa_report(write=true) 导出封盘覆盖报告。`;
 				return toolText(
 					`负向封盘已完成: ${sealed.state.project.id} (status=${sealed.status})\n` +
 						`封盘依据: ${sealed.sealMeta.reason}\n` +
 						`已排除面 (${sealed.sealMeta.excludedSurface.length}): ${sealed.sealMeta.excludedSurface.slice(0, 12).join(", ") || "(自动汇总)"}\n\n` +
-						`调 nuwa_report(write=true) 导出封盘覆盖报告。`,
+						reportHint,
 					{
 						root,
 						ok: true,
 						sealed: true,
 						status: sealed.status,
 						sealMeta: sealed.sealMeta,
+						...(reportPath ? { reportPath } : {}),
 					},
 				);
 			}
@@ -1282,6 +1373,7 @@ export class NuwaCoreEngine {
 				);
 			}
 
+			const syncedPath = syncTerminalReportsMcp(root, updated, { writeMd: false });
 			cleanupTrackedProcesses(root, { reason: "nuwa_complete:completed" });
 			let distillLine = "";
 			let distilledCount = 0;
@@ -1303,8 +1395,8 @@ export class NuwaCoreEngine {
 			}
 
 			return toolText(
-				`完成已验收: ${updated.project.id}\n证据: ${res.from.join(",")}${distillLine}\n\n调 nuwa_report(write=true) 生成报告。`,
-				{ root, ok: true, distilled: distilledCount },
+				`完成已验收: ${updated.project.id}\n证据: ${res.from.join(",")}${distillLine}\n\n${syncedPath ? `已同步更新报告: ${syncedPath}` : "调 nuwa_report(write=true) 生成报告。"}`,
+				{ root, ok: true, distilled: distilledCount, ...(syncedPath ? { reportPath: syncedPath } : {}) },
 			);
 		} catch (e) {
 			return toolError(e);
@@ -1405,7 +1497,9 @@ export class NuwaCoreEngine {
 				st.runtime.status === "sealed_negative" || st.project.status === "sealed_negative"
 					? "sealed_negative"
 					: st.project.status;
-			const metricsLine = `metrics: repeat_ratio=${rep.repeatRatio.toFixed(2)} · last_ok=${probe.lastOk} · blockedIntents=${blockedIntents} · blockedCommits=${blockedCommits}${paused ? " · paused=true" : ""}`;
+			const curTokens = st.runtime.tokens ?? 0;
+			const totalTokens = (st.runtime.totalTokens ?? 0) + curTokens;
+			const metricsLine = `metrics: repeat_ratio=${rep.repeatRatio.toFixed(2)} · last_ok=${probe.lastOk} · blockedIntents=${blockedIntents} · blockedCommits=${blockedCommits} · tokens=${curTokens} · totalTokens=${totalTokens}${paused ? " · paused=true" : ""}`;
 			return toolText(`${statusBoard(st, root)}\n${metricsLine}`, {
 				root,
 				status: effectiveStatus,
@@ -1414,6 +1508,8 @@ export class NuwaCoreEngine {
 				last_ok: probe.lastOk,
 				blockedIntents,
 				blockedCommits,
+				tokens: curTokens,
+				totalTokens,
 			});
 		} catch (e) {
 			return toolError(e);

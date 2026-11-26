@@ -58,6 +58,7 @@ env -u BUN_OPTIONS -u NUWA_KB_DB PI_AGENT_HOME="$_G6_SANDBOX/agent" bun test --i
   tests/v6_belief_calibration.test.ts \
   tests/v6_traffic_hybrid.test.ts \
   tests/v6_core_mcp_l2eval.test.ts \
-  tests/v6_integration_wiring.test.ts || fail=1
+  tests/v6_integration_wiring.test.ts \
+  tests/v6_issues53_54_55_regression.test.ts || fail=1
 
 exit $fail

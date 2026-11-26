@@ -214,6 +214,7 @@ declare module "@oh-my-pi/pi-coding-agent" {
 
 	export interface ToolCallEvent {
 		toolName: string;
+		toolCallId?: string;
 		input?: Record<string, unknown>;
 	}
 
@@ -256,7 +257,13 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		on(event: "session_shutdown", handler: (event: unknown, ctx: ExtensionContext) => void): void;
 		on(event: "before_subagent_spawn", handler: (event: Record<string, unknown>, ctx: ExtensionContext) => unknown): void;
 		on(event: "tool_execution_end", handler: (event: unknown, ctx: ExtensionContext) => void): void;
-		on(event: "tool_call", handler: (event: ToolCallEvent, ctx: ExtensionContext) => { block: true; reason: string } | void): void;
+		on(
+			event: "tool_call",
+			handler: (
+				event: ToolCallEvent,
+				ctx: ExtensionContext,
+			) => { block: true; reason: string } | { input?: Record<string, unknown>; additionalContext?: string } | void,
+		): void;
 		on(event: "session_stop", handler: (event: SessionStopEvent, ctx: ExtensionContext) => { decision: "block"; reason: string } | undefined | void): void;
 		on(event: string, handler: (...args: any[]) => any): void;
 	}

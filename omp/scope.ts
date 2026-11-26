@@ -2266,6 +2266,10 @@ export interface UnifiedNetworkEnvOptions {
 	extraNoProxy?: readonly string[];
 	includeAllProxy?: boolean;
 	ghHttpTimeoutSec?: number;
+	/** 启用 Bun 运行时安全模式（Issue #53）：socks* 代理仅注入 NUWA_EGRESS_PROXY/ALL_PROXY，不写入触发 UnsupportedProxyProtocol 的 HTTP_PROXY/HTTPS_PROXY */
+	bunSafe?: boolean;
+	/** 可选模型 API 专用代理（http/https URL 或 "direct"/"none"） */
+	modelProxy?: string | null;
 }
 
 const VALID_EGRESS_SCHEMES = new Set(["http:", "https:", "socks4:", "socks4a:", "socks5:", "socks5h:"]);
@@ -2289,7 +2293,7 @@ function sanitizeEgressProxyUrl(raw: string | null | undefined): string {
 }
 
 /**
- * 统一跨运行时网络边界环境变量构造器（Issue #48 / NW-28）：
+ * 统一跨运行时网络边界环境变量构造器（Issue #48 / NW-28, Issue #53）：
  * 为 bash/curl/wget/python/node/bun/ruby/perl/php/gh 统一注入 HTTP_PROXY/http_proxy/HTTPS_PROXY/https_proxy/NO_PROXY/no_proxy，
  * 同步写入 NUWA_SCOPE_ALLOW_HOSTS 与 GH_HTTP_TIMEOUT，避免不同工具层各自走不同代理或无限挂死。
  */
@@ -2299,6 +2303,12 @@ export function buildUnifiedNetworkEnv(
 	opts: UnifiedNetworkEnvOptions = {},
 ): Record<string, string> {
 	const cleanProxy = sanitizeEgressProxyUrl(egressUrl);
+	const rawModelProxy = String(opts.modelProxy ?? "").trim();
+	const modelProxyDirect = rawModelProxy.toLowerCase() === "direct" || rawModelProxy.toLowerCase() === "none";
+	const cleanModelProxy = rawModelProxy && !modelProxyDirect ? sanitizeEgressProxyUrl(rawModelProxy) : "";
+	if (cleanModelProxy && /^socks/i.test(cleanModelProxy)) {
+		throw new Error(`非法 modelProxy 协议（Bun fetch 仅支持 http/https）: ${JSON.stringify(cleanModelProxy)}`);
+	}
 
 	const rawAllowed = Array.isArray(allowedHosts)
 		? allowedHosts
@@ -2340,11 +2350,18 @@ export function buildUnifiedNetworkEnv(
 			? String(Math.floor(opts.ghHttpTimeoutSec))
 			: "5";
 
+	const isSocksProxy = Boolean(cleanProxy && /^socks/i.test(cleanProxy));
+	const effectiveHttpProxy = cleanModelProxy
+		? cleanModelProxy
+		: modelProxyDirect || (opts.bunSafe && isSocksProxy)
+			? ""
+			: cleanProxy;
+
 	const env: Record<string, string> = {
-		HTTP_PROXY: cleanProxy,
-		http_proxy: cleanProxy,
-		HTTPS_PROXY: cleanProxy,
-		https_proxy: cleanProxy,
+		HTTP_PROXY: effectiveHttpProxy,
+		http_proxy: effectiveHttpProxy,
+		HTTPS_PROXY: effectiveHttpProxy,
+		https_proxy: effectiveHttpProxy,
 		NO_PROXY: noProxyVal,
 		no_proxy: noProxyVal,
 		GH_HTTP_TIMEOUT: ghTimeout,
@@ -2352,7 +2369,8 @@ export function buildUnifiedNetworkEnv(
 
 	if (cleanProxy) {
 		env.NUWA_EGRESS_PROXY = cleanProxy;
-		if (opts.includeAllProxy || /^socks/i.test(cleanProxy)) {
+		env.NUWA_EGRESS = cleanProxy;
+		if (opts.includeAllProxy || isSocksProxy) {
 			env.ALL_PROXY = cleanProxy;
 			env.all_proxy = cleanProxy;
 		}

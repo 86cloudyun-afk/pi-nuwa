@@ -21,12 +21,14 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
 	accessSync,
 	appendFileSync,
 	chmodSync,
 	constants,
 	copyFileSync,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -40,7 +42,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 
 const VALID_MODES = new Set(["ctf", "pentest", "audit", "coding", "ops"]);
@@ -158,10 +160,21 @@ const HELP_TEXT = `女娲 v6.0 外层无头守护器与环境自检工具 (nuwa-
   --verify-model <m>           双盲复验子代理模型（透传 NUWA_MODEL_VERIFY）
   --sandbox <none|docker|sidecar> 命令执行沙盒隔离模式（透传 NUWA_SANDBOX，默认: none）
   --sandbox-image <img>        Docker/Sidecar 沙盒镜像名（透传 NUWA_SANDBOX_IMAGE，默认: nuwa-sandbox:latest）
-  --egress-proxy <url>         统一出口代理 URL（同步注入 HTTP_PROXY/HTTPS_PROXY/NO_PROXY）
+  --egress-proxy <url>         统一出口代理 URL（http/https 同步注入 HTTP_PROXY/HTTPS_PROXY；socks* 隔离仅注入 NUWA_EGRESS_PROXY/ALL_PROXY 防止 Bun fetch 崩溃）
+  --model-proxy <url|direct>   模型 API 专用代理（http/https URL 或 direct/none 表示模型直连而工具继续走 --egress-proxy）
+  --no-proxy <hosts>           追加不走代理的直连域名/网段（逗号分隔，写入 NO_PROXY/no_proxy）
+  --resume-stopped, --force    显式允许接管 status=stopped 的操作者停机项目并引导续跑
+  --migrate-workspace          若 --root 位于 /tmp 等易失目录，启动前自动迁移至持久化工作区后再运行
   --omp-bin <path>             指定 omp 可执行路径（默认: omp，测试可注入 stub）
   --dry-run                    仅打印规划配置与首轮启动命令并退出 0
   -h, --help                   显示本帮助信息
+
+停环/异常项目续跑指南:
+  1. 操作者停环 (status=stopped) 项目可直接追加 --resume-stopped（或 --force）续跑:
+     nuwa-autonomous --root <已有项目目录> --resume-stopped
+  2. 若旧项目位于 /tmp 易失目录，可同时追加 --migrate-workspace 自动迁出至持久化工作区:
+     nuwa-autonomous --root /tmp/<proj> --migrate-workspace --resume-stopped
+  3. 负向封盘 (status=sealed_negative) 与完成 (status=completed) 属合法终态，守护器退出 0；如需重跑请换新 --root 或会话内 nuwa_init(force=true)。
 
 自检子命令 (doctor):
   nuwa-autonomous doctor [--json] [--agent-home <dir>] [--omp-bin <path>] [--sandbox <none|docker|sidecar>] [--sandbox-image <img>]
@@ -274,6 +287,10 @@ function parseArgs(argv) {
 		sandboxExplicit: false,
 		sandboxImage: "",
 		egressProxy: (process.env.NUWA_EGRESS_PROXY ?? "").trim(),
+		modelProxy: (process.env.NUWA_MODEL_PROXY ?? "").trim(),
+		noProxy: (process.env.NUWA_NO_PROXY ?? "").trim(),
+		resumeStopped: false,
+		migrateWorkspace: false,
 		ompBin: "omp",
 		dryRun: false,
 		help: false,
@@ -386,6 +403,19 @@ function parseArgs(argv) {
 			case "--egress-proxy":
 				opts.egressProxy = take().trim();
 				break;
+			case "--model-proxy":
+				opts.modelProxy = take().trim();
+				break;
+			case "--no-proxy":
+				opts.noProxy = [opts.noProxy, take().trim()].filter(Boolean).join(",");
+				break;
+			case "--resume-stopped":
+			case "--force":
+				opts.resumeStopped = true;
+				break;
+			case "--migrate-workspace":
+				opts.migrateWorkspace = true;
+				break;
 			case "--omp-bin":
 				opts.ompBin = take().trim() || "omp";
 				break;
@@ -426,6 +456,26 @@ function parseArgs(argv) {
 			!parsedProxy.hostname
 		) {
 			throw new Error(`参数 --egress-proxy 仅支持 http/https/socks 代理 URL`);
+		}
+	}
+	if (!opts.help && opts.modelProxy) {
+		const mpLower = opts.modelProxy.toLowerCase();
+		if (mpLower !== "direct" && mpLower !== "none") {
+			let parsedModelProxy;
+			try {
+				parsedModelProxy = new URL(opts.modelProxy);
+			} catch {
+				throw new Error(`参数 --model-proxy 不是合法 URL（支持 http/https URL 或 direct/none）`);
+			}
+			const proto = parsedModelProxy.protocol.toLowerCase();
+			if (proto.startsWith("socks")) {
+				throw new Error(
+					`参数 --model-proxy 不支持 ${proto}// 协议（Bun fetch 仅支持 http/https 代理，请改用 http/https 代理或 direct）`,
+				);
+			}
+			if (!["http:", "https:"].includes(proto) || !parsedModelProxy.hostname) {
+				throw new Error(`参数 --model-proxy 仅支持 http/https URL 或 direct/none`);
+			}
 		}
 	}
 	opts.root = resolve(opts.root || process.cwd());
@@ -1759,6 +1809,7 @@ function verifyWorkspaceIntegrityDaemon(root, opts = {}) {
 	if (exists && opts.recordBaseline && hasNuwaDir) {
 		try {
 			atomicWriteJsonDaemon(metaPath, {
+				...(meta && typeof meta === "object" ? meta : {}),
 				schema: 1,
 				root: normRoot,
 				hadGit: Boolean(meta?.hadGit || gitPresent || expectGitEnv),
@@ -1790,7 +1841,7 @@ function verifyWorkspaceIntegrityDaemon(root, opts = {}) {
 		warnings.push({
 			code: "NUWA_VOLATILE_TMP_WORKSPACE",
 			severity: "warn",
-			message: `工作区位于易失临时目录 (${normRoot})，建议迁移至持久化目录 ${resolveDefaultWorkspacesDirDaemon()} 或设置 NUWA_STATE_DIR`,
+			message: `工作区位于易失临时目录 (${normRoot})，建议迁移至持久化目录 ${resolveDefaultWorkspacesDirDaemon()}（可追加 --migrate-workspace 自动迁出）或设置 NUWA_STATE_DIR`,
 		});
 	}
 
@@ -1808,8 +1859,12 @@ function verifyWorkspaceIntegrityDaemon(root, opts = {}) {
 	return { ok: !hasError, status, exists, isVolatileTmp, gitExpected, gitPresent, gitHeadValid, warnings };
 }
 
-function buildUnifiedNetworkEnvDaemon(egressUrl, allowedHosts = []) {
+function buildUnifiedNetworkEnvDaemon(egressUrl, allowedHosts = [], netOpts = {}) {
 	const cleanProxy = String(egressUrl ?? "").trim();
+	const rawModelProxy = String(netOpts?.modelProxy ?? "").trim();
+	const modelProxyDirect = /^(?:direct|none)$/i.test(rawModelProxy);
+	const cleanModelProxy = rawModelProxy && !modelProxyDirect ? rawModelProxy : "";
+	const isSocksProxy = Boolean(cleanProxy && /^socks/i.test(cleanProxy));
 	const ghSec = String(getGhHttpTimeoutSec());
 	const noProxySet = new Set(["127.0.0.1", "localhost", "::1"]);
 	if (cleanProxy) {
@@ -1823,6 +1878,18 @@ function buildUnifiedNetworkEnvDaemon(egressUrl, allowedHosts = []) {
 			/* ignore */
 		}
 	}
+	const extraNoProxy = Array.isArray(netOpts?.extraNoProxy)
+		? netOpts.extraNoProxy
+		: String(netOpts?.extraNoProxy ?? "")
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean);
+	for (const item of extraNoProxy) {
+		const token = String(item ?? "").trim().toLowerCase();
+		if (token && !/[\r\n\s,]/.test(token)) {
+			noProxySet.add(token);
+		}
+	}
 	const noProxy = [...noProxySet].join(",");
 	const out = {
 		GH_HTTP_TIMEOUT: ghSec,
@@ -1832,13 +1899,24 @@ function buildUnifiedNetworkEnvDaemon(egressUrl, allowedHosts = []) {
 		NO_PROXY: noProxy,
 		no_proxy: noProxy,
 	};
+	// Issue #53：socks* 代理下 Bun fetch() 注入 HTTP_PROXY/HTTPS_PROXY 会抛出 UnsupportedProxyProtocol；
+	// 仅在非 socks 代理或显式提供 http/https --model-proxy 时注入 HTTP_PROXY/HTTPS_PROXY，
+	// 否则只保留 NUWA_EGRESS_PROXY/NUWA_EGRESS/ALL_PROXY 供 curl/python/sqlmap 等工具出口使用。
+	const httpProxyForSdk = cleanModelProxy
+		? cleanModelProxy
+		: !modelProxyDirect && cleanProxy && !isSocksProxy
+			? cleanProxy
+			: "";
+	if (httpProxyForSdk) {
+		out.HTTP_PROXY = httpProxyForSdk;
+		out.http_proxy = httpProxyForSdk;
+		out.HTTPS_PROXY = httpProxyForSdk;
+		out.https_proxy = httpProxyForSdk;
+	}
 	if (cleanProxy) {
-		out.HTTP_PROXY = cleanProxy;
-		out.http_proxy = cleanProxy;
-		out.HTTPS_PROXY = cleanProxy;
-		out.https_proxy = cleanProxy;
 		out.NUWA_EGRESS_PROXY = cleanProxy;
-		if (/^socks/i.test(cleanProxy)) {
+		out.NUWA_EGRESS = cleanProxy;
+		if (isSocksProxy) {
 			out.ALL_PROXY = cleanProxy;
 			out.all_proxy = cleanProxy;
 		}
@@ -1946,6 +2024,118 @@ function isReincarnateStop(state) {
 	return false;
 }
 
+function isSealedNegativeDaemon(state) {
+	return state?.project?.status === "sealed_negative" || state?.runtime?.status === "sealed_negative";
+}
+
+function isTerminalSuccessDaemon(state) {
+	return state?.project?.status === "completed" || isSealedNegativeDaemon(state);
+}
+
+function isStoppedStateDaemon(state) {
+	return state?.project?.status === "stopped" && !isReincarnateStop(state);
+}
+
+function planTmpMigrationTargetDaemon(oldRoot, targetHint) {
+	const normOld = resolve(oldRoot);
+	const baseDir = resolveDefaultWorkspacesDirDaemon();
+	const hash = createHash("sha256").update(normOld).digest("hex").slice(0, 8);
+	const slug = slugifyDaemon(targetHint || basename(normOld) || "workspace");
+	const baseCand = resolve(join(baseDir, `${slug}-${hash}`));
+	if (!existsSync(baseCand)) return baseCand;
+	try {
+		if (readdirSync(baseCand).length === 0) return baseCand;
+	} catch {
+		/* ignore */
+	}
+	return resolve(join(baseDir, `${slug}-${hash}-${Date.now().toString(36)}`));
+}
+
+/**
+ * Issue #53：将位于 /tmp 等易失目录下的女娲工作区原子迁移到持久化工作区目录。
+ * 迁移前自动对 .nuwa/nuwa.db 执行 WAL checkpoint，迁移后更新 workspace-meta.json 与 daemon-config.json 中的 root 路径。
+ */
+function migrateWorkspaceFromTmpDaemon(oldRoot, targetHint) {
+	const normOld = resolve(oldRoot);
+	if (!existsSync(normOld) || !isVolatileTempPathDaemon(normOld)) {
+		return { migrated: false, oldRoot: normOld, newRoot: normOld };
+	}
+	const newRoot = planTmpMigrationTargetDaemon(normOld, targetHint);
+	if (newRoot === normOld) {
+		return { migrated: false, oldRoot: normOld, newRoot };
+	}
+
+	mkdirSync(dirname(newRoot), { recursive: true });
+	const oldDb = sqliteDbPathDaemon(normOld);
+	if (existsSync(oldDb)) {
+		let db = null;
+		try {
+			db = new Database(oldDb);
+			db.run("PRAGMA wal_checkpoint(TRUNCATE);");
+		} catch {
+			/* ignore checkpoint error */
+		} finally {
+			try {
+				db?.close();
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+
+	const stagingRoot = `${newRoot}.migrating-${process.pid}-${Date.now()}`;
+	try {
+		cpSync(normOld, stagingRoot, { recursive: true, force: true, preserveTimestamps: true });
+		const stagingNuwa = join(stagingRoot, ".nuwa");
+		if (existsSync(stagingNuwa)) {
+			const metaPath = join(stagingNuwa, "workspace-meta.json");
+			let prevMeta = {};
+			if (existsSync(metaPath)) {
+				try {
+					prevMeta = JSON.parse(readFileSync(metaPath, "utf8")) || {};
+				} catch {
+					prevMeta = {};
+				}
+			}
+			atomicWriteJsonDaemon(metaPath, {
+				...prevMeta,
+				schema: 1,
+				root: newRoot,
+				migratedFrom: normOld,
+				migratedAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			});
+			const cfgPath = join(stagingNuwa, "daemon-config.json");
+			if (existsSync(cfgPath)) {
+				try {
+					const prevCfg = JSON.parse(readFileSync(cfgPath, "utf8")) || {};
+					atomicWriteJsonDaemon(cfgPath, {
+						...prevCfg,
+						root: newRoot,
+						migratedFrom: normOld,
+						updatedAt: new Date().toISOString(),
+					});
+				} catch {
+					/* ignore */
+				}
+			}
+		}
+		if (existsSync(newRoot)) {
+			rmSync(newRoot, { recursive: true, force: true });
+		}
+		renameSync(stagingRoot, newRoot);
+	} catch (err) {
+		try {
+			rmSync(stagingRoot, { recursive: true, force: true });
+		} catch {
+			/* ignore */
+		}
+		throw err;
+	}
+
+	return { migrated: true, oldRoot: normOld, newRoot };
+}
+
 function defaultGoalFor(mode, target) {
 	switch (mode) {
 		case "coding":
@@ -1973,7 +2163,13 @@ function buildChildEnv(opts, gen) {
 		}
 	}
 	const effectiveProxy = (opts.egressProxy || process.env.NUWA_EGRESS_PROXY || "").trim();
-	const unifiedNetEnv = buildUnifiedNetworkEnvDaemon(effectiveProxy, allowedHosts);
+	const modelProxyRaw = String(opts.modelProxy ?? "").trim();
+	const modelProxyDirect = /^(?:direct|none)$/i.test(modelProxyRaw);
+	const effectiveIsSocks = Boolean(effectiveProxy && /^socks/i.test(effectiveProxy));
+	const unifiedNetEnv = buildUnifiedNetworkEnvDaemon(effectiveProxy, allowedHosts, {
+		modelProxy: modelProxyRaw,
+		extraNoProxy: opts.noProxy,
+	});
 	const env = {
 		...process.env,
 		...unifiedNetEnv,
@@ -1987,6 +2183,26 @@ function buildChildEnv(opts, gen) {
 		NUWA_GENERATION: String(gen),
 	};
 	delete env.NUWA_WEBHOOK_URL;
+	// Issue #53：防止继承自父环境的 socks* HTTP_PROXY/HTTPS_PROXY 污染 Bun fetch()，或在 direct/socks 隔离时剔除 HTTP(S)_PROXY
+	if (!unifiedNetEnv.HTTP_PROXY) {
+		const forceStripHttpProxy = modelProxyDirect || (effectiveIsSocks && !modelProxyRaw);
+		let capturedSocksProxy = "";
+		for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"]) {
+			const val = String(env[key] ?? "").trim();
+			if (forceStripHttpProxy || (val && /^socks/i.test(val))) {
+				if (val && /^socks/i.test(val) && !capturedSocksProxy) {
+					capturedSocksProxy = val;
+				}
+				delete env[key];
+			}
+		}
+		if (capturedSocksProxy) {
+			if (!env.NUWA_EGRESS_PROXY) env.NUWA_EGRESS_PROXY = capturedSocksProxy;
+			if (!env.NUWA_EGRESS) env.NUWA_EGRESS = capturedSocksProxy;
+			if (!env.ALL_PROXY) env.ALL_PROXY = capturedSocksProxy;
+			if (!env.all_proxy) env.all_proxy = capturedSocksProxy;
+		}
+	}
 	if (opts.target) {
 		env.NUWA_TARGET = opts.target;
 	}
@@ -2014,7 +2230,7 @@ function buildChildEnv(opts, gen) {
 	return env;
 }
 
-function buildPrompt(opts, state, gen) {
+function buildPrompt(opts, state, gen, promptOpts = {}) {
 	const target = state?.project?.url || state?.project?.target || opts.target;
 	const mode = state?.project?.mode || opts.mode;
 	const goal = state?.project?.goal || opts.goal || defaultGoalFor(mode, target);
@@ -2022,8 +2238,9 @@ function buildPrompt(opts, state, gen) {
 	const stateGen = Number(state?.runtime?.generation ?? 0);
 	const displayGen = Math.max(gen, stateGen || 1);
 	const handoff = typeof state?.runtime?.handoffSummary === "string" ? state.runtime.handoffSummary.trim() : "";
+	const resumingStopped = Boolean(promptOpts?.resumingStopped && state?.project?.status === "stopped");
 
-	if (handoff) {
+	if (handoff && !resumingStopped) {
 		return [
 			`[女娲无头守护 · 第 ${displayGen} 代交接接力]`,
 			`目标: ${target} (mode=${mode})`,
@@ -2043,16 +2260,21 @@ function buildPrompt(opts, state, gen) {
 	if (state) {
 		const factCount = Object.keys(state.facts ?? {}).length;
 		const openCount = Object.values(state.intents ?? {}).filter((i) => i.status === "open" || i.status === "claimed").length;
+		const stoppedNote = resumingStopped
+			? [`前置停机说明: 操作者已通过 --resume-stopped 授权从 stopped 恢复（原 stopReason=${state.project?.stopReason ?? "未记录"}）`]
+			: [];
 		return [
-			`[女娲无头守护 · 第 ${displayGen} 代恢复起跑]`,
+			`[女娲无头守护 · 第 ${displayGen} 代${resumingStopped ? "停机续跑" : "恢复起跑"}]`,
 			`目标: ${target} (mode=${mode}) — ${goal}`,
 			`项目根目录: ${opts.root}`,
 			`当前磁盘状态: phase=${phase} facts=${factCount} open/claimed=${openCount}`,
+			...stoppedNote,
+			...(handoff ? [``, `上一轮交接参考:`, handoff] : []),
 			``,
 			`恢复指令:`,
-			`1. 立即调用 nuwa_init(root=${JSON.stringify(opts.root)}, resume=true, force=true) 接管会话所有权并确认 nuwa_status。`,
-			`2. 继续推进未完成 frontier 意图，证据全部经真实命令回显入账。`,
-			`3. 达成验收条件后调用 nuwa_complete 与 nuwa_report(write=true) 收尾。`,
+			`1. 立即调用 nuwa_init(root=${JSON.stringify(opts.root)}, resume=true, force=true) 接管会话所有权${resumingStopped ? "并将状态恢复为 active" : ""}，随后确认 nuwa_status。`,
+			`2. 继续推进未完成 frontier 意图或用 nuwa_plan 补充新探索路径，证据全部经真实命令回显入账。`,
+			`3. 达成验收条件或确认无解需负向封盘时调用 nuwa_complete(seal=true/false) 与 nuwa_report(write=true) 收尾。`,
 		].join("\n");
 	}
 
@@ -2085,13 +2307,19 @@ function formatCompletionSummary(root, state, gen, startedAt) {
 	const elapsedSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
 	const reportPath = reportFilePath(root);
 	const reportHint = existsSync(reportPath) ? `${reportPath}（已生成）` : `${reportPath}（未写入，可运行 nuwa_report 生成）`;
-	return [
-		`任务已完成 (status=completed)`,
+	const sealed = isSealedNegativeDaemon(state);
+	const sealReason = state.runtime?.sealMeta?.reason || state.project?.sealMeta?.reason || state.project?.stopReason || "";
+	const lines = [
+		sealed ? `任务已负向封盘 (status=sealed_negative)` : `任务已完成 (status=completed)`,
 		`  项目: ${state.project?.id ?? "-"} (${state.project?.url ?? state.project?.target ?? "-"})`,
 		`  模式: ${state.project?.mode ?? "-"} · 阶段: ${state.project?.phase ?? "-"} · 守护世代: ${gen} (state.gen=${state.runtime?.generation ?? 1})`,
 		`  耗时: ${elapsedSec}s · 事实: ${facts.length} (flag=${flags}, vuln=${vulns}, loot=${loots})`,
-		`  报告: ${reportHint}`,
-	].join("\n");
+	];
+	if (sealed && sealReason) {
+		lines.push(`  封盘依据: ${sealReason}`);
+	}
+	lines.push(`  报告: ${reportHint}`);
+	return lines.join("\n");
 }
 
 function maskWebhookUrl(rawUrl) {
@@ -2600,7 +2828,7 @@ async function main() {
 		process.exit(0);
 	}
 
-	const initialState = readDiskState(opts.root);
+	let initialState = readDiskState(opts.root);
 	if (!opts.target && !initialState) {
 		logErr(`未指定 --target 且 ${stateFilePath(opts.root)} 不存在（使用 --help 查看用法）`);
 		process.exit(2);
@@ -2614,12 +2842,19 @@ async function main() {
 	opts.goal = effectiveGoal;
 
 	if (opts.dryRun) {
+		const plannedMigrationRoot =
+			opts.migrateWorkspace && isVolatileTempPathDaemon(opts.root)
+				? planTmpMigrationTargetDaemon(opts.root, effectiveTarget || basename(opts.root))
+				: null;
 		const envPreview = buildChildEnv(opts, 1);
-		const prompt = buildPrompt(opts, initialState, 1);
+		const prompt = buildPrompt(opts, initialState, 1, {
+			resumingStopped: Boolean(opts.resumeStopped && isStoppedStateDaemon(initialState)),
+		});
 		const ompArgs = buildOmpArgs(opts, prompt);
 		const plan = {
 			dryRun: true,
 			root: opts.root,
+			...(plannedMigrationRoot ? { plannedMigrationRoot } : {}),
 			target: effectiveTarget,
 			mode: effectiveMode,
 			goal: effectiveGoal,
@@ -2639,6 +2874,11 @@ async function main() {
 			fastModel: opts.fastModel || null,
 			deepModel: opts.deepModel || null,
 			verifyModel: opts.verifyModel || null,
+			egressProxy: opts.egressProxy || null,
+			modelProxy: opts.modelProxy || null,
+			noProxy: opts.noProxy || null,
+			resumeStopped: opts.resumeStopped,
+			migrateWorkspace: opts.migrateWorkspace,
 			sandbox: opts.sandbox,
 			sandboxImage: opts.sandboxImage || null,
 			ompBin: opts.ompBin,
@@ -2663,6 +2903,8 @@ async function main() {
 				...(envPreview.NUWA_MODEL_DEEP ? { NUWA_MODEL_DEEP: envPreview.NUWA_MODEL_DEEP } : {}),
 				...(envPreview.NUWA_MODEL_VERIFY ? { NUWA_MODEL_VERIFY: envPreview.NUWA_MODEL_VERIFY } : {}),
 				...(envPreview.NUWA_EGRESS_PROXY ? { NUWA_EGRESS_PROXY: envPreview.NUWA_EGRESS_PROXY } : {}),
+				...(envPreview.NUWA_EGRESS ? { NUWA_EGRESS: envPreview.NUWA_EGRESS } : {}),
+				...(envPreview.ALL_PROXY ? { ALL_PROXY: envPreview.ALL_PROXY } : {}),
 				...(envPreview.HTTP_PROXY ? { HTTP_PROXY: envPreview.HTTP_PROXY, HTTPS_PROXY: envPreview.HTTPS_PROXY } : {}),
 				...(envPreview.NO_PROXY ? { NO_PROXY: envPreview.NO_PROXY } : {}),
 				GH_HTTP_TIMEOUT: envPreview.GH_HTTP_TIMEOUT,
@@ -2675,6 +2917,15 @@ async function main() {
 		process.exit(0);
 	}
 
+	if (opts.migrateWorkspace && isVolatileTempPathDaemon(opts.root)) {
+		const mig = migrateWorkspaceFromTmpDaemon(opts.root, effectiveTarget || basename(opts.root));
+		if (mig.migrated) {
+			log(`[WorkspaceGuard] 已根据 --migrate-workspace 将工作区从易失目录迁出: ${mig.oldRoot} -> ${mig.newRoot}`);
+			opts.root = mig.newRoot;
+			opts.migratedFrom = mig.oldRoot;
+			initialState = readDiskState(opts.root);
+		}
+	}
 	if (opts.migratedFromTmp) {
 		log(`[WorkspaceGuard] 默认工作目录位于易失临时路径，已自动迁出至持久化工作区: ${opts.root}`);
 	}
@@ -2776,13 +3027,30 @@ async function main() {
 				return "resumed";
 			}
 			const stDuringPause = readDiskState(opts.root);
-			if (stDuringPause?.project?.status === "completed") return "completed";
-			if (stDuringPause?.project?.status === "stopped" && !isReincarnateStop(stDuringPause)) return "stopped";
+			if (isTerminalSuccessDaemon(stDuringPause)) {
+				return isSealedNegativeDaemon(stDuringPause) ? "sealed_negative" : "completed";
+			}
+			if (
+				isStoppedStateDaemon(stDuringPause) &&
+				(!allowStoppedResumeOnce || stoppedMarker(stDuringPause) !== initialStoppedMarker)
+			) {
+				return "stopped";
+			}
 			sweepSubagentWatchdogDaemon(opts.root);
 			await Bun.sleep(pausePollMs);
 		}
 		return "timeout";
 	};
+
+	const stoppedMarker = (st) =>
+		isStoppedStateDaemon(st)
+			? JSON.stringify({
+					stopReason: st?.project?.stopReason ?? "",
+					stoppedAt: st?.project?.stoppedAt ?? "",
+				})
+			: "";
+	const initialStoppedMarker = opts.resumeStopped ? stoppedMarker(initialState) : "";
+	let allowStoppedResumeOnce = Boolean(initialStoppedMarker);
 
 	let gen = 1;
 	let consecutiveErrors = 0;
@@ -2795,19 +3063,28 @@ async function main() {
 		if (pauseResult === "timeout") break;
 
 		const preState = readDiskState(opts.root);
-		if (preState?.project?.status === "completed") {
-			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_completed" });
+		if (isTerminalSuccessDaemon(preState)) {
+			const termEvent = isSealedNegativeDaemon(preState) ? "sealed_negative" : "completed";
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: `project_${termEvent}` });
 			const summary = formatCompletionSummary(opts.root, preState, gen, startedAt);
 			log(summary);
-			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, preState, gen, { summary }));
+			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload(termEvent, opts, preState, gen, { summary }));
 			process.exit(0);
 		}
-		if (preState?.project?.status === "stopped" && !isReincarnateStop(preState)) {
-			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_stopped" });
-			const reason = preState.project?.stopReason ?? "未记录";
-			log(`项目已停机 (status=stopped)，原因: ${reason}`);
-			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, preState, gen, { reason }));
-			process.exit(2);
+		let resumingStoppedThisGen = false;
+		if (isStoppedStateDaemon(preState)) {
+			const curMarker = stoppedMarker(preState);
+			if (allowStoppedResumeOnce && curMarker === initialStoppedMarker) {
+				allowStoppedResumeOnce = false;
+				resumingStoppedThisGen = true;
+				log(`检测到已停机项目 (status=stopped, reason=${preState.project?.stopReason ?? "未记录"})，已根据 --resume-stopped 放行第 ${gen} 代恢复起跑...`);
+			} else {
+				cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_stopped" });
+				const reason = preState.project?.stopReason ?? "未记录";
+				log(`项目已停机 (status=stopped)，原因: ${reason}${opts.resumeStopped ? "" : "（如需续跑可追加 --resume-stopped）"}`);
+				await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, preState, gen, { reason }));
+				process.exit(2);
+			}
 		}
 		const preBudget = checkBudgetCap(preState, opts);
 		if (preBudget.exceeded) {
@@ -2830,7 +3107,7 @@ async function main() {
 		const hardDeadlineMs = Math.max(1, Math.min(genTimeoutMs, remainingMaxHoursMs));
 		const deadlineIsMaxHours = remainingMaxHoursMs <= genTimeoutMs;
 
-		const prompt = buildPrompt(opts, preState, gen);
+		const prompt = buildPrompt(opts, preState, gen, { resumingStopped: resumingStoppedThisGen });
 		const ompArgs = buildOmpArgs(opts, prompt);
 		const childEnv = buildChildEnv(opts, gen);
 		const hasHandoff = Boolean(preState?.runtime?.handoffSummary);
@@ -2907,19 +3184,30 @@ async function main() {
 			process.exit(1);
 		}
 
-		if (postState?.project?.status === "completed") {
-			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_completed" });
+		if (isTerminalSuccessDaemon(postState)) {
+			const termEvent = isSealedNegativeDaemon(postState) ? "sealed_negative" : "completed";
+			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: `project_${termEvent}` });
 			const summary = formatCompletionSummary(opts.root, postState, gen, startedAt);
 			log(summary);
-			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, postState, gen, { summary }));
+			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload(termEvent, opts, postState, gen, { summary }));
 			process.exit(0);
 		}
-		if (postState?.project?.status === "stopped" && !isReincarnateStop(postState)) {
-			cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_stopped" });
-			const reason = postState.project?.stopReason ?? "未记录";
-			log(`项目已停机 (status=stopped)，原因: ${reason}`);
-			await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, postState, gen, { reason }));
-			process.exit(2);
+		if (isStoppedStateDaemon(postState)) {
+			const curMarker = stoppedMarker(postState);
+			const canRetryCrashBeforeResume =
+				exitCode !== 0 &&
+				resumingStoppedThisGen &&
+				Boolean(initialStoppedMarker) &&
+				curMarker === initialStoppedMarker;
+			if (canRetryCrashBeforeResume) {
+				allowStoppedResumeOnce = true;
+			} else {
+				cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "project_stopped" });
+				const reason = postState.project?.stopReason ?? "未记录";
+				log(`项目已停机 (status=stopped)，原因: ${reason}`);
+				await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, postState, gen, { reason }));
+				process.exit(2);
+			}
 		}
 		const postBudget = checkBudgetCap(postState, opts);
 		if (postBudget.exceeded) {
@@ -2989,13 +3277,14 @@ async function main() {
 	// 循环结束前最后复核一次磁盘状态并清理所有登记子进程
 	cleanupTrackedProcessesDaemon(opts.root, { graceMs: 300, reason: "daemon_loop_exit" });
 	const finalState = readDiskState(opts.root);
-	if (finalState?.project?.status === "completed") {
+	if (isTerminalSuccessDaemon(finalState)) {
+		const termEvent = isSealedNegativeDaemon(finalState) ? "sealed_negative" : "completed";
 		const summary = formatCompletionSummary(opts.root, finalState, gen, startedAt);
 		log(summary);
-		await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("completed", opts, finalState, gen, { summary }));
+		await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload(termEvent, opts, finalState, gen, { summary }));
 		process.exit(0);
 	}
-	if (finalState?.project?.status === "stopped" && !isReincarnateStop(finalState)) {
+	if (isStoppedStateDaemon(finalState)) {
 		const reason = finalState.project?.stopReason ?? "未记录";
 		log(`项目已停机 (status=stopped)，原因: ${reason}`);
 		await sendDaemonWebhook(opts.webhook, opts.root, buildWebhookEventPayload("stopped", opts, finalState, gen, { reason }));
