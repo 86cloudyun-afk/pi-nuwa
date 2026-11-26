@@ -1448,16 +1448,20 @@ export class NuwaSqliteStore {
 			);
 			for (const f of factsList) {
 				const extra = extractExtraFields(f as unknown as Record<string, unknown>, KNOWN_FACT_KEYS);
+				const fKind = f.kind ?? "note";
+				const fTitle = typeof f.title === "string" ? f.title : String(f.id ?? "");
+				const fDetail = typeof f.detail === "string" ? f.detail : "";
+				const fCreatedAt = typeof f.createdAt === "string" && f.createdAt ? f.createdAt : ts;
 				insFact.run(
 					f.id,
-					f.kind,
-					f.title,
-					f.detail,
+					fKind,
+					fTitle,
+					fDetail,
 					f.command ?? null,
 					f.output ?? null,
 					f.intent ?? null,
 					f.key ?? null,
-					f.createdAt,
+					fCreatedAt,
 					f.verified === undefined ? null : f.verified ? 1 : 0,
 					f.verifyStage ?? null,
 					f.verifyNote ?? null,
@@ -1474,9 +1478,9 @@ export class NuwaSqliteStore {
 				);
 				insFts.run(
 					f.id,
-					f.kind,
-					f.title,
-					f.detail,
+					fKind,
+					fTitle,
+					fDetail,
 					f.command ?? "",
 					[f.output ?? "", formatFactMetaSearchText(f.meta)].filter(Boolean).join(" "),
 					f.key ?? "",
@@ -1498,17 +1502,17 @@ export class NuwaSqliteStore {
 				const extra = extractExtraFields(it as unknown as Record<string, unknown>, KNOWN_INTENT_KEYS);
 				insIntent.run(
 					it.id,
-					it.phase,
-					it.key,
-					it.title,
-					it.detail,
+					it.phase ?? "recon",
+					typeof it.key === "string" ? it.key : String(it.id ?? ""),
+					typeof it.title === "string" ? it.title : String(it.id ?? ""),
+					typeof it.detail === "string" ? it.detail : "",
 					JSON.stringify(it.from ?? []),
 					it.to ?? null,
-					it.status,
+					it.status ?? "open",
 					it.worker ?? null,
-					it.priority,
-					it.attempts,
-					it.createdAt,
+					Number.isFinite(Number(it.priority)) ? Number(it.priority) : 0,
+					Number.isFinite(Number(it.attempts)) ? Number(it.attempts) : 0,
+					typeof it.createdAt === "string" && it.createdAt ? it.createdAt : ts,
 					it.claimedAt ?? null,
 					it.doneAt ?? null,
 					it.note ?? null,
@@ -1537,12 +1541,12 @@ export class NuwaSqliteStore {
 				const extra = extractExtraFields(entry as unknown as Record<string, unknown>, KNOWN_ATTEMPTED_KEYS);
 				insAttempted.run(
 					ak,
-					entry.key,
-					entry.expectedKind,
-					entry.targetKey,
-					entry.surfaceDomain,
-					entry.status,
-					entry.at,
+					typeof entry.key === "string" ? entry.key : ak,
+					entry.expectedKind ?? "note",
+					typeof entry.targetKey === "string" ? entry.targetKey : "",
+					entry.surfaceDomain ?? "http",
+					entry.status ?? "done",
+					typeof entry.at === "string" && entry.at ? entry.at : ts,
 					JSON.stringify(entry.from ?? []),
 					extra ? JSON.stringify(extra) : null,
 				);
@@ -1559,20 +1563,20 @@ export class NuwaSqliteStore {
 				const extra = extractExtraFields(a as unknown as Record<string, unknown>, KNOWN_ASSET_KEYS);
 				insAsset.run(
 					a.id,
-					a.kind,
-					a.target,
+					a.kind ?? "host",
+					typeof a.target === "string" ? a.target : String(a.host ?? a.id ?? ""),
 					a.host ?? null,
 					a.port ?? null,
 					a.scheme ?? null,
 					a.reachableVia !== undefined ? JSON.stringify(a.reachableVia) : null,
 					a.tags !== undefined ? JSON.stringify(a.tags) : null,
 					a.sourceFactId ?? null,
-					a.createdAt,
+					typeof a.createdAt === "string" && a.createdAt ? a.createdAt : ts,
 					extra ? JSON.stringify(extra) : null,
 				);
 			}
 
-			// 同步替换 hypotheses
+			// 同步替换 hypotheses（兼容缺省 statement/falsificationTest/linkedIntents 的历史/稀疏假设节点）
 			this.db.query("DELETE FROM hypotheses").run();
 			const insHyp = this.db.query(
 				`INSERT INTO hypotheses (
@@ -1582,19 +1586,30 @@ export class NuwaSqliteStore {
 				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			);
 			for (const h of hypsList) {
-				const extra = extractExtraFields(h as unknown as Record<string, unknown>, KNOWN_HYPOTHESIS_KEYS);
+				const rawHyp = h as unknown as Record<string, unknown>;
+				const extra = extractExtraFields(rawHyp, KNOWN_HYPOTHESIS_KEYS);
+				const hTitle = typeof h.title === "string" ? h.title : String(h.id ?? "");
+				const hStatement =
+					typeof h.statement === "string"
+						? h.statement
+						: typeof rawHyp.rationale === "string"
+							? rawHyp.rationale
+							: hTitle;
+				const hFalsification = typeof h.falsificationTest === "string" ? h.falsificationTest : "";
+				const hCreatedAt = typeof h.createdAt === "string" && h.createdAt ? h.createdAt : ts;
+				const hUpdatedAt = typeof h.updatedAt === "string" && h.updatedAt ? h.updatedAt : hCreatedAt;
 				insHyp.run(
 					h.id,
-					h.title,
-					h.statement,
+					hTitle,
+					hStatement,
 					JSON.stringify(h.requiredFacts ?? []),
-					h.falsificationTest,
-					h.expectedGain,
-					h.estimatedCost,
-					h.status,
+					hFalsification,
+					Number.isFinite(Number(h.expectedGain)) ? Number(h.expectedGain) : 0,
+					Number.isFinite(Number(h.estimatedCost)) ? Number(h.estimatedCost) : 0,
+					h.status ?? "open",
 					JSON.stringify(h.linkedIntents ?? []),
-					h.createdAt,
-					h.updatedAt,
+					hCreatedAt,
+					hUpdatedAt,
 					h.note ?? null,
 					extra ? JSON.stringify(extra) : null,
 				);
@@ -1690,6 +1705,10 @@ export class NuwaSqliteStore {
 		const vault = safeLoadVault(this.root, opts?.vault);
 		const safeFact = redactUnknownForStorage(fact, vault);
 		const extra = extractExtraFields(safeFact as unknown as Record<string, unknown>, KNOWN_FACT_KEYS);
+		const fKind = safeFact.kind ?? "note";
+		const fTitle = typeof safeFact.title === "string" ? safeFact.title : String(safeFact.id ?? "");
+		const fDetail = typeof safeFact.detail === "string" ? safeFact.detail : "";
+		const fCreatedAt = typeof safeFact.createdAt === "string" && safeFact.createdAt ? safeFact.createdAt : nowIso();
 
 		const tx = this.db.transaction(() => {
 			this.db
@@ -1702,14 +1721,14 @@ export class NuwaSqliteStore {
 				)
 				.run(
 					safeFact.id,
-					safeFact.kind,
-					safeFact.title,
-					safeFact.detail,
+					fKind,
+					fTitle,
+					fDetail,
 					safeFact.command ?? null,
 					safeFact.output ?? null,
 					safeFact.intent ?? null,
 					safeFact.key ?? null,
-					safeFact.createdAt,
+					fCreatedAt,
 					safeFact.verified === undefined ? null : safeFact.verified ? 1 : 0,
 					safeFact.verifyStage ?? null,
 					safeFact.verifyNote ?? null,
@@ -1732,9 +1751,9 @@ export class NuwaSqliteStore {
 				)
 				.run(
 					safeFact.id,
-					safeFact.kind,
-					safeFact.title,
-					safeFact.detail,
+					fKind,
+					fTitle,
+					fDetail,
 					safeFact.command ?? "",
 					[safeFact.output ?? "", formatFactMetaSearchText(safeFact.meta)].filter(Boolean).join(" "),
 					safeFact.key ?? "",
@@ -1765,7 +1784,7 @@ export class NuwaSqliteStore {
 				const res = this.db
 					.query("INSERT OR IGNORE INTO journal (ts, type, dedup_hash, payload_json) VALUES (?, ?, ?, ?)")
 					.run(ts, type, dedupHash, payloadJson);
-				insertedSeq = Number(res.lastInsertRowid ?? 0);
+				insertedSeq = Number(res.changes ?? 0) > 0 ? Number(res.lastInsertRowid ?? 0) : 0;
 			} else {
 				const res = this.db
 					.query("INSERT INTO journal (ts, type, dedup_hash, payload_json) VALUES (?, ?, NULL, ?)")

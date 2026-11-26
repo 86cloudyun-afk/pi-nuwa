@@ -9,6 +9,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { NuwaSqliteStore, loadStateFromSqlite, resolveStorageBackend, sqliteDbPath } from "./sqlite-store";
 import type { Cfg, Fact, FactKind, Intent, NuwaState, Phase, SealMeta } from "./types";
 
 export const UI_PHASES = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
@@ -867,19 +868,48 @@ export interface FullStatusOptions {
 
 function readStateReadOnly(root: string): { state: NuwaState; entries: JournalEntry[] } {
 	const normRoot = resolve(root);
-	const sp = join(normRoot, ".nuwa", "state.json");
-	if (!existsSync(sp)) {
-		throw new Error(`未找到状态文件: ${sp}`);
-	}
-	const state = JSON.parse(readFileSync(sp, "utf8")) as NuwaState;
-	const jp = join(normRoot, ".nuwa", "journal.jsonl");
-	let entries: JournalEntry[] = [];
-	if (existsSync(jp)) {
+	const backend = resolveStorageBackend(normRoot);
+	const dbFile = sqliteDbPath(normRoot);
+	let state: NuwaState | null = null;
+	let loadedFromSqlite = false;
+	if ((backend === "sqlite" || backend === "dual") && existsSync(dbFile)) {
 		try {
-			const rawJ = readFileSync(jp, "utf8");
-			entries = parseJournalTail(rawJ.length > 2_000_000 ? rawJ.slice(-2_000_000) : rawJ, 200);
+			state = loadStateFromSqlite(normRoot);
+			loadedFromSqlite = Boolean(state);
+		} catch {
+			state = null;
+		}
+	}
+	if (!state) {
+		const sp = join(normRoot, ".nuwa", "state.json");
+		if (!existsSync(sp)) {
+			throw new Error(
+				`未找到状态文件: ${(backend === "sqlite" || backend === "dual") && existsSync(dbFile) ? dbFile : sp}`,
+			);
+		}
+		state = JSON.parse(readFileSync(sp, "utf8")) as NuwaState;
+	}
+	let entries: JournalEntry[] = [];
+	if (loadedFromSqlite || ((backend === "sqlite" || backend === "dual") && existsSync(dbFile))) {
+		let store: NuwaSqliteStore | null = null;
+		try {
+			store = new NuwaSqliteStore(normRoot, { readonly: true });
+			entries = store.readJournalTail(200) as JournalEntry[];
 		} catch {
 			entries = [];
+		} finally {
+			store?.close();
+		}
+	}
+	if (entries.length === 0) {
+		const jp = join(normRoot, ".nuwa", "journal.jsonl");
+		if (existsSync(jp)) {
+			try {
+				const rawJ = readFileSync(jp, "utf8");
+				entries = parseJournalTail(rawJ.length > 2_000_000 ? rawJ.slice(-2_000_000) : rawJ, 200);
+			} catch {
+				entries = [];
+			}
 		}
 	}
 	return { state, entries };

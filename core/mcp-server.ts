@@ -418,11 +418,10 @@ export class NuwaCoreEngine {
 			this.warmKb();
 			const curCfg = readCfg();
 			const sid = this.sessionId;
-			const rawMode = p.mode === undefined ? "ctf" : String(p.mode);
-			if (!VALID_MODES.has(rawMode as Mode)) {
-				throw new Error(`非法 mode: ${rawMode}`);
+			const explicitRawMode = p.mode === undefined ? undefined : String(p.mode);
+			if (explicitRawMode !== undefined && !VALID_MODES.has(explicitRawMode as Mode)) {
+				throw new Error(`非法 mode: ${explicitRawMode}`);
 			}
-			const mode = rawMode as Mode;
 			const resume = Boolean(p.resume ?? false);
 			const force = Boolean(p.force ?? false);
 			const migrate = Boolean(p.migrate ?? false);
@@ -434,6 +433,43 @@ export class NuwaCoreEngine {
 					}
 				: {};
 			const targetArg = typeof p.target === "string" && p.target.trim() ? p.target.trim() : undefined;
+			let probeRoot = "";
+			if (typeof p.root === "string" && p.root.trim()) {
+				probeRoot = resolve(this.cwd, p.root.trim());
+			} else if (this.configuredProjectRoot) {
+				probeRoot = this.configuredProjectRoot;
+			} else if (targetArg) {
+				const targetDir = resolve(this.cwd, targetArg);
+				if (hasProjectState(targetDir)) probeRoot = targetDir;
+			}
+			if (!probeRoot && !targetArg) {
+				const local = findLocalRoot(this.cwd, sid);
+				if (local) {
+					probeRoot = local;
+				} else if (isSharedCwd(this.cwd)) {
+					const ptr = readSessionPointer(sid);
+					if (ptr?.root) probeRoot = resolve(ptr.root);
+				} else {
+					probeRoot = resolve(this.cwd);
+				}
+			}
+			if (!probeRoot && resume && !explicitRawMode && targetArg) {
+				const localCand = findLocalRoot(this.cwd, sid) ?? (hasProjectState(resolve(this.cwd)) ? resolve(this.cwd) : null);
+				if (localCand) {
+					const localSt = loadState(localCand);
+					if (localSt) {
+						try {
+							if (localSt.project.url === normalizeTargetForMode(targetArg, localSt.project.mode).url) {
+								probeRoot = localCand;
+							}
+						} catch {
+							/* 非匹配目标则按常规流程校验 */
+						}
+					}
+				}
+			}
+			const preExisting = probeRoot && hasProjectState(probeRoot) ? loadState(probeRoot) : null;
+			const mode = ((explicitRawMode as Mode | undefined) ?? preExisting?.project?.mode ?? "ctf") as Mode;
 			const rawTarget =
 				targetArg ??
 				(!resume && !migrate && (mode === "coding" || mode === "ops" || mode === "audit")
@@ -446,6 +482,8 @@ export class NuwaCoreEngine {
 				root = resolve(this.cwd, p.root.trim());
 			} else if (this.configuredProjectRoot) {
 				root = this.configuredProjectRoot;
+			} else if (probeRoot && preExisting) {
+				root = probeRoot;
 			} else if (rawTarget) {
 				root = defaultProjectRoot(this.cwd, rawTarget, sid, mode);
 			} else {
@@ -1050,12 +1088,9 @@ export class NuwaCoreEngine {
 			let finalState = commitRes.state;
 			let savedEvLog: SavedEvidenceLog | undefined;
 			if (!effBlocked && (Boolean(p.save_evidence_log) || rawResponseStr !== undefined)) {
-				const createdFact = Object.values(finalState.facts)
-					.sort((a, b) => a.id.localeCompare(b.id))
-					.at(-1);
 				const targetFact =
-					(!isFree && finalState.intents[rawId]?.to ? finalState.facts[finalState.intents[rawId]!.to!] : undefined) ??
-					createdFact;
+					(commitRes.factId ? finalState.facts[commitRes.factId] : undefined) ??
+					(!isFree && finalState.intents[rawId]?.to ? finalState.facts[finalState.intents[rawId]!.to!] : undefined);
 				if (targetFact) {
 					savedEvLog = saveFactEvidenceLog(root, {
 						factId: targetFact.id,

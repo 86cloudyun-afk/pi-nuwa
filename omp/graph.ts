@@ -393,7 +393,7 @@ export function inspectGraph(
 		const normRoot = resolve(rootOrState);
 		const sp = join(normRoot, ".nuwa", "state.json");
 		const dbFile = sqliteDbPath(normRoot);
-		const backend = resolveStorageBackend();
+		const backend = resolveStorageBackend(normRoot);
 		if ((backend === "sqlite" || backend === "dual") && existsSync(dbFile)) {
 			try {
 				st = loadStateFromSqlite(normRoot, { fallbackToJson: false });
@@ -1628,6 +1628,7 @@ export function executeCommitWithGates(
 ): {
 	state: NuwaState;
 	text: string;
+	factId?: string;
 	verifyStageOut?: VerifyStage;
 	verifyIntentId?: string;
 	ingestedRole?: string;
@@ -1637,6 +1638,7 @@ export function executeCommitWithGates(
 	blockedCommitsDelta: number;
 } {
 	let text = "";
+	let factId: string | undefined;
 	let verifyStageOut: VerifyStage | undefined;
 	let verifyIntentId: string | undefined;
 	let ingestedRole: string | undefined;
@@ -1713,6 +1715,7 @@ export function executeCommitWithGates(
 			...(p.evidenceRef ? { evidenceRef: p.evidenceRef } : {}),
 			...(p.agentResult ? { agentResult: p.agentResult } : {}),
 		});
+		factId = r.fact?.id;
 		blockedIntents = r.blockedIntents;
 		blockedCommits = r.blockedCommits;
 		blockedIntentsDelta = r.blockedIntentsDelta;
@@ -1915,6 +1918,7 @@ export function executeCommitWithGates(
 	return {
 		state,
 		text,
+		...(factId ? { factId } : {}),
 		verifyStageOut,
 		verifyIntentId,
 		ingestedRole,

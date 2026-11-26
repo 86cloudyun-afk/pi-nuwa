@@ -1266,7 +1266,7 @@ export function recommendAdaptiveModelRoute(
 
 	// 默认模型未降权（或默认模型仍处冷启动但存在样本充足的高优候选）：仅当存在样本充足的健康候选且明显领先时平滑升级
 	const bestMature = [...matureHealthyCandidates].sort((a, b) => b.routeWeight - a.routeWeight)[0];
-	const upgradeMargin = defaultEval.coldStart ? 0.18 : 0.12;
+	const upgradeMargin = 0.12;
 	if (bestMature && bestMature.modelId !== effectiveDefaultModel && bestMature.routeWeight >= defaultEval.routeWeight + upgradeMargin) {
 		const safeBest = allowedSet.has(bestMature.modelId) ? bestMature.modelId : effectiveDefaultModel;
 		return {

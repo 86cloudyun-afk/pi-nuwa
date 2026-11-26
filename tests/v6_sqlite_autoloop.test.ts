@@ -40,7 +40,7 @@ import {
 import { loadOobCanaries } from "../omp/oob";
 import { defaultScopeForTarget } from "../omp/scope";
 import { upsertSessionRole } from "../omp/session-vault";
-import { SCHEMA, journalAppend, loadState, normalizeState, saveState, statePath } from "../omp/storage";
+import { SCHEMA, journalAppend, loadState, normalizeState, saveState, statePath, withLock } from "../omp/storage";
 import type { NuwaState } from "../omp/types";
 
 const tmpDirs: string[] = [];
@@ -1323,5 +1323,155 @@ describe("v6.0 OOB 自主播撒与节流轮询闭环 (omp/auto-loops.ts)", () =>
 		expect(fetchCalls).toBe(2);
 		expect(poll3.newHits.length).toBe(0);
 		expect(poll3.evidenceFacts.length).toBe(0);
+	});
+});
+
+describe("v6.0.0 Boost 自检加固回归（文件锁原子落锁与 SQLite Journal 去重）", () => {
+	test("withLock 使用临时文件硬链接原子落锁：4 进程并发累加零丢写且空锁宽限期内不误抢", async () => {
+		const root = makeTmpDir("nuwa-lock-race-");
+		mkdirSync(join(root, ".nuwa"), { recursive: true });
+		const counterFile = join(root, ".nuwa", "conc-counter.txt");
+		writeFileSync(counterFile, "0", "utf8");
+
+		// 1) 4 个真实并发子进程各持锁累加 20 次 -> 必须精确等于 80 且全程零空锁碰撞异常
+		const workerScript = `
+			import { readFileSync, writeFileSync } from "node:fs";
+			import { withLock } from ${JSON.stringify(resolve(import.meta.dir, "..", "omp", "storage.ts"))};
+			const root = process.argv[1];
+			const counter = process.argv[2];
+			for (let i = 0; i < 20; i++) {
+				withLock(root, () => {
+					const cur = Number(readFileSync(counter, "utf8").trim() || "0");
+					writeFileSync(counter, String(cur + 1), "utf8");
+				});
+			}
+		`;
+		const procs = Array.from({ length: 4 }, () =>
+			Bun.spawn([process.execPath, "-e", workerScript, root, counterFile], {
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		const codes = await Promise.all(procs.map((p) => p.exited));
+		expect(codes).toEqual([0, 0, 0, 0]);
+		expect(Number(readFileSync(counterFile, "utf8").trim())).toBe(80);
+
+		// 2) 刚创建的 0 字节空锁文件在宽限期(<300ms)内被子进程补充完整活 PID 后，withLock 绝不误删活锁而是等待其超时/释放
+		const lockFile = join(root, ".nuwa", "state.lock");
+		writeFileSync(lockFile, "", "utf8");
+		const updaterScript = `
+			import { writeFileSync } from "node:fs";
+			const lp = process.argv[1];
+			setTimeout(() => {
+				writeFileSync(lp, JSON.stringify({ pid: process.pid, ts: Date.now() }), "utf8");
+			}, 40);
+			setTimeout(() => process.exit(0), 220);
+		`;
+		const child = Bun.spawn([process.execPath, "-e", updaterScript, lockFile], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		const tStart = Date.now();
+		expect(() => withLock(root, () => "should-timeout", { timeoutMs: 120 })).toThrow(/locked by pid/);
+		expect(Date.now() - tStart).toBeGreaterThanOrEqual(35);
+		await child.exited;
+		rmSync(lockFile, { force: true });
+	});
+
+	test("appendJournal 在 dedupHash 冲突被 INSERT OR IGNORE 时返回 0，绝不残留前次 lastInsertRowid", () => {
+		const root = makeTmpDir("nuwa-journal-dedup-");
+		const store = new NuwaSqliteStore(root);
+		try {
+			const seq1 = store.appendJournal({ type: "evt_first", msg: "first" });
+			const seq2 = store.appendJournal({ type: "evt_dedup", msg: "once" }, { dedupHash: "hash-only-once" });
+			const seq3 = store.appendJournal({ type: "evt_third", msg: "third" });
+			expect(seq1).toBe(1);
+			expect(seq2).toBe(2);
+			expect(seq3).toBe(3);
+
+			// 冲突去重插入：res.changes === 0，必须返回 0 而非残留的 seq3 (3)
+			const dupSeq = store.appendJournal(
+				{ type: "evt_dedup", msg: "duplicate" },
+				{ dedupHash: "hash-only-once" },
+			);
+			expect(dupSeq).toBe(0);
+
+			const rows = store.rawDb.query("SELECT COUNT(*) AS cnt FROM journal").get() as { cnt: number };
+			expect(rows.cnt).toBe(3);
+		} finally {
+			store.close();
+		}
+	});
+
+	test("SQLite saveState 对缺省 statement/falsificationTest 等字段的历史或稀疏 HypothesisNode/Fact 安全落库不报 NOT NULL 错误", () => {
+		const root = makeTmpDir("nuwa-sparse-hyp-");
+		const store = new NuwaSqliteStore(root);
+		const now = new Date().toISOString();
+		try {
+			const sparseState = {
+				schema: 2,
+				version: "6.0.0",
+				project: {
+					id: "sparse-proj",
+					target: "http://127.0.0.1:8080",
+					url: "http://127.0.0.1:8080",
+					host: "127.0.0.1",
+					port: 8080,
+					scheme: "http",
+					goal: "稀疏节点兼容测试",
+					mode: "pentest",
+					status: "running",
+					phase: "vuln",
+					createdAt: now,
+					updatedAt: now,
+				},
+				facts: {
+					f1: { id: "f1", kind: "note", title: "仅有基础字段的事实" },
+				},
+				intents: {
+					i1: { id: "i1", phase: "recon", title: "缺少 detail 与 attempts 的意图" },
+				},
+				seq: { fact: 1, intent: 1 },
+				runtime: {
+					attemptedKeys: {
+						"k1": { key: "k1", status: "done" },
+					},
+				},
+				assets: {
+					a1: { id: "a1", kind: "host", host: "127.0.0.1" },
+				},
+				hypotheses: {
+					h_legacy: {
+						id: "h_legacy",
+						title: "仅含 rationale 的历史形态假设",
+						rationale: "若候选节点成立则深入排查",
+						requiredFacts: ["f1"],
+						expectedGain: 75,
+						estimatedCost: 10,
+						confidence: 0.72,
+						status: "open",
+						createdAt: now,
+						updatedAt: now,
+					},
+				},
+			} as unknown as Parameters<NuwaSqliteStore["saveState"]>[0];
+
+			expect(() => store.saveState(sparseState)).not.toThrow();
+			const reloaded = store.loadState()!;
+			expect(reloaded).not.toBeNull();
+			expect(reloaded.facts.f1?.title).toBe("仅有基础字段的事实");
+			expect(reloaded.facts.f1?.detail).toBe("");
+			expect(reloaded.intents.i1?.title).toBe("缺少 detail 与 attempts 的意图");
+			expect(reloaded.assets?.a1?.target).toBe("127.0.0.1");
+			const hyp = reloaded.hypotheses?.h_legacy as unknown as Record<string, unknown>;
+			expect(hyp).toBeDefined();
+			expect(hyp.statement).toBe("若候选节点成立则深入排查");
+			expect(hyp.rationale).toBe("若候选节点成立则深入排查");
+			expect(hyp.falsificationTest).toBe("");
+			expect(hyp.confidence).toBe(0.72);
+			expect(hyp.status).toBe("open");
+		} finally {
+			store.close();
+		}
 	});
 });

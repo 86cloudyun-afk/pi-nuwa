@@ -434,7 +434,7 @@ export function validateVerificationCommit(
 		}
 
 		const worker = String(input.worker ?? "").trim();
-		if (input.requireVerifierWorker && worker && worker !== "nuwa-verifier") {
+		if (input.requireVerifierWorker && worker !== "nuwa-verifier") {
 			return {
 				ok: false,
 				reason: "双盲复验须由独立审查代理 nuwa-verifier 认领执行",

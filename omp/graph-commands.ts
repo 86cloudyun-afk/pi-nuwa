@@ -93,7 +93,7 @@ const VERSION = NUWA_VERSION;
 /** 纯只读加载项目状态（不触发任何迁移或写盘副作用，用于只读诊断视图）。 */
 function loadStateStrictlyReadOnly(root: string): NuwaState | null {
 	const normRoot = resolve(root);
-	const backend = resolveStorageBackend();
+	const backend = resolveStorageBackend(normRoot);
 	const dbFile = sqliteDbPath(normRoot);
 	if ((backend === "sqlite" || backend === "dual") && existsSync(dbFile)) {
 		try {
@@ -337,7 +337,7 @@ export function buildDoctorSummary(foundRoot: string | null): string {
 		existsSync(join(agentHome, "agents", "fujiang.md")) || existsSync(join(repoAgentsDir, "fujiang.md"));
 	const hasVerifier =
 		existsSync(join(agentHome, "agents", "nuwa-verifier.md")) || existsSync(join(repoAgentsDir, "nuwa-verifier.md"));
-	const backend = resolveStorageBackend();
+	const backend = resolveStorageBackend(foundRoot ?? undefined);
 
 	const lines = [
 		`[女娲 v${VERSION} 环境体检]`,

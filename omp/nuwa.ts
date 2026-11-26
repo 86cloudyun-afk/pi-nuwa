@@ -440,7 +440,150 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	const liveCalls = new Map<string, number>();
 	const autoAborts = new Map<string, AbortController>();
 	const pumpSessions = new Map<string, ExtensionContext>();
+	const activeSpawns = new Map<
+		string,
+		{
+			spawnId: string;
+			root: string;
+			agent: string;
+			intentId?: string;
+			rawTask: string;
+			injectedTask: string;
+			sessionId: string;
+		}
+	>();
 	let spawnSeq = 0;
+
+	const resolveWatchdogTaskId = (wd: SubagentWatchdog, ctx: ExtensionContext): string => {
+		const direct = ctx.agent?.id?.trim();
+		if (direct && wd.getTask(direct)) return direct;
+		if (ctx.agent?.kind === "sub") {
+			const running = wd.listTasks({ status: "running" });
+			const agentName = typeof ctx.agent?.name === "string" ? ctx.agent.name.trim() : "";
+			if (agentName) {
+				const sameAgent = running.filter((t) => t.agent === agentName);
+				if (sameAgent.length === 1) return sameAgent[0]!.taskId;
+			}
+			if (running.length === 1) return running[0]!.taskId;
+		}
+		return direct || sidOf(ctx);
+	};
+
+	const completeWatchdogOnTaskEnd = (
+		root: string,
+		evObj: Record<string, unknown>,
+		inputObj: Record<string, unknown>,
+		ctx: ExtensionContext,
+	): void => {
+		if (ctx.agent?.kind === "sub") return;
+		const wd = new SubagentWatchdog(root);
+		const running = wd.listTasks({ status: "running" });
+		if (running.length === 0) return;
+
+		const details =
+			evObj.details && typeof evObj.details === "object"
+				? (evObj.details as Record<string, unknown>)
+				: evObj.result && typeof evObj.result === "object" && (evObj.result as Record<string, unknown>).details && typeof (evObj.result as Record<string, unknown>).details === "object"
+					? ((evObj.result as Record<string, unknown>).details as Record<string, unknown>)
+					: undefined;
+
+		const explicitIds = new Set<string>();
+		const pushStrId = (v: unknown) => {
+			if (typeof v === "string" && v.trim()) explicitIds.add(v.trim());
+		};
+		const pushArrIds = (arr: unknown) => {
+			if (!Array.isArray(arr)) return;
+			for (const item of arr) {
+				if (typeof item === "string") pushStrId(item);
+				else if (item && typeof item === "object") {
+					const rec = item as Record<string, unknown>;
+					pushStrId(rec.spawnId);
+					pushStrId(rec.taskId);
+					pushStrId(rec.id);
+				}
+			}
+		};
+
+		pushStrId(evObj.spawnId);
+		pushStrId(evObj.taskId);
+		pushStrId(details?.spawnId);
+		pushStrId(details?.taskId);
+		pushArrIds(details?.spawnIds);
+		pushArrIds(details?.taskIds);
+		pushStrId(inputObj.spawnId);
+		pushStrId(inputObj.taskId);
+		pushArrIds(inputObj.tasks);
+
+		const matchedIds = new Set<string>();
+		for (const r of running) {
+			if (explicitIds.has(r.taskId)) matchedIds.add(r.taskId);
+		}
+
+		// 若宿主未回传 spawnId，则通过派单正文、intentId 或任务文本前缀精确配对本轮派生的子代理
+		if (matchedIds.size === 0) {
+			const taskTexts: string[] = [];
+			const addTaskText = (v: unknown) => {
+				if (typeof v === "string" && v.trim()) taskTexts.push(v.trim());
+			};
+			addTaskText(inputObj.task);
+			addTaskText(inputObj.prompt);
+			if (Array.isArray(inputObj.tasks)) {
+				for (const item of inputObj.tasks) {
+					if (item && typeof item === "object") {
+						addTaskText((item as Record<string, unknown>).task);
+						addTaskText((item as Record<string, unknown>).prompt);
+					}
+				}
+			}
+
+			const intentIds = new Set<string>();
+			if (typeof inputObj.intentId === "string" && inputObj.intentId.trim()) intentIds.add(inputObj.intentId.trim());
+			if (typeof details?.intentId === "string" && details.intentId.trim()) intentIds.add(details.intentId.trim());
+			for (const txt of taskTexts) {
+				for (const m of txt.matchAll(/\[女娲派单\s+(i\d{3,})\]/g)) {
+					if (m[1]) intentIds.add(m[1]);
+				}
+			}
+
+			const normRoot = resolve(root);
+			for (const [sidKey, sp] of activeSpawns.entries()) {
+				if (resolve(sp.root) !== normRoot) continue;
+				if (
+					taskTexts.some((txt) => txt === sp.rawTask || txt === sp.injectedTask || sp.injectedTask.includes(txt)) ||
+					(sp.intentId && intentIds.has(sp.intentId))
+				) {
+					matchedIds.add(sidKey);
+				}
+			}
+
+			if (matchedIds.size === 0 && intentIds.size > 0) {
+				for (const r of running) {
+					if (r.intentId && intentIds.has(r.intentId)) matchedIds.add(r.taskId);
+				}
+			}
+
+			if (matchedIds.size === 0) {
+				const agentArg =
+					typeof inputObj.agent === "string"
+						? inputObj.agent.trim()
+						: typeof inputObj.agentName === "string"
+							? inputObj.agentName.trim()
+							: "";
+				if (agentArg) {
+					const byAgent = running.filter((r) => r.agent === agentArg);
+					if (byAgent.length === 1) matchedIds.add(byAgent[0]!.taskId);
+				} else if (running.length === 1) {
+					matchedIds.add(running[0]!.taskId);
+				}
+			}
+		}
+
+		const status = evObj.isError === true ? "failed" : "completed";
+		for (const tid of matchedIds) {
+			wd.completeTask(tid, status);
+			activeSpawns.delete(tid);
+		}
+	};
 
 	const hasExec = (): boolean => typeof (pi as unknown as { exec?: unknown }).exec === "function";
 
@@ -599,16 +742,55 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		}),
 		async execute(_id, p, _sig, _up, ctx) {
 			try {
-				warmBundledKb();
+				const warmResult = warmBundledKb();
+				void warmResult;
 				const curCfg = readCfg();
 				const sid = sidOf(ctx);
-				const mode = (p.mode ?? "ctf") as Mode;
+				const explicitMode = p.mode as Mode | undefined;
+				let probeRoot = "";
+				if (p.root) {
+					probeRoot = resolve(ctx.cwd, p.root);
+				} else if (p.target) {
+					const targetDir = resolve(ctx.cwd, p.target);
+					if (hasProjectState(targetDir)) probeRoot = targetDir;
+				}
+				if (!probeRoot && !p.target) {
+					const local = findLocalRoot(ctx.cwd, sid);
+					if (local) {
+						probeRoot = local;
+					} else if (isSharedCwd(ctx.cwd)) {
+						const ptr = readSessionPointer(sid);
+						if (ptr?.root) probeRoot = resolve(ptr.root);
+					} else {
+						probeRoot = resolve(ctx.cwd);
+					}
+				}
+				if (!probeRoot && p.resume && !explicitMode && p.target) {
+					const localCand = findLocalRoot(ctx.cwd, sid) ?? (hasProjectState(resolve(ctx.cwd)) ? resolve(ctx.cwd) : null);
+					if (localCand) {
+						const localSt = loadState(localCand);
+						if (localSt) {
+							const localMode = localSt.project.mode;
+							try {
+								if (localSt.project.url === normalizeTargetForMode(p.target, localMode).url) {
+									probeRoot = localCand;
+								}
+							} catch {
+								/* 非匹配目标则按常规流程校验 */
+							}
+						}
+					}
+				}
+				const preExisting = probeRoot && hasProjectState(probeRoot) ? loadState(probeRoot) : null;
+				const mode = (explicitMode ?? preExisting?.project?.mode ?? "ctf") as Mode;
 				const rawTarget =
 					p.target ?? (!p.resume && !p.migrate && (mode === "coding" || mode === "ops" || mode === "audit") ? ctx.cwd : undefined);
 				const want = rawTarget ? normalizeTargetForMode(rawTarget, mode).url : "";
 				let root: string;
 				if (p.root) {
 					root = resolve(ctx.cwd, p.root);
+				} else if (probeRoot && preExisting) {
+					root = probeRoot;
 				} else if (rawTarget) {
 					root = defaultProjectRoot(ctx.cwd, rawTarget, sid, mode);
 				} else {
@@ -1223,10 +1405,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				let finalState = commitRes.state;
 				let savedEvLog: SavedEvidenceLog | undefined;
 				if (!effBlocked && (p.save_evidence_log || p.raw_response !== undefined)) {
-					const createdFact = Object.values(finalState.facts).sort((a, b) => a.id.localeCompare(b.id)).at(-1);
 					const targetFact =
-						(!isFree && finalState.intents[rawId]?.to ? finalState.facts[finalState.intents[rawId]!.to!] : undefined) ??
-						createdFact;
+						(commitRes.factId ? finalState.facts[commitRes.factId] : undefined) ??
+						(!isFree && finalState.intents[rawId]?.to ? finalState.facts[finalState.intents[rawId]!.to!] : undefined);
 					if (targetFact) {
 						savedEvLog = saveFactEvidenceLog(root, {
 							factId: targetFact.id,
@@ -2141,7 +2322,8 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				if (!found) return notify("当前目录没有女娲项目", "error");
 				const n = Math.max(1, Math.min(100, Number(arg.split(/\s+/)[1]) || 10));
 				try {
-					notify(readFileSync(journalPath(found), "utf8").trim().split("\n").slice(-n).join("\n"));
+					const tail = readJournalTail(found, n);
+					notify(tail.length > 0 ? tail.map((e) => JSON.stringify(e)).join("\n") : "(空日志)");
 				} catch {
 					notify("(空日志)");
 				}
@@ -2521,6 +2703,15 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				intentId: routeCtx.intentId,
 				pid: pidVal,
 			});
+			activeSpawns.set(spawnId, {
+				spawnId,
+				root,
+				agent: agentName || "fujiang",
+				...(routeCtx.intentId ? { intentId: routeCtx.intentId } : {}),
+				rawTask: trimmedRawTask,
+				injectedTask: preInjectedTask,
+				sessionId: sidOf(ctx),
+			});
 
 			const routedModel = routeSubagentModel({
 				agent: agentName,
@@ -2588,6 +2779,15 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const root = findLocalRoot(c.cwd, sid) ?? findRoot(c.cwd, sid);
 			if (root) {
 				abortAutoBatch(root, "session_shutdown");
+				try {
+					const wd = new SubagentWatchdog(root);
+					for (const t of wd.listTasks({ status: "running" })) {
+						wd.completeTask(t.taskId, "cancelled");
+						activeSpawns.delete(t.taskId);
+					}
+				} catch {
+					/* ignore watchdog cleanup */
+				}
 				cleanupTrackedProcesses(root, { reason: "session_shutdown" });
 			}
 		} catch {
@@ -2600,12 +2800,17 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		const sid = sidOf(ctx);
 		liveCalls.set(sid, (liveCalls.get(sid) ?? 0) + 1);
 		try {
+			const evObj = (event ?? {}) as Record<string, unknown>;
+			const { toolName, inputObj, command, output } = extractEventOutput(evObj);
 			const root = resolveRootWithLineage(ctx);
 			if (root && !isMain(ctx)) {
-				const subId = ctx.agent?.id ?? sid;
-				new SubagentWatchdog(root).recordOutput(subId);
+				const wd = new SubagentWatchdog(root);
+				wd.recordOutput(resolveWatchdogTaskId(wd, ctx));
 			}
-			const { toolName, inputObj, command, output } = extractEventOutput((event ?? {}) as Record<string, unknown>);
+			const normTool = toolName.trim().toLowerCase();
+			if (root && (normTool === "task" || normTool === "subagent" || normTool === "agent" || normTool === "delegate")) {
+				completeWatchdogOnTaskEnd(root, evObj, inputObj, ctx);
+			}
 			if (!isTrustedEvidenceEvent(toolName, inputObj)) return;
 			if (!root) return;
 			if (command || output) {
@@ -2631,8 +2836,8 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			const projScope = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
 
 			if (active && !main) {
-				const subId = ctx.agent?.id ?? sidOf(ctx);
-				new SubagentWatchdog(root).recordRequest(subId);
+				const wd = new SubagentWatchdog(root);
+				wd.recordRequest(resolveWatchdogTaskId(wd, ctx));
 			}
 
 			if (active && !main && /^nuwa_(init|plan|claim|commit|flag|complete|expand|stop)$/.test(name)) {

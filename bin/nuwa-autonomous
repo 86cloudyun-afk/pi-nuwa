@@ -426,7 +426,12 @@ function parseArgs(argv) {
 		}
 	}
 	opts.root = resolve(opts.root || process.cwd());
-	if (!opts.help && !opts.rootExplicit && !existsSync(join(opts.root, ".nuwa", "state.json"))) {
+	if (
+		!opts.help &&
+		!opts.rootExplicit &&
+		!existsSync(join(opts.root, ".nuwa", "state.json")) &&
+		!existsSync(join(opts.root, ".nuwa", "nuwa.db"))
+	) {
 		if (isVolatileTempPathDaemon(opts.root) || isSharedRootDaemon(opts.root)) {
 			const slugLabel = slugifyDaemon(opts.target || "workspace");
 			opts.root = join(resolveDefaultWorkspacesDirDaemon(), slugLabel);
@@ -1787,16 +1792,124 @@ function buildUnifiedNetworkEnvDaemon(egressUrl, allowedHosts = []) {
 	return out;
 }
 
-function readDiskState(root) {
-	const p = stateFilePath(root);
-	if (!existsSync(p)) return null;
+function sqliteDbPathDaemon(root) {
+	return join(root, ".nuwa", "nuwa.db");
+}
+
+function resolveStorageBackendDaemon(root) {
+	const raw = String(process.env.NUWA_STORAGE_BACKEND ?? "").trim().toLowerCase();
+	if (raw === "json" || raw === "sqlite" || raw === "dual") return raw;
+	const dbFile = sqliteDbPathDaemon(root);
+	if (existsSync(dbFile)) {
+		try {
+			if (statSync(dbFile).size > 0) return "sqlite";
+		} catch {
+			/* ignore */
+		}
+	}
+	return "json";
+}
+
+function openReadonlySqliteMemorySnapshotDaemon(dbFile) {
+	const raw = readFileSync(dbFile);
+	const copy = new Uint8Array(raw.length);
+	copy.set(raw);
+	if (
+		copy.length >= 100 &&
+		Buffer.from(copy.subarray(0, 16)).toString("latin1") === "SQLite format 3\0" &&
+		copy[18] === 2 &&
+		copy[19] === 2
+	) {
+		copy[18] = 1;
+		copy[19] = 1;
+	}
+	return Database.deserialize(copy, { readonly: true });
+}
+
+function readSqliteStateDaemon(root) {
+	const dbFile = sqliteDbPathDaemon(root);
+	if (!existsSync(dbFile)) return null;
+	let db = null;
 	try {
-		const parsed = JSON.parse(readFileSync(p, "utf8"));
-		if (parsed && typeof parsed === "object" && parsed.project) return parsed;
-		return null;
+		const walFile = `${dbFile}-wal`;
+		let walNonEmpty = false;
+		try {
+			walNonEmpty = existsSync(walFile) && statSync(walFile).size > 0;
+		} catch {
+			walNonEmpty = false;
+		}
+		if (!walNonEmpty) {
+			try {
+				db = openReadonlySqliteMemorySnapshotDaemon(dbFile);
+			} catch {
+				db = null;
+			}
+		}
+		if (!db) {
+			db = openReadonlyKbDb(dbFile);
+		}
+
+		const metaRows = db
+			.query("SELECT key, value FROM meta WHERE key IN ('project_json', 'runtime_json')")
+			.all();
+		let project = null;
+		let runtime = {};
+		for (const row of metaRows) {
+			if (row?.key === "project_json" && typeof row.value === "string") {
+				project = JSON.parse(row.value);
+			} else if (row?.key === "runtime_json" && typeof row.value === "string") {
+				runtime = JSON.parse(row.value);
+			}
+		}
+		if (!project || typeof project !== "object") return null;
+
+		const facts = {};
+		for (const row of db.query("SELECT id, kind, verify_stage FROM facts").all()) {
+			if (!row?.id) continue;
+			facts[row.id] = {
+				id: String(row.id),
+				kind: String(row.kind ?? "note"),
+				...(row.verify_stage ? { verifyStage: String(row.verify_stage) } : {}),
+			};
+		}
+
+		const intents = {};
+		for (const row of db.query("SELECT id, status FROM intents").all()) {
+			if (!row?.id) continue;
+			intents[row.id] = {
+				id: String(row.id),
+				status: String(row.status ?? "open"),
+			};
+		}
+
+		return { project, runtime, facts, intents };
 	} catch {
 		return null;
+	} finally {
+		try {
+			db?.close();
+		} catch {
+			/* ignore */
+		}
 	}
+}
+
+function readDiskState(root) {
+	const backend = resolveStorageBackendDaemon(root);
+	if (backend === "sqlite" || backend === "dual") {
+		const sqliteState = readSqliteStateDaemon(root);
+		if (sqliteState) return sqliteState;
+	}
+	const p = stateFilePath(root);
+	if (existsSync(p)) {
+		try {
+			const parsed = JSON.parse(readFileSync(p, "utf8"));
+			if (parsed && typeof parsed === "object" && parsed.project) return parsed;
+		} catch {
+			/* ignore */
+		}
+	}
+	return readSqliteStateDaemon(root);
 }
 
 function isReincarnateStop(state) {
@@ -2272,7 +2385,12 @@ function fileActivityPart(filePath) {
 
 function readActivitySignature(root) {
 	const nuwaDir = join(root, ".nuwa");
-	return `${fileActivityPart(join(nuwaDir, "journal.jsonl"))}|${fileActivityPart(join(nuwaDir, "state.json"))}`;
+	return [
+		fileActivityPart(join(nuwaDir, "journal.jsonl")),
+		fileActivityPart(join(nuwaDir, "state.json")),
+		fileActivityPart(join(nuwaDir, "nuwa.db")),
+		fileActivityPart(join(nuwaDir, "nuwa.db-wal")),
+	].join("|");
 }
 
 async function awaitChildWithWatchdog(child, params) {
@@ -2413,7 +2531,7 @@ async function awaitChildWithWatchdog(child, params) {
 			if (Date.now() - lastActivityAt >= idleTimeoutMs) {
 				triggerWatchdog(
 					"idle",
-					`第 ${gen} 代触发空闲看门狗：.nuwa/journal.jsonl 与 .nuwa/state.json 连续 ${formatDurationMs(idleTimeoutMs)} 未更新，判定挂起并发送 SIGTERM...`,
+					`第 ${gen} 代触发空闲看门狗：.nuwa/journal.jsonl、.nuwa/state.json 与 .nuwa/nuwa.db(-wal) 连续 ${formatDurationMs(idleTimeoutMs)} 未更新，判定挂起并发送 SIGTERM...`,
 				);
 			}
 		}, pollMs);

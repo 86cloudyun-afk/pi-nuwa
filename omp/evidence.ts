@@ -3,13 +3,15 @@
  *
  * 约束：仅使用 import type 引用 ./types，严禁运行时 import ./nuwa。
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
 	accessSync,
 	chmodSync,
 	closeSync,
 	constants,
 	existsSync,
+	linkSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -303,11 +305,11 @@ function procStartTime(pid: number): string | null {
 	}
 }
 
-function readLockHolder(lockFile: string): { pid?: number; ts?: number; start?: string | null } | null {
+function readLockHolder(lockFile: string): { pid?: number; ts?: number; start?: string | null; nonce?: string } | null {
 	try {
 		const raw = readFileSync(lockFile, "utf8").trim();
 		if (!raw) return null;
-		const parsed = JSON.parse(raw) as { pid?: number; ts?: number; start?: string | null };
+		const parsed = JSON.parse(raw) as { pid?: number; ts?: number; start?: string | null; nonce?: string };
 		return parsed && typeof parsed === "object" ? parsed : null;
 	} catch {
 		return null;
@@ -323,15 +325,81 @@ function withLedgerLock<T>(normRoot: string, fn: () => T, timeoutMs = LEDGER_LOC
 
 	const deadline = Date.now() + timeoutMs;
 	let backoff = 4;
+	const myNonce = `${process.pid}-${Date.now()}-${randomBytes(6).toString("hex")}`;
+	const payload = JSON.stringify({
+		pid: process.pid,
+		ts: Date.now(),
+		start: procStartTime(process.pid),
+		nonce: myNonce,
+	});
 
 	for (;;) {
-		let fd = -1;
+		const tmp = `${p}.tmp-${process.pid}-${atomicLedgerSeq++}`;
+		let acquired = false;
+		let useFallback = false;
+		let tfd = -1;
 		try {
-			fd = openSync(p, "wx", 0o600);
-		} catch (err) {
-			const code = (err as NodeJS.ErrnoException)?.code;
-			if (code !== "EEXIST") throw err;
+			tfd = openSync(tmp, "wx", 0o600);
+			writeSync(tfd, payload);
+			closeSync(tfd);
+			tfd = -1;
+			try {
+				linkSync(tmp, p);
+				acquired = true;
+			} catch (linkErr) {
+				const lcode = (linkErr as NodeJS.ErrnoException)?.code;
+				if (lcode === "EEXIST") {
+					acquired = false;
+				} else if (lcode === "EXDEV" || lcode === "EPERM" || lcode === "ENOSYS" || lcode === "EOPNOTSUPP") {
+					useFallback = true;
+				} else {
+					throw linkErr;
+				}
+			}
+		} finally {
+			if (tfd >= 0) {
+				try {
+					closeSync(tfd);
+				} catch {
+					/* ignore */
+				}
+			}
+			try {
+				unlinkSync(tmp);
+			} catch {
+				/* ignore */
+			}
+		}
 
+		if (useFallback) {
+			let fd = -1;
+			try {
+				fd = openSync(p, "wx", 0o600);
+				writeSync(fd, payload);
+				closeSync(fd);
+				fd = -1;
+				acquired = true;
+			} catch (err) {
+				if (fd >= 0) {
+					try {
+						closeSync(fd);
+					} catch {
+						/* ignore */
+					}
+					try {
+						unlinkSync(p);
+					} catch {
+						/* ignore */
+					}
+					throw err;
+				}
+				const code = (err as NodeJS.ErrnoException)?.code;
+				if (code !== "EEXIST") throw err;
+				acquired = false;
+			}
+		}
+
+		if (!acquired) {
 			const held = readLockHolder(p);
 			if (held) {
 				const heldPid = typeof held.pid === "number" ? held.pid : 0;
@@ -350,7 +418,7 @@ function withLedgerLock<T>(normRoot: string, fn: () => T, timeoutMs = LEDGER_LOC
 				// 刚创建尚未写完 JSON 的极短窗口内暂缓抢占，避免误删并发写者的活锁
 				let recentlyCreated = false;
 				try {
-					recentlyCreated = Date.now() - statSync(p).mtimeMs < 250;
+					recentlyCreated = Date.now() - statSync(p).mtimeMs < 300;
 				} catch {
 					recentlyCreated = false;
 				}
@@ -369,33 +437,16 @@ function withLedgerLock<T>(normRoot: string, fn: () => T, timeoutMs = LEDGER_LOC
 			continue;
 		}
 
-		try {
-			writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now(), start: procStartTime(process.pid) }));
-			closeSync(fd);
-			fd = -1;
-		} catch (writeErr) {
-			if (fd >= 0) {
-				try {
-					closeSync(fd);
-				} catch {
-					/* ignore */
-				}
-			}
-			try {
-				unlinkSync(p);
-			} catch {
-				/* ignore */
-			}
-			throw writeErr;
-		}
-
 		heldLedgerLocks.add(p);
 		try {
 			return fn();
 		} finally {
 			heldLedgerLocks.delete(p);
 			try {
-				unlinkSync(p);
+				const cur = readLockHolder(p);
+				if (!cur?.nonce || cur.nonce === myNonce) {
+					unlinkSync(p);
+				}
 			} catch {
 				/* 已被回收 */
 			}
@@ -593,7 +644,8 @@ function collectArtifactTexts(projectId: string): string[] {
 			if (totalBytes >= MAX_TOTAL) break;
 			const full = join(dir, name);
 			try {
-				const st = statSync(full);
+				const st = lstatSync(full);
+				if (st.isSymbolicLink()) continue;
 				if (st.isDirectory()) {
 					walk(full, depth + 1);
 				} else if (st.isFile() && st.size > 0) {

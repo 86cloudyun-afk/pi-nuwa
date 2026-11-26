@@ -1,20 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import {
-	existsSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	readdirSync,
-	rmSync,
-	statSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as graphMod from "../omp/graph";
 import * as nuwaMod from "../omp/nuwa";
 import { NuwaCoreEngine } from "../core/mcp-server";
+import { validateVerificationCommit } from "../omp/verifier-gate";
+import { openNuwaDb } from "../omp/sqlite-store";
 
 const EXPECTED_12_TOOLS = [
 	"nuwa_init",
@@ -768,6 +760,358 @@ describe("Boost 异构审查边界回归验证（#37 全部 6 项 P1 与 P2 反�
 		const stFinal = nuwaMod.loadState(ws)!;
 		expect(stFinal.intents[realIntentId]?.calibrationSettled).toBe(true);
 		expect(stFinal.runtime.calibrationSettledCount).toBeGreaterThanOrEqual(1);
+	});
+});
+
+describe("v6.0.0 Boost 自我检测全链路缺陷修缮回归验证", () => {
+	test("纯 SQLite 模式（无 state.json/journal.jsonl）下 raw 状态/斜杠命令/守护器/WAL 空闲检测全部打通", async () => {
+		setEnvTemp("NUWA_STORAGE_BACKEND", "sqlite");
+		const ws = makeWorkspace("nuwa-boost-sqlite-");
+		const h = setupHarness(ws, "s-boost-sqlite");
+
+		await h.call("nuwa_init", {
+			target: "http://127.0.0.1:18201",
+			mode: "pentest",
+			goal: "验证纯 SQLite 全链路只读与守护器兼容",
+			root: ws,
+		});
+		expect(existsSync(nuwaMod.sqliteDbPath(ws))).toBe(true);
+
+		const cmd = "curl -sS http://127.0.0.1:18201/flag";
+		const out = "HTTP/1.1 200 OK\nhttp_code=200 size_download=48 remote_ip=127.0.0.1 time_total=0.01\n\nflag{sqlite_full_e2e_ok}";
+		nuwaMod.recordToolExecution(ws, { tool: "bash", command: cmd, output: out, agentName: "fujiang" });
+		await h.call("nuwa_flag", { value: "flag{sqlite_full_e2e_ok}", command: cmd, output: out });
+		await h.call("nuwa_complete", { summary: "纯 SQLite 完成" });
+
+		// 移除 JSON 兼容快照与 JSONL 日志文件，模拟纯 SQLite 单库状态
+		if (existsSync(nuwaMod.statePath(ws))) unlinkSync(nuwaMod.statePath(ws));
+		if (existsSync(nuwaMod.journalPath(ws))) unlinkSync(nuwaMod.journalPath(ws));
+		expect(existsSync(nuwaMod.statePath(ws))).toBe(false);
+		expect(existsSync(nuwaMod.journalPath(ws))).toBe(false);
+
+		// 1) nuwa_status(raw=true) 与 /nuwa raw / /nuwa log 在无 state.json 时正常返回
+		const rawJsonRes = await h.call("nuwa_status", { raw: true, format: "json", root: ws });
+		expect(rawJsonRes.isError).toBeFalsy();
+		const parsedRaw = JSON.parse(rawJsonRes.content[0].text);
+		expect(parsedRaw.project.status).toBe("completed");
+		expect(Object.values(parsedRaw.facts).some((f: any) => f.kind === "flag")).toBe(true);
+
+		const mcpEngine = new NuwaCoreEngine({ projectRoot: ws, cwd: ws, sessionId: "s-boost-mcp" });
+		const mcpRawRes = await mcpEngine.callTool("nuwa_status", { raw: true, format: "text", root: ws });
+		expect(mcpRawRes.isError).toBe(false);
+		expect(mcpRawRes.content[0].text).toContain("completed");
+
+		h.notifications.length = 0;
+		await h.runSlash("query raw");
+		expect(h.notifications.at(-1)?.level).toBe("info");
+		expect(h.notifications.at(-1)?.text).toContain("flag{sqlite_full_e2e_ok}");
+
+		h.notifications.length = 0;
+		await h.runSlash("log 5");
+		expect(h.notifications.at(-1)?.level).toBe("info");
+		expect(h.notifications.at(-1)?.text).toContain('"type":"complete"');
+		expect(h.notifications.at(-1)?.text).toContain('"type":"flag"');
+
+		h.notifications.length = 0;
+		await h.runSlash("log 20");
+		expect(h.notifications.at(-1)?.text).toContain('"type":"init"');
+
+		// 2) bin/nuwa-autonomous 在无 state.json 时从 nuwa.db 识别 status=completed 干净退出码 0
+		const fakeBin = makeWorkspace("nuwa-boost-bin-");
+		const fakeOmp = join(fakeBin, "omp");
+		writeFileSync(fakeOmp, "#!/usr/bin/env bash\necho FAIL_SHOULD_NOT_SPAWN >&2\nexit 99\n", "utf8");
+		chmodSync(fakeOmp, 0o755);
+		const daemonRes = Bun.spawnSync(
+			[
+				process.execPath,
+				resolve(import.meta.dir, "..", "bin", "nuwa-autonomous"),
+				"--root",
+				ws,
+				"--omp-bin",
+				fakeOmp,
+				"--max-generations",
+				"1",
+			],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env, NUWA_STORAGE_BACKEND: "sqlite", NUWA_ALLOW_TMP_WORKSPACE: "1" },
+			},
+		);
+		expect(daemonRes.exitCode).toBe(0);
+		expect(daemonRes.stdout.toString("utf8")).toContain("任务已完成 (status=completed)");
+		expect(daemonRes.stderr.toString("utf8")).not.toContain("FAIL_SHOULD_NOT_SPAWN");
+
+		// 3) 开启短 idle 看门狗(450ms)，假子进程在 >640ms 内仅持续写 nuwa.db/WAL 不写 state.json/journal.jsonl，随后落盘 completed -> 不得误杀且成功退出 0
+		const wsWal = makeWorkspace("nuwa-boost-daemon-wal-");
+		const hw = setupHarness(wsWal, "s-boost-wal");
+		await hw.call("nuwa_init", { target: "http://127.0.0.1:18209", mode: "pentest", root: wsWal });
+		if (existsSync(nuwaMod.statePath(wsWal))) unlinkSync(nuwaMod.statePath(wsWal));
+		if (existsSync(nuwaMod.journalPath(wsWal))) unlinkSync(nuwaMod.journalPath(wsWal));
+
+		const walOmp = join(fakeBin, "omp-wal");
+		const sqliteModPath = resolve(import.meta.dir, "..", "omp", "sqlite-store.ts");
+		writeFileSync(
+			walOmp,
+			`#!/usr/bin/env bun
+import { loadStateFromSqlite, saveStateToSqlite } from ${JSON.stringify(sqliteModPath)};
+const cwd = process.cwd();
+for (let step = 0; step < 5; step++) {
+  if (step > 0) await Bun.sleep(160);
+  const st = loadStateFromSqlite(cwd)!;
+  st.runtime.turns = (st.runtime.turns ?? 0) + 1;
+  if (step === 4) {
+    st.project.status = "completed";
+    st.runtime.status = "completed";
+  }
+  saveStateToSqlite(cwd, st);
+}
+process.exit(0);
+`,
+			"utf8",
+		);
+		chmodSync(walOmp, 0o755);
+
+		const walDaemonRes = Bun.spawnSync(
+			[
+				process.execPath,
+				resolve(import.meta.dir, "..", "bin", "nuwa-autonomous"),
+				"--root",
+				wsWal,
+				"--omp-bin",
+				walOmp,
+				"--max-generations",
+				"1",
+			],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...process.env,
+					NUWA_STORAGE_BACKEND: "sqlite",
+					NUWA_ALLOW_TMP_WORKSPACE: "1",
+					NUWA_DAEMON_IDLE_MS: "450",
+					NUWA_DAEMON_MAX_ERRORS: "1",
+					NUWA_DAEMON_BACKOFF_MS: "10",
+				},
+			},
+		);
+		expect(walDaemonRes.exitCode).toBe(0);
+		expect(walDaemonRes.stdout.toString("utf8")).toContain("任务已完成 (status=completed)");
+		expect(walDaemonRes.stderr.toString("utf8")).not.toContain("触发空闲看门狗");
+	}, 15_000);
+
+	test("nuwa.db 与过期 state.json 并存且无环境变量时优先只读 nuwa.db 且零写盘", async () => {
+		const ws = makeWorkspace("nuwa-boost-coexist-");
+		const h = setupHarness(ws, "s-boost-coexist");
+
+		// 1) 先在 json 模式落盘旧 state.json 并保留快照
+		setEnvTemp("NUWA_STORAGE_BACKEND", "json");
+		await h.call("nuwa_init", {
+			target: "http://127.0.0.1:18202",
+			mode: "pentest",
+			goal: "OLD_STALE_JSON_GOAL",
+			root: ws,
+		});
+		expect(existsSync(nuwaMod.statePath(ws))).toBe(true);
+		const staleJsonSnapshot = readFileSync(nuwaMod.statePath(ws), "utf8");
+
+		// 2) 切到 sqlite 模式推进状态并写入新事实，再还原陈旧 state.json 制造共存冲突
+		setEnvTemp("NUWA_STORAGE_BACKEND", "sqlite");
+		await h.call("nuwa_claim", { id: "i001", worker: "fujiang" });
+		const freshCmd = "curl -sS http://127.0.0.1:18202/api/v2/health";
+		const freshOut =
+			"HTTP/1.1 200 OK\nhttp_code=200 size_download=64 remote_ip=127.0.0.1 time_total=0.01\n\n{\"tag\":\"FRESH_SQLITE_ONLY_MARKER\"}";
+		nuwaMod.recordToolExecution(ws, { tool: "bash", command: freshCmd, output: freshOut, agentName: "fujiang" });
+		await h.call("nuwa_commit", {
+			id: "i001",
+			kind: "endpoint",
+			title: "FRESH_SQLITE_ENDPOINT",
+			detail: "仅存在于 SQLite 的最新接口",
+			command: freshCmd,
+			output: freshOut,
+		});
+		writeFileSync(nuwaMod.statePath(ws), staleJsonSnapshot, "utf8");
+
+		// 执行一次 checkpoint 清理 WAL 确保干净单文件只读测试
+		const ckDb = openNuwaDb(ws);
+		ckDb.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+		ckDb.close();
+
+		// 3) 删除 NUWA_STORAGE_BACKEND 环境变量后验证所有只读入口均识别 nuwa.db 且严格零写盘
+		setEnvTemp("NUWA_STORAGE_BACKEND", undefined);
+		const snapBefore = snapshotTreeMtimes(join(ws, ".nuwa"));
+		await Bun.sleep(15);
+
+		const diag = graphMod.inspectGraph(ws, { status: "done", limit: 20 });
+		expect(diag.ok).toBe(true);
+		expect(diag.summary.totalFacts).toBe(1);
+		expect(diag.relatedFacts.some((f) => f.title.includes("FRESH_SQLITE_ENDPOINT"))).toBe(true);
+
+		const statusRes = await h.call("nuwa_status", { root: ws });
+		expect(statusRes.content[0].text).toContain("OLD_STALE_JSON_GOAL");
+		const rawJsonRes = await h.call("nuwa_status", { raw: true, format: "json", root: ws });
+		expect(rawJsonRes.content[0].text).toContain("FRESH_SQLITE_ENDPOINT");
+
+		const doctorText = graphMod.buildDoctorSummary(ws);
+		expect(doctorText).toContain("mode=sqlite");
+
+		const snapAfter = snapshotTreeMtimes(join(ws, ".nuwa"));
+		expect(snapAfter).toEqual(snapBefore);
+	});
+
+	test("nuwa_commit 在 f1000 及去重命中时精确绑定 evidenceRef；coding/ops 缺省 mode 的 resume 兼容", async () => {
+		// 1) f1000 词法排序陷阱回归 + 去重命中回归
+		const ws = makeWorkspace("nuwa-boost-f1000-");
+		const h = setupHarness(ws, "s-boost-f1000");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18203", mode: "pentest", root: ws });
+
+		nuwaMod.withLock(ws, () => {
+			const s = nuwaMod.loadState(ws)!;
+			s.seq.fact = 998;
+			nuwaMod.saveState(ws, s);
+		});
+
+		const cmd999 = "curl -sS http://127.0.0.1:18203/a";
+		const out999 = "HTTP/1.1 200 OK\nhttp_code=200 size_download=32 remote_ip=127.0.0.1 time_total=0.01\n\n{\"ep\":\"a\"}";
+		nuwaMod.recordToolExecution(ws, { tool: "bash", command: cmd999, output: out999, agentName: "fujiang" });
+		const r999 = await h.call("nuwa_commit", {
+			free_note: true,
+			kind: "endpoint",
+			title: "端点 999",
+			detail: "第一个端点",
+			command: cmd999,
+			output: out999,
+			root: ws,
+		});
+		expect(r999.isError).toBeFalsy();
+
+		const cmd1000 = "curl -sS http://127.0.0.1:18203/b";
+		const out1000 = "HTTP/1.1 200 OK\nhttp_code=200 size_download=40 remote_ip=127.0.0.1 time_total=0.01\n\n{\"ep\":\"b\"}";
+		nuwaMod.recordToolExecution(ws, { tool: "bash", command: cmd1000, output: out1000, agentName: "fujiang" });
+		const r1000 = await h.call("nuwa_commit", {
+			free_note: true,
+			kind: "endpoint",
+			title: "端点 1000",
+			detail: "第 1000 个端点",
+			command: cmd1000,
+			output: out1000,
+			save_evidence_log: true,
+			raw_response: "RAW_LOG_FOR_F1000",
+			root: ws,
+		});
+		expect(r1000.details?.evidenceRef).toBe(".nuwa/evidence/f1000.log");
+		const stMid = nuwaMod.loadState(ws)!;
+		expect(stMid.facts.f1000?.evidenceRef).toBe(".nuwa/evidence/f1000.log");
+		expect(stMid.facts.f999?.evidenceRef).toBeUndefined();
+
+		// 重复提交同 title ("端点 999") 命中去重，evidenceRef 必须精确落到 f999 而非误覆写 f1000
+		const r999Dup = await h.call("nuwa_commit", {
+			free_note: true,
+			kind: "endpoint",
+			title: "端点 999",
+			detail: "补录原始回显",
+			command: cmd999,
+			output: out999,
+			save_evidence_log: true,
+			raw_response: "RAW_LOG_FOR_F999",
+			root: ws,
+		});
+		expect(r999Dup.details?.evidenceRef).toBe(".nuwa/evidence/f999.log");
+		const stAfterDup = nuwaMod.loadState(ws)!;
+		expect(stAfterDup.facts.f999?.evidenceRef).toBe(".nuwa/evidence/f999.log");
+		expect(stAfterDup.facts.f1000?.evidenceRef).toBe(".nuwa/evidence/f1000.log");
+
+		// 2) coding / ops 本地项目在未显式传 mode 时 resume=true + target 不得被默认 ctf 拒绝
+		const codingWs = makeWorkspace("nuwa-boost-coding-");
+		const hc = setupHarness(codingWs, "s-boost-coding");
+		await hc.call("nuwa_init", { target: codingWs, mode: "coding", goal: "工程修复", root: codingWs });
+		const resumeCoding1 = await hc.call("nuwa_init", { root: codingWs, resume: true, target: codingWs });
+		expect(resumeCoding1.isError).toBeFalsy();
+		const resumeCoding2 = await hc.call("nuwa_init", { target: codingWs, resume: true });
+		expect(resumeCoding2.isError).toBeFalsy();
+
+		const opsWs = makeWorkspace("nuwa-boost-ops-");
+		const mcpOps = new NuwaCoreEngine({ projectRoot: opsWs, cwd: opsWs, sessionId: "s-boost-ops" });
+		const initOps = await mcpOps.callTool("nuwa_init", { target: "billing-svc", mode: "ops", root: opsWs });
+		expect(initOps.isError).toBe(false);
+		const resumeOps = await mcpOps.callTool("nuwa_init", { root: opsWs, resume: true, target: "billing-svc" });
+		expect(resumeOps.isError).toBe(false);
+	});
+
+	test("SubagentWatchdog 生命周期闭环（完成释放槽位/缺省 spawnId 回退/关闭清理）与 requireVerifierWorker 空值拦截", async () => {
+		const ws = makeWorkspace("nuwa-boost-wd-");
+		const h = setupHarness(ws, "s-boost-wd");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18204", mode: "pentest", root: ws });
+
+		const onSpawn = h.hooks.get("before_subagent_spawn")![0]!;
+		const onToolCall = h.hooks.get("tool_call")![0]!;
+		const onEnd = h.hooks.get("tool_execution_end")![0]!;
+		const onShutdown = h.hooks.get("session_shutdown")![0]!;
+
+		// 连续派发 5 轮（超过默认 maxConcurrency=4），包含无 spawnId 回退与显式 spawnId，每轮完成后槽位立即归还
+		for (let i = 1; i <= 5; i++) {
+			const withExplicit = i <= 2;
+			const spawnEvt: Record<string, unknown> = {
+				...(withExplicit ? { spawnId: `sp-loop-${i}` } : {}),
+				agent: "fujiang",
+				task: `[女娲派单 i001] 探测路径 /v${i}`,
+			};
+			const spawnOut = onSpawn(spawnEvt, h.ctx) as { spawnId: string; task: string };
+			const subCtx: any = {
+				...h.ctx,
+				agent: { kind: "sub", id: withExplicit ? `sp-loop-${i}` : `host-sub-${i}`, name: "fujiang", parentId: "main-0" },
+			};
+			onToolCall({ toolName: "bash", input: { command: `curl -sS http://127.0.0.1:18204/v${i}` } }, subCtx);
+			onEnd(
+				{
+					toolName: "bash",
+					input: { command: `curl -sS http://127.0.0.1:18204/v${i}` },
+					result: { stdout: "HTTP/1.1 200 OK", stderr: "" },
+				},
+				subCtx,
+			);
+			const wdMid = new nuwaMod.SubagentWatchdog(ws);
+			expect(wdMid.activeCount()).toBe(1);
+			expect(wdMid.getTask(spawnOut.spawnId)?.lastOutputAt).toBeGreaterThanOrEqual(
+				wdMid.getTask(spawnOut.spawnId)!.startedAt,
+			);
+
+			onEnd(
+				{
+					toolName: "task",
+					input: { agent: "fujiang", task: spawnEvt.task },
+					details: withExplicit ? { spawnId: `sp-loop-${i}` } : {},
+					result: { stdout: "subagent done" },
+				},
+				h.ctx,
+			);
+
+			const wdAfter = new nuwaMod.SubagentWatchdog(ws);
+			expect(wdAfter.activeCount()).toBe(0);
+			expect(wdAfter.availableSlots()).toBe(4);
+			expect(wdAfter.getTask(spawnOut.spawnId)?.status).toBe("completed");
+		}
+
+		// 验证 session_shutdown 回收尚未结案的 running 任务
+		const orphanRes = onSpawn({ spawnId: "sp-orphan", agent: "fujiang", task: "未结束的游离任务" }, h.ctx) as {
+			spawnId: string;
+		};
+		expect(new nuwaMod.SubagentWatchdog(ws).activeCount()).toBe(1);
+		onShutdown({}, h.ctx);
+		const wdShutdown = new nuwaMod.SubagentWatchdog(ws);
+		expect(wdShutdown.activeCount()).toBe(0);
+		expect(wdShutdown.getTask(orphanRes.spawnId)?.status).toBe("cancelled");
+
+		// 验证 requireVerifierWorker=true 时空 worker 也必须拦截
+		const emptyWorkerGate = validateVerificationCommit({
+			intentKey: "verify-vuln:f010",
+			kind: "vuln",
+			worker: "",
+			hasFreshExecution: true,
+			requireVerifierWorker: true,
+		});
+		expect(emptyWorkerGate.ok).toBe(false);
 	});
 });
 

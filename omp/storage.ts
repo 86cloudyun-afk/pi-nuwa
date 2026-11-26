@@ -11,12 +11,13 @@
  * 约束：严禁运行时 `import "./nuwa"`，保持纯单向无环模块依赖。
  */
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
 	appendFileSync,
 	closeSync,
 	existsSync,
 	fsyncSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
@@ -349,8 +350,9 @@ function sleepSync(ms: number): void {
 }
 
 const heldLocks = new Set<string>();
+let lockFileSeq = 0;
 
-/** 单写者锁：同进程可重入防自锁；活进程持锁时只等不抢；空壳或死进程的锁立即回收。 */
+/** 单写者锁：先写完整载荷再用硬链接原子落锁（零空文件窗口），支持同进程重入与死锁自动回收。 */
 export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: number }): T {
 	mkdirSync(stateDir(root), { recursive: true });
 	const p = resolve(lockPath(root));
@@ -359,51 +361,130 @@ export function withLock<T>(root: string, fn: () => T, opts?: { timeoutMs?: numb
 	}
 	const deadline = Date.now() + (opts?.timeoutMs ?? 10_000);
 	let backoff = 4;
+	const myNonce = `${process.pid}-${Date.now()}-${randomBytes(6).toString("hex")}`;
+	const lockPayload = JSON.stringify({
+		pid: process.pid,
+		ts: Date.now(),
+		start: procStartTime(process.pid),
+		nonce: myNonce,
+	});
+
 	for (;;) {
-		let fd = -1;
+		const tmp = `${p}.tmp-${process.pid}-${lockFileSeq++}`;
+		let acquired = false;
+		let useFallback = false;
+		let tfd = -1;
 		try {
-			fd = openSync(p, "wx");
-			writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now(), start: procStartTime(process.pid) }));
-			fsyncSync(fd);
-			closeSync(fd);
-			fd = -1;
-			heldLocks.add(p);
+			tfd = openSync(tmp, "wx", 0o600);
+			writeSync(tfd, lockPayload);
+			fsyncSync(tfd);
+			closeSync(tfd);
+			tfd = -1;
 			try {
-				return fn();
-			} finally {
-				heldLocks.delete(p);
-				try {
-					unlinkSync(p);
-				} catch {
-					/* 已被回收 */
+				linkSync(tmp, p);
+				acquired = true;
+			} catch (linkErr) {
+				const lcode = (linkErr as NodeJS.ErrnoException)?.code;
+				if (lcode === "EEXIST") {
+					acquired = false;
+				} else if (lcode === "EXDEV" || lcode === "EPERM" || lcode === "ENOSYS" || lcode === "EOPNOTSUPP") {
+					useFallback = true;
+				} else {
+					throw linkErr;
 				}
 			}
-		} catch (err) {
-			if (fd >= 0) {
+		} finally {
+			if (tfd >= 0) {
 				try {
-					closeSync(fd);
+					closeSync(tfd);
 				} catch {
 					/* ignore */
 				}
 			}
-			const code = (err as NodeJS.ErrnoException)?.code;
-			if (code !== "EEXIST") throw err;
-			const held = readJson<{ pid?: number; ts?: number; start?: string }>(p);
-			const heldPid = typeof held?.pid === "number" ? held.pid : 0;
-			const heldStart = typeof held?.start === "string" ? held.start : null;
-			const sameProcess = heldPid > 0 && pidAlive(heldPid) && (!heldStart || heldStart === procStartTime(heldPid));
-			if (sameProcess) {
-				if (Date.now() >= deadline) {
-					throw new Error(`state locked by pid ${heldPid} (>${Date.now() - (held?.ts ?? Date.now())}ms)`);
+			try {
+				unlinkSync(tmp);
+			} catch {
+				/* ignore */
+			}
+		}
+
+		if (useFallback) {
+			let fd = -1;
+			try {
+				fd = openSync(p, "wx", 0o600);
+				writeSync(fd, lockPayload);
+				fsyncSync(fd);
+				closeSync(fd);
+				fd = -1;
+				acquired = true;
+			} catch (err) {
+				if (fd >= 0) {
+					try {
+						closeSync(fd);
+					} catch {
+						/* ignore */
+					}
+					try {
+						unlinkSync(p);
+					} catch {
+						/* ignore */
+					}
+					throw err;
 				}
-				sleepSync(backoff);
-				backoff = Math.min(backoff * 2, 120);
-				continue;
+				const code = (err as NodeJS.ErrnoException)?.code;
+				if (code !== "EEXIST") throw err;
+				acquired = false;
+			}
+		}
+
+		if (!acquired) {
+			const held = readJson<{ pid?: number; ts?: number; start?: string; nonce?: string }>(p);
+			if (held) {
+				const heldPid = typeof held.pid === "number" ? held.pid : 0;
+				const heldStart = typeof held.start === "string" ? held.start : null;
+				const sameProcess = heldPid > 0 && pidAlive(heldPid) && (!heldStart || heldStart === procStartTime(heldPid));
+				if (sameProcess) {
+					if (Date.now() >= deadline) {
+						throw new Error(`state locked by pid ${heldPid} (>${Date.now() - (held.ts ?? Date.now())}ms)`);
+					}
+					sleepSync(backoff);
+					backoff = Math.min(backoff * 2, 120);
+					continue;
+				}
+			} else {
+				// 刚创建但尚未完成写入的极短窗口内暂缓抢占，避免误删并发写者锁文件
+				let recentlyCreated = false;
+				try {
+					recentlyCreated = Date.now() - statSync(p).mtimeMs < 300;
+				} catch {
+					recentlyCreated = false;
+				}
+				if (recentlyCreated && Date.now() < deadline) {
+					sleepSync(backoff);
+					backoff = Math.min(backoff * 2, 32);
+					continue;
+				}
 			}
 			try {
 				unlinkSync(p);
 			} catch {
 				/* 被别的进程先回收，下一轮重试 */
+			}
+			continue;
+		}
+
+		heldLocks.add(p);
+		try {
+			return fn();
+		} finally {
+			heldLocks.delete(p);
+			try {
+				const cur = readJson<{ nonce?: string }>(p);
+				if (!cur?.nonce || cur.nonce === myNonce) {
+					unlinkSync(p);
+				}
+			} catch {
+				/* 已被回收 */
 			}
 		}
 	}
@@ -890,6 +971,15 @@ function sessionPointerPath(sessionId: string): string {
 }
 
 function stateOwner(dir: string): string | undefined {
+	const backend = resolveStorageBackend(dir);
+	if ((backend === "sqlite" || backend === "dual") && existsSync(sqliteDbPath(dir))) {
+		try {
+			const owner = loadStateFromSqlite(dir)?.project?.ownerSessionId;
+			if (owner !== undefined) return owner;
+		} catch {
+			/* 回退 JSON 读取 */
+		}
+	}
 	const raw = readJson<{ project?: { ownerSessionId?: string } }>(statePath(dir));
 	if (raw?.project?.ownerSessionId !== undefined) return raw.project.ownerSessionId;
 	if (existsSync(sqliteDbPath(dir))) {
@@ -903,11 +993,42 @@ function stateOwner(dir: string): string | undefined {
 }
 
 function stateUrl(dir: string): string | undefined {
+	const backend = resolveStorageBackend(dir);
+	if ((backend === "sqlite" || backend === "dual") && existsSync(sqliteDbPath(dir))) {
+		try {
+			const url = loadStateFromSqlite(dir)?.project?.url;
+			if (url !== undefined) return url;
+		} catch {
+			/* 回退 JSON 读取 */
+		}
+	}
 	const raw = readJson<{ project?: { url?: string } }>(statePath(dir));
 	if (raw?.project?.url !== undefined) return raw.project.url;
 	if (existsSync(sqliteDbPath(dir))) {
 		try {
 			return loadStateFromSqlite(dir)?.project?.url;
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
+
+function stateMode(dir: string): Mode | undefined {
+	const backend = resolveStorageBackend(dir);
+	if ((backend === "sqlite" || backend === "dual") && existsSync(sqliteDbPath(dir))) {
+		try {
+			const mode = loadStateFromSqlite(dir)?.project?.mode;
+			if (mode) return mode;
+		} catch {
+			/* 回退 JSON 读取 */
+		}
+	}
+	const raw = readJson<{ project?: { mode?: Mode } }>(statePath(dir));
+	if (raw?.project?.mode) return raw.project.mode;
+	if (existsSync(sqliteDbPath(dir))) {
+		try {
+			return loadStateFromSqlite(dir)?.project?.mode;
 		} catch {
 			return undefined;
 		}
@@ -928,11 +1049,13 @@ function safeTargetUrl(raw: string, mode: Mode = "ctf"): string {
 	}
 }
 
-/** target 为空表示“不按目标过滤”；有 target 时只认同一个规范化 URL。 */
+/** target 为空表示“不按目标过滤”；有 target 时只认同一个规范化 URL（兼容 coding/ops/audit 本地模式）。 */
 function sameTarget(dir: string, targetUrl: string): boolean {
 	if (!targetUrl) return true;
 	const url = stateUrl(dir);
-	return !url || url === safeTargetUrl(targetUrl);
+	if (!url) return true;
+	const mode = stateMode(dir) ?? "ctf";
+	return url === safeTargetUrl(targetUrl, mode);
 }
 
 export function readSessionPointer(sessionId: string): { root?: string; sessionId?: string } | null {
