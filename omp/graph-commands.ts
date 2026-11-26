@@ -15,21 +15,22 @@ import {
 	type ScopePolicy,
 } from "./types";
 import {
-	atomicWrite,
+	SCHEMA,
 	cell,
-	checkAndLogAutoRuleSource,
 	getAgentHome,
 	loadState,
-	loadStateJsonOnly,
 	logEvent,
 	nextFactId,
 	normOneLine,
+	normalizeState,
 	nowIso,
 	readCfg,
+	readJson,
 	resolveStorageBackend,
 	saveState,
 	sha,
 	sqliteDbPath,
+	statePath,
 	withLock,
 } from "./storage";
 import { defaultScopeForTarget } from "./scope";
@@ -66,6 +67,7 @@ import {
 	appendIntentSpecs,
 	beliefGraphPath,
 	loadBeliefGraphReadOnly,
+	saveBeliefGraph,
 } from "./graph-planner";
 import { loadStateFromSqlite, openNuwaDb } from "./sqlite-store";
 import {
@@ -96,6 +98,8 @@ import {
 	SPECIALIST_ROLES,
 	classifyIntentForSpecialist,
 	recommendSpecialistAndModel,
+	resolveColdStartSpecialistModel,
+	resolveEnvSpecialistModelOptions,
 } from "./specialist-squad";
 import {
 	applyChainResultToBeliefGraph,
@@ -112,7 +116,19 @@ import {
 
 const VERSION = NUWA_VERSION;
 
-/** 纯只读加载项目状态（不触发任何迁移或写盘副作用，用于只读诊断视图）。 */
+function isTerminalCommandState(st: NuwaState | null | undefined): boolean {
+	if (!st) return true;
+	const ps = String(st.project.status ?? "");
+	return (
+		ps === "completed" ||
+		ps === "done" ||
+		ps === "sealed_negative" ||
+		st.runtime.status === "completed" ||
+		st.runtime.status === "sealed_negative"
+	);
+}
+
+/** 纯只读加载项目状态（严格零磁盘写入、绝不调用 loadStateJsonOnly 回写恢复，专用于只读诊断视图）。 */
 function loadStateStrictlyReadOnly(root: string): NuwaState | null {
 	const normRoot = resolve(root);
 	const backend = resolveStorageBackend(normRoot);
@@ -125,8 +141,14 @@ function loadStateStrictlyReadOnly(root: string): NuwaState | null {
 			/* 回退只读 JSON */
 		}
 	}
-	const fromJson = loadStateJsonOnly(normRoot);
-	if (fromJson) return fromJson;
+	const sp = statePath(normRoot);
+	if (existsSync(sp)) {
+		const rawJson = readJson<NuwaState>(sp);
+		if (rawJson && rawJson.schema === SCHEMA && rawJson.project) {
+			const cloned = JSON.parse(JSON.stringify(rawJson)) as NuwaState;
+			return normalizeState(cloned);
+		}
+	}
 	if (existsSync(dbFile)) {
 		try {
 			return loadStateFromSqlite(normRoot, { fallbackToJson: false });
@@ -414,7 +436,7 @@ export function isCompliantSandboxDockerCommand(cmd: string, projectId: string):
 export function executeSessionCommand(found: string | null, subArg: string): { msg: string; level: "info" | "error" } {
 	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
 	const sub = subArg.trim();
-	if (!sub || sub === "list") return { msg: formatSessionVaultSummary(found), level: "info" };
+	if (!sub || sub.toLowerCase() === "list") return { msg: formatSessionVaultSummary(found), level: "info" };
 	if (sub === "clear") {
 		const st = loadState(found);
 		clearSessionVault(found, st?.project.id);
@@ -468,8 +490,9 @@ export function executeSessionCommand(found: string | null, subArg: string): { m
 export function executeScopeCommand(found: string | null, subArg: string): { msg: string; level: "info" | "error" } {
 	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
 	const sub = subArg.trim();
-	if (!sub) {
-		const st = loadState(found);
+	const subLower = sub.toLowerCase();
+	if (!sub || subLower === "show" || subLower === "list") {
+		const st = loadStateStrictlyReadOnly(found);
 		if (!st) return { msg: "state 读取失败", level: "error" };
 		const sc = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
 		return {
@@ -479,7 +502,7 @@ export function executeScopeCommand(found: string | null, subArg: string): { msg
 	}
 	const updated = withLock(found, () => {
 		const s = loadState(found);
-		if (!s) return null;
+		if (!s || isTerminalCommandState(s)) return null;
 		let sc: ScopePolicy = s.project.scope ?? defaultScopeForTarget(s.project.url || s.project.target, s.project.mode);
 		const [op, val = ""] = sub.split(/\s+/, 2);
 		const v = val.trim();
@@ -624,14 +647,15 @@ export async function executeOobCommand(
 ): Promise<{ msg: string; level: "info" | "error" }> {
 	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
 	const normRoot = resolve(found);
-	const st = loadState(normRoot);
-	if (!st) return { msg: "state 读取失败", level: "error" };
-	const scope = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
 	const sub = subArg.trim();
 
-	if (!sub || sub === "list") {
+	if (!sub || sub.toLowerCase() === "list") {
+		const roSt = loadStateStrictlyReadOnly(normRoot);
+		if (!roSt) return { msg: "state 读取失败", level: "error" };
+		const roScope =
+			roSt.project.scope ?? defaultScopeForTarget(roSt.project.url || roSt.project.target, roSt.project.mode);
 		const list = loadOobCanaries(normRoot);
-		const domains = (scope.oobDomains ?? []).join(", ") || "(未配置，请先 /nuwa scope +oob <domain>)";
+		const domains = (roScope.oobDomains ?? []).join(", ") || "(未配置，请先 /nuwa scope +oob <domain>)";
 		if (list.length === 0) {
 			return { msg: `OOB 域名白名单: ${domains}\n当前尚无活跃 Canary（用法: /nuwa oob gen <domain> [purpose] | poll <url> [token]）`, level: "info" };
 		}
@@ -644,6 +668,10 @@ export async function executeOobCommand(
 			level: "info",
 		};
 	}
+
+	const st = loadState(normRoot);
+	if (!st) return { msg: "state 读取失败", level: "error" };
+	const scope = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
 
 	const parts = sub.split(/\s+/);
 	const op = parts[0]?.toLowerCase() ?? "";
@@ -1018,7 +1046,7 @@ export function executeHybridCommand(
 	if (shouldPlan && bridged.intents.length > 0) {
 		withLock(normRoot, () => {
 			const s = loadState(normRoot);
-			if (!s) return;
+			if (!s || isTerminalCommandState(s)) return;
 			plannedIds = appendIntentSpecs(
 				s,
 				bridged.intents.slice(0, 12).map((spec) => ({
@@ -1166,15 +1194,16 @@ export function executeSquadCommand(
 			if (openIntents.length === 0) {
 				headerLines.push(`- (当前无待派发开放意图)`);
 			} else {
+				const envModelOpts = resolveEnvSpecialistModelOptions();
 				for (const it of openIntents) {
 					const rec =
 						settledCount > 0
-							? recommendSpecialistAndModel(it, st, calibRecords)
+							? recommendSpecialistAndModel(it, st, calibRecords, envModelOpts)
 							: (() => {
 									const cls = classifyIntentForSpecialist(it, st);
 									return {
 										recommendedRole: cls.role,
-										recommendedModel: DEFAULT_SUBAGENT_MODEL,
+										recommendedModel: resolveColdStartSpecialistModel(cls.role),
 										reason: cls.reason,
 									};
 								})();
@@ -1233,10 +1262,10 @@ export async function executeChainsCommand(
 		let verifyIid = "";
 		withLock(normRoot, () => {
 			const s = loadState(normRoot);
-			if (!s) return;
+			if (!s || isTerminalCommandState(s)) return;
 			const bGraph = initBeliefGraphFromState(s, loadBeliefGraphReadOnly(normRoot) ?? undefined);
 			applyChainResultToBeliefGraph(execRes, bGraph, s, { applyToState: true });
-			atomicWrite(beliefGraphPath(normRoot), `${JSON.stringify(bGraph, null, 2)}\n`);
+			saveBeliefGraph(normRoot, s, bGraph);
 
 			if (execRes.verified && execRes.candidateFact) {
 				const cf = execRes.candidateFact;
@@ -1382,9 +1411,18 @@ export async function executeCdpCommand(
 	if (sub === "capture") {
 		const targetUrl = parts[1]?.trim() || st.project.url;
 		const cap = await captureCdpSessionTraffic(targetUrl, normRoot, scope);
+		if (cap.blockedByScope && cap.entries.length === 0 && cap.syncedRoles.length === 0) {
+			return {
+				msg: redactVaultSecrets(
+					`CDP 流量捕获已拦截: ${cap.blockReason || "目标超出 Scope 授权范围"}`,
+					normRoot,
+				),
+				level: "error",
+			};
+		}
 		withLock(normRoot, () => {
 			const s = loadState(normRoot);
-			if (!s) return;
+			if (!s || isTerminalCommandState(s)) return;
 			s.project.activeRoles = Object.keys(loadSessionVault(normRoot).roles).sort();
 			saveState(normRoot, s);
 			logEvent(normRoot, {
@@ -1421,7 +1459,7 @@ export async function executeCdpCommand(
 			const af = diffRes.fact;
 			withLock(normRoot, () => {
 				const s = loadState(normRoot);
-				if (!s) return;
+				if (!s || isTerminalCommandState(s)) return;
 				const fKey = `cdp-authdiff:${sha(`${af.title}|${af.command}`)}`;
 				if (!Object.values(s.facts).some((x) => x.key === fKey)) {
 					const fid = nextFactId(s);
@@ -1483,14 +1521,11 @@ function phaseStats(st: NuwaState): Array<{ phase: Phase; open: number; claimed:
 }
 
 function detectAutoRulesSource(root?: string, st?: NuwaState): string {
+	// 状态看板保持 100% 纯只读零磁盘写入
 	const agentHome = getAgentHome();
 	if (root && root.trim()) {
 		try {
-			const loaded = loadAutoRules(root, agentHome);
-			if (loaded.error) {
-				return checkAndLogAutoRuleSource(root);
-			}
-			return loaded.source;
+			return loadAutoRules(root, agentHome).source;
 		} catch {
 			/* ignore */
 		}

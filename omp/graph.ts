@@ -1934,9 +1934,18 @@ export function executeCommitWithGates(
 	};
 }
 
+function isTerminalAutonomousState(st: NuwaState | null | undefined): boolean {
+	if (!st) return true;
+	return (
+		st.project.status !== "active" ||
+		st.runtime.status === "completed" ||
+		st.runtime.status === "sealed_negative"
+	);
+}
+
 /**
  * v6.0 批处理收尾自主安全闭环（自动多角色鉴权差分 + 自动 OOB Canary 规划与节流轮询）。
- * 受 `NUWA_AUTO_LOOPS !== "0"`、Web 模式、Scope 护栏及冷却/30s 节流保护。
+ * 受 `NUWA_AUTO_LOOPS !== "0"`、Web 模式、终态守卫、Scope 护栏及冷却/30s 节流保护。
  */
 export async function runPostBatchAutonomousLoops(
 	root: string,
@@ -1956,7 +1965,7 @@ export async function runPostBatchAutonomousLoops(
 
 	const normRoot = resolve(root);
 	const latest = loadState(normRoot);
-	if (!latest || latest.project.scheme === "local") return out;
+	if (!latest || latest.project.scheme === "local" || isTerminalAutonomousState(latest)) return out;
 	const sc =
 		latest.project.scope ?? defaultScopeForTarget(latest.project.url || latest.project.target, latest.project.mode);
 
@@ -1970,7 +1979,7 @@ export async function runPostBatchAutonomousLoops(
 				if (adRes.candidateFacts.length > 0 || adRes.verifyIntentSpecs.length > 0) {
 					withLock(normRoot, () => {
 						const s = loadState(normRoot);
-						if (!s) return;
+						if (!s || isTerminalAutonomousState(s)) return;
 						const addedFids: string[] = [];
 						for (const cf of adRes.candidateFacts) {
 							if (cf.key && Object.values(s.facts).some((x) => x.key === cf.key)) continue;
@@ -2008,7 +2017,7 @@ export async function runPostBatchAutonomousLoops(
 	if ((sc.oobDomains?.length ?? 0) > 0 && !opts?.signal?.aborted) {
 		try {
 			const cur = loadState(normRoot);
-			if (cur) {
+			if (cur && !isTerminalAutonomousState(cur)) {
 				const planRes = planAutonomousOobProbes(cur, normRoot, sc);
 				out.oobPlannedCanaries = planRes.createdCanaries.length;
 				if (planRes.createdCanaries.length > 0) {
@@ -2029,7 +2038,7 @@ export async function runPostBatchAutonomousLoops(
 					if (pollRes.evidenceFacts.length > 0) {
 						withLock(normRoot, () => {
 							const s = loadState(normRoot);
-							if (!s) return;
+							if (!s || isTerminalAutonomousState(s)) return;
 							const addedOobFids: string[] = [];
 							for (const ef of pollRes.evidenceFacts) {
 								if (Object.values(s.facts).some((x) => x.key === ef.key)) continue;
@@ -2064,7 +2073,7 @@ export async function runPostBatchAutonomousLoops(
 	if (!opts?.signal?.aborted) {
 		try {
 			const curForChain = loadState(normRoot);
-			if (curForChain) {
+			if (curForChain && !isTerminalAutonomousState(curForChain)) {
 				const bGraph = initBeliefGraphFromState(curForChain, loadOrInitBeliefGraph(normRoot, curForChain));
 				const chainRes = await runAutonomousChainVerification(curForChain, normRoot, sc, {
 					beliefGraph: bGraph,
@@ -2073,7 +2082,7 @@ export async function runPostBatchAutonomousLoops(
 				if (chainRes.executedResults.length > 0) {
 					withLock(normRoot, () => {
 						const s = loadState(normRoot);
-						if (!s) return;
+						if (!s || isTerminalAutonomousState(s)) return;
 						const addedChainFids: string[] = [];
 						for (const cf of chainRes.candidateFacts) {
 							if (cf.key && Object.values(s.facts).some((x) => x.key === cf.key)) continue;
@@ -2106,7 +2115,10 @@ export async function runPostBatchAutonomousLoops(
 					});
 				}
 				if ((process.env.NUWA_AUTO_CDP ?? "0").trim() === "1" && !opts?.signal?.aborted) {
-					await runAutonomousCdpLoop(curForChain, normRoot, sc, { enableCapture: true });
+					const recheck = loadState(normRoot);
+					if (recheck && !isTerminalAutonomousState(recheck)) {
+						await runAutonomousCdpLoop(recheck, normRoot, sc, { enableCapture: true });
+					}
 				}
 			}
 		} catch {

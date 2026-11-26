@@ -610,13 +610,56 @@ function extractSafeProductTokens(input: string): string[] {
 	return out.slice(0, 3);
 }
 
+function loadQuarantinedDistilledPairs(db: Database): Set<string> {
+	const out = new Set<string>();
+	if (!hasTable(db, "kb_items")) return out;
+	try {
+		const rows = db
+			.query(
+				`SELECT id, lower(tech) AS tech, tags
+				 FROM kb_items
+				 WHERE source = 'distilled' AND status = 'quarantined'`,
+			)
+			.all() as Array<{ id?: string; tech?: string; tags?: string }>;
+		for (const row of rows) {
+			const tech = String(row.tech ?? "").trim().toLowerCase();
+			const idStr = String(row.id ?? "").trim();
+			if (tech && idStr.startsWith(`exp:${tech}:`)) {
+				const ik = idStr.slice(`exp:${tech}:`.length).trim();
+				if (ik) out.add(`${tech}|${ik}`);
+			} else if (idStr.startsWith("exp:")) {
+				const rest = idStr.slice(4);
+				const idx = rest.indexOf(":");
+				if (idx > 0) {
+					const tPart = rest.slice(0, idx).trim().toLowerCase();
+					const ikPart = rest.slice(idx + 1).trim();
+					if (tPart && ikPart) out.add(`${tPart}|${ikPart}`);
+				}
+			}
+			const tagsStr = String(row.tags ?? "");
+			for (const part of tagsStr.split(",")) {
+				const trimmed = part.trim();
+				if (tech && trimmed.startsWith("intent:")) {
+					const ik = trimmed.slice("intent:".length).trim();
+					if (ik) out.add(`${tech}|${ik}`);
+				}
+			}
+		}
+	} catch {
+		/* ignore */
+	}
+	return out;
+}
+
 function formatExperienceHints(db: Database, techKeys: string[], limit = 3): string {
 	if (!techKeys.length || !hasTable(db, "experience")) return "";
 	const uniq = [...new Set(techKeys.map((t) => t.trim().toLowerCase()).filter(Boolean))];
 	if (!uniq.length) return "";
 	const placeholders = uniq.map(() => "?").join(",");
 	try {
-		const rows = db
+		const quarantined = loadQuarantinedDistilledPairs(db);
+		const fetchLimit = Math.max(limit, limit + quarantined.size);
+		const rawRows = db
 			.query(
 				`SELECT tech_key, intent_key, phase, success_count, fail_count, helpful_pattern, pitfall_note
 				 FROM experience
@@ -624,7 +667,10 @@ function formatExperienceHints(db: Database, techKeys: string[], limit = 3): str
 				 ORDER BY (success_count - fail_count) DESC, success_count DESC, updated_at DESC
 				 LIMIT ?`,
 			)
-			.all(...uniq, limit) as unknown as ExperienceRecord[];
+			.all(...uniq, fetchLimit) as unknown as ExperienceRecord[];
+		const rows = rawRows
+			.filter((r) => !quarantined.has(`${String(r.tech_key ?? "").trim().toLowerCase()}|${r.intent_key}`))
+			.slice(0, limit);
 		if (!rows.length) return "";
 		const lines = rows.map((r) => {
 			const parts = [
@@ -1944,19 +1990,28 @@ export function computeExperiencePriorityBoost(
 	try {
 		if (!hasTable(db, "experience")) return 0;
 
+		const quarantined = loadQuarantinedDistilledPairs(db);
+		if (techs.some((t) => quarantined.has(`${t}|${intentKey}`))) {
+			return 0;
+		}
+
 		const placeholders = techs.map(() => "?").join(",");
-		const rows = db
+		const rawRows = db
 			.query(
-				`SELECT intent_key, success_count, fail_count, updated_at
+				`SELECT lower(tech_key) AS tech_key, intent_key, success_count, fail_count, updated_at
 				 FROM experience
 				 WHERE tech_key IN (${placeholders})`,
 			)
 			.all(...techs) as Array<{
+			tech_key?: string;
 			intent_key?: string;
 			success_count?: number;
 			fail_count?: number;
 			updated_at?: string;
 		}>;
+		const rows = rawRows.filter(
+			(r) => !quarantined.has(`${String(r.tech_key ?? "").trim().toLowerCase()}|${String(r.intent_key ?? "")}`),
+		);
 
 		const nowMs = opts?.nowMs ?? Date.now();
 		let totalN = 0;

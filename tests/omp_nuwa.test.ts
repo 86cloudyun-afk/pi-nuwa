@@ -243,7 +243,8 @@ describe("directive", () => {
 		st.runtime.turns = 3;
 		const d = buildDirective(st, cfg);
 		expect(d).toContain("nuwa_claim");
-		expect(d).toContain('agent:"fujiang"');
+		expect(d).toContain("fujiang");
+		expect(d).toContain("nuwa-scout");
 		expect(d).toContain("nuwa_commit");
 		expect(d).not.toContain("sapper dispatch");
 		expect(d).not.toContain("bin/nuwa \"");

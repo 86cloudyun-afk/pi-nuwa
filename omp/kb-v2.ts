@@ -1457,8 +1457,11 @@ export function upsertDistilledExperienceCard(
 	const tags = rawTags.includes(`intent:${intentKey}`) ? rawTags : `${rawTags},intent:${intentKey}`;
 	const severity = String(input.severity ?? "MEDIUM").trim().toUpperCase();
 	const ref = String(input.ref ?? "nuwa-distilled-experience").trim();
-	const status: KbItemStatus =
+	const hasExplicitStatus =
+		input.status === "active" || input.status === "promoted" || input.status === "quarantined";
+	const insertStatus: KbItemStatus =
 		input.status === "promoted" || input.status === "quarantined" ? input.status : "active";
+	const explicitStatusOrNull: KbItemStatus | null = hasExplicitStatus ? (input.status as KbItemStatus) : null;
 	const nowIso = new Date().toISOString();
 	const simhash = computeSimHash64(`${tech} ${intentKey} ${title} ${tags} ${summary} ${payloadOrCheck}`);
 
@@ -1478,11 +1481,24 @@ export function upsertDistilledExperienceCard(
 				payload_or_check = excluded.payload_or_check,
 				severity = excluded.severity,
 				ref = excluded.ref,
-				status = excluded.status,
+				status = COALESCE(?, kb_items.status),
 				simhash = excluded.simhash,
 				updated_at = excluded.updated_at
 			WHERE kb_items.source = 'distilled'
-		`).run(id, tech, title, summary, tags, payloadOrCheck, severity, ref, status, simhash, nowIso);
+		`).run(
+			id,
+			tech,
+			title,
+			summary,
+			tags,
+			payloadOrCheck,
+			severity,
+			ref,
+			insertStatus,
+			simhash,
+			nowIso,
+			explicitStatusOrNull,
+		);
 
 		db.query("DELETE FROM kb_items_fts WHERE id = ?").run(id);
 		db.query(`

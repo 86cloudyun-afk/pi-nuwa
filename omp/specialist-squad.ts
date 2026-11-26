@@ -1051,3 +1051,62 @@ export function recommendSpecialistAndModel(
 		reason: reasonParts.join(" "),
 	};
 }
+
+function cleanEnvModel(raw: string | undefined): string | undefined {
+	const trimmed = (raw ?? "").trim();
+	return trimmed || undefined;
+}
+
+/**
+ * 解析当前环境变量（`NUWA_MODEL_FAST` / `NUWA_MODEL_DEEP` / `NUWA_MODEL_VERIFY`）构造专精小队模型路由选项。
+ * 未配置上述环境变量时返回空选项以沿用内置 Gemini 4 主力白名单。
+ */
+export function resolveEnvSpecialistModelOptions(
+	env: Record<string, string | undefined> = process.env,
+): RecommendSpecialistOptions {
+	const fastModel = cleanEnvModel(env.NUWA_MODEL_FAST);
+	const deepModel = cleanEnvModel(env.NUWA_MODEL_DEEP);
+	const verifyModel = cleanEnvModel(env.NUWA_MODEL_VERIFY);
+	if (!fastModel && !deepModel && !verifyModel) {
+		return {};
+	}
+	const configuredPool = [...new Set([fastModel, deepModel, verifyModel].filter((m): m is string => Boolean(m)))];
+	const allowedModels =
+		configuredPool.length >= 2
+			? configuredPool
+			: [...new Set([...configuredPool, ...DEFAULT_ALLOWED_SPECIALIST_MODELS])];
+	const defaultModel = deepModel ?? fastModel ?? verifyModel ?? DEFAULT_ALLOWED_SPECIALIST_MODELS[1];
+	return {
+		allowedModels,
+		defaultModel,
+		...(fastModel ? { fastModel } : {}),
+		...(deepModel ? { deepModel } : {}),
+		...(verifyModel ? { verifyModel } : {}),
+	};
+}
+
+/**
+ * 冷启动场景下按专精角色 tier 映射当前生效的环境变量模型或默认模型。
+ */
+export function resolveColdStartSpecialistModel(
+	role: SpecialistRole,
+	env: Record<string, string | undefined> = process.env,
+): string {
+	const fastModel = cleanEnvModel(env.NUWA_MODEL_FAST);
+	const deepModel = cleanEnvModel(env.NUWA_MODEL_DEEP);
+	const verifyModel = cleanEnvModel(env.NUWA_MODEL_VERIFY);
+	const prof = NUWA_SPECIALIST_SQUAD[role] ?? NUWA_SPECIALIST_SQUAD.fujiang;
+	if (!fastModel && !deepModel && !verifyModel) {
+		return prof.defaultModel;
+	}
+	if (role === "nuwa-verifier") {
+		return verifyModel ?? deepModel ?? fastModel ?? prof.defaultModel;
+	}
+	if (prof.preferredModelTier === "fast") {
+		return fastModel ?? deepModel ?? verifyModel ?? prof.defaultModel;
+	}
+	if (prof.preferredModelTier === "deep") {
+		return deepModel ?? verifyModel ?? fastModel ?? prof.defaultModel;
+	}
+	return deepModel ?? fastModel ?? verifyModel ?? prof.defaultModel;
+}

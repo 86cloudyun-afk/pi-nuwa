@@ -87,7 +87,7 @@ while [[ $# -gt 0 ]]; do
       cat <<'EOF'
 用法: ./install.sh [--keep-legacy] [--force-agents] [--clean-kb] [--rollback]
   --keep-legacy   保留旧的 $SAPPER_HOME/bin/nuwa（默认改名为 nuwa.legacy）
-  --force-agents  强制用仓库最新模板覆盖已存在的 $AGENT_HOME/agents/{fujiang,nuwa-verifier}.md
+  --force-agents  强制用仓库最新模板覆盖已存在的 $AGENT_HOME/agents/ 下全部 6 个 5+1 专精小队模板
   --clean-kb      删除已有 $AGENT_HOME/nuwa-kb/kb.db 并从随仓种子全新构建纯净知识库
   --rollback      恢复最近一次安装前的 nuwa-omp 扩展
 

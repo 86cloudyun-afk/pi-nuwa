@@ -2339,7 +2339,7 @@ export class NuwaUnifiedEngine {
 	}
 
 	/**
-	 * `/nuwa` 斜杠命令单一权威执行入口（含全部 25 个子命令与自然语言目标上膛/并入）。
+	 * `/nuwa` 斜杠命令单一权威执行入口（含全部 28 个子命令与自然语言目标上膛/并入）。
 	 */
 	async executeSlashCommand(
 		rawArgs: string | undefined,

@@ -754,11 +754,12 @@ describe("多会话隔离 armPump、战略复盘与世代轮转放行（Bug 5 + 
 		const stRes1 = await h.call("nuwa_status", {});
 		expect(stRes1.content[0].text).toContain("rules=project");
 
-		// 2. 损坏 JSON 后不阻塞 nuwa_status，回退 builtin 且 journal 记录 autoexec_config_invalid
+		// 2. 损坏 JSON 后不阻塞 nuwa_status，严格零写盘回退 builtin；执行规则源核验时 journal 记录 autoexec_config_invalid
 		writeFileSync(cfgFile, "{ bad json !!!", "utf8");
 		const stRes2 = await h.call("nuwa_status", {});
 		expect(stRes2.details?.error).toBeUndefined();
 		expect(stRes2.content[0].text).toContain("rules=builtin");
+		expect(mod.checkAndLogAutoRuleSource(dir)).toBe("builtin");
 		const journal = readFileSync(join(dir, ".nuwa", "journal.jsonl"), "utf8");
 		expect(journal).toContain('"type":"autoexec_config_invalid"');
 

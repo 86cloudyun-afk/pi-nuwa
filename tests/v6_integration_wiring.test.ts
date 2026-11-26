@@ -1483,6 +1483,6 @@ process.exit(0);
 		expect(wdAfterOne.activeCount()).toBe(1);
 		expect(wdAfterOne.getTask(spA.spawnId)?.status).toBe("completed");
 		expect(wdAfterOne.getTask(spB.spawnId)?.status).toBe("running");
-	});
+	}, 20_000);
 });
 

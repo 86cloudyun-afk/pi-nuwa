@@ -1687,6 +1687,7 @@ export async function runAutonomousChainVerification(
 			baseUrl: state.project.url || state.project.target,
 			state,
 			...opts,
+			applyBeliefUpdate: false,
 		});
 		out.executedResults.push(execRes);
 

@@ -829,6 +829,16 @@ function checkExtensionInstallation(agentHome) {
 		}
 	}
 
+	const v7ModulesFound = [];
+	const v7ModulesMissing = [];
+	for (const mod of V7_EXT_MODULES) {
+		if (existsSync(join(extDir, mod))) {
+			v7ModulesFound.push(mod);
+		} else {
+			v7ModulesMissing.push(mod);
+		}
+	}
+
 	const conflicts = [];
 	if (existsSync(extRoot)) {
 		try {
@@ -842,7 +852,12 @@ function checkExtensionInstallation(agentHome) {
 		}
 	}
 
-	const ok = indexExists && toolsMissing.length === 0 && coreModulesMissing.length === 0;
+	const isV7OrAbove = typeof version === "string" && Number.parseInt(version.split(".")[0] ?? "0", 10) >= 7;
+	const ok =
+		indexExists &&
+		toolsMissing.length === 0 &&
+		coreModulesMissing.length === 0 &&
+		(!isV7OrAbove || v7ModulesMissing.length === 0);
 	let reason = "";
 	if (!indexExists) {
 		reason = `未检测到已安装扩展入口 ${indexPath}（请运行 ./install.sh）`;
@@ -850,6 +865,8 @@ function checkExtensionInstallation(agentHome) {
 		reason = `扩展缺少必需工具 (${toolsMissing.join(", ")})`;
 	} else if (coreModulesMissing.length > 0) {
 		reason = `扩展缺少核心模块 (${coreModulesMissing.join(", ")})`;
+	} else if (isV7OrAbove && v7ModulesMissing.length > 0) {
+		reason = `扩展缺少 v7 核心模块 (${v7ModulesMissing.join(", ")})`;
 	}
 
 	return {
@@ -870,6 +887,8 @@ function checkExtensionInstallation(agentHome) {
 		v5ModulesMissing,
 		v6ModulesFound,
 		v6ModulesMissing,
+		v7ModulesFound,
+		v7ModulesMissing,
 		conflicts,
 		...(reason ? { reason } : {}),
 	};
@@ -1043,7 +1062,7 @@ function checkKnowledgeBase(agentHome, explicitPath, explicitAgentHome = false) 
 	}
 }
 
-function checkAgentTemplates(agentHome) {
+function checkAgentTemplates(agentHome, extVersion = null) {
 	const agentsDir = join(agentHome, "agents");
 	const checkOne = (filename) => {
 		const full = join(agentsDir, filename);
@@ -1071,9 +1090,17 @@ function checkAgentTemplates(agentHome) {
 		}
 	}
 	const squadMissing = SQUAD_AGENT_FILES.filter((af) => !squad[af]?.exists);
+	const isV7OrAbove = typeof extVersion === "string" && Number.parseInt(extVersion.split(".")[0] ?? "0", 10) >= 7;
+	const agentsOk = missing.length === 0 && (!isV7OrAbove || squadMissing.length === 0);
+	const agentReason =
+		missing.length > 0
+			? `缺少核心子代理模板: ${missing.join(", ")}`
+			: isV7OrAbove && squadMissing.length > 0
+				? `缺少 5+1 专精小队子代理模板: ${squadMissing.join(", ")}`
+				: "";
 
 	return {
-		ok: missing.length === 0,
+		ok: agentsOk,
 		critical: false,
 		dir: agentsDir,
 		fujiang,
@@ -1081,7 +1108,7 @@ function checkAgentTemplates(agentHome) {
 		squad,
 		squadMissing,
 		missing,
-		...(missing.length > 0 ? { reason: `缺少子代理模板: ${missing.join(", ")}` } : {}),
+		...(agentReason ? { reason: agentReason } : {}),
 	};
 }
 
@@ -1225,8 +1252,8 @@ function runDoctor(argv) {
 	// 4. 检查 KB 数据库与记录数
 	const kbCheck = checkKnowledgeBase(agentHome, opts.kbDb, Boolean(opts.agentHome));
 
-	// 5. 检查子代理模板 fujiang.md / nuwa-verifier.md
-	const agentsCheck = checkAgentTemplates(agentHome);
+	// 5. 检查子代理模板（v7+ 校验全部 6 个 5+1 专精小队模板）
+	const agentsCheck = checkAgentTemplates(agentHome, extensionCheck.version);
 
 	// 6. 检查本地工具链
 	const toolchainCheck = checkToolchain();
@@ -1294,7 +1321,7 @@ function runDoctor(argv) {
 		`${badge(ompCheck)} omp: ${ompCheck.ok ? `${ompCheck.version ?? "ok"} (${ompCheck.path})` : ompCheck.reason}`,
 		`${badge(extensionCheck)} 扩展与工具: ${
 			extensionCheck.ok
-				? `v${extensionCheck.version ?? "?"} · 工具 ${extensionCheck.toolsCount}/${extensionCheck.toolsRequired} · 核心模块 ${extensionCheck.coreModulesFound.length}/${extensionCheck.coreModulesFound.length + extensionCheck.coreModulesMissing.length} · v4模块 ${extensionCheck.v4ModulesFound.length}/${V4_EXT_MODULES.length} · v5模块 ${extensionCheck.v5ModulesFound.length}/${V5_EXT_MODULES.length}`
+				? `v${extensionCheck.version ?? "?"} · 工具 ${extensionCheck.toolsCount}/${extensionCheck.toolsRequired} · 核心模块 ${extensionCheck.coreModulesFound.length}/${extensionCheck.coreModulesFound.length + extensionCheck.coreModulesMissing.length} · v4模块 ${extensionCheck.v4ModulesFound.length}/${V4_EXT_MODULES.length} · v5模块 ${extensionCheck.v5ModulesFound.length}/${V5_EXT_MODULES.length} · v6模块 ${extensionCheck.v6ModulesFound.length}/${V6_EXT_MODULES.length} · v7模块 ${extensionCheck.v7ModulesFound.length}/${V7_EXT_MODULES.length}`
 				: extensionCheck.reason
 		}`,
 		`${badge(kbCheck)} 知识库 KB: ${
@@ -1304,7 +1331,7 @@ function runDoctor(argv) {
 						.join(", ") || "无表"})`
 				: kbCheck.reason
 		}`,
-		`${badge(agentsCheck)} 子代理模板: fujiang.md=${agentsCheck.fujiang.exists ? "就绪" : "缺失"}, nuwa-verifier.md=${agentsCheck.nuwaVerifier.exists ? "就绪" : "缺失"} (${agentsCheck.dir})`,
+		`${badge(agentsCheck)} 子代理模板: 5+1专精小队 ${SQUAD_AGENT_FILES.length - agentsCheck.squadMissing.length}/${SQUAD_AGENT_FILES.length}${agentsCheck.reason ? ` (${agentsCheck.reason})` : ` (就绪: ${agentsCheck.dir})`}`,
 		`${badge(toolchainCheck)} 本地工具链: 可用 ${toolchainCheck.available.length}/${DOCTOR_PROBE_TOOLS.length} (${toolchainCheck.available.join(", ") || "无"})${
 			toolchainCheck.missing.length ? ` | 缺失: ${toolchainCheck.missing.join(", ")}` : ""
 		}`,

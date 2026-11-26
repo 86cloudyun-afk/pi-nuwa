@@ -584,5 +584,361 @@ describe("v7.0.0 KB 2.0 混合语义治理、5+1 专精小队与多跳攻击链�
 		} finally {
 			db.close();
 		}
-	}, 30_000);
+
+		// 验证 nuwa-autonomous doctor --json 完整校验 V7_EXT_MODULES 与 6 个专精小队模板（#92 P1-4）
+		const docOk = spawnSync("bun", [join(targetBin, "nuwa-autonomous"), "doctor", "--json"], {
+			cwd: sb.root,
+			env: env as NodeJS.ProcessEnv,
+			encoding: "utf8",
+			timeout: 15_000,
+		});
+		expect(docOk.status).toBe(0);
+		const docOkJson = JSON.parse(docOk.stdout);
+		expect(docOkJson.ok).toBe(true);
+		expect(docOkJson.checks.extension.v7ModulesFound.length).toBe(5);
+		expect(docOkJson.checks.extension.v7ModulesMissing.length).toBe(0);
+		expect(docOkJson.checks.agents.ok).toBe(true);
+		expect(docOkJson.checks.agents.squadMissing.length).toBe(0);
+
+		// 删除 v7 模块与新小队模板后 doctor 必须报错并告警
+		rmSync(join(sb.agentHome, "extensions", "nuwa-omp", "cdp-bridge.ts"), { force: true });
+		rmSync(join(sb.agentHome, "agents", "nuwa-scout.md"), { force: true });
+		const docFail = spawnSync("bun", [join(targetBin, "nuwa-autonomous"), "doctor", "--json"], {
+			cwd: sb.root,
+			env: env as NodeJS.ProcessEnv,
+			encoding: "utf8",
+			timeout: 15_000,
+		});
+		expect(docFail.status).toBe(1);
+		const docFailJson = JSON.parse(docFail.stdout);
+		expect(docFailJson.ok).toBe(false);
+		expect(docFailJson.checks.extension.ok).toBe(false);
+		expect(docFailJson.checks.extension.v7ModulesMissing).toContain("cdp-bridge.ts");
+		expect(docFailJson.checks.agents.ok).toBe(false);
+		expect(docFailJson.checks.agents.squadMissing).toContain("nuwa-scout.md");
+	}, 35_000);
+});
+
+describe("Wave 2 Boost 异构终审全量反例回归（#91 / #92 / #93）", () => {
+	test("终审 A (#91 P1-1 & P1-2): 损坏 autoexec.json 下 omp nuwa_status 零写盘，且 /nuwa scope show|list 与 session/oob list 零写锁零改写", async () => {
+		const sb = makeSandbox("nuwa-v7-r91-");
+		process.env.PI_AGENT_HOME = sb.agentHome;
+		process.env.NUWA_KB_DB = sb.kbDb;
+		nuwaMod.ensureBundledKb(sb.kbDb, { agentHome: sb.agentHome });
+
+		// 1) 遗留纯 state.json + 损坏 autoexec.json 场景（无 journal.jsonl、无 nuwa.db）
+		process.env.NUWA_STORAGE_BACKEND = "json";
+		const stLegacy = nuwaMod.newState("http://127.0.0.1:19801", "终审A零写盘验证", "pentest", nuwaMod.readCfg(), "r91-sid");
+		nuwaMod.seedPhase(stLegacy, "recon");
+		nuwaMod.saveStateJsonOnly(sb.root, stLegacy);
+		writeFileSync(join(sb.root, ".nuwa", "autoexec.json"), "{ invalid json syntax", "utf8");
+		rmSync(join(sb.root, ".nuwa", "journal.jsonl"), { force: true });
+		delete process.env.NUWA_STORAGE_BACKEND;
+
+		const nuwaDir = join(sb.root, ".nuwa");
+		const filesBefore = readdirSync(nuwaDir).sort();
+		const dirMtimeBefore = statSync(nuwaDir).mtimeMs;
+		const stateMtimeBefore = statSync(nuwaMod.statePath(sb.root)).mtimeMs;
+
+		const h = createOmpHarness(sb.root, "r91-sid");
+		const stRes = await h.tools.get("nuwa_status").execute("r91-1", { root: sb.root }, undefined, undefined, h.ctx);
+		expect(stRes.isError).toBe(false);
+		expect(existsSync(join(nuwaDir, "journal.jsonl"))).toBe(false);
+		expect(existsSync(nuwaMod.sqliteDbPath(sb.root))).toBe(false);
+
+		const eng = new nuwaMod.NuwaUnifiedEngine({ projectRoot: sb.root, cwd: sb.root, agentHome: sb.agentHome, sessionId: "r91-sid" });
+		for (const cmd of ["scope", "scope show", "scope list", "session LIST", "oob LIST"]) {
+			const r = await eng.executeSlashCommand(cmd);
+			expect(r.level).toBe("info");
+		}
+		expect(readdirSync(nuwaDir).sort()).toEqual(filesBefore);
+		expect(statSync(nuwaDir).mtimeMs).toBe(dirMtimeBefore);
+		expect(statSync(nuwaMod.statePath(sb.root)).mtimeMs).toBe(stateMtimeBefore);
+
+		// 2) 默认 SQLite 活跃项目 + 损坏 autoexec.json 场景：omp nuwa_status 不改写 nuwa.db mtime
+		const sbSqlite = makeSandbox("nuwa-v7-r91-sql-");
+		const hSql = createOmpHarness(sbSqlite.root, "r91-sql-sid");
+		await hSql.tools.get("nuwa_init").execute(
+			"init-sql",
+			{ target: "http://127.0.0.1:19802", mode: "ctf", root: sbSqlite.root },
+			undefined,
+			undefined,
+			hSql.ctx,
+		);
+		writeFileSync(join(sbSqlite.root, ".nuwa", "autoexec.json"), "{ broken", "utf8");
+		const dbFile = nuwaMod.sqliteDbPath(sbSqlite.root);
+		await Bun.sleep(20);
+		const dbMtime0 = statSync(dbFile).mtimeMs;
+		const stSqlRes = await hSql.tools.get("nuwa_status").execute("st-sql", { root: sbSqlite.root }, undefined, undefined, hSql.ctx);
+		expect(stSqlRes.isError).toBe(false);
+		expect(statSync(dbFile).mtimeMs).toBe(dbMtime0);
+	});
+
+	test("终审 B (#92 P1-1 & P1-2 & P1-3): KB 2.0 冻结经验零穿透不复活、专精角色锁死与环境变量联动、攻击链单次回灌及终态闭环守卫", async () => {
+		const sb = makeSandbox("nuwa-v7-r92-");
+		process.env.PI_AGENT_HOME = sb.agentHome;
+		process.env.NUWA_KB_DB = sb.kbDb;
+		buildKb({ outPath: sb.kbDb });
+
+		// 1) P1-1: quarantined 经验不穿透 formatExperienceHints / UCB1，二次蒸馏不复活 quarantined、不降级 promoted
+		const stDistill = nuwaMod.newState("http://127.0.0.1:19810", "蒸馏测试", "pentest", nuwaMod.readCfg());
+		stDistill.facts.f1 = {
+			id: "f1",
+			kind: "service",
+			title: "Spring Boot Actuator 暴露",
+			detail: "检测到 Spring Boot 服务",
+			createdAt: "2026-11-26T00:00:00Z",
+		};
+		stDistill.facts.f2 = {
+			id: "f2",
+			kind: "vuln",
+			title: "Actuator env 敏感泄露",
+			detail: "Spring Actuator 暴露配置",
+			verified: true,
+			verifyStage: "confirmed",
+			createdAt: "2026-11-26T00:01:00Z",
+		};
+		stDistill.intents.i1 = {
+			id: "i1",
+			key: "ep:f1:/actuator/env",
+			phase: "vuln",
+			title: "核验 Actuator env",
+			detail: "检查 /actuator/env",
+			status: "done",
+			priority: 80,
+			from: ["f1"],
+			to: "f2",
+			attempts: 1,
+			createdAt: "2026-11-26T00:00:30Z",
+			updatedAt: "2026-11-26T00:01:00Z",
+		};
+		const d1 = nuwaMod.distillProjectExperience(stDistill, { dbPath: sb.kbDb });
+		expect(d1.updated).toBeGreaterThanOrEqual(1);
+		const canonKey = nuwaMod.canonicalizeExperienceIntentKey("ep:f1:/actuator/env");
+
+		// 另插入一张 promoted 卡片，并将上述蒸馏卡通过 5 条误报结算冻结为 quarantined
+		nuwaMod.upsertDistilledExperienceCard(sb.kbDb, {
+			id: "exp:spring:promoted-card",
+			tech: "spring",
+			intentKey: "promoted-card",
+			phase: "vuln",
+			title: "高胜率晋升经验卡",
+			summary: "已晋升有效模式",
+			payload_or_check: "GET /actuator/heapdump",
+			status: "promoted",
+		});
+		const fpRecs: nuwaMod.CalibrationRecord[] = Array.from({ length: 5 }, (_, idx) => ({
+			predictionId: `fp-r92-${idx}`,
+			intentId: canonKey,
+			taskCategory: "exploit",
+			modelId: "gemini-4-neon-xhigh",
+			predictedConfidence: 0.8,
+			estimatedTokens: 2000,
+			settled: true,
+			outcome: 0,
+			isFalsePositive: true,
+			actualTokens: 2100,
+			durationMs: 800,
+			source: "verifier-gate",
+			createdAt: new Date(1700000000000 + idx * 1000).toISOString(),
+			settledAt: new Date(1700000000500 + idx * 1000).toISOString(),
+		}));
+		const gov = nuwaMod.governDistilledExperience(sb.kbDb, fpRecs);
+		expect(gov.quarantinedIds).toContain(`exp:spring:${canonKey}`);
+
+		// 校验 kbLookupSafe 不穿透输出被冻结经验，且 UCB1 返回 0
+		const springLookup = nuwaMod.kbLookupSafe("spring", "auto", 5, { dbPath: sb.kbDb, autoInit: false });
+		expect(springLookup).not.toContain(canonKey);
+		expect(nuwaMod.computeExperiencePriorityBoost(["spring"], "ep:f001:/actuator/env", { dbPath: sb.kbDb })).toBe(0);
+
+		// 二次无校准记录蒸馏：quarantined 不得复活为 active，promoted 不得被重置降级为 active
+		nuwaMod.upsertDistilledExperienceCard(sb.kbDb, {
+			id: "exp:spring:promoted-card",
+			tech: "spring",
+			intentKey: "promoted-card",
+			phase: "vuln",
+			title: "高胜率晋升经验卡更新",
+			summary: "补充摘要",
+			payload_or_check: "HEAD /actuator/heapdump",
+		});
+		nuwaMod.distillProjectExperience(stDistill, { dbPath: sb.kbDb });
+		const verifyDb = new Database(sb.kbDb, { readonly: true });
+		try {
+			const qRow = verifyDb.query("SELECT status FROM kb_items WHERE id = ?").get(`exp:spring:${canonKey}`) as { status: string };
+			const pRow = verifyDb.query("SELECT status FROM kb_items WHERE id = ?").get("exp:spring:promoted-card") as { status: string };
+			expect(qRow.status).toBe("quarantined");
+			expect(pRow.status).toBe("promoted");
+		} finally {
+			verifyDb.close();
+		}
+
+		// 2) P1-2: routeSubagentModel 锁死当前专精角色，且 frontierList / squad 联动 NUWA_MODEL_* 环境变量
+		const roleWs = makeSandbox("nuwa-v7-r92-role-");
+		for (let i = 0; i < 5; i++) {
+			const pScout = `p-scout-${i}`;
+			nuwaMod.recordPrediction(roleWs.root, {
+				predictionId: pScout,
+				intentId: `recon:${i}`,
+				taskCategory: "recon",
+				modelId: "model-fast",
+				predictedConfidence: 0.8,
+				estimatedTokens: 1000,
+				note: "role=nuwa-scout",
+			});
+			nuwaMod.settlePrediction(roleWs.root, {
+				predictionId: pScout,
+				outcome: 1,
+				isFalsePositive: false,
+				actualTokens: 900,
+				durationMs: 300,
+				source: "exec-ledger",
+			});
+			const pAuthGood = `p-auth-good-${i}`;
+			nuwaMod.recordPrediction(roleWs.root, {
+				predictionId: pAuthGood,
+				intentId: `auth:${i}`,
+				taskCategory: "auth",
+				modelId: "model-deep",
+				predictedConfidence: 0.85,
+				estimatedTokens: 1500,
+				note: "role=nuwa-auth-breaker",
+			});
+			nuwaMod.settlePrediction(roleWs.root, {
+				predictionId: pAuthGood,
+				outcome: 1,
+				isFalsePositive: false,
+				actualTokens: 1400,
+				durationMs: 400,
+				source: "verifier-gate",
+			});
+			const pAuthBad = `p-auth-bad-${i}`;
+			nuwaMod.recordPrediction(roleWs.root, {
+				predictionId: pAuthBad,
+				intentId: `auth-bad:${i}`,
+				taskCategory: "auth",
+				modelId: "model-fast",
+				predictedConfidence: 0.8,
+				estimatedTokens: 1200,
+				note: "role=nuwa-auth-breaker",
+			});
+			nuwaMod.settlePrediction(roleWs.root, {
+				predictionId: pAuthBad,
+				outcome: 0,
+				isFalsePositive: true,
+				actualTokens: 1200,
+				durationMs: 350,
+				source: "verifier-gate",
+			});
+		}
+
+		process.env.NUWA_MODEL_FAST = "model-fast";
+		process.env.NUWA_MODEL_DEEP = "model-deep";
+		process.env.NUWA_MODEL_VERIFY = "model-verify";
+		try {
+			const routed = nuwaMod.routeSubagentModel({
+				agent: "nuwa-auth-breaker",
+				phase: "recon",
+				intentKeys: ["recon:baseline"],
+				root: roleWs.root,
+				allowedModels: ["model-fast", "model-deep", "model-verify"],
+			});
+			expect(routed).toBe("model-deep");
+
+			const stSquad = nuwaMod.newState("http://127.0.0.1:19812", "小队模型环境变量测试", "pentest", nuwaMod.readCfg());
+			nuwaMod.addIntent(stSquad, {
+				phase: "vuln",
+				title: "多角色 JWT BOLA 水平越权鉴权差分核验",
+				detail: "对比 userA/userB 访问 /api/orders?id=1002 的响应结构差异",
+				priority: 90,
+			});
+			nuwaMod.saveState(roleWs.root, stSquad);
+			const fItems = nuwaMod.frontierList(stSquad, 5, 900, roleWs.root);
+			expect(fItems[0]?.recommendedSpecialist).toBe("nuwa-auth-breaker");
+			expect(fItems[0]?.recommendedModel).toBe("model-deep");
+			const squadOut = nuwaMod.executeSquadCommand(roleWs.root, "");
+			expect(squadOut.msg).toContain("模型=model-deep");
+		} finally {
+			delete process.env.NUWA_MODEL_FAST;
+			delete process.env.NUWA_MODEL_DEEP;
+			delete process.env.NUWA_MODEL_VERIFY;
+		}
+
+		// 3) P1-3: runAutonomousChainVerification 绝不双重衰减信念，且终态项目拒绝 runPostBatchAutonomousLoops 改写
+		let hitCount = 0;
+		const srv = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req) {
+				hitCount += 1;
+				const u = new URL(req.url);
+				if (u.pathname === "/assets/app.bundle.js.map") {
+					return Response.json({
+						version: 3,
+						sources: ["src/approvals.ts"],
+						sourcesContent: [`const API = "/api/internal/approvals/202";`],
+					});
+				}
+				return Response.json({ error: "Forbidden" }, { status: 403 });
+			},
+		});
+		try {
+			const url = `http://127.0.0.1:${srv.port}`;
+			const chainSb1 = makeSandbox("nuwa-v7-chain-single1-");
+			const chainSb2 = makeSandbox("nuwa-v7-chain-single2-");
+			const mkChainState = () => {
+				const s = nuwaMod.newState(url, "单次回灌测试", "pentest", nuwaMod.readCfg());
+				s.facts.f1 = {
+					id: "f1",
+					kind: "endpoint",
+					title: "SourceMap 泄露内部审批路由",
+					detail: "静态资源 /assets/app.bundle.js.map 暴露未公开内部审批接口路由线索",
+					targetKey: "/assets/app.bundle.js.map",
+					meta: { bundles: ["/assets/app.bundle.js.map"] },
+					createdAt: "2026-11-26T01:00:00Z",
+				};
+				s.facts.f2 = {
+					id: "f2",
+					kind: "endpoint",
+					title: "越权读取审批单中的 exportTicket",
+					detail: "访问泄露的内部审批路由读取一次性 exportTicket",
+					createdAt: "2026-11-26T01:01:00Z",
+				};
+				return s;
+			};
+
+			const s1 = mkChainState();
+			const bg1 = nuwaMod.initBeliefGraphFromState(s1);
+			await nuwaMod.runAutonomousChainVerification(s1, chainSb1.root, s1.project.scope!, {
+				beliefGraph: bg1,
+				applyBeliefUpdate: false,
+				maxVerifyChains: 1,
+			});
+
+			const s2 = mkChainState();
+			const bg2 = nuwaMod.initBeliefGraphFromState(s2);
+			await nuwaMod.runAutonomousChainVerification(s2, chainSb2.root, s2.project.scope!, {
+				beliefGraph: bg2,
+				applyBeliefUpdate: true,
+				maxVerifyChains: 1,
+			});
+
+			const nid1 = nuwaMod.resolveBeliefNodeId(bg1, "f2")!;
+			const nid2 = nuwaMod.resolveBeliefNodeId(bg2, "f2")!;
+			expect(bg2.nodes[nid2]!.beta).toBeCloseTo(bg1.nodes[nid1]!.beta, 6);
+
+			// 终态项目调用 runPostBatchAutonomousLoops 必须零发包、零改写
+			const termSb = makeSandbox("nuwa-v7-term-loop-");
+			const termSt = mkChainState();
+			(termSt.project as { status: string }).status = "done";
+			termSt.runtime.status = "completed";
+			nuwaMod.saveState(termSb.root, termSt);
+			const hitsBeforeTerm = hitCount;
+			const factsBeforeTerm = Object.keys(nuwaMod.loadState(termSb.root)!.facts).length;
+			await nuwaMod.runPostBatchAutonomousLoops(termSb.root, {});
+			expect(hitCount).toBe(hitsBeforeTerm);
+			expect(Object.keys(nuwaMod.loadState(termSb.root)!.facts).length).toBe(factsBeforeTerm);
+		} finally {
+			srv.stop(true);
+		}
+	});
 });

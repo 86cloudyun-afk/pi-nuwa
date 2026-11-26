@@ -937,6 +937,7 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 							records,
 							{
 								allowedModels: pool,
+								allowedRoles: [agentName as SpecialistRole],
 								defaultModel: baseModel,
 								fastModel,
 								deepModel: deepModel ?? verifyModel,

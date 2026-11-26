@@ -6,7 +6,6 @@
  *   - 异步派单缓冲、`taskFile`/占位符展开、`eval` 词法解析与 `SubagentWatchdog` 生命周期统一委托给 `./dispatch-bridge`；
  *   - 本文件仅保留宿主 TUI 胶水、自动侦察批与后台续跑心跳钩子，并 100% 完整重导出 v4–v7 全部公共符号与类型。
  */
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { setInterval as setNodeInterval } from "node:timers";
 import type { ExtensionAPI, ExtensionContext, SessionStopEvent } from "@oh-my-pi/pi-coding-agent";
@@ -51,7 +50,6 @@ import { ensureBundledKb } from "./kb";
 import { registerActiveSession, resolveLineageRoot } from "./lineage";
 import {
 	SubagentWatchdog,
-	checkAndLogAutoRuleSource,
 	cleanupTrackedProcesses,
 	findLocalRoot,
 	findRoot,
@@ -67,7 +65,6 @@ import {
 	readJournalTail,
 	readJson,
 	saveState,
-	statePath,
 	verifyWorkspaceIntegrity,
 	withLock,
 } from "./storage";
@@ -162,7 +159,10 @@ export {
 	type BatchTaskItem, type ChunkBatchOptions, type ChunkBatchResult, type DispatchReceipt,
 	type DispatchValidationResult, type SubagentDispatchPayload,
 } from "./lineage";
-export { distillProjectExperience, ensureBundledKb, kbLookupSafe } from "./kb";
+export {
+	canonicalizeExperienceIntentKey, computeExperiencePriorityBoost, distillProjectExperience,
+	ensureBundledKb, kbLookupSafe,
+} from "./kb";
 export { redactVaultSecrets, upsertSessionRole } from "./session-vault";
 export {
 	buildFalsePositiveNote, extractVerifyTargetFactId, isVerifyVulnIntentKey,
@@ -634,10 +634,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			root: z.string().optional(),
 		}),
 		async execute(_id, p, _sig, _up, ctx) {
-			const res = await engine.callTool("nuwa_status", p as Record<string, unknown>, hooksForCtx(ctx));
-			const d = res.details as { root?: string; status?: string } | undefined;
-			if (d?.root && d.status === "active" && existsSync(statePath(d.root))) checkAndLogAutoRuleSource(d.root);
-			return res;
+			return engine.callTool("nuwa_status", p as Record<string, unknown>, hooksForCtx(ctx));
 		},
 	});
 	pi.registerTool({

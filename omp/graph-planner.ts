@@ -62,7 +62,12 @@ import {
 	type SearchPivotRecommendation,
 } from "./belief-search";
 import { hasCalibrationRecords, loadCalibrationRecords, type CalibrationRecord } from "./calibration";
-import { classifyIntentForSpecialist, recommendSpecialistAndModel } from "./specialist-squad";
+import {
+	classifyIntentForSpecialist,
+	recommendSpecialistAndModel,
+	resolveColdStartSpecialistModel,
+	resolveEnvSpecialistModelOptions,
+} from "./specialist-squad";
 
 export function kbLookup(query: string, kind: KbLookupKind, limit = 5): string {
 	return kbLookupSafe(query, kind, limit, { agentHome: getAgentHome() });
@@ -1800,13 +1805,19 @@ export function frontierList(st: NuwaState, limit = 20, claimTtl = 900, root?: s
 	for (const item of topItems) {
 		try {
 			if (calibRecords && calibRecords.some((r) => r.settled)) {
-				const rec = recommendSpecialistAndModel(item.intent, st, calibRecords);
+				const rec = recommendSpecialistAndModel(
+					item.intent,
+					st,
+					calibRecords,
+					resolveEnvSpecialistModelOptions(),
+				);
 				item.recommendedSpecialist = rec.recommendedRole;
 				item.recommendedModel = rec.recommendedModel;
 				item.specialistReason = rec.reason;
 			} else {
 				const cls = classifyIntentForSpecialist(item.intent, st);
 				item.recommendedSpecialist = cls.role;
+				item.recommendedModel = resolveColdStartSpecialistModel(cls.role);
 				item.specialistReason = cls.reason;
 			}
 		} catch {
