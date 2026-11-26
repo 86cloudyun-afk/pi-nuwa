@@ -307,8 +307,9 @@ const VERIFY_SIGNALS: readonly SignalRule[] = [
 	},
 	{
 		label: "正负对照复核 candidate 证据",
-		weight: 3.5,
-		textRe: /(?:candidate|候选发现|疑似漏洞)[\s\S]{0,24}(?:正负对照|独立重放|复验裁定)/i,
+		weight: 5.5,
+		textRe:
+			/(?:candidate|候选发现|疑似漏洞|候选缺陷)[\s\S]{0,32}(?:正负对照|独立重放|复验裁定|证伪|复验)|(?:正负对照|独立重放|复验裁定)[\s\S]{0,32}(?:candidate|候选发现|疑似漏洞|候选缺陷)/i,
 	},
 ];
 
@@ -630,6 +631,16 @@ export function isMechanicalCalibrationRecord(rec: unknown): rec is SpecialistCa
 	}
 	if (typeof r.modelId !== "string" || !r.modelId.trim()) return false;
 	if (!VALID_TASK_CATEGORIES.has(r.taskCategory)) return false;
+	if (
+		(r.actualTokens !== undefined &&
+			(typeof r.actualTokens !== "number" || !Number.isFinite(r.actualTokens) || r.actualTokens < 0)) ||
+		(r.estimatedTokens !== undefined &&
+			(typeof r.estimatedTokens !== "number" || !Number.isFinite(r.estimatedTokens) || r.estimatedTokens < 0)) ||
+		(r.durationMs !== undefined &&
+			(typeof r.durationMs !== "number" || !Number.isFinite(r.durationMs) || r.durationMs < 0))
+	) {
+		return false;
+	}
 	return true;
 }
 
@@ -715,14 +726,22 @@ export function recommendSpecialistAndModel(
 		);
 	}
 
-	// 2. 校验可选 allowedRoles 范围
+	// 2. 校验可选 allowedRoles 范围（若调用方显式传入 allowedRoles，严格拒绝空数组或全非法角色名，禁止静默放开）
 	const allowedRoleSet = new Set<SpecialistRole>();
-	if (opts?.allowedRoles && Array.isArray(opts.allowedRoles) && opts.allowedRoles.length > 0) {
+	if (opts && "allowedRoles" in opts && opts.allowedRoles !== undefined) {
+		if (!Array.isArray(opts.allowedRoles)) {
+			throw new CalibrationError("INVALID_INPUT", "recommendSpecialistAndModel: allowedRoles 必须为有效角色数组");
+		}
 		for (const r of opts.allowedRoles) {
 			if (VALID_SPECIALIST_ROLES.has(r)) allowedRoleSet.add(r);
 		}
-	}
-	if (allowedRoleSet.size === 0) {
+		if (allowedRoleSet.size === 0) {
+			throw new CalibrationError(
+				"INVALID_INPUT",
+				"recommendSpecialistAndModel 需要至少包含 1 个合法 SpecialistRole 的 allowedRoles 白名单",
+			);
+		}
+	} else {
 		for (const r of SPECIALIST_ROLES) allowedRoleSet.add(r);
 	}
 
@@ -812,8 +831,8 @@ export function recommendSpecialistAndModel(
 	for (const role of candidateRoles) {
 		const roleBaselineModel = resolveRoleDefaultModelInAllowlist(role, allowedModels, allowedModelSet, opts);
 		const roleTaggedSlice = recordsByRole.get(role) ?? [];
-		// 若该角色专属样本充足，用专属切片驱动模型自适应路由；否则回退使用全局白名单校准账本
-		const sliceForAdaptive = roleTaggedSlice.length >= minSamples ? roleTaggedSlice : allowlistedRecords;
+		// 当账本存在角色标记时，严格仅使用该角色自身的校准记录评估自适应模型，绝不混入其他角色的记录
+		const sliceForAdaptive = anyRoleTaggedRecords ? roleTaggedSlice : allowlistedRecords;
 		const adaptiveDecision = recommendAdaptiveModelRoute(sliceForAdaptive, {
 			allowedModels,
 			defaultModel: roleBaselineModel,
@@ -841,20 +860,30 @@ export function recommendSpecialistAndModel(
 			const globalModelMetrics: CalibrationDimensionMetrics | undefined =
 				calibrationSummary.byModel[modelId];
 
-			// 选择最具代表性的评估切片：三维精确切片 >= minSamples > 角色×模型 >= minSamples > (若无角色标签则用类别×模型 / 全局模型)
+			// 选择最具代表性的评估切片：
+			// - 当 anyRoleTaggedRecords=true 时，严格隔离各角色战绩（本角色在该模型无记录则保持 undefined 纯冷启动，严禁嫁接其他角色指标）；
+			// - 仅当历史账本完全不含角色标签（!anyRoleTaggedRecords）时，回退采用类别×模型或全局模型指标。
 			let activeMetrics: CalibrationDimensionMetrics | undefined;
-			if (exactSlice.length >= minSamples) {
-				activeMetrics = computeCalibrationSummary(exactSlice).global;
-			} else if (roleModelSlice.length >= minSamples) {
-				activeMetrics = computeCalibrationSummary(roleModelSlice).global;
-			} else if (exactSlice.length > 0 && anyRoleTaggedRecords) {
-				activeMetrics = computeCalibrationSummary(exactSlice).global;
-			} else if (!anyRoleTaggedRecords && (catModelMetrics?.settledCount ?? 0) >= minSamples) {
-				activeMetrics = catModelMetrics;
-			} else if (!anyRoleTaggedRecords && (globalModelMetrics?.settledCount ?? 0) >= minSamples) {
-				activeMetrics = globalModelMetrics;
+			if (anyRoleTaggedRecords) {
+				if (exactSlice.length >= minSamples) {
+					activeMetrics = computeCalibrationSummary(exactSlice).global;
+				} else if (roleModelSlice.length >= minSamples) {
+					activeMetrics = computeCalibrationSummary(roleModelSlice).global;
+				} else if (exactSlice.length > 0) {
+					activeMetrics = computeCalibrationSummary(exactSlice).global;
+				} else if (roleModelSlice.length > 0) {
+					activeMetrics = computeCalibrationSummary(roleModelSlice).global;
+				} else {
+					activeMetrics = undefined;
+				}
 			} else {
-				activeMetrics = catModelMetrics?.settledCount ? catModelMetrics : globalModelMetrics;
+				if ((catModelMetrics?.settledCount ?? 0) >= minSamples) {
+					activeMetrics = catModelMetrics;
+				} else if ((globalModelMetrics?.settledCount ?? 0) >= minSamples) {
+					activeMetrics = globalModelMetrics;
+				} else {
+					activeMetrics = catModelMetrics?.settledCount ? catModelMetrics : globalModelMetrics;
+				}
 			}
 
 			const settledCount = activeMetrics?.settledCount ?? 0;

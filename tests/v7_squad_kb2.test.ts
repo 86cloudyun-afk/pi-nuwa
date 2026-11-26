@@ -868,3 +868,349 @@ describe("5. governDistilledExperience 连续 5 次零产出自动冻结、反�
 		}
 	});
 });
+
+describe("6. Boost 异构深度审查 6 项 P1 边界反例回归测试", () => {
+	test("P1-1: governDistilledExperience 按 settledAt/createdAt 稳定升序排列，倒序/乱序输入绝不误冻结最新已回暖卡片且准确冻结最新连败卡片", () => {
+		const memDb = new Database(":memory:");
+		try {
+			ingestV7SeedPack(memDb, PACK_PATH, { seedDir: KB_DIR });
+
+			upsertDistilledExperienceCard(memDb, {
+				id: "exp:order:time-recovered",
+				tech: "nextjs",
+				intentKey: "vuln:time-recovered",
+				title: "早期 5 连败但最新实锤回暖经验卡",
+				summary: "验证倒序传入记录时按真实时间戳升序计算尾部连败为 0",
+				payload_or_check: "检查最新实锤恢复后不应被误冻结",
+			});
+			upsertDistilledExperienceCard(memDb, {
+				id: "exp:order:time-degraded",
+				tech: "nextjs",
+				intentKey: "vuln:time-degraded",
+				title: "最早 1 次命中但最近连续 5 次零产出退化经验卡",
+				summary: "验证最早命中排在数组末尾时仍按真实时间戳识别最新 5 连败冻结",
+				payload_or_check: "检查最近连续 5 次零产出必须被冻结",
+			});
+
+			// 倒序传入：数组第 0 项是最新的 t6 (10:06:30) 命中，后面跟着早期的 t5..t1 零产出
+			const reversedRecovered: ExperienceCalibrationRecord[] = [
+				{
+					...makeSettledRecord({
+						id: "rec-t6-hit",
+						experienceId: "exp:order:time-recovered",
+						taskCategory: "auth",
+						modelId: "gemini-4-neon-xhigh",
+						outcome: 1,
+						source: "verifier-gate",
+					}),
+					createdAt: "2026-11-26T10:06:00.000Z",
+					settledAt: "2026-11-26T10:06:30.000Z",
+				},
+				...[5, 4, 3, 2, 1].map((n) => ({
+					...makeSettledRecord({
+						id: `rec-t${n}-miss`,
+						experienceId: "exp:order:time-recovered",
+						taskCategory: "auth",
+						modelId: "gemini-4-neon-xhigh",
+						outcome: 0,
+						source: "verifier-gate",
+					}),
+					createdAt: `2026-11-26T10:0${n}:00.000Z`,
+					settledAt: `2026-11-26T10:0${n}:30.000Z`,
+				})),
+			];
+
+			// 乱序传入：最近 t2..t6 连续 5 次零产出在前，最早 t1 (10:01:30) 命中放在数组最末尾
+			const shuffledDegraded: ExperienceCalibrationRecord[] = [
+				...[6, 5, 4, 3, 2].map((n) => ({
+					...makeSettledRecord({
+						id: `deg-t${n}-miss`,
+						experienceId: "exp:order:time-degraded",
+						taskCategory: "auth",
+						modelId: "gemini-4-neon-xhigh",
+						outcome: 0,
+						source: "verifier-gate",
+					}),
+					createdAt: `2026-11-26T10:0${n}:00.000Z`,
+					settledAt: `2026-11-26T10:0${n}:30.000Z`,
+				})),
+				{
+					...makeSettledRecord({
+						id: "deg-t1-hit",
+						experienceId: "exp:order:time-degraded",
+						taskCategory: "auth",
+						modelId: "gemini-4-neon-xhigh",
+						outcome: 1,
+						source: "verifier-gate",
+					}),
+					createdAt: "2026-11-26T10:01:00.000Z",
+					settledAt: "2026-11-26T10:01:30.000Z",
+				},
+			];
+
+			const res = governDistilledExperience(memDb, [...reversedRecovered, ...shuffledDegraded]);
+			expect(res.details["exp:order:time-recovered"]?.consecutiveZeroYield).toBe(0);
+			expect(res.details["exp:order:time-recovered"]?.newStatus).not.toBe("quarantined");
+			expect(res.quarantinedIds).not.toContain("exp:order:time-recovered");
+
+			expect(res.details["exp:order:time-degraded"]?.consecutiveZeroYield).toBe(5);
+			expect(res.details["exp:order:time-degraded"]?.newStatus).toBe("quarantined");
+			expect(res.quarantinedIds).toContain("exp:order:time-degraded");
+		} finally {
+			memDb.close();
+		}
+	});
+
+	test("P1-2: 经验卡归因严格校验完整 ID 边界（杜绝短前缀跨卡误杀）且 note 顺带提及种子卡绝不遮蔽 intentId 绑定的真实蒸馏卡", () => {
+		const memDb = new Database(":memory:");
+		try {
+			ingestV7SeedPack(memDb, PACK_PATH, { seedDir: KB_DIR });
+
+			upsertDistilledExperienceCard(memDb, {
+				id: "exp:nextjs:auth",
+				tech: "nextjs",
+				intentKey: "vuln:short-auth",
+				title: "短前缀无辜经验卡",
+				summary: "0 派单记录，绝不可被 auth-bypass 子串误命中",
+				payload_or_check: "检查短前缀隔离",
+			});
+			upsertDistilledExperienceCard(memDb, {
+				id: "exp:nextjs:auth-bypass",
+				tech: "nextjs",
+				intentKey: "vuln:long-auth-bypass",
+				title: "长后缀连续零产出经验卡",
+				summary: "真实连续 5 次零产出的目标卡",
+				payload_or_check: "检查精确命中长 ID",
+			});
+			upsertDistilledExperienceCard(memDb, {
+				id: "exp:spring:actuator-check",
+				tech: "spring-boot",
+				intentKey: "vuln:spring-act-check",
+				title: "通过 intentId 关联但 note 顺带提及 T1190 的经验卡",
+				summary: "验证种子 ID T1190 不会提前截断遮蔽 intentId 反向索引",
+				payload_or_check: "检查 intentId 正常归因冻结",
+			});
+
+			const recs: ExperienceCalibrationRecord[] = [];
+			for (let i = 0; i < 5; i++) {
+				recs.push(
+					makeSettledRecord({
+						id: `prefix-test-${i}`,
+						intentId: `other-intent-${i}`,
+						note: "tested exp:nextjs:auth-bypass zero yield",
+						taskCategory: "auth",
+						modelId: "gemini-4-neon-xhigh",
+						outcome: 0,
+						source: "verifier-gate",
+					}),
+				);
+				recs.push(
+					makeSettledRecord({
+						id: `shadow-test-${i}`,
+						intentId: "vuln:spring-act-check",
+						note: "related to MITRE T1190 probe zero yield",
+						taskCategory: "recon",
+						modelId: "gemini-4-neon-xhigh",
+						outcome: 0,
+						source: "verifier-gate",
+					}),
+				);
+			}
+
+			const res = governDistilledExperience(memDb, recs);
+			// 无辜短前缀卡 exp:nextjs:auth 必须毫发无损维持 active
+			expect(res.quarantinedIds).not.toContain("exp:nextjs:auth");
+			expect(res.activeIds).toContain("exp:nextjs:auth");
+			expect(res.details["exp:nextjs:auth"]).toBeUndefined();
+
+			// 真实目标卡与被 note 提及 T1190 的卡均须准确记账冻结
+			expect(res.quarantinedIds).toContain("exp:nextjs:auth-bypass");
+			expect(res.quarantinedIds).toContain("exp:spring:actuator-check");
+			expect(res.details["exp:spring:actuator-check"]?.consecutiveZeroYield).toBe(5);
+		} finally {
+			memDb.close();
+		}
+	});
+
+	test("P1-3: 拒绝 predictedConfidence=NaN / 负数 actualTokens 脏记录，且 kind='experience' 外部导入源与 SQL 更新条件严格一致", () => {
+		const memDb = new Database(":memory:");
+		try {
+			ingestV7SeedPack(memDb, PACK_PATH, { seedDir: KB_DIR });
+
+			// 直接写入一条 source='imported-exp', kind='experience' 的外部导入蒸馏经验卡
+			memDb
+				.query(`
+					INSERT INTO kb_items (
+						id, kind, tech, title, summary, tags, payload_or_check, severity, ref,
+						source, status, simhash, updated_at
+					) VALUES (
+						'exp:custom:imported-card', 'experience', 'cloud', '外部导入经验卡', '验证非 distilled 字面量源同步写库',
+						'cloud,intent:vuln:imported-exp', '核查写库一致性', 'MEDIUM', 'imported',
+						'imported-exp', 'active', '1122334455667788', '2026-11-26T10:00:00.000Z'
+					)
+				`)
+				.run();
+
+			// 先传入 5 条含 NaN 置信度与负 Token 的脏记录 -> 必须全部归入 ignoredUnsettledOrInvalidCount，accepted=0
+			const dirtyRecs: ExperienceCalibrationRecord[] = Array.from({ length: 5 }, (_, i) => ({
+				...makeSettledRecord({
+					id: `dirty-nan-${i}`,
+					experienceId: "exp:custom:imported-card",
+					taskCategory: "recon",
+					modelId: "gemini-4-neon-xhigh",
+					outcome: 1,
+					source: "verifier-gate",
+				}),
+				predictedConfidence: Number.NaN,
+				actualTokens: -500,
+			}));
+
+			const dirtyRes = governDistilledExperience(memDb, dirtyRecs);
+			expect(dirtyRes.acceptedMechanicalRecords).toBe(0);
+			expect(dirtyRes.ignoredUnsettledOrInvalidCount).toBe(5);
+
+			// 再传入 5 条合法连续零产出记录 -> 数据库实际行状态与 quarantinedIds 必须同步变为 quarantined
+			const validMissRecs: ExperienceCalibrationRecord[] = Array.from({ length: 5 }, (_, i) =>
+				makeSettledRecord({
+					id: `imported-miss-${i}`,
+					experienceId: "exp:custom:imported-card",
+					taskCategory: "recon",
+					modelId: "gemini-4-neon-xhigh",
+					outcome: 0,
+					source: "verifier-gate",
+				}),
+			);
+
+			const govRes = governDistilledExperience(memDb, validMissRecs);
+			expect(govRes.quarantinedIds).toContain("exp:custom:imported-card");
+			const dbRow = memDb
+				.query("SELECT status, consecutive_zero_yield FROM kb_items WHERE id = ?")
+				.get("exp:custom:imported-card") as { status: string; consecutive_zero_yield: number };
+			expect(dbRow.status).toBe("quarantined");
+			expect(dbRow.consecutive_zero_yield).toBe(5);
+		} finally {
+			memDb.close();
+		}
+	});
+
+	test("P1-4: hybridKbSearch 将 kind 与 tech 下推至全部 SQL WHERE 子句并覆盖 payload_or_check，绝不被大池挤出漏召回", () => {
+		const memDb = new Database(":memory:");
+		try {
+			ingestV7SeedPack(memDb, PACK_PATH, { seedDir: KB_DIR });
+
+			upsertDistilledExperienceCard(memDb, {
+				id: "exp:cloud:hecha-check",
+				tech: "cloud",
+				intentKey: "vuln:cloud-hecha",
+				title: "云配置专项核查经验卡",
+				summary: "针对云存储与元数据的核查经验",
+				payload_or_check: "执行只读配置核查与独有标记 UNIQUE_BODY_ONLY_MARKER_9921 验证",
+			});
+
+			// 即使全库有数百条种子卡含高频词“核查”，指定 kind="experience" 下推 SQL 后仍 100% 召回该经验卡
+			const expHits = hybridKbSearch(memDb, "核查", { kind: "experience", limit: 5 });
+			expect(expHits.length).toBeGreaterThan(0);
+			expect(expHits.some((h) => h.id === "exp:cloud:hecha-check")).toBe(true);
+
+			// 仅出现在 payload_or_check 正文的独有词同样在 LIKE 补充层准确召回
+			const bodyOnlyHits = hybridKbSearch(memDb, "UNIQUE_BODY_ONLY_MARKER_9921", { limit: 5 });
+			expect(bodyOnlyHits.some((h) => h.id === "exp:cloud:hecha-check")).toBe(true);
+
+			// 指定 tech="cloud" 检索宽泛中文词“安全 配置 校验”可充分召回满额 cloud 卡片（不被前序非 cloud 卡截断）
+			const cloudHits = hybridKbSearch(memDb, "安全 配置 校验", { tech: "cloud", limit: 10 });
+			expect(cloudHits.length).toBe(10);
+			expect(cloudHits.every((h) => h.tech === "cloud")).toBe(true);
+		} finally {
+			memDb.close();
+		}
+	});
+
+	test("P1-5 & P1-6: recommendSpecialistAndModel 隔离跨角色失败污染、candidate 正负对照 100% 锁定 nuwa-verifier、且非法 allowedRoles 显式抛错", () => {
+		const state = createMockState();
+
+		// P1-5 反例复验：nuwa-auth-breaker 在 neon 有 6 次失败，在 carbon 有 0 次记录；
+		// 其他角色 fujiang 在 carbon (同 category="auth") 有 6 次失败 -> 绝不能污染 nuwa-auth-breaker × carbon！
+		const crossRoleRecs: SpecialistCalibrationRecord[] = [];
+		for (let i = 0; i < 6; i++) {
+			crossRoleRecs.push(
+				makeSettledRecord({
+					id: `auth-neon-fail-${i}`,
+					taskCategory: "auth",
+					modelId: "gemini-4-neon-xhigh",
+					specialistRole: "nuwa-auth-breaker",
+					outcome: 0,
+					isFalsePositive: true,
+					predictedConfidence: 0.9,
+					actualTokens: 3000,
+					source: "verifier-gate",
+				}),
+			);
+			crossRoleRecs.push(
+				makeSettledRecord({
+					id: `fujiang-carbon-fail-${i}`,
+					taskCategory: "auth",
+					modelId: "gemini-4-carbon-high",
+					specialistRole: "fujiang",
+					outcome: 0,
+					isFalsePositive: true,
+					predictedConfidence: 0.9,
+					actualTokens: 3000,
+					source: "verifier-gate",
+				}),
+			);
+		}
+
+		const isolatedRes = recommendSpecialistAndModel(
+			{
+				key: "vuln:check-bola",
+				phase: "vuln",
+				title: "多角色会话差分核验订单 BOLA 越权",
+				detail: "对比低权与高权响应",
+			},
+			state,
+			crossRoleRecs,
+			{
+				allowedModels: ["gemini-4-neon-xhigh", "gemini-4-carbon-high"],
+				defaultModel: "gemini-4-neon-xhigh",
+				minSamples: 5,
+			},
+		);
+
+		const authCarbonCand = isolatedRes.candidates.find(
+			(c) => c.role === "nuwa-auth-breaker" && c.modelId === "gemini-4-carbon-high",
+		);
+		expect(authCarbonCand).toBeDefined();
+		expect(authCarbonCand!.settledCount).toBe(0);
+		expect(authCarbonCand!.coldStart).toBe(true);
+		expect(authCarbonCand!.demoted).toBe(false);
+		expect(isolatedRes.recommendedRole).toBe("nuwa-auth-breaker");
+		expect(isolatedRes.recommendedModel).toBe("gemini-4-carbon-high");
+
+		// P1-6a 反例复验：不含 verify- 前缀但标题要求对 candidate 候选发现做正负对照复验裁定（即使详情含 BOLA 越权）-> 100% 锁定 nuwa-verifier
+		const verifyClass = classifyIntentForSpecialist(
+			{
+				key: "vuln:check-f12",
+				phase: "vuln",
+				title: "对 candidate 候选发现做正负对照复验裁定",
+				detail: "核查订单接口 BOLA 越权",
+			},
+			state,
+		);
+		expect(verifyClass.role).toBe("nuwa-verifier");
+		expect(verifyClass.taskCategory).toBe("verify");
+		expect(verifyClass.fallbackRoles).toEqual([]);
+
+		// P1-6b 反例复验：显式传入空或全非法 allowedRoles 必须抛出 CalibrationError("INVALID_INPUT")，严禁静默放开全角色
+		expect(() =>
+			recommendSpecialistAndModel({ key: "vuln:check-bola", title: "BOLA 越权" }, state, [], {
+				allowedRoles: ["nonexistent-role" as any],
+			}),
+		).toThrow(CalibrationError);
+
+		expect(() =>
+			recommendSpecialistAndModel({ key: "vuln:check-bola", title: "BOLA 越权" }, state, [], {
+				allowedRoles: [],
+			}),
+		).toThrow(CalibrationError);
+	});
+});

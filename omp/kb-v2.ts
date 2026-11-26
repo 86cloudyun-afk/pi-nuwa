@@ -235,6 +235,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS kb_items_fts USING fts5(
 );
 `;
 
+const DISTILLED_SQL_PREDICATE =
+	"(source = 'distilled' OR (kind = 'experience' AND source NOT IN ('seed', 'seed-v4', 'seed-v7')))";
+
+const NOT_DISTILLED_UPSERT_GUARD =
+	"NOT (kb_items.source = 'distilled' OR (kb_items.kind = 'experience' AND kb_items.source NOT IN ('seed', 'seed-v4', 'seed-v7')))";
+
 export interface SecuritySynonymCluster {
 	conceptId: string;
 	terms: readonly string[];
@@ -1028,7 +1034,7 @@ function loadAndSyncV4SeedsInTx(db: Database, seedDir: string | null, nowIso: st
 			ref = excluded.ref,
 			simhash = excluded.simhash,
 			updated_at = excluded.updated_at
-		WHERE kb_items.source != 'distilled'
+		WHERE ${NOT_DISTILLED_UPSERT_GUARD}
 	`);
 
 	const cardRows = db
@@ -1291,7 +1297,7 @@ export function ingestV7SeedPack(
 					source = 'seed-v7',
 					simhash = excluded.simhash,
 					updated_at = excluded.updated_at
-				WHERE kb_items.source != 'distilled'
+				WHERE ${NOT_DISTILLED_UPSERT_GUARD}
 			`);
 
 			const insCompatCard = db.query(
@@ -1579,8 +1585,10 @@ export function hybridKbSearch(
 
 		const candidateMap = new Map<string, { row: KbItemRecord; rawBm25: number | null }>();
 		const recallPoolSize = Math.max(140, limit * 16);
+		const filterKind = opts?.kind ? String(opts.kind).trim() : "";
+		const filterTech = opts?.tech ? String(opts.tech).trim().toLowerCase() : "";
 
-		// 1. FTS5 宽召回（结合原始词与中英同义扩展词）
+		// 1. FTS5 宽召回（结合原始词与中英同义扩展词，并将 kind/tech 下推至 SQL 层防止被其他类别挤出 LIMIT）
 		const ftsExpr = buildSafeExpandedFtsMatch(expansion.expandedTerms);
 		if (ftsExpr && hasTable(db, "kb_items_fts")) {
 			try {
@@ -1591,12 +1599,20 @@ export function hybridKbSearch(
 						JOIN kb_items k ON k.id = kb_items_fts.id
 						WHERE kb_items_fts MATCH ?
 						  AND (? = 1 OR k.status != 'quarantined')
+						  AND (? = '' OR k.kind = ?)
+						  AND (? = '' OR LOWER(k.tech) = ?)
 						ORDER BY raw_bm25 ASC
 						LIMIT ?
 					`)
-					.all(ftsExpr, includeQuarantined ? 1 : 0, recallPoolSize) as unknown as Array<
-					KbItemRecord & { raw_bm25?: number }
-				>;
+					.all(
+						ftsExpr,
+						includeQuarantined ? 1 : 0,
+						filterKind,
+						filterKind,
+						filterTech,
+						filterTech,
+						recallPoolSize,
+					) as unknown as Array<KbItemRecord & { raw_bm25?: number }>;
 				for (const r of ftsRows) {
 					candidateMap.set(r.id, {
 						row: r,
@@ -1608,7 +1624,7 @@ export function hybridKbSearch(
 			}
 		}
 
-		// 2. 参数化 LIKE 子串与中文双字切分补充召回（解决 unicode61 连续中文整句未切词问题）
+		// 2. 参数化 LIKE 子串与中文双字切分补充召回（含 payload_or_check 并下推 kind/tech 过滤）
 		const subPhrases: string[] = [];
 		for (const term of expansion.expandedTerms) {
 			if (term.length >= 2 && subPhrases.length < 10) {
@@ -1627,21 +1643,30 @@ export function hybridKbSearch(
 			const likeConds = subPhrases
 				.map(
 					() =>
-						"(title LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR tech LIKE ? ESCAPE '\\')",
+						"(title LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR tech LIKE ? ESCAPE '\\' OR payload_or_check LIKE ? ESCAPE '\\')",
 				)
 				.join(" OR ");
 			const likeParams: Array<string | number> = [];
 			for (const p of subPhrases) {
 				const pat = `%${escapeLikePattern(p.toLowerCase())}%`;
-				likeParams.push(pat, pat, pat, pat);
+				likeParams.push(pat, pat, pat, pat, pat);
 			}
-			likeParams.push(includeQuarantined ? 1 : 0, recallPoolSize);
+			likeParams.push(
+				includeQuarantined ? 1 : 0,
+				filterKind,
+				filterKind,
+				filterTech,
+				filterTech,
+				recallPoolSize,
+			);
 
 			const subRows = db
 				.query(`
 					SELECT * FROM kb_items
 					WHERE (${likeConds})
 					  AND (? = 1 OR status != 'quarantined')
+					  AND (? = '' OR kind = ?)
+					  AND (? = '' OR LOWER(tech) = ?)
 					LIMIT ?
 				`)
 				.all(...likeParams) as unknown as KbItemRecord[];
@@ -1653,15 +1678,23 @@ export function hybridKbSearch(
 			}
 		}
 
-		// 3. 若候选池仍偏小（例如极端罕见口语），补充采样活跃条目执行 SimHash + N-gram 兜底匹配
+		// 3. 若候选池仍偏小（例如极端罕见口语），补充采样活跃条目执行 SimHash + N-gram 兜底匹配（同样下推 kind/tech）
 		if (candidateMap.size < Math.min(40, limit * 4)) {
 			const fallbackRows = db
 				.query(`
 					SELECT * FROM kb_items
 					WHERE (? = 1 OR status != 'quarantined')
+					  AND (? = '' OR kind = ?)
+					  AND (? = '' OR LOWER(tech) = ?)
 					LIMIT 200
 				`)
-				.all(includeQuarantined ? 1 : 0) as unknown as KbItemRecord[];
+				.all(
+					includeQuarantined ? 1 : 0,
+					filterKind,
+					filterKind,
+					filterTech,
+					filterTech,
+				) as unknown as KbItemRecord[];
 			for (const r of fallbackRows) {
 				if (!candidateMap.has(r.id)) {
 					candidateMap.set(r.id, { row: r, rawBm25: null });
@@ -1828,52 +1861,95 @@ export function hybridKbSearch(
 	}
 }
 
-const SELF_CERT_SOURCE_RE =
-	/^(?:self|model|agent|llm|assistant|subagent|fujiang|ai|auto-self|self-eval|self_check)(?:$|:|-|_)/i;
+function isDistilledExperienceItem(item: Pick<KbItemRecord, "kind" | "source">): boolean {
+	return (
+		item.source === "distilled" ||
+		(item.kind === "experience" &&
+			item.source !== "seed" &&
+			item.source !== "seed-v4" &&
+			item.source !== "seed-v7")
+	);
+}
+
+function parseCalibrationEventTimeMs(rec: ExperienceCalibrationRecord): number | null {
+	for (const raw of [rec.settledAt, rec.createdAt]) {
+		const s = String(raw ?? "").trim();
+		if (!s) continue;
+		const ms = Date.parse(s);
+		if (Number.isFinite(ms)) return ms;
+	}
+	return null;
+}
 
 function resolveReferencedKbItemId(
 	rec: ExperienceCalibrationRecord,
 	allItemsById: ReadonlyMap<string, KbItemRecord>,
 	distilledByIntentKey: ReadonlyMap<string, string[]>,
 ): string[] {
-	const matched = new Set<string>();
-
+	// 1. 显式字段优先精确绑定（若显式指向内置种子卡，交由外层执行种子卡保护统计）
+	const explicitMatched = new Set<string>();
 	for (const explicit of [rec.experienceId, rec.cardId, rec.kbItemId]) {
 		const id = String(explicit ?? "").trim();
 		if (id && allItemsById.has(id)) {
-			matched.add(id);
+			explicitMatched.add(id);
 		}
 	}
-	if (matched.size > 0) return [...matched];
+	if (explicitMatched.size > 0) return [...explicitMatched];
+
+	// 2. 隐式归因：同时收集 note 完整边界 Token 与 intentId 反向索引，严禁前缀子串误杀或种子卡遮蔽蒸馏卡
+	const distilledMatched = new Set<string>();
+	const explicitSeedMatched = new Set<string>();
+
+	const addCandidate = (id: string, allowSeedFallback: boolean) => {
+		const item = allItemsById.get(id);
+		if (!item) return;
+		if (isDistilledExperienceItem(item)) {
+			distilledMatched.add(id);
+		} else if (allowSeedFallback) {
+			explicitSeedMatched.add(id);
+		}
+	};
 
 	const noteText = `${rec.note ?? ""} ${rec.settlementNote ?? ""}`.trim();
 	if (noteText) {
-		const kvMatches = noteText.matchAll(/\b(?:exp|card|kb|experienceId|cardId)\s*[:=]\s*([A-Za-z0-9:._-]+)/gi);
+		const kvMatches = noteText.matchAll(
+			/\b(?:exp|card|kb|experienceId|cardId)\s*[:=]\s*([A-Za-z0-9:._-]+)(?![A-Za-z0-9:._-])/gi,
+		);
 		for (const m of kvMatches) {
-			const cand = m[1]!;
-			if (allItemsById.has(cand)) matched.add(cand);
-			if (allItemsById.has(`exp:${cand}`)) matched.add(`exp:${cand}`);
+			const rawCand = m[1]!.replace(/\.+$/, "");
+			for (const cand of [m[1]!, rawCand]) {
+				if (!cand) continue;
+				addCandidate(cand, true);
+				addCandidate(`exp:${cand}`, false);
+			}
 		}
-		for (const id of allItemsById.keys()) {
-			if (noteText.includes(id)) {
-				matched.add(id);
+
+		// 提取前后严格不紧邻标识符字符的独立 Token，彻底杜绝 exp:nextjs:auth-bypass 误命中 exp:nextjs:auth
+		const tokenMatches = noteText.matchAll(/(?<![A-Za-z0-9:._-])([A-Za-z0-9:._-]+)(?![A-Za-z0-9:._-])/g);
+		for (const m of tokenMatches) {
+			const tok = m[1]!;
+			const stripped = tok.replace(/\.+$/, "");
+			// note 自由文本顺带提及普通种子编号（如 MITRE T1190 / CVE）不视为攻击种子卡，仅匹配蒸馏经验卡
+			addCandidate(tok, false);
+			if (stripped && stripped !== tok) {
+				addCandidate(stripped, false);
 			}
 		}
 	}
-	if (matched.size > 0) return [...matched];
 
 	const intentId = String(rec.intentId ?? "").trim();
 	if (intentId) {
-		if (allItemsById.has(intentId)) {
-			matched.add(intentId);
-		}
+		addCandidate(intentId, true);
 		const byIntent = distilledByIntentKey.get(intentId.toLowerCase());
 		if (byIntent) {
-			for (const id of byIntent) matched.add(id);
+			for (const id of byIntent) addCandidate(id, false);
 		}
 	}
 
-	return [...matched];
+	if (distilledMatched.size > 0) {
+		return [...distilledMatched];
+	}
+	return [...explicitSeedMatched];
 }
 
 /**
@@ -1940,21 +2016,22 @@ export function governDistilledExperience(
 
 		for (const r of allRows) {
 			allItemsById.set(r.id, r);
-			if (r.source === "distilled" || r.kind === "experience") {
+			if (isDistilledExperienceItem(r)) {
 				// 建立 intentKey 反向索引（例如 exp:nextjs:server-action-auth -> server-action-auth）
 				const parts = r.id.split(":");
 				if (parts.length >= 3 && parts[0] === "exp") {
 					const ik = parts.slice(2).join(":").toLowerCase();
 					const arr = distilledByIntentKey.get(ik) ?? [];
-					arr.push(r.id);
-					distilledByIntentKey.set(ik, arr);
-				}
-				const tagMatch = r.tags.match(/\bintent:([A-Za-z0-9:._-]+)/i);
-				if (tagMatch?.[1]) {
-					const ik = tagMatch[1].toLowerCase();
-					const arr = distilledByIntentKey.get(ik) ?? [];
 					if (!arr.includes(r.id)) arr.push(r.id);
 					distilledByIntentKey.set(ik, arr);
+				}
+				for (const tagMatch of r.tags.matchAll(/\bintent:([A-Za-z0-9:._-]+)/gi)) {
+					if (tagMatch[1]) {
+						const ik = tagMatch[1].toLowerCase();
+						const arr = distilledByIntentKey.get(ik) ?? [];
+						if (!arr.includes(r.id)) arr.push(r.id);
+						distilledByIntentKey.set(ik, arr);
+					}
 				}
 			}
 		}
@@ -1964,17 +2041,19 @@ export function governDistilledExperience(
 		let ignoredUnsettledOrInvalidCount = 0;
 		let protectedSeedSkips = 0;
 
-		const groupedRecords = new Map<string, ExperienceCalibrationRecord[]>();
+		const groupedRecords = new Map<string, Array<{ rec: ExperienceCalibrationRecord; origIdx: number }>>();
 
-		for (const rec of records) {
+		for (let recIdx = 0; recIdx < records.length; recIdx++) {
+			const rec = records[recIdx];
 			if (!rec || typeof rec !== "object") {
 				ignoredUnsettledOrInvalidCount += 1;
 				continue;
 			}
-			const rawSource = String(rec.source ?? "").trim();
-			if (rawSource && !ALLOWED_SETTLEMENT_SOURCES.has(rawSource as CalibrationSettlementSource)) {
+			const hasExplicitSource = rec.source !== undefined && rec.source !== null && String(rec.source).trim() !== "";
+			const rawSource = typeof rec.source === "string" ? rec.source.trim() : hasExplicitSource ? String(rec.source) : "";
+			if (hasExplicitSource && !ALLOWED_SETTLEMENT_SOURCES.has(rawSource as CalibrationSettlementSource)) {
 				rejectedSelfCertCount += 1;
-				if (throwOnSelfCert || (throwOnSelfCert && SELF_CERT_SOURCE_RE.test(rawSource))) {
+				if (throwOnSelfCert) {
 					throw new CalibrationError(
 						"SELF_CERTIFICATION_FORBIDDEN",
 						`governDistilledExperience 严禁采信非机械结算来源: ${rawSource}`,
@@ -1990,6 +2069,26 @@ export function governDistilledExperience(
 				ignoredUnsettledOrInvalidCount += 1;
 				continue;
 			}
+			if (
+				typeof rec.predictedConfidence !== "number" ||
+				!Number.isFinite(rec.predictedConfidence) ||
+				rec.predictedConfidence < 0 ||
+				rec.predictedConfidence > 1
+			) {
+				ignoredUnsettledOrInvalidCount += 1;
+				continue;
+			}
+			if (
+				(rec.actualTokens !== undefined &&
+					(typeof rec.actualTokens !== "number" || !Number.isFinite(rec.actualTokens) || rec.actualTokens < 0)) ||
+				(rec.estimatedTokens !== undefined &&
+					(typeof rec.estimatedTokens !== "number" || !Number.isFinite(rec.estimatedTokens) || rec.estimatedTokens < 0)) ||
+				(rec.durationMs !== undefined &&
+					(typeof rec.durationMs !== "number" || !Number.isFinite(rec.durationMs) || rec.durationMs < 0))
+			) {
+				ignoredUnsettledOrInvalidCount += 1;
+				continue;
+			}
 
 			acceptedMechanicalRecords += 1;
 			const refIds = resolveReferencedKbItemId(rec, allItemsById, distilledByIntentKey);
@@ -1997,18 +2096,12 @@ export function governDistilledExperience(
 				const targetItem = allItemsById.get(itemId);
 				if (!targetItem) continue;
 				// 硬性保护普通种子卡（严禁任何校准记录降权或冻结内置种子卡）
-				const isDistilled =
-					targetItem.source === "distilled" ||
-					(targetItem.kind === "experience" &&
-						targetItem.source !== "seed" &&
-						targetItem.source !== "seed-v4" &&
-						targetItem.source !== "seed-v7");
-				if (!isDistilled) {
+				if (!isDistilledExperienceItem(targetItem)) {
 					protectedSeedSkips += 1;
 					continue;
 				}
 				const list = groupedRecords.get(itemId) ?? [];
-				list.push(rec);
+				list.push({ rec, origIdx: recIdx });
 				groupedRecords.set(itemId, list);
 			}
 		}
@@ -2029,13 +2122,24 @@ export function governDistilledExperience(
 			    consecutive_zero_yield = ?,
 			    roi_score = ?,
 			    updated_at = ?
-			WHERE id = ? AND source = 'distilled'
+			WHERE id = ? AND ${DISTILLED_SQL_PREDICATE}
 		`);
 
 		const runGovTx = db.transaction(() => {
-			for (const [itemId, seq] of groupedRecords.entries()) {
+			for (const [itemId, rawEntries] of groupedRecords.entries()) {
 				const item = allItemsById.get(itemId)!;
 				const prevStatus: KbItemStatus = item.status;
+
+				// 严格按 settledAt ?? createdAt 时间升序排列（相同或缺失时间戳保持原相对顺序），防止倒序/乱序误算尾部连败
+				const sortedEntries = [...rawEntries].sort((a, b) => {
+					const ta = parseCalibrationEventTimeMs(a.rec);
+					const tb = parseCalibrationEventTimeMs(b.rec);
+					if (ta !== null && tb !== null && ta !== tb) {
+						return ta - tb;
+					}
+					return a.origIdx - b.origIdx;
+				});
+				const seq = sortedEntries.map((e) => e.rec);
 
 				let hitCount = 0;
 				let missCount = 0;
@@ -2154,9 +2258,9 @@ export function governDistilledExperience(
 
 		runGovTx();
 
-		// 汇总全库当前蒸馏经验卡状态分布
+		// 汇总全库当前蒸馏经验卡状态分布（与 isDistilledExperienceItem 严格一致）
 		const distilledRows = db
-			.query("SELECT id, status FROM kb_items WHERE source = 'distilled'")
+			.query(`SELECT id, status FROM kb_items WHERE ${DISTILLED_SQL_PREDICATE}`)
 			.all() as Array<{ id: string; status: KbItemStatus }>;
 		for (const r of distilledRows) {
 			if (r.status === "quarantined") quarantinedIds.push(r.id);
