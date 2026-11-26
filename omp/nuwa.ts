@@ -877,6 +877,12 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					const resumed = withLock(root, () => {
 						const s = loadState(root);
 						if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
+						if (s.project.status === "sealed_negative" || s.runtime.status === "sealed_negative") {
+							// 封盘是终态：resume 只重绑会话，不得把 sealed_negative 复活为 active
+							s.project.ownerSessionId = sid;
+							saveState(root, s, { reason: "resume-sealed-noop" });
+							return s;
+						}
 						s.project.status = "active";
 						s.project.stopReason = undefined;
 						s.project.ownerSessionId = sid;
@@ -2436,6 +2442,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const st = withLock(found, () => {
 					const s = loadState(found);
 					if (!s) return null;
+					if (s.project.status === "sealed_negative" || s.runtime.status === "sealed_negative") return s; // 封盘终态：不复活
 					s.project.status = "active";
 					s.project.stopReason = undefined;
 					s.runtime.status = "active";
@@ -2498,6 +2505,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const it = withLock(root, () => {
 					const s = loadState(root);
 					if (!s) return null;
+					if (s.project.status === "sealed_negative" || s.runtime.status === "sealed_negative") return null; // 封盘终态：不再派生意图
 					s.project.status = "active";
 					s.project.stopReason = undefined;
 					s.project.ownerSessionId = sid;
@@ -2506,7 +2514,13 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					saveState(root, s);
 					return intent;
 				});
-				if (!it) return notify("state 读取失败", "error");
+				if (!it) {
+					const cur = loadState(root);
+					if (cur?.project.status === "sealed_negative" || cur?.runtime.status === "sealed_negative") {
+						return notify(`该项目已封盘 (sealed_negative)：${cur.project.id}；新目标请换 root 或 nuwa_init(force=true) 重建`, "error");
+					}
+					return notify("state 读取失败", "error");
+				}
 				writePointer(root, sid);
 				const st = loadState(root)!;
 				bindMainSession(ctx as ExtensionContext, root, st.project.id);
