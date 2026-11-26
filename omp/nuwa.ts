@@ -215,7 +215,7 @@ export {
 	pickMode, pidAlive, planIntents, preflightEgressCheck, prepareNextGeneration, processTrackerPath, proofKinds, readCfg,
 	readFactEvidenceLog, readPausedState, readReincarnatePolicy, readSpilledBatchTasks, recordFlag, recordToolExecution,
 	releaseAutoBatchRemaining, releaseStaleClaims, renderDetail, renderFullStatus, reportMarkdown,
-	resolveConfiguredEgressUrl, resolveDefaultWorkspacesDir, resolvePersistentStateDir,
+	resolveConfiguredEgressUrl, resolveDefaultWorkspacesDir, resolveLineageRoot, resolvePersistentStateDir,
 	resolveReportPhaseTransition, routeSubagentModel, runSpaSurfaceWorkflow, sampleSoft404Baseline, saveFactEvidenceLog,
 	saveHumanSessionToVault, saveState, sealEngagement, searchArchiveIndexes, seedEpisode, seedPhase,
 	setPausedState, sha, shouldRecommendSeal, shouldReincarnate, sigOf, slug, stateDir, statePath,

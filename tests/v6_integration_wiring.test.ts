@@ -217,6 +217,23 @@ describe("v6.0.0 SQLite WAL 权威存储全链路接线与兼容导出", () => {
 		const diag = nuwaMod.inspectGraph(ws, { intentId: "i001" });
 		expect(diag.ok).toBe(true);
 		expect(diag.intents[0]?.status).toBe("done");
+
+		// 验证纯 SQLite 模式下血缘探测（meta 表 project_json）及全部只读命令严格零写盘（不产生 -wal/-shm 且 mtime 零变化）
+		const resolvedLineage = nuwaMod.resolveLineageRoot(
+			{ cwd: ws, sessionId: "sess-sqlite-wiring", agent: { kind: "sub", id: "sub-0", parentId: "main-0" } },
+			h.agentHome,
+		);
+		expect(resolvedLineage).toBe(ws);
+
+		await Bun.sleep(15);
+		const snapBeforeRo = snapshotTreeMtimes(ws);
+		expect(snapBeforeRo.some((f) => f.rel.endsWith("-wal") || f.rel.endsWith("-shm"))).toBe(false);
+		await h.call("nuwa_status", {});
+		for (const cmd of ["belief", "calibrate", "traffic", "hybrid", "mcp"]) {
+			await h.runSlash(cmd);
+		}
+		const snapAfterRo = snapshotTreeMtimes(ws);
+		expect(snapAfterRo).toEqual(snapBeforeRo);
 	});
 });
 

@@ -903,6 +903,40 @@ function configureAndInitDb(db: Database, dbFile: string, readonly: boolean): vo
  * - 只读模式（`readonly: true`）绝不执行建表、写事务或元数据修改，无写锁争抢；
  * - 遇到已存在但为 0 字节空文件或格式/页损坏文件时统一抛出 `NuwaSqliteCorruptError`。
  */
+const SQLITE_HEADER_MAGIC = "SQLite format 3\0";
+
+function hasNonEmptyWalSidecar(dbFile: string): boolean {
+	const walFile = `${dbFile}-wal`;
+	if (!existsSync(walFile)) return false;
+	try {
+		return statSync(walFile).size > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * 零磁盘写副作用的内存只读快照打开：
+ * 当 WAL 库已正常关闭（不存在非空 `-wal`）或缺失 `-shm` 时，直接在内存副本中将 WAL 版本头字节 (18,19) 降为 1，
+ * 通过 `Database.deserialize(..., { readonly: true })` 纯内存只读加载，严禁在磁盘新建/修改 `-wal` 或 `-shm`。
+ */
+function openReadonlyMemorySnapshot(dbFile: string): Database {
+	const raw = readFileSync(dbFile);
+	const buf = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+	const copy = new Uint8Array(buf.length);
+	copy.set(buf);
+	if (
+		copy.length >= 100 &&
+		Buffer.from(copy.subarray(0, 16)).toString("latin1") === SQLITE_HEADER_MAGIC &&
+		copy[18] === 2 &&
+		copy[19] === 2
+	) {
+		copy[18] = 1;
+		copy[19] = 1;
+	}
+	return Database.deserialize(copy, { readonly: true });
+}
+
 export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 	const dbFile = sqliteDbPath(root);
 	const readonly = opts?.readonly === true;
@@ -921,6 +955,32 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 
 	const tryOpen = (): Database => {
 		assertNotZeroByteCorrupt();
+		if (readonly) {
+			if (!existsSync(dbFile)) {
+				throw new Error(`SQLITE_CANTOPEN: unable to open database file (${dbFile})`);
+			}
+			// 无活跃非空 -wal 时直接走纯内存只读反序列化，确保 100% 零新建 -wal/-shm、零 mtime 变动
+			if (!hasNonEmptyWalSidecar(dbFile)) {
+				let memDb: Database | null = null;
+				try {
+					memDb = openReadonlyMemorySnapshot(dbFile);
+					configureAndInitDb(memDb, dbFile, true);
+					return memDb;
+				} catch (memErr) {
+					try {
+						memDb?.close();
+					} catch {
+						/* ignore */
+					}
+					if (memErr instanceof NuwaSqliteCorruptError) throw memErr;
+					if (isCorruptError(memErr)) {
+						throw new NuwaSqliteCorruptError(dbFile, memErr instanceof Error ? memErr.message : String(memErr));
+					}
+					throw memErr;
+				}
+			}
+		}
+
 		let db: Database | null = null;
 		try {
 			db = readonly ? new Database(dbFile, { readonly: true }) : new Database(dbFile, { create: true });
@@ -932,11 +992,11 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 			} catch {
 				/* ignore */
 			}
-			// 兼容极少数外部 WAL 库缺失 -shm 导致纯 readonly 无法映射共享内存的场景：回退普通打开并立即锁定 query_only=ON
+			// 存在非空 -wal 但极端缺失 -shm 导致 readonly 报 SQLITE_CANTOPEN 时：回退纯内存只读快照，严禁回退读写模式触碰磁盘
 			if (readonly && isReadonlyCantOpenError(err) && existsSync(dbFile)) {
 				let fbDb: Database | null = null;
 				try {
-					fbDb = new Database(dbFile);
+					fbDb = openReadonlyMemorySnapshot(dbFile);
 					configureAndInitDb(fbDb, dbFile, true);
 					return fbDb;
 				} catch (fbErr) {

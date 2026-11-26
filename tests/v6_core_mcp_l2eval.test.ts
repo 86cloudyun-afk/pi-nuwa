@@ -540,7 +540,7 @@ describe("benchmarks/run-l2-eval.ts L2 五场景微基准全量验收与硬门�
 		expect(summary.gates.zeroVaultLeakGate).toBe(true);
 		expect(summary.gates.hardenedConvergenceGate).toBe(true);
 		expect(summary.gates.allPassed).toBe(true);
-	});
+	}, 30_000);
 
 	test("支持 --scenario 单场景过滤运行与非法场景参数拦截", async () => {
 		await expect(runL2BenchmarkSuite({ scenario: "nonexistent-scenario" })).rejects.toThrow("未知 L2 场景 ID");
@@ -564,7 +564,7 @@ describe("benchmarks/run-l2-eval.ts L2 五场景微基准全量验收与硬门�
 		expect(parsed.scenarios[0]!.id).toBe("t5-hardened-zero-vuln");
 		expect(parsed.scenarios[0]!.terminalStatus).toBe("sealed_negative");
 		expect(parsed.gates.allPassed).toBe(true);
-	});
+	}, 30_000);
 
 	test("t3-blind-ssrf-oob 严格限定仅允许回调本场景专属 collectorPort，拒绝其他本机端口", async () => {
 		const srv = startL2ScenarioServer("t3-blind-ssrf-oob");

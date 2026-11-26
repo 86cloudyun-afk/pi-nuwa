@@ -19,6 +19,7 @@ import {
 	openSync,
 	readFileSync,
 	renameSync,
+	statSync,
 	writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -225,10 +226,24 @@ function inspectRootState(root: string): RootStateMeta {
 	if (existsSync(dbFile)) {
 		let db: Database | null = null;
 		try {
-			db = new Database(dbFile, { readonly: true });
-			const row = db.query("SELECT project_json FROM nuwa_meta WHERE id = 1").get() as { project_json?: string } | null;
-			if (row?.project_json) {
-				const proj = JSON.parse(row.project_json) as { status?: string; ownerSessionId?: string };
+			const walFile = `${dbFile}-wal`;
+			const hasWal = existsSync(walFile) && statSync(walFile).size > 0;
+			if (hasWal) {
+				db = new Database(dbFile, { readonly: true });
+			} else {
+				const raw = readFileSync(dbFile);
+				if (raw.byteLength < 100) return { exists: false };
+				const copy = new Uint8Array(raw.byteLength);
+				copy.set(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
+				if (copy[18] === 2 && copy[19] === 2) {
+					copy[18] = 1;
+					copy[19] = 1;
+				}
+				db = Database.deserialize(copy, { readonly: true });
+			}
+			const row = db.query("SELECT value FROM meta WHERE key = 'project_json'").get() as { value?: string } | null;
+			if (row?.value) {
+				const proj = JSON.parse(row.value) as { status?: string; ownerSessionId?: string };
 				return {
 					exists: true,
 					status: typeof proj?.status === "string" ? proj.status : undefined,
