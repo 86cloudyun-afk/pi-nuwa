@@ -171,6 +171,8 @@ interface SessionInterceptorState {
 	scope: ScopePolicy;
 	mode: Mode | string;
 	allowedMethods?: ReadonlySet<string>;
+	readonlyLockCount: number;
+	lastReadonlyBlockReason?: string;
 	blockedRequests: BlockedCdpRequest[];
 	probeRules: Map<string, ProbeInterceptRule>;
 	onAllowedRequest?: (info: { requestId: string; url: string; method: string; headers: Record<string, string> }) => void;
@@ -271,6 +273,7 @@ export interface InPageProbeOptions {
 	recorder?: TrafficRecorder;
 	roleLabel?: string;
 	soft404Baseline?: Soft404BaselineInput | Soft404Baseline | null;
+	extraSecrets?: string[];
 }
 
 export interface InPageSignedProbeResult {
@@ -378,8 +381,8 @@ function collectPlaywrightBrowsers(cacheRoot: string, preferHeadlessShell: boole
 		return [];
 	}
 
-	// 按目录名逆序排列，使更高版本号（如 chromium-1248 > chromium-1134）排在前面
-	const sorted = [...entries].sort((a, b) => b.localeCompare(a));
+	// 按目录名数值感知逆序排列，使更高版本号（如 chromium-1248 > chromium-999）排在前面
+	const sorted = [...entries].sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
 	const headlessShellBins: string[] = [];
 	const fullChromeBins: string[] = [];
 
@@ -388,7 +391,7 @@ function collectPlaywrightBrowsers(cacheRoot: string, preferHeadlessShell: boole
 		let subDirs: string[] = [];
 		try {
 			if (!statSync(fullDir).isDirectory()) continue;
-			subDirs = readdirSync(fullDir).sort((a, b) => b.localeCompare(a));
+			subDirs = readdirSync(fullDir).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
 		} catch {
 			continue;
 		}
@@ -603,6 +606,7 @@ export class CdpClient {
 	private closed = false;
 	private readonly pending = new Map<number, PendingRpcEntry>();
 	private readonly listeners = new Map<string, Set<CdpEventListener>>();
+	private readonly eventWaiters = new Set<(err: Error) => void>();
 
 	constructor(transport: CdpTransportLike, opts?: CdpClientOptions) {
 		this.transport = transport;
@@ -685,7 +689,7 @@ export class CdpClient {
 		}
 	}
 
-	/** 等待满足条件的单次 CDP 事件（含超时自动退订）。 */
+	/** 等待满足条件的单次 CDP 事件（含超时自动退订与断连立即唤醒拒绝）。 */
 	public waitForEvent<T = Record<string, unknown>>(
 		event: string,
 		opts?: {
@@ -700,10 +704,20 @@ export class CdpClient {
 		const timeoutMs = Math.max(100, opts?.timeoutMs ?? this.defaultTimeoutMs);
 		return new Promise<T>((resolvePromise, rejectPromise) => {
 			let done = false;
+			const onAbort = (err: Error) => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				off();
+				this.eventWaiters.delete(onAbort);
+				rejectPromise(err);
+			};
+
 			const timer = setTimeout(() => {
 				if (done) return;
 				done = true;
 				off();
+				this.eventWaiters.delete(onAbort);
 				rejectPromise(new Error(`等待 CDP 事件超时 (${event}, ${timeoutMs}ms)`));
 			}, timeoutMs);
 
@@ -715,8 +729,11 @@ export class CdpClient {
 				done = true;
 				clearTimeout(timer);
 				off();
+				this.eventWaiters.delete(onAbort);
 				resolvePromise(typed);
 			});
+
+			this.eventWaiters.add(onAbort);
 		});
 	}
 
@@ -790,6 +807,14 @@ export class CdpClient {
 			this.pending.delete(id);
 			try {
 				entry.reject(err);
+			} catch {
+				/* ignore */
+			}
+		}
+		for (const abortWaiter of [...this.eventWaiters]) {
+			this.eventWaiters.delete(abortWaiter);
+			try {
+				abortWaiter(err);
 			} catch {
 				/* ignore */
 			}
@@ -930,22 +955,23 @@ async function readDevToolsWsEndpoint(
 			const reader = stream.getReader();
 			let buffer = "";
 			try {
-				while (!settled) {
+				while (true) {
 					const { done, value } = await reader.read();
 					if (done) break;
-					if (value) {
+					if (!settled && value) {
 						const chunk = decoder.decode(value, { stream: true });
 						collectedLogs.push(chunk);
 						if (collectedLogs.length > 24) collectedLogs.shift();
 						buffer += chunk;
 						const match = wsRegex.exec(buffer);
 						if (match?.[1]) {
-							if (!settled) {
-								settled = true;
-								clearTimeout(timer);
-								resolvePromise(match[1].trim());
-							}
-							break;
+							settled = true;
+							clearTimeout(timer);
+							buffer = "";
+							collectedLogs.length = 0;
+							resolvePromise(match[1].trim());
+							// 关键：匹配成功后不中断循环，继续后台静默排空子进程管道输出直至关闭，防止 64KB 缓冲写满死锁
+							continue;
 						}
 						if (buffer.length > 8192) {
 							buffer = buffer.slice(-2048);
@@ -1200,24 +1226,31 @@ export async function closeCdpSession(session: CdpSession | null | undefined): P
 			}
 		}
 
-		// 二次兜底清剿任何残留的渲染器/GPU/crashpad 子进程
-		const remainingPids = new Set<number>([
-			...(rootPid ? findDescendantPids(rootPid) : []),
-			...(session.processTag ? findLiveProcessesByTag(session.processTag) : []),
-		]);
-		if (remainingPids.size > 0) {
+		// 轮询清剿直至后代进程与标识进程彻底清零（防止返回瞬间仍有渲染器/GPU/crashpad 子进程存活）
+		const reapDeadline = Date.now() + 1_800;
+		while (Date.now() < reapDeadline) {
+			const remainingPids = new Set<number>([
+				...(rootPid ? findDescendantPids(rootPid) : []),
+				...(session.processTag ? findLiveProcessesByTag(session.processTag) : []),
+			]);
+			if (remainingPids.size === 0) break;
 			for (const remPid of remainingPids) {
 				safeKillPid(remPid, "SIGKILL");
 			}
-			await Bun.sleep(60);
+			await Bun.sleep(25);
 		}
 	}
 
 	if (session.ownsUserDataDir && session.userDataDir) {
-		try {
-			rmSync(session.userDataDir, { recursive: true, force: true });
-		} catch {
-			/* ignore */
+		for (let attempt = 0; attempt < 6; attempt++) {
+			try {
+				if (!existsSync(session.userDataDir)) break;
+				rmSync(session.userDataDir, { recursive: true, force: true });
+				if (!existsSync(session.userDataDir)) break;
+			} catch {
+				/* 子进程句柄刚释放时短暂重试 */
+			}
+			await Bun.sleep(30);
 		}
 	}
 }
@@ -1380,6 +1413,7 @@ async function ensureSessionInterceptor(
 		enabled: true,
 		scope,
 		mode,
+		readonlyLockCount: 0,
 		blockedRequests: [],
 		probeRules: new Map<string, ProbeInterceptRule>(),
 	};
@@ -1398,9 +1432,36 @@ async function ensureSessionInterceptor(
 		const resourceType = typeof params.resourceType === "string" ? params.resourceType : undefined;
 		const reqHeaders = normalizeCdpHeadersObject(reqObj.headers);
 
-		// 放行浏览器内部 about:blank / data: / blob: 非网络资源
 		const lowerUrl = rawUrl.trim().toLowerCase();
-		if (lowerUrl.startsWith("about:") || lowerUrl.startsWith("data:") || lowerUrl.startsWith("blob:")) {
+		if (lowerUrl.startsWith("about:")) {
+			void session.client
+				.send("Fetch.continueRequest", { requestId }, { sessionId: session.sessionId, timeoutMs: 3_000 })
+				.catch(() => {});
+			return;
+		}
+		if (lowerUrl.startsWith("data:") || lowerUrl.startsWith("blob:")) {
+			if (state.readonlyLockCount > 0) {
+				const reason = formatScopeBlockReason(
+					"egress-proxy",
+					`页面内只读探针执行期间禁止非 HTTP(S) 伪协议请求 (${rawUrl.slice(0, 48)})`,
+					"N-007",
+				);
+				state.lastReadonlyBlockReason = reason;
+				state.blockedRequests.push({
+					url: redactTrafficUrl(rawUrl),
+					method,
+					...(resourceType ? { resourceType } : {}),
+					reason,
+				});
+				void session.client
+					.send(
+						"Fetch.failRequest",
+						{ requestId, errorReason: "BlockedByClient" },
+						{ sessionId: session.sessionId, timeoutMs: 3_000 },
+					)
+					.catch(() => {});
+				return;
+			}
 			void session.client
 				.send("Fetch.continueRequest", { requestId }, { sessionId: session.sessionId, timeoutMs: 3_000 })
 				.catch(() => {});
@@ -1440,6 +1501,7 @@ async function ensureSessionInterceptor(
 					"N-008",
 				);
 				matchedRule.blockedReason = reason;
+				state.lastReadonlyBlockReason = reason;
 				state.blockedRequests.push({
 					url: redactTrafficUrl(rawUrl),
 					method,
@@ -1475,13 +1537,16 @@ async function ensureSessionInterceptor(
 			return;
 		}
 
-		// 3. 可选会话级方法白名单检查
-		if (state.allowedMethods && !state.allowedMethods.has(method)) {
+		// 3. 会话级只读锁（探针执行期间引用计数 > 0）或显式方法白名单检查：防止页面丢弃内部头后改写 POST 逃逸
+		const blockedByReadonlyLock = state.readonlyLockCount > 0 && !READONLY_HTTP_METHODS.has(method);
+		const blockedByAllowedSet = Boolean(state.allowedMethods && !state.allowedMethods.has(method));
+		if (blockedByReadonlyLock || blockedByAllowedSet) {
 			const reason = formatScopeBlockReason(
 				"egress-proxy",
 				`CDP 会话只读策略拦截非白名单方法 (${method} ${rawUrl})`,
 				"N-008",
 			);
+			state.lastReadonlyBlockReason = reason;
 			state.blockedRequests.push({
 				url: redactTrafficUrl(rawUrl),
 				method,
@@ -1613,6 +1678,144 @@ function shouldRecordTransaction(tx: TrackedNetworkTransaction, includeStaticAss
 	return rt === "document" || tx.status >= 400;
 }
 
+const COOKIE_NON_SECRET_ATTRS = new Set([
+	"path",
+	"domain",
+	"expires",
+	"max-age",
+	"samesite",
+	"secure",
+	"httponly",
+	"priority",
+	"partitioned",
+	"version",
+]);
+
+const GENERIC_HEADER_WORDS = new Set([
+	"true",
+	"false",
+	"null",
+	"none",
+	"lax",
+	"strict",
+	"1",
+	"0",
+	"application/json",
+	"text/html",
+	"text/plain",
+	"*/*",
+	"keep-alive",
+	"close",
+	"no-cache",
+	"no-store",
+]);
+
+const SENSITIVE_HEADER_NAME_HINT_RE =
+	/(?:auth|token|key|secret|cookie|session|jwt|csrf|xsrf|pass|cred|sign|bearer|ticket)/i;
+
+/**
+ * 从任意请求头/角色头映射中深度拆解全部原始敏感值（含 Authorization 裸 Token、Basic 解码口令、Cookie 各非属性键值对及自定义敏感头），
+ * 供 `TrafficRecorder` 与返回摘要全链路零明文擦除使用。
+ */
+function extractSecretsFromHeadersMap(headers?: Record<string, string>): string[] {
+	if (!headers || typeof headers !== "object") return [];
+	const out = new Set<string>();
+	const addSecret = (raw: string | undefined, minLen = 3) => {
+		const s = String(raw ?? "").trim();
+		if (s.length < minLen) return;
+		if (GENERIC_HEADER_WORDS.has(s.toLowerCase())) return;
+		out.add(s);
+	};
+
+	const parseCookieSegments = (cookieText: string) => {
+		addSecret(cookieText, 4);
+		for (const line of cookieText.split(/\r?\n/)) {
+			for (const part of line.split(";")) {
+				const seg = part.trim();
+				if (!seg) continue;
+				const eq = seg.indexOf("=");
+				if (eq <= 0) continue;
+				const ck = seg.slice(0, eq).trim();
+				const cv = seg.slice(eq + 1).trim();
+				if (!ck || !cv || COOKIE_NON_SECRET_ATTRS.has(ck.toLowerCase())) continue;
+				addSecret(`${ck}=${cv}`, 4);
+				addSecret(cv, 3);
+			}
+		}
+	};
+
+	for (const [rawK, rawV] of Object.entries(headers)) {
+		const k = String(rawK ?? "").trim();
+		const v = String(rawV ?? "").trim();
+		if (!k || !v) continue;
+		const lower = k.toLowerCase();
+		if (lower === INTERNAL_PROBE_HEADER) continue;
+
+		if (lower === "cookie" || lower === "set-cookie") {
+			parseCookieSegments(v);
+			continue;
+		}
+		if (lower === "authorization" || lower === "proxy-authorization") {
+			addSecret(v, 4);
+			const bare = v.replace(/^(?:Bearer|Basic|Token|JWT|Digest)\s+/i, "").trim();
+			addSecret(bare, 3);
+			if (/^Basic\s+/i.test(v) && bare) {
+				try {
+					const decoded = Buffer.from(bare, "base64").toString("utf8");
+					const colon = decoded.indexOf(":");
+					if (colon >= 0) {
+						addSecret(decoded.slice(colon + 1), 3);
+					}
+				} catch {
+					/* ignore */
+				}
+			}
+			continue;
+		}
+		if (SENSITIVE_HEADER_NAME_HINT_RE.test(lower)) {
+			addSecret(v, 3);
+			const bare = v.replace(/^(?:Bearer|Basic|Token|JWT|Digest)\s+/i, "").trim();
+			addSecret(bare, 3);
+		}
+	}
+
+	return [...out];
+}
+
+/** 使用瞬态秘密集合（含 URL 编码变体）与 SessionVault 对任意文本执行彻底零明文擦除。 */
+function scrubTextWithExtraSecrets(
+	text: string,
+	extraSecrets?: readonly string[],
+	rootOrVault?: string | SessionVault,
+): string {
+	if (!text) return text;
+	let out = text;
+	if (extraSecrets && extraSecrets.length > 0) {
+		const expanded = new Set<string>();
+		for (const raw of extraSecrets) {
+			const s = String(raw ?? "").trim();
+			if (s.length < 3 || GENERIC_HEADER_WORDS.has(s.toLowerCase())) continue;
+			expanded.add(s);
+			try {
+				const enc = encodeURIComponent(s);
+				if (enc && enc.length >= 3) expanded.add(enc);
+			} catch {
+				/* ignore */
+			}
+		}
+		const ordered = [...expanded].sort((a, b) => b.length - a.length);
+		for (const sec of ordered) {
+			if (out.includes(sec)) {
+				out = out.split(sec).join(REDACTED_MARKER);
+			}
+		}
+	}
+	if (rootOrVault) {
+		out = redactVaultSecrets(out, rootOrVault);
+	}
+	return out;
+}
+
 function parseSetCookiePairs(rawSetCookie: string): Array<{ name: string; value: string }> {
 	const out: Array<{ name: string; value: string }> = [];
 	for (const line of rawSetCookie.split(/\r?\n/)) {
@@ -1644,21 +1847,30 @@ export async function captureCdpSessionTraffic(
 	// 入口 URL 前置 Scope 强拦截（越界目标零启动、零发包）
 	const entryCheck = checkHttpTargetScope(targetUrl, "GET", scope, mode, "CDP 导航入口");
 	if (!entryCheck.ok) {
-		const vaultSummary = formatSessionVaultSummary(resolvedRoot);
+		const vaultSummary = scrubTextWithExtraSecrets(
+			formatSessionVaultSummary(resolvedRoot),
+			opts?.extraSecrets,
+			resolvedRoot,
+		);
+		const safeEntryUrl = redactTrafficUrl(targetUrl, {
+			root: resolvedRoot,
+			extraSecrets: opts?.extraSecrets,
+		});
+		const safeEntryReason = scrubTextWithExtraSecrets(entryCheck.reason, opts?.extraSecrets, resolvedRoot);
 		return {
 			ok: false,
-			targetUrl: redactTrafficUrl(targetUrl, { root: resolvedRoot }),
+			targetUrl: safeEntryUrl,
 			blockedByScope: true,
-			blockReason: entryCheck.reason,
+			blockReason: safeEntryReason,
 			capturedCount: 0,
 			entries: [],
 			blockedCount: 1,
 			blockedRequests: [
 				{
-					url: redactTrafficUrl(targetUrl, { root: resolvedRoot }),
+					url: safeEntryUrl,
 					method: "GET",
 					resourceType: "Document",
-					reason: entryCheck.reason,
+					reason: safeEntryReason,
 				},
 			],
 			syncedRoles: [],
@@ -1668,14 +1880,12 @@ export async function captureCdpSessionTraffic(
 
 	const ownsSession = !opts?.session;
 	const session = opts?.session ?? (await launchCdpSession(opts?.launchOptions));
+	const capturedTransientSecrets = new Set<string>();
 	const recorder =
 		opts?.recorder ??
 		new TrafficRecorder(resolvedRoot, {
 			extraSecrets: opts?.extraSecrets,
 		});
-	for (const sec of opts?.extraSecrets ?? []) {
-		recorder.registerTransientSecret(sec);
-	}
 
 	const transactions = new Map<string, TrackedNetworkTransaction>();
 	const unsubscribers: Array<() => void> = [];
@@ -1687,12 +1897,19 @@ export async function captureCdpSessionTraffic(
 
 	const registerSecretToRecorder = (val: string | undefined) => {
 		const clean = String(val ?? "").trim();
-		if (clean.length >= 4) {
+		if (clean.length >= 3 && !GENERIC_HEADER_WORDS.has(clean.toLowerCase())) {
+			capturedTransientSecrets.add(clean);
 			recorder.registerTransientSecret(clean);
 		}
 	};
+	for (const sec of opts?.extraSecrets ?? []) {
+		registerSecretToRecorder(sec);
+	}
 
 	const harvestHeadersAuth = (headers: Record<string, string>, isResponse: boolean) => {
+		for (const sec of extractSecretsFromHeadersMap(headers)) {
+			registerSecretToRecorder(sec);
+		}
 		for (const [rawName, rawValue] of Object.entries(headers)) {
 			const lower = rawName.toLowerCase().trim();
 			const val = String(rawValue ?? "").trim();
@@ -2018,16 +2235,29 @@ export async function captureCdpSessionTraffic(
 		}
 
 		const latestVault = loadSessionVault(resolvedRoot);
+		const allCapturedSecrets = [...capturedTransientSecrets];
 		const newlyBlocked = interceptor.blockedRequests.slice(startBlockedIdx).map((b) => ({
 			...b,
-			url: redactTrafficUrl(b.url, {
+			url: scrubTextWithExtraSecrets(
+				redactTrafficUrl(b.url, {
+					root: resolvedRoot,
+					vault: latestVault,
+					extraSecrets: allCapturedSecrets,
+				}),
+				allCapturedSecrets,
+				latestVault,
+			),
+			reason: scrubTextWithExtraSecrets(b.reason, allCapturedSecrets, latestVault),
+		}));
+		const safeTargetUrl = scrubTextWithExtraSecrets(
+			redactTrafficUrl(targetUrl, {
 				root: resolvedRoot,
 				vault: latestVault,
-				extraSecrets: opts?.extraSecrets,
+				extraSecrets: allCapturedSecrets,
 			}),
-			reason: redactVaultSecrets(b.reason, latestVault),
-		}));
-		const safeTargetUrl = redactTrafficUrl(targetUrl, { root: resolvedRoot, vault: latestVault });
+			allCapturedSecrets,
+			latestVault,
+		);
 
 		return {
 			ok: true,
@@ -2038,7 +2268,11 @@ export async function captureCdpSessionTraffic(
 			blockedCount: newlyBlocked.length,
 			blockedRequests: newlyBlocked,
 			syncedRoles,
-			vaultSummary: formatSessionVaultSummary(latestVault),
+			vaultSummary: scrubTextWithExtraSecrets(
+				formatSessionVaultSummary(latestVault),
+				allCapturedSecrets,
+				latestVault,
+			),
 			...(session.browserVersion ? { browserVersion: session.browserVersion } : {}),
 		};
 	} finally {
@@ -2128,8 +2362,10 @@ function buildInPageReadonlyProbeExpression(payload: {
 			signedByHook = true;
 			if (signOut && typeof signOut === "object") {
 				const hdrSrc = signOut.headers && typeof signOut.headers === "object" ? signOut.headers : signOut;
+				const internalLower = cfg.internalHeaderName.toLowerCase();
 				for (const [hk, hv] of Object.entries(hdrSrc)) {
-					if (hk === "url" && typeof signOut.headers === "object") continue;
+					if (hk.toLowerCase() === "url" && hdrSrc === signOut) continue;
+					if (hk.toLowerCase() === internalLower) continue;
 					if (typeof hv === "string" || typeof hv === "number") {
 						mergedHeaders[hk] = String(hv);
 						appliedSigHeaders.push(hk);
@@ -2137,6 +2373,9 @@ function buildInPageReadonlyProbeExpression(payload: {
 				}
 				if (typeof signOut.url === "string" && signOut.url.trim()) {
 					const resolvedOut = new URL(signOut.url.trim(), cfg.expectedOrigin);
+					if (resolvedOut.protocol !== "http:" && resolvedOut.protocol !== "https:") {
+						return { ok: false, invalidProtocolBlocked: resolvedOut.toString() };
+					}
 					if (cfg.enforceSameOrigin && resolvedOut.origin !== cfg.expectedOrigin) {
 						return { ok: false, crossOriginHookBlocked: resolvedOut.toString() };
 					}
@@ -2148,6 +2387,13 @@ function buildInPageReadonlyProbeExpression(payload: {
 			}
 		}
 
+		// 大小写不敏感清空同名旧键，防止自定义头或钩子注入合并破坏内部对齐令牌
+		const internalLowerName = cfg.internalHeaderName.toLowerCase();
+		for (const existingKey of Object.keys(mergedHeaders)) {
+			if (existingKey.toLowerCase() === internalLowerName) {
+				delete mergedHeaders[existingKey];
+			}
+		}
 		mergedHeaders[cfg.internalHeaderName] = cfg.probeToken;
 
 		const resp = await window.fetch(targetUrl, {
@@ -2194,13 +2440,37 @@ export async function executeInPageSignedProbe(
 	const timeoutMs = Math.max(300, opts?.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
 	const rawMethod = String(probeSpec.method ?? "GET").trim().toUpperCase();
 
+	const probeExtraSecrets = [
+		...new Set([
+			...(opts?.extraSecrets ?? []),
+			...extractSecretsFromHeadersMap(probeSpec.overrideAuthHeaders),
+			...extractSecretsFromHeadersMap(probeSpec.headers),
+		]),
+	];
+	if (opts?.recorder) {
+		for (const sec of probeExtraSecrets) {
+			opts.recorder.registerTransientSecret(sec);
+		}
+	}
+	const rootOrVault = opts?.vault ?? opts?.root;
+
 	const makeBlockedResult = (reason: string, rawUrl: string): InPageSignedProbeResult => {
 		const emptyHash = computeBodyHash("");
+		const safeReason = scrubTextWithExtraSecrets(reason, probeExtraSecrets, rootOrVault);
+		const safeBlockedUrl = scrubTextWithExtraSecrets(
+			redactTrafficUrl(rawUrl, {
+				root: opts?.root,
+				vault: opts?.vault,
+				extraSecrets: probeExtraSecrets,
+			}),
+			probeExtraSecrets,
+			rootOrVault,
+		);
 		return {
 			ok: false,
 			blocked: true,
-			blockReason: reason,
-			url: redactTrafficUrl(rawUrl, { root: opts?.root, vault: opts?.vault }),
+			blockReason: safeReason,
+			url: safeBlockedUrl,
 			method: rawMethod || "GET",
 			status: 0,
 			headers: {},
@@ -2299,6 +2569,8 @@ export async function executeInPageSignedProbe(
 		...(probeSpec.overrideAuthHeaders ? { overrideHeaders: probeSpec.overrideAuthHeaders } : {}),
 	};
 	interceptor.probeRules.set(probeToken, rule);
+	interceptor.readonlyLockCount += 1;
+	interceptor.lastReadonlyBlockReason = undefined;
 
 	const cleanCustomHeaders: Record<string, string> = {};
 	for (const [hk, hv] of Object.entries(probeSpec.headers ?? {})) {
@@ -2342,6 +2614,16 @@ export async function executeInPageSignedProbe(
 		}
 
 		const preVal = evalRes.result?.value;
+		if (preVal && typeof preVal.invalidProtocolBlocked === "string") {
+			return makeBlockedResult(
+				formatScopeBlockReason(
+					"egress-proxy",
+					`签名钩子返回了非 HTTP(S) 协议目标 (${preVal.invalidProtocolBlocked.slice(0, 64)})，已被协议护栏阻断`,
+					"N-007",
+				),
+				preVal.invalidProtocolBlocked,
+			);
+		}
 		if (preVal && typeof preVal.crossOriginHookBlocked === "string") {
 			return makeBlockedResult(
 				formatScopeBlockReason(
@@ -2351,6 +2633,9 @@ export async function executeInPageSignedProbe(
 				),
 				preVal.crossOriginHookBlocked,
 			);
+		}
+		if (!rule.matchedUrl && interceptor.lastReadonlyBlockReason) {
+			return makeBlockedResult(interceptor.lastReadonlyBlockReason, resolvedUrl.toString());
 		}
 
 		if (evalRes.exceptionDetails) {
@@ -2362,7 +2647,15 @@ export async function executeInPageSignedProbe(
 			return {
 				ok: false,
 				blocked: false,
-				url: redactTrafficUrl(resolvedUrl.toString(), { root: opts?.root, vault: opts?.vault }),
+				url: scrubTextWithExtraSecrets(
+					redactTrafficUrl(resolvedUrl.toString(), {
+						root: opts?.root,
+						vault: opts?.vault,
+						extraSecrets: probeExtraSecrets,
+					}),
+					probeExtraSecrets,
+					rootOrVault,
+				),
 				method: safeMethod,
 				status: 0,
 				headers: {},
@@ -2375,8 +2668,20 @@ export async function executeInPageSignedProbe(
 				signedByHook: false,
 				appliedSignatureHeaders: [],
 				durationMs: Math.max(0, Date.now() - startedAt),
-				error: opts?.root || opts?.vault ? redactVaultSecrets(errDesc, opts.vault ?? opts.root!) : errDesc,
+				error: scrubTextWithExtraSecrets(errDesc, probeExtraSecrets, rootOrVault),
 			};
+		}
+
+		// 若非 Mock 会话下请求未经过 CDP 探针对齐规则（如页面包装器剥离了内部对齐头或伪造响应），拒绝采信防止逃逸/串味
+		if (!session.isMock && !rule.matchedUrl) {
+			return makeBlockedResult(
+				formatScopeBlockReason(
+					"egress-proxy",
+					"页面请求未命中 CDP 探针拦截对齐规则（内部对齐头可能被页面脚本丢弃或未走受控网络栈），已拒绝采信响应",
+					"N-008",
+				),
+				resolvedUrl.toString(),
+			);
 		}
 
 		const val = evalRes.result?.value ?? {};
@@ -2402,10 +2707,23 @@ export async function executeInPageSignedProbe(
 			opts?.soft404Baseline ?? undefined,
 		);
 
-		const redactOpts = { root: opts?.root, vault: opts?.vault, maxChars: 1024 };
+		const redactOpts = {
+			root: opts?.root,
+			vault: opts?.vault,
+			extraSecrets: probeExtraSecrets,
+			maxChars: 1024,
+		};
 		const safeHeaders = redactTrafficHeaders(rawRespHeaders, redactOpts);
-		const safeSnippet = redactTrafficBody(rawBody, redactOpts) ?? "";
-		const safeUrl = redactTrafficUrl(resolvedUrl.toString(), redactOpts);
+		const safeSnippet = scrubTextWithExtraSecrets(
+			redactTrafficBody(rawBody, redactOpts) ?? "",
+			probeExtraSecrets,
+			rootOrVault,
+		);
+		const safeUrl = scrubTextWithExtraSecrets(
+			redactTrafficUrl(resolvedUrl.toString(), redactOpts),
+			probeExtraSecrets,
+			rootOrVault,
+		);
 
 		if (opts?.recorder) {
 			opts.recorder.record({
@@ -2445,6 +2763,9 @@ export async function executeInPageSignedProbe(
 		if (rule.blockedReason) {
 			return makeBlockedResult(rule.blockedReason, rule.matchedUrl ?? resolvedUrl.toString());
 		}
+		if (!rule.matchedUrl && interceptor.lastReadonlyBlockReason) {
+			return makeBlockedResult(interceptor.lastReadonlyBlockReason, resolvedUrl.toString());
+		}
 		const errMsg = err instanceof Error ? err.message : String(err);
 		const isTimeout = /超时|timeout/i.test(errMsg);
 		const emptyHash = computeBodyHash("");
@@ -2452,7 +2773,15 @@ export async function executeInPageSignedProbe(
 			ok: false,
 			blocked: false,
 			...(isTimeout ? { timedOut: true } : {}),
-			url: redactTrafficUrl(resolvedUrl.toString(), { root: opts?.root, vault: opts?.vault }),
+			url: scrubTextWithExtraSecrets(
+				redactTrafficUrl(resolvedUrl.toString(), {
+					root: opts?.root,
+					vault: opts?.vault,
+					extraSecrets: probeExtraSecrets,
+				}),
+				probeExtraSecrets,
+				rootOrVault,
+			),
 			method: safeMethod,
 			status: 0,
 			headers: {},
@@ -2465,10 +2794,11 @@ export async function executeInPageSignedProbe(
 			signedByHook: false,
 			appliedSignatureHeaders: [],
 			durationMs: Math.max(0, Date.now() - startedAt),
-			error: opts?.root || opts?.vault ? redactVaultSecrets(errMsg, opts.vault ?? opts.root!) : errMsg,
+			error: scrubTextWithExtraSecrets(errMsg, probeExtraSecrets, rootOrVault),
 		};
 	} finally {
 		interceptor.probeRules.delete(probeToken);
+		interceptor.readonlyLockCount = Math.max(0, interceptor.readonlyLockCount - 1);
 	}
 }
 
@@ -2619,21 +2949,28 @@ export async function runCdpSignedAuthDiff(
 
 		const vault = loadSessionVault(resolvedRoot);
 		const allRoleHeaders = new Map<string, Record<string, string>>();
+		const diffExtraSecretsSet = new Set<string>();
+
 		for (const roleName of Object.keys(vault.roles)) {
 			const hdrs = getRoleHeadersMap(vault, roleName);
 			if (hdrs && Object.keys(hdrs).length > 0) {
 				allRoleHeaders.set(roleName, hdrs);
+				for (const sec of extractSecretsFromHeadersMap(hdrs)) {
+					diffExtraSecretsSet.add(sec);
+					recorder.registerTransientSecret(sec);
+				}
 			}
 		}
 		for (const [extraRole, extraHdrs] of Object.entries(opts?.extraRoleHeaders ?? {})) {
 			if (extraHdrs && Object.keys(extraHdrs).length > 0) {
 				allRoleHeaders.set(extraRole, { ...extraHdrs });
-				for (const hv of Object.values(extraHdrs)) {
-					recorder.registerTransientSecret(hv);
-					recorder.registerTransientSecret(hv.replace(/^(?:Bearer|Basic|Token|JWT)\s+/i, ""));
+				for (const sec of extractSecretsFromHeadersMap(extraHdrs)) {
+					diffExtraSecretsSet.add(sec);
+					recorder.registerTransientSecret(sec);
 				}
 			}
 		}
+		const diffExtraSecrets = [...diffExtraSecretsSet];
 
 		// 确定基线角色与待测对比角色
 		let baselineRole = opts?.baselineRole?.trim() || "";
@@ -2679,7 +3016,7 @@ export async function runCdpSignedAuthDiff(
 					overrideAuthHeaders: allRoleHeaders.get(baselineRole),
 				},
 				scope,
-				{ mode, timeoutMs, root: resolvedRoot, vault },
+				{ mode, timeoutMs, root: resolvedRoot, vault, extraSecrets: diffExtraSecrets },
 			);
 			if (sampleProbe.ok && (sampleProbe.status === 200 || (sampleProbe.status >= 300 && sampleProbe.status < 400))) {
 				resolvedSoft404 = {
@@ -2775,6 +3112,7 @@ export async function runCdpSignedAuthDiff(
 					recorder,
 					roleLabel: baselineRole,
 					soft404Baseline: resolvedSoft404,
+					extraSecrets: diffExtraSecrets,
 				},
 			);
 
@@ -2806,6 +3144,7 @@ export async function runCdpSignedAuthDiff(
 						recorder,
 						roleLabel: testRole,
 						soft404Baseline: resolvedSoft404,
+						extraSecrets: diffExtraSecrets,
 					},
 				);
 
@@ -2820,7 +3159,7 @@ export async function runCdpSignedAuthDiff(
 
 				const unsignedCode = unsignedStatuses[target.rawPath];
 				const rawSummary = `CDP 页面内加签差分检出 ${verdict.kind}：路径 ${target.rawPath} 在角色 ${testRole} 下返回 HTTP ${testedProbe.status}（与基线 ${baselineRole} 相似度 ${verdict.similarity}${unsignedCode ? `，无签名直连返回 HTTP ${unsignedCode}` : ""}）`;
-				const safeSummary = redactVaultSecrets(rawSummary, vault);
+				const safeSummary = scrubTextWithExtraSecrets(rawSummary, diffExtraSecrets, vault);
 
 				findings.push({
 					path: target.rawPath,
@@ -2861,19 +3200,29 @@ export async function runCdpSignedAuthDiff(
 		});
 
 		const testedPaths = validTargets.map((t) => t.rawPath);
+		const safeTargetUrl = scrubTextWithExtraSecrets(
+			redactTrafficUrl(targetUrl, {
+				root: resolvedRoot,
+				vault,
+				extraSecrets: diffExtraSecrets,
+			}),
+			diffExtraSecrets,
+			vault,
+		);
 		let fact: AutoFact | null = null;
 		if (findings.length > 0) {
 			const top = findings[0]!;
-			const safeDetail = redactVaultSecrets(
+			const safeDetail = scrubTextWithExtraSecrets(
 				findings.map((f) => f.summary).join(" | "),
+				diffExtraSecrets,
 				vault,
 			);
 			fact = {
 				kind: "vuln",
 				title: `CDP 动态加签契约差分检出 ${findings.length} 处越权边界缺陷 (${top.kind})`.slice(0, 120),
 				detail: safeDetail.slice(0, 600),
-				command: `nuwa-cdp-signed-diff ${redactTrafficUrl(targetUrl, { root: resolvedRoot, vault })}`,
-				output: redactVaultSecrets(
+				command: `nuwa-cdp-signed-diff ${safeTargetUrl}`,
+				output: scrubTextWithExtraSecrets(
 					JSON.stringify(
 						findings.map((f) => ({
 							path: f.path,
@@ -2884,6 +3233,7 @@ export async function runCdpSignedAuthDiff(
 							similarity: f.similarity,
 						})),
 					),
+					diffExtraSecrets,
 					vault,
 				).slice(0, 800),
 				meta: {
@@ -2893,13 +3243,9 @@ export async function runCdpSignedAuthDiff(
 			};
 		}
 
-		// 确保无任何已知敏感串残留在返回结构中
-		const checkNoMarkerOnly = REDACTED_MARKER;
-		void checkNoMarkerOnly;
-
 		return {
 			ok: true,
-			targetUrl: redactTrafficUrl(targetUrl, { root: resolvedRoot, vault }),
+			targetUrl: safeTargetUrl,
 			blockedByScope: false,
 			effectiveConcurrency,
 			testedPaths,

