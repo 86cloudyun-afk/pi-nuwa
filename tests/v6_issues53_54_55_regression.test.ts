@@ -7,12 +7,14 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as graphMod from "../omp/graph";
 import * as nuwaMod from "../omp/nuwa";
+import * as reportingMod from "../omp/reporting";
 import * as scopeMod from "../omp/scope";
 import * as uiMod from "../omp/ui";
 import { NuwaCoreEngine } from "../core/mcp-server";
@@ -826,4 +828,354 @@ describe("PR #55 + P1–P8: sealed_negative 终态守卫、跨会话只读、报
 		expect(String(statusRes.content[0]?.text ?? "")).toContain("blockedIntents=120");
 		expect(String(statusRes.content[0]?.text ?? "")).toContain("blockedCommits=125");
 	});
+});
+
+describe("深度审查回归：Async/eval 竞态、终态防降级篡改、全链路口径及 --force-resume / 新 /tmp 直迁", () => {
+	test("Issue #54 深度场景：async 批派单先 tool_execution_end 后 before_subagent_spawn（乱序+无 name），看门狗不被误注销，eval 内 tool.task 经 tool_result 收口，以及空 tasks/taskFile/context 展开", async () => {
+		const ws = makeWorkspace("nuwa-iss54-async-deep-");
+		const h = setupHarness(ws, "sess-iss54-async");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18901", mode: "pentest", root: ws });
+
+		const onToolCall = h.hooks.get("tool_call")![0]!;
+		const onSpawn = h.hooks.get("before_subagent_spawn")![0]!;
+		const onToolEnd = h.hooks.get("tool_execution_end")![0]!;
+		const onToolResult = h.hooks.get("tool_result")![0]!;
+
+		// 1) 空批派单 tasks: [] 直接被拦截
+		const emptyBatch = onToolCall({ toolName: "task", toolCallId: "tc-empty-batch", input: { tasks: [] } }, h.ctx) as Record<string, unknown>;
+		expect(emptyBatch?.block).toBe(true);
+		expect(String(emptyBatch?.reason ?? "")).toContain("nuwa N-007");
+
+		// 2) taskFile 含 [TARGET] 且共享 input.context 含 [TARGET]，校验自动展开并替换 taskFile 防止宿主再读未展开原文件
+		const tfPath = join(ws, "probe-task.md");
+		writeFileSync(tfPath, "[女娲派单 i001] 使用 taskFile 核查 http://TARGET/admin 是否存在鉴权绕过", "utf8");
+		const tfRewrite = onToolCall(
+			{
+				toolName: "task",
+				toolCallId: "tc-tf-ph",
+				input: {
+					agent: "fujiang",
+					taskFile: tfPath,
+					context: { base: "https://TARGET/api" },
+				},
+			},
+			h.ctx,
+		) as { input?: Record<string, unknown> };
+		expect(tfRewrite?.input).toBeTruthy();
+		expect(String(tfRewrite.input?.task ?? "")).toContain("127.0.0.1:18901/admin");
+		expect(tfRewrite.input?.taskFile).toBeUndefined();
+		expect((tfRewrite.input?.context as Record<string, unknown>)?.base).toBe("http://127.0.0.1:18901/api");
+		onToolEnd({ toolName: "task", toolCallId: "tc-tf-ph", input: tfRewrite.input, result: { details: { results: [] } } }, h.ctx);
+
+		// 3) 真实 async 批派单（无 name）：tool_execution_end 在后台子代理 before_subagent_spawn 前触发且带有 progress(pending)
+		const asyncBatchTc = onToolCall(
+			{
+				toolName: "task",
+				toolCallId: "tc-async-1",
+				input: {
+					tasks: [
+						{ agent: "fujiang", task: "[女娲派单 i001] 探测第一条异步任务 alpha" },
+						{ agent: "nuwa-verifier", task: "[女娲派单 i002] 复验第二条异步任务 beta" },
+					],
+				},
+			},
+			h.ctx,
+		);
+		expect(asyncBatchTc).toBeUndefined();
+
+		// 若先启动了一条其它在途看门狗任务，async.state="running" 的 tool_execution_end 绝对不能把正在跑的唯一任务误注销
+		const wd = new nuwaMod.SubagentWatchdog(ws);
+		wd.startTask({ taskId: "pre-running-job", agent: "fujiang" });
+		expect(wd.activeCount()).toBe(1);
+
+		onToolEnd(
+			{
+				toolName: "task",
+				toolCallId: "tc-async-1",
+				result: {
+					details: {
+						async: { state: "running" },
+						progress: [
+							{ index: 0, id: "brave-owl-71", status: "pending" },
+							{ index: 1, id: "calm-fox-82", status: "pending" },
+						],
+						results: [],
+					},
+				},
+			},
+			h.ctx,
+		);
+		expect(wd.activeCount()).toBe(1); // 不得误注销 pre-running-job
+
+		// 后台子代理乱序到达：calm-fox-82（index=1）先 spawn，brave-owl-71（index=0）后 spawn
+		const sp1 = onSpawn(
+			{ type: "before_subagent_spawn", agent: "nuwa-verifier", invocationKind: "task", spawnKey: "calm-fox-82" },
+			h.ctx,
+		) as Record<string, unknown>;
+		const sp0 = onSpawn(
+			{ type: "before_subagent_spawn", agent: "fujiang", invocationKind: "task", spawnKey: "brave-owl-71" },
+			h.ctx,
+		) as Record<string, unknown>;
+		expect(sp1.block).not.toBe(true);
+		expect(sp0.block).not.toBe(true);
+		expect(String(sp1.task ?? "")).toContain("第二条异步任务 beta");
+		expect(String(sp0.task ?? "")).toContain("第一条异步任务 alpha");
+		expect(wd.activeCount()).toBe(3);
+
+		// 完成后正常收口
+		onToolEnd(
+			{
+				toolName: "task",
+				toolCallId: "tc-async-1",
+				result: { details: { results: [{ id: "brave-owl-71" }, { id: "calm-fox-82" }, { id: "pre-running-job" }] } },
+			},
+			h.ctx,
+		);
+		expect(wd.activeCount()).toBe(0);
+
+		// 4) eval 内多条 agent({ prompt, label }) 与 tool.task()：外层 eval 先结束，后台异步子代理携 Parent.label 前缀随后 spawn，以及 js-task 经 tool_result 收口
+		const evalEmptyBlocked = onToolCall(
+			{ toolName: "eval", toolCallId: "tc-eval-empty", input: { code: 'await agent({ agent: "fujiang", prompt: "   " });' } },
+			h.ctx,
+		) as Record<string, unknown>;
+		expect(evalEmptyBlocked?.block).toBe(true);
+
+		onToolCall(
+			{
+				toolName: "eval",
+				toolCallId: "tc-eval-multi",
+				input: {
+					code: [
+						'agent({ agent: "fujiang", label: "lbl-a", prompt: "测试端点 http://TARGET/eval-a" });',
+						'agent({ agent: "nuwa-verifier", label: "lbl-b", prompt: "核验端点 http://TARGET/eval-b" });',
+					].join("\n"),
+				},
+			},
+			h.ctx,
+		);
+		// 外层 eval 成功执行后即返回，尚未消费的 eval agent 派单不得在 tool_execution_end("eval") 时被提前销毁
+		onToolEnd({ toolName: "eval", toolCallId: "tc-eval-multi", isError: false, result: { text: "queued 2" } }, h.ctx);
+
+		const evSpB = onSpawn(
+			{ type: "before_subagent_spawn", agent: "nuwa-verifier", invocationKind: "eval", spawnKey: "root-parent.lbl-b" },
+			h.ctx,
+		) as Record<string, unknown>;
+		const evSpA = onSpawn(
+			{ type: "before_subagent_spawn", agent: "fujiang", invocationKind: "eval", spawnKey: "lbl-a" },
+			h.ctx,
+		) as Record<string, unknown>;
+		expect(evSpB.block).not.toBe(true);
+		expect(evSpA.block).not.toBe(true);
+		expect(String(evSpB.task ?? "")).toContain("127.0.0.1:18901/eval-b");
+		expect(String(evSpA.task ?? "")).toContain("127.0.0.1:18901/eval-a");
+		expect(wd.activeCount()).toBe(2);
+
+		// 通过 tool_result（eval 内 tool.task 专属通道）精确回收并记录可信执行账本（且去重不记两遍）
+		onToolResult(
+			{
+				toolName: "task",
+				toolCallId: "js-task-1",
+				result: { details: { results: [{ id: "lbl-a" }, { id: "root-parent.lbl-b" }] } },
+			},
+			h.ctx,
+		);
+		expect(wd.activeCount()).toBe(0);
+
+		const journal = readFileSync(join(ws, ".nuwa", "journal.jsonl"), "utf8");
+		expect(journal).not.toContain("dispatch_omp_protocol_fallback");
+	});
+
+	test("PR #55 终态不可篡改与全链路口径：nuwa_stop/plan/claim/expand/slash 均拦截、/nuwa seal 同步 Token、跨/同会话真零写入及 SARIF/renderFullStatus 对齐", async () => {
+		const ws = makeWorkspace("nuwa-pr55-immutable-");
+		const h = setupHarness(ws, "sess-pr55-lock", { contextUsage: { tokens: 24680, usedTokens: 24680 } });
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18902", mode: "pentest", root: ws });
+
+		// 通过 /nuwa seal 封盘并验证 Token 与 reportWritten 同步
+		await h.runCommand("seal 经/nuwa seal人工负向封盘");
+		const sealedState = nuwaMod.loadState(ws)!;
+		expect(sealedState.project.status).toBe("sealed_negative");
+		expect(sealedState.runtime.status).toBe("sealed_negative");
+		expect(sealedState.runtime.tokens).toBe(24680);
+		expect(sealedState.runtime.reportWritten).toBe(true);
+		expect(existsSync(join(ws, ".nuwa", "REPORT.md"))).toBe(true);
+
+		// 封盘后调用 nuwa_stop（硬停/软暂停）、/nuwa stop、/nuwa pause、nuwa_plan、nuwa_claim、nuwa_expand 均不得复活或改写为 stopped
+		const stopHardRes = await h.call("nuwa_stop", { reason: "尝试覆写终态", confirm: "STOP", root: ws });
+		expect(stopHardRes.details?.stopped).toBe(false);
+		expect(stopHardRes.details?.terminal).toBe(true);
+		const stopPauseRes = await h.call("nuwa_stop", { pause: true, reason: "尝试软暂停终态", root: ws });
+		expect(stopPauseRes.details?.paused).toBe(false);
+		expect(existsSync(join(ws, ".nuwa", "paused.json"))).toBe(false);
+
+		await h.runCommand("stop 试图命令停机");
+		await h.runCommand("pause 试图命令软暂停");
+		expect(existsSync(join(ws, ".nuwa", "paused.json"))).toBe(false);
+		expect(nuwaMod.loadState(ws)?.project.status).toBe("sealed_negative");
+
+		const planBlocked = await h.call("nuwa_plan", { intents: [{ title: "forbidden after seal" }], root: ws });
+		expect(planBlocked.details?.error).toBe(true);
+		const claimBlocked = await h.call("nuwa_claim", { id: "i001", worker: "fujiang", root: ws });
+		expect(claimBlocked.details?.error).toBe(true);
+		const expandBlocked = await h.call("nuwa_expand", { root: ws });
+		expect(expandBlocked.details?.error).toBe(true);
+
+		// MCP Server 同构拦截检查
+		const engSame = new NuwaCoreEngine({ cwd: ws, sessionId: "sess-pr55-lock", agentHome: h.agentHome });
+		const mcpStop = await engSame.callTool("nuwa_stop", { root: ws, confirm: "STOP", reason: "mcp try stop" });
+		expect(mcpStop.details?.stopped).toBe(false);
+		expect(mcpStop.details?.terminal).toBe(true);
+		expect((await engSame.callTool("nuwa_plan", { root: ws, intents: [{ title: "mcp forbidden" }] })).isError).toBe(true);
+		expect((await engSame.callTool("nuwa_expand", { root: ws })).isError).toBe(true);
+
+		// 同会话无 force 调 nuwa_init(resume=true) 真正零写盘只读
+		const statePath = join(ws, ".nuwa", "state.json");
+		const mtimeBefore = statSync(statePath).mtimeMs;
+		await new Promise((r) => setTimeout(r, 25));
+		const roResume = await h.call("nuwa_init", { resume: true, root: ws });
+		expect(roResume.details?.readonly).toBe(true);
+		expect(roResume.details?.status).toBe("sealed_negative");
+		expect(statSync(statePath).mtimeMs).toBe(mtimeBefore);
+
+		// buildDirective / SARIF / PoC Bundle / renderFullStatus 全口径一致
+		const cfg = {
+			loop: true,
+			infinite: true,
+			maxTurns: 10,
+			maxStall: 5,
+			idleTurns: 4,
+			reincarnateTokens: 140000,
+			reincarnateTurns: 30,
+			tickMs: 1000,
+			maxParallel: 3,
+			claimTtl: 60000,
+			autoExpand: true,
+			autoExecute: false,
+			requireFujiang: true,
+		};
+		const dirTerminal = graphMod.buildDirective(sealedState, cfg, ws);
+		expect(dirTerminal).toContain("status=sealed_negative");
+		expect(dirTerminal).not.toContain("至少 1 次 task 批量派单");
+
+		const sarif = reportingMod.buildSarifReport(sealedState, ws) as any;
+		expect(sarif.runs[0].invocations[0].properties.status).toBe("sealed_negative");
+		expect(sarif.runs[0].invocations[0].endTimeUtc).toBeTruthy();
+
+		const fullJson = JSON.parse(uiMod.renderFullStatus(ws, { format: "json" }));
+		expect(fullJson.project.status).toBe("sealed_negative");
+		expect(fullJson.runtime.status).toBe("sealed_negative");
+		expect(fullJson.runtime.tokens).toBe(24680);
+		expect(fullJson.runtime.totalTokens).toBe(24680);
+		const fullText = uiMod.renderFullStatus(ws, { format: "text" });
+		expect(fullText).toContain("tokens=24680");
+		expect(fullText).toContain("totalTokens=24680");
+
+		const snap = uiMod.buildSnapshot(sealedState, cfg, 0);
+		expect(snap.runtime.status).toBe("sealed_negative");
+	});
+
+	test("Issue #53 别名与直迁增强：--force-resume 别名、NUWA_EGRESS 旧变量兼容与尚未创建的 /tmp 新目录配合 --migrate-workspace 直落持久化目录", async () => {
+		const ws = makeWorkspace("nuwa-iss53-alias-");
+		const stubDir = makeWorkspace("nuwa-iss53-alias-stub-");
+		const persistBase = makeWorkspace("nuwa-iss53-alias-persist-");
+
+		// 1) NUWA_EGRESS 旧环境变量下同样开启 Bun fetch 代理隔离
+		const legacyEnvDry = spawnSync(
+			DAEMON_BIN,
+			["--root", ws, "--target", "http://127.0.0.1:18903", "--dry-run"],
+			{
+				encoding: "utf8",
+				timeout: 10_000,
+				env: makeCleanDaemonEnv({ NUWA_EGRESS: "socks5h://127.0.0.1:7891" }),
+			},
+		);
+		expect(legacyEnvDry.status).toBe(0);
+		expect(legacyEnvDry.stdout).toContain(`"ALL_PROXY": "socks5h://127.0.0.1:7891"`);
+		expect(legacyEnvDry.stdout).not.toContain(`"HTTP_PROXY": "socks5h://`);
+
+		// 2) --force-resume 别名可正常接管 status=stopped 项目并完成
+		const h = setupHarness(ws, "sess-iss53-force-resume");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18903", mode: "pentest", root: ws });
+		await h.call("nuwa_stop", { reason: "测试别名接管", confirm: "STOP", root: ws });
+		const storagePath = resolve(import.meta.dir, "..", "omp", "storage.ts");
+		const completeStub = writeExecutableStub(
+			stubDir,
+			"omp-force-resume",
+			`#!/usr/bin/env bun
+import { loadState, saveState } from ${JSON.stringify(storagePath)};
+const st = loadState(process.env.NUWA_PROJECT);
+st.project.status = "completed";
+st.project.stopReason = undefined;
+st.project.completedAt = new Date().toISOString();
+st.runtime.status = "completed";
+saveState(process.env.NUWA_PROJECT, st, { reason: "complete" });
+`,
+		);
+		const aliasRun = spawnSync(
+			DAEMON_BIN,
+			["--root", ws, "--force-resume", "--omp-bin", completeStub],
+			{ encoding: "utf8", timeout: 15_000, env: makeCleanDaemonEnv() },
+		);
+		expect(aliasRun.status).toBe(0);
+		expect(nuwaMod.loadState(ws)?.project.status).toBe("completed");
+
+		// 3) 尚不存在的 /tmp 新路径配合 --migrate-workspace：直接重定位创建于持久化目录，不在 /tmp 建状态
+		const nonexistentTmp = join(tmpdir(), `nuwa-nonexistent-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+		const dryFresh = spawnSync(
+			DAEMON_BIN,
+			["--root", nonexistentTmp, "--target", "http://127.0.0.1:18904", "--migrate-workspace", "--dry-run"],
+			{
+				encoding: "utf8",
+				timeout: 10_000,
+				env: makeCleanDaemonEnv({ NUWA_WORKSPACES_DIR: persistBase }),
+			},
+		);
+		expect(dryFresh.status).toBe(0);
+		expect(dryFresh.stdout).toContain("plannedMigrationRoot");
+		expect(dryFresh.stdout).toContain(`"NUWA_PROJECT": "${resolve(persistBase)}`);
+
+		const graphPath = resolve(import.meta.dir, "..", "omp", "graph.ts");
+		const freshStub = writeExecutableStub(
+			stubDir,
+			"omp-fresh-persist",
+			`#!/usr/bin/env bun
+import { newState } from ${JSON.stringify(graphPath)};
+import { saveState } from ${JSON.stringify(storagePath)};
+const root = process.env.NUWA_PROJECT;
+const st = newState("http://127.0.0.1:18904", "fresh persisted", "pentest", {}, "sess-fresh");
+st.project.status = "completed";
+st.project.completedAt = new Date().toISOString();
+st.runtime.status = "completed";
+saveState(root, st, { reason: "complete" });
+`,
+		);
+		const runFresh = spawnSync(
+			DAEMON_BIN,
+			[
+				"--root",
+				nonexistentTmp,
+				"--target",
+				"http://127.0.0.1:18904",
+				"--egress-proxy",
+				"socks5h://u:secret@127.0.0.1:7891",
+				"--migrate-workspace",
+				"--omp-bin",
+				freshStub,
+			],
+			{
+				encoding: "utf8",
+				timeout: 15_000,
+				env: makeCleanDaemonEnv({ NUWA_WORKSPACES_DIR: persistBase }),
+			},
+		);
+		expect(runFresh.status).toBe(0);
+		expect(existsSync(nonexistentTmp)).toBe(false);
+		expect(runFresh.stdout).toContain("重定位至持久化目录");
+		const migLine = runFresh.stdout.split("\n").find((l) => l.includes("重定位至持久化目录:"));
+		expect(migLine).toBeTruthy();
+		const targetPersistRoot = migLine!.split("->").pop()!.trim();
+		const daemonCfg = JSON.parse(readFileSync(join(targetPersistRoot, ".nuwa", "daemon-config.json"), "utf8"));
+		expect(daemonCfg.egressProxy).not.toContain("secret");
+		expect(daemonCfg.egressProxy).toContain("***");
+		expect(nuwaMod.loadState(targetPersistRoot)?.project.status).toBe("completed");
+	}, 25_000);
 });

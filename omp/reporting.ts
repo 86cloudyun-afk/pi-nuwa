@@ -566,15 +566,32 @@ export function buildSarifReport(st: NuwaState, root?: string): Record<string, u
 				},
 				invocations: [
 					{
-						executionSuccessful: st.project?.status !== "stopped" || !st.project?.stopReason,
+						executionSuccessful:
+							(st.runtime?.status === "sealed_negative" || st.project?.status === "sealed_negative"
+								? "sealed_negative"
+								: st.runtime?.status === "completed" || st.project?.status === "completed"
+									? "completed"
+									: st.project?.status ?? "active") !== "stopped" || !st.project?.stopReason,
 						...(st.project?.createdAt ? { startTimeUtc: st.project.createdAt } : {}),
-						...(st.project?.completedAt ? { endTimeUtc: st.project.completedAt } : {}),
+						...(() => {
+							const sealMeta = st.runtime?.sealMeta ?? st.project?.sealMeta;
+							const endAt = st.project?.completedAt ?? sealMeta?.sealedAt;
+							return endAt ? { endTimeUtc: endAt } : {};
+						})(),
 						properties: {
 							projectId: st.project?.id ?? "",
 							mode: st.project?.mode ?? "pentest",
-							status: st.project?.status ?? "active",
+							status:
+								st.runtime?.status === "sealed_negative" || st.project?.status === "sealed_negative"
+									? "sealed_negative"
+									: st.runtime?.status === "completed" || st.project?.status === "completed"
+										? "completed"
+										: (st.project?.status ?? "active"),
 							phase: st.project?.phase ?? "report",
 							target: maybeRedact(st.project?.url || st.project?.target || "", root),
+							...((st.runtime?.sealMeta ?? st.project?.sealMeta)
+								? { sealMeta: st.runtime?.sealMeta ?? st.project?.sealMeta }
+								: {}),
 						},
 					},
 				],
@@ -787,12 +804,18 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 
 	// 3. README.md
 	const generatedAt = new Date().toISOString();
+	const effectiveStatus =
+		st.runtime?.status === "sealed_negative" || st.project.status === "sealed_negative"
+			? "sealed_negative"
+			: st.runtime?.status === "completed" || st.project.status === "completed"
+				? "completed"
+				: st.project.status;
 	const readmeLines = [
 		`# 审计取证包 (Evidence Bundle) — ${st.project.host}:${st.project.port}`,
 		``,
 		`- 项目 ID: ${st.project.id}`,
 		`- 目标: ${st.project.url || st.project.target}`,
-		`- 模式: ${st.project.mode} · 状态: ${st.project.status} · 阶段: ${st.project.phase}`,
+		`- 模式: ${st.project.mode} · 状态: ${effectiveStatus} · 阶段: ${st.project.phase}`,
 		`- 生成时间: ${generatedAt}`,
 		`- 已确认漏洞数: ${confirmed.length}`,
 		``,
@@ -824,7 +847,7 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 				host: st.project.host,
 				port: st.project.port,
 				mode: st.project.mode,
-				status: st.project.status,
+				status: effectiveStatus,
 				phase: st.project.phase,
 			},
 			confirmedCount: confirmed.length,

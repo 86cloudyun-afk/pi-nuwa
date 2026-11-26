@@ -381,6 +381,9 @@ const DISPATCH_EMPTY_CONTEXT_RE =
 const DISPATCH_PLACEHOLDER_CASE_RE =
 	/\[(?:TARGET|HOST|DOMAIN|URL|TARGET_URL)\]|https?:\/\/(?:TARGET|HOST|DOMAIN)(?::\d+)?|\$\{?(?:TARGET|HOST|DOMAIN|U)\}?/;
 const PENDING_DISPATCH_TTL_MS = 5 * 60_000;
+const EVAL_DISPATCH_WINDOW_TTL_MS = 60_000;
+const MAX_OMP_TASK_FILE_BYTES = 4 * 1024 * 1024;
+const TASK_FILE_PREVIEW_BYTES = 512 * 1024;
 
 interface PendingToolDispatch {
 	seq: number;
@@ -394,8 +397,149 @@ interface PendingToolDispatch {
 	taskText: string;
 	context?: Record<string, unknown> | string;
 	spawnKeyCandidates: string[];
+	asyncPending?: boolean;
+	evalWindow?: boolean;
 	reusable?: boolean;
 	createdAt: number;
+}
+
+function readTaskFileForDispatch(
+	filePath: string,
+): { exists: boolean; unreadable?: boolean; empty?: boolean; tooLarge?: boolean; text: string } {
+	try {
+		const fStat = statSync(filePath);
+		if (!fStat.isFile()) return { exists: false, text: "" };
+		if (fStat.size > MAX_OMP_TASK_FILE_BYTES) {
+			return { exists: true, tooLarge: true, text: "" };
+		}
+		if (fStat.size === 0) return { exists: true, empty: true, text: "" };
+		const raw = readFileSync(filePath, "utf8");
+		const trimmed = raw.trim();
+		if (!trimmed) return { exists: true, empty: true, text: "" };
+		return {
+			exists: true,
+			empty: false,
+			text: trimmed.length > TASK_FILE_PREVIEW_BYTES ? trimmed.slice(0, TASK_FILE_PREVIEW_BYTES) : trimmed,
+		};
+	} catch {
+		return { exists: false, unreadable: true, text: "" };
+	}
+}
+
+function expandPlaceholdersPlain(
+	raw: string,
+	targetInfo: { url: string; host: string },
+): string {
+	let body = String(raw ?? "");
+	const targetUrl = String(targetInfo.url ?? "").trim();
+	const resolvedHost = String(targetInfo.host ?? "").trim();
+	if (targetUrl) {
+		body = body
+			.replace(/https?:\/\/(?:TARGET|HOST|DOMAIN)(?::\d+)?/g, targetUrl)
+			.replace(/\$\{?U\}?/g, targetUrl)
+			.replace(/\[(?:TARGET_URL|URL)\]/g, targetUrl);
+	}
+	if (resolvedHost) {
+		body = body
+			.replace(/\[(?:TARGET|HOST|DOMAIN)\]/g, resolvedHost)
+			.replace(/\$\{?(?:TARGET|HOST|DOMAIN)\}?/g, resolvedHost)
+			.replace(/\b(?:TARGET|HOST|DOMAIN)\b/g, resolvedHost);
+	}
+	return body;
+}
+
+function expandDispatchContextValue(
+	ctxVal: unknown,
+	targetInfo: { url: string; host: string; egress?: string },
+): { value: Record<string, unknown> | string | undefined; changed: boolean } {
+	if (typeof ctxVal === "string") {
+		if (!DISPATCH_PLACEHOLDER_CASE_RE.test(ctxVal)) return { value: ctxVal, changed: false };
+		const expanded = expandPlaceholdersPlain(ctxVal, targetInfo);
+		return { value: expanded, changed: expanded !== ctxVal };
+	}
+	if (ctxVal && typeof ctxVal === "object" && !Array.isArray(ctxVal)) {
+		const rec = ctxVal as Record<string, unknown>;
+		let changed = false;
+		const out: Record<string, unknown> = { ...rec };
+		for (const [k, v] of Object.entries(rec)) {
+			if (typeof v === "string" && DISPATCH_PLACEHOLDER_CASE_RE.test(v)) {
+				const expanded = expandPlaceholdersPlain(v, targetInfo);
+				if (expanded !== v) {
+					out[k] = expanded;
+					changed = true;
+				}
+			}
+		}
+		return { value: out, changed };
+	}
+	return { value: ctxVal as Record<string, unknown> | string | undefined, changed: false };
+}
+
+interface ParsedEvalAgentCall {
+	agent: string;
+	prompt?: string;
+	label?: string;
+	hasEmptyPrompt: boolean;
+}
+
+function extractEvalStringProp(objText: string, prop: string): { found: boolean; value: string } {
+	const re = new RegExp(`\\b${prop}\\s*:\\s*(?:"((?:[^"\\\\]|\\\\.)*)"|'((?:[^'\\\\]|\\\\.)*)'|\`((?:[^\`\\\\]|\\\\.)*)\`)`, "s");
+	const m = re.exec(objText);
+	if (!m) return { found: false, value: "" };
+	const raw = m[1] ?? m[2] ?? m[3] ?? "";
+	return {
+		found: true,
+		value: raw.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\(["'`\\])/g, "$1"),
+	};
+}
+
+function parseEvalAgentCalls(code: string): ParsedEvalAgentCall[] {
+	const results: ParsedEvalAgentCall[] = [];
+	const callRe = /\bagent\s*\(\s*\{/g;
+	let match: RegExpExecArray | null;
+	while ((match = callRe.exec(code)) !== null) {
+		let idx = match.index + match[0].length;
+		let depth = 1;
+		let quote: string | null = null;
+		let escaped = false;
+		while (idx < code.length && depth > 0) {
+			const ch = code[idx]!;
+			if (escaped) {
+				escaped = false;
+				idx++;
+				continue;
+			}
+			if (quote) {
+				if (ch === "\\") escaped = true;
+				else if (ch === quote) quote = null;
+				idx++;
+				continue;
+			}
+			if (ch === '"' || ch === "'" || ch === "`") {
+				quote = ch;
+			} else if (ch === "{") {
+				depth++;
+			} else if (ch === "}") {
+				depth--;
+				if (depth === 0) break;
+			}
+			idx++;
+		}
+		if (depth !== 0) continue;
+		const body = code.slice(match.index + match[0].length, idx);
+		const ag = extractEvalStringProp(body, "agent");
+		const pr = extractEvalStringProp(body, "prompt");
+		const tk = pr.found ? pr : extractEvalStringProp(body, "task");
+		const lb = extractEvalStringProp(body, "label");
+		const nm = lb.found ? lb : extractEvalStringProp(body, "name");
+		results.push({
+			agent: ag.found && ag.value.trim() ? ag.value.trim() : "fujiang",
+			...(tk.found ? { prompt: tk.value } : {}),
+			...(nm.found && nm.value.trim() ? { label: nm.value.trim() } : {}),
+			hasEmptyPrompt: tk.found && tk.value.trim().length === 0,
+		});
+	}
+	return results;
 }
 
 function isTerminalProjectState(st: NuwaState | null | undefined): boolean {
@@ -525,15 +669,22 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 	let spawnSeq = 0;
 	let dispatchSeq = 0;
 	const pendingToolDispatches: PendingToolDispatch[] = [];
+	const seenEvidenceToolCallIds = new Set<string>();
+	const TERMINAL_PROGRESS_STATES = new Set(["completed", "failed", "error", "aborted", "cancelled"]);
 
 	const prunePendingDispatches = (nowMs = Date.now()): void => {
 		for (let i = pendingToolDispatches.length - 1; i >= 0; i--) {
-			if (nowMs - pendingToolDispatches[i]!.createdAt > PENDING_DISPATCH_TTL_MS) {
+			const e = pendingToolDispatches[i]!;
+			const ttl = e.evalWindow ? EVAL_DISPATCH_WINDOW_TTL_MS : PENDING_DISPATCH_TTL_MS;
+			if (nowMs - e.createdAt > ttl) {
 				pendingToolDispatches.splice(i, 1);
 			}
 		}
 		if (pendingToolDispatches.length > 200) {
 			pendingToolDispatches.splice(0, pendingToolDispatches.length - 200);
+		}
+		if (seenEvidenceToolCallIds.size > 500) {
+			seenEvidenceToolCallIds.clear();
 		}
 	};
 
@@ -558,6 +709,115 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		}
 	};
 
+	const extractEventDetails = (evObj: Record<string, unknown>): Record<string, unknown> | undefined => {
+		if (evObj.details && typeof evObj.details === "object") {
+			return evObj.details as Record<string, unknown>;
+		}
+		const resObj = evObj.result && typeof evObj.result === "object" ? (evObj.result as Record<string, unknown>) : undefined;
+		if (resObj?.details && typeof resObj.details === "object") {
+			return resObj.details as Record<string, unknown>;
+		}
+		return undefined;
+	};
+
+	const reconcilePendingDispatchesOnToolResult = (
+		root: string,
+		toolCallId: string,
+		evObj: Record<string, unknown>,
+	): void => {
+		const normRoot = resolve(root);
+		const details = extractEventDetails(evObj);
+		const asyncObj = details?.async && typeof details.async === "object" ? (details.async as Record<string, unknown>) : undefined;
+		const asyncRunning = asyncObj?.state === "running";
+		const progressArr = Array.isArray(details?.progress) ? (details.progress as Array<Record<string, unknown>>) : [];
+		const resultsArr = Array.isArray(details?.results) ? (details.results as Array<Record<string, unknown>>) : [];
+
+		let hasUnsettledProgress = false;
+		const settledIds = new Set<string>();
+		const settledIndices = new Set<number>();
+
+		for (const res of resultsArr) {
+			if (!res || typeof res !== "object") continue;
+			if (typeof res.id === "string" && res.id.trim()) settledIds.add(res.id.trim());
+			if (typeof res.spawnId === "string" && res.spawnId.trim()) settledIds.add(res.spawnId.trim());
+			if (typeof res.taskId === "string" && res.taskId.trim()) settledIds.add(res.taskId.trim());
+			if (typeof res.index === "number") settledIndices.add(res.index);
+		}
+
+		for (const prog of progressArr) {
+			if (!prog || typeof prog !== "object") continue;
+			const progId =
+				typeof prog.id === "string" && prog.id.trim()
+					? prog.id.trim()
+					: typeof prog.spawnId === "string" && prog.spawnId.trim()
+						? prog.spawnId.trim()
+						: typeof prog.taskId === "string" && prog.taskId.trim()
+							? prog.taskId.trim()
+							: "";
+			const progIdx = typeof prog.index === "number" ? prog.index : -1;
+			const progState = typeof prog.status === "string" ? prog.status.trim().toLowerCase() : "";
+			const isTerminal = progState ? TERMINAL_PROGRESS_STATES.has(progState) : false;
+
+			if (isTerminal) {
+				if (progId) settledIds.add(progId);
+				if (progIdx >= 0) settledIndices.add(progIdx);
+				continue;
+			}
+
+			// 异步模式下（pending/running 或 async.state === "running"）把预分配随机 agentId 动态绑回对应 index 的缓冲条目
+			if (progId && toolCallId) {
+				const targetEntry = pendingToolDispatches.find(
+					(e) =>
+						resolve(e.root) === normRoot &&
+						e.toolCallId === toolCallId &&
+						(progIdx >= 0 ? e.index === progIdx : true),
+				);
+				if (targetEntry) {
+					if (!targetEntry.spawnKeyCandidates.includes(progId)) {
+						targetEntry.spawnKeyCandidates.unshift(progId);
+					}
+					targetEntry.asyncPending = true;
+				}
+			}
+			if (asyncRunning || progState === "pending" || progState === "running") {
+				hasUnsettledProgress = true;
+			}
+		}
+
+		if (!toolCallId) return;
+
+		if (asyncRunning || hasUnsettledProgress) {
+			// 仅清理已经进入 results 或到达终态的条目；保留仍在排队等待 before_subagent_spawn 的异步条目
+			for (let i = pendingToolDispatches.length - 1; i >= 0; i--) {
+				const e = pendingToolDispatches[i]!;
+				if (resolve(e.root) !== normRoot || e.toolCallId !== toolCallId) continue;
+				const idxSettled = settledIndices.has(e.index);
+				const idSettled = e.spawnKeyCandidates.some((c) => settledIds.has(c));
+				if (idxSettled || idSettled) {
+					pendingToolDispatches.splice(i, 1);
+				} else {
+					e.asyncPending = true;
+				}
+			}
+			return;
+		}
+
+		clearPendingDispatchesByToolCall(normRoot, toolCallId);
+	};
+
+	const matchesSpawnCandidate = (cand: string, actualKey: string): boolean => {
+		if (!cand || !actualKey) return false;
+		if (cand === actualKey) return true;
+		if (actualKey.startsWith(`${cand}-`) && /^\d+$/.test(actualKey.slice(cand.length + 1))) return true;
+		const dotIdx = actualKey.lastIndexOf(".");
+		if (dotIdx > 0 && dotIdx < actualKey.length - 1) {
+			const tail = actualKey.slice(dotIdx + 1);
+			if (tail === cand) return true;
+			if (tail.startsWith(`${cand}-`) && /^\d+$/.test(tail.slice(cand.length + 1))) return true;
+		}
+		return false;
+	};
+
 	const consumePendingToolDispatch = (
 		root: string,
 		sessionId: string,
@@ -575,20 +835,31 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		if (normSpawnKey) {
 			matchedIdx = pendingToolDispatches.findIndex((e) => {
 				if (resolve(e.root) !== normRoot) return false;
-				return e.spawnKeyCandidates.some(
-					(cand) =>
-						cand === normSpawnKey ||
-						(normSpawnKey.startsWith(`${cand}-`) && /^\d+$/.test(normSpawnKey.slice(cand.length + 1))),
-				);
+				return e.spawnKeyCandidates.some((cand) => matchesSpawnCandidate(cand, normSpawnKey));
 			});
 		}
 
-		const pickBest = (requireSameAgent: boolean, requireSameSession: boolean, kindFilter?: "task" | "eval"): number => {
+		const pickBest = (
+			requireSameAgent: boolean,
+			requireSameSession: boolean,
+			kindFilter?: "task" | "eval",
+			skipExplicitKeyedAsync = true,
+		): number => {
 			return pendingToolDispatches.findIndex((e) => {
 				if (resolve(e.root) !== normRoot) return false;
 				if (requireSameSession && e.sessionId !== sessionId) return false;
 				if (kindFilter && e.invocationKind !== kindFilter) return false;
 				if (requireSameAgent && normAgent && e.agent.trim().toLowerCase() !== normAgent) return false;
+				// 如果条目已经明确绑定了属于另一场 async 派单的特定 spawnKey 且当前传入的 spawnKey 不为空也不匹配它，不跨单抢消费
+				if (
+					skipExplicitKeyedAsync &&
+					e.asyncPending &&
+					normSpawnKey &&
+					e.spawnKeyCandidates.length > 0 &&
+					!e.spawnKeyCandidates.some((cand) => matchesSpawnCandidate(cand, normSpawnKey))
+				) {
+					return false;
+				}
 				return true;
 			});
 		};
@@ -599,6 +870,15 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		if (matchedIdx < 0 && normKind === "eval") matchedIdx = pickBest(false, false, "eval");
 		if (matchedIdx < 0 && !normKind) matchedIdx = pickBest(true, true, undefined);
 		if (matchedIdx < 0 && !normKind) matchedIdx = pickBest(false, true, undefined);
+		if (matchedIdx < 0 && normKind === "task") {
+			// eval 内调用 tool.task(...) 时子代理可能以 invocationKind="task" 触发，允许消费尚带 evalWindow 的同代理条目
+			matchedIdx = pendingToolDispatches.findIndex(
+				(e) =>
+					resolve(e.root) === normRoot &&
+					e.evalWindow &&
+					(!normAgent || e.agent.trim().toLowerCase() === normAgent),
+			);
+		}
 
 		if (matchedIdx < 0) return undefined;
 		const hit = pendingToolDispatches[matchedIdx]!;
@@ -642,23 +922,25 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		if (running.length === 0) return;
 		const safeInput = inputObj && typeof inputObj === "object" ? inputObj : {};
 
-		const details =
-			evObj.details && typeof evObj.details === "object"
-				? (evObj.details as Record<string, unknown>)
-				: evObj.result && typeof evObj.result === "object" && (evObj.result as Record<string, unknown>).details && typeof (evObj.result as Record<string, unknown>).details === "object"
-					? ((evObj.result as Record<string, unknown>).details as Record<string, unknown>)
-					: undefined;
+		const details = extractEventDetails(evObj);
+		const asyncObj = details?.async && typeof details.async === "object" ? (details.async as Record<string, unknown>) : undefined;
+		const asyncRunning = asyncObj?.state === "running";
 
 		const explicitIds = new Set<string>();
 		const pushStrId = (v: unknown) => {
 			if (typeof v === "string" && v.trim()) explicitIds.add(v.trim());
 		};
-		const pushArrIds = (arr: unknown) => {
+		const pushArrIds = (arr: unknown, onlyTerminalStatus = false) => {
 			if (!Array.isArray(arr)) return;
 			for (const item of arr) {
-				if (typeof item === "string") pushStrId(item);
-				else if (item && typeof item === "object") {
+				if (typeof item === "string") {
+					if (!onlyTerminalStatus) pushStrId(item);
+				} else if (item && typeof item === "object") {
 					const rec = item as Record<string, unknown>;
+					if (onlyTerminalStatus) {
+						const st = typeof rec.status === "string" ? rec.status.trim().toLowerCase() : "";
+						if (!TERMINAL_PROGRESS_STATES.has(st)) continue;
+					}
 					pushStrId(rec.spawnId);
 					pushStrId(rec.taskId);
 					pushStrId(rec.id);
@@ -674,15 +956,21 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		pushArrIds(details?.spawnIds);
 		pushArrIds(details?.taskIds);
 		pushArrIds(details?.results);
-		pushArrIds(details?.progress);
+		// progress 里的 pending/running 任务尚未结束，仅吸收明确已到达终态的 progress 项
+		pushArrIds(details?.progress, true);
 		pushStrId(safeInput.spawnId);
 		pushStrId(safeInput.taskId);
 		pushArrIds(safeInput.tasks);
+
+		// async 模式返回运行态句柄（results 为空、无任何终态 ID）：此时子代理仍在后台队列或运行中，绝不误注销看门狗
+		if (asyncRunning && explicitIds.size === 0) return;
 
 		const matchedIds = new Set<string>();
 		for (const r of running) {
 			if (explicitIds.has(r.taskId)) matchedIds.add(r.taskId);
 		}
+
+		if (asyncRunning && matchedIds.size === 0) return;
 
 		// 若宿主未回传 spawnId，则通过精确派单正文或 intentId 严格配对对应子代理（严禁用短子串误释放并行同类任务）
 		if (matchedIds.size === 0) {
@@ -1036,6 +1324,34 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					return toolText(`已从 .sapper 迁移: ${migrated.project.id}\n\n${statusBoard(migrated, root)}`, { root, migrated: true });
 				}
 				if (existing && p.resume) {
+					if (isTerminalProjectState(existing) && !p.force) {
+						const termStatus = terminalStatusOf(existing);
+						let finalTerminal = existing;
+						if (existing.project.status !== termStatus || existing.runtime.status !== termStatus) {
+							finalTerminal = withLock(root, () => {
+								const s = loadState(root);
+								if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
+								s.project.status = termStatus;
+								s.runtime.status = termStatus;
+								saveState(root, s, {
+									reason: termStatus === "sealed_negative" ? "resume-sealed-align" : "resume-completed-align",
+								});
+								return s;
+							});
+						}
+						const wsIntegrity = verifyWorkspaceIntegrity(root);
+						refreshUi(ctx, root, finalTerminal, true);
+						return toolText(
+							`项目已处于终态 (${termStatus}): ${finalTerminal.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoard(finalTerminal, root)}`,
+							{
+								root,
+								status: termStatus,
+								sealed: termStatus === "sealed_negative",
+								readonly: true,
+								integrity: wsIntegrity.status,
+							},
+						);
+					}
 					if (isPausedState(root)) {
 						setPausedState(root, false, "nuwa_init resume");
 					}
@@ -1044,11 +1360,13 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
 						if (isTerminalProjectState(s)) {
 							const termStatus = terminalStatusOf(s);
-							// 封盘/完成是终态：resume 只重绑会话，绝不复活为 active
-							s.project.ownerSessionId = sid;
-							saveState(root, s, {
-								reason: termStatus === "sealed_negative" ? "resume-sealed-noop" : "resume-completed-noop",
-							});
+							if (s.project.status !== termStatus || s.runtime.status !== termStatus) {
+								s.project.status = termStatus;
+								s.runtime.status = termStatus;
+								saveState(root, s, {
+									reason: termStatus === "sealed_negative" ? "resume-sealed-noop" : "resume-completed-noop",
+								});
+							}
 							return s;
 						}
 						s.project.status = "active";
@@ -1087,12 +1405,10 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						saveState(root, s, { reason: "init" });
 						return s;
 					});
-					const wsIntegrity = verifyWorkspaceIntegrity(root, { recordBaseline: true });
-					writePointer(root, sid);
-					bindMainSession(ctx, root, resumed.project.id);
-					refreshUi(ctx, root, resumed, true);
 					if (isTerminalProjectState(resumed)) {
 						const termStatus = terminalStatusOf(resumed);
+						const wsIntegrity = verifyWorkspaceIntegrity(root);
+						refreshUi(ctx, root, resumed, true);
 						return toolText(
 							`项目已处于终态 (${termStatus}): ${resumed.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoard(resumed, root)}`,
 							{
@@ -1104,6 +1420,10 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 							},
 						);
 					}
+					const wsIntegrity = verifyWorkspaceIntegrity(root, { recordBaseline: true });
+					writePointer(root, sid);
+					bindMainSession(ctx, root, resumed.project.id);
+					refreshUi(ctx, root, resumed, true);
 					return toolText(`已恢复 ${resumed.project.id}\n\n${statusBoard(resumed, root)}`, { root, integrity: wsIntegrity.status });
 				}
 				if (existing && !p.force) {
@@ -1197,6 +1517,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const updated = withLock(root, () => {
 					const s = loadState(root);
 					if (!s) throw new Error("state 不存在；先 nuwa_init");
+					if (isTerminalProjectState(s)) {
+						throw new Error(`项目已处于终态 (${terminalStatusOf(s)})，禁止继续 nuwa_plan 派生意图`);
+					}
 
 					// 同步当前 claimed 意图到跨子代理在途登记池（#50）
 					for (const it of Object.values(s.intents)) {
@@ -1359,6 +1682,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				withLock(root, () => {
 					const s = loadState(root);
 					if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+					if (isTerminalProjectState(s)) {
+						throw new Error(`项目已处于终态 (${terminalStatusOf(s)})，禁止继续认领 nuwa_claim`);
+					}
 					const r = claimIntent(s, p.id, p.worker, curCfg.claimTtl, root);
 					expectedKind = r.intent.expectedKind;
 					targetKey = r.intent.targetKey ?? "";
@@ -2136,6 +2462,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const st = withLock(root, () => {
 					const s = loadState(root);
 					if (!s) throw new Error("state 不存在；先 nuwa_init");
+					if (isTerminalProjectState(s)) {
+						throw new Error(`项目已处于终态 (${terminalStatusOf(s)})，禁止继续 nuwa_expand 扩展攻击面`);
+					}
 					const r = autoPlan(s, curCfg);
 					rejectedReasons = [...r.rejectedReasons];
 
@@ -2211,6 +2540,14 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+				if (isTerminalProjectState(st)) {
+					const termStatus = terminalStatusOf(st);
+					refreshUi(ctx, root, st, true);
+					return toolText(
+						`项目已处于终态 (${termStatus}): ${st.project.id}（终态不可通过 nuwa_stop 降级为 stopped/paused）`,
+						{ root, stopped: false, paused: false, terminal: true, status: termStatus },
+					);
+				}
 
 				// #44 免确认即时软暂停通道
 				if (p.pause === true) {
@@ -2352,11 +2689,31 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const reason = arg.slice(4).trim() || "人工通过 /nuwa seal 执行负向封盘";
 				try {
 					abortAutoBatch(found, "sealed_negative");
+					const extCtx = ctx as ExtensionContext;
+					const liveUsage = extCtx.getContextUsage?.() as { tokens?: number; usedTokens?: number } | undefined;
+					const liveTokens = Number(liveUsage?.tokens ?? liveUsage?.usedTokens ?? 0);
+					if (Number.isFinite(liveTokens) && liveTokens > 0) {
+						withLock(found, () => {
+							const pre = loadState(found);
+							if (pre && liveTokens > (pre.runtime.tokens ?? 0)) {
+								pre.runtime.tokens = liveTokens;
+								saveState(found, pre);
+							}
+						});
+					}
 					const sealed = sealEngagement(found, { reason });
+					withLock(found, () => {
+						const post = loadState(found);
+						if (post) {
+							post.runtime.reportWritten = true;
+							saveState(found, post, { reason: "slash-seal-report-flag" });
+						}
+					});
+					sealed.state.runtime.reportWritten = true;
 					const reportPath = syncTerminalReports(found, sealed.state, { writeMd: true });
 					cleanupTrackedProcesses(found, { reason: "slash_seal" });
 					if (isPausedState(found)) setPausedState(found, false, "sealed_negative");
-					refreshUi(ctx as ExtensionContext, found, sealed.state, true);
+					refreshUi(extCtx, found, sealed.state, true);
 					return notify(
 						`已封盘 ${sealed.state.project.id} (status=${sealed.status}) · 原因: ${sealed.sealMeta.reason}${reportPath ? ` · 报告: ${reportPath}` : ""}`,
 					);
@@ -2446,6 +2803,12 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			// /nuwa pause [reason] (#44 免确认软暂停)
 			if (arg === "pause" || arg.startsWith("pause ")) {
 				if (!found) return notify("当前目录没有女娲项目", "error");
+				const stPre = loadState(found);
+				if (stPre && isTerminalProjectState(stPre)) {
+					const termStatus = terminalStatusOf(stPre);
+					refreshUi(ctx as ExtensionContext, found, stPre, true);
+					return notify(`该项目已处于终态 (${termStatus}): ${stPre.project.id}，终态不可挂起`, "error");
+				}
 				const reason = arg.slice(5).trim() || "user paused via /nuwa pause";
 				abortAutoBatch(found, `paused:${reason}`);
 				setPausedState(found, true, reason);
@@ -2619,6 +2982,12 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			}
 			if (arg === "stop" || arg.startsWith("stop ")) {
 				if (!found) return notify("当前目录没有女娲项目", "error");
+				const preSt = loadState(found);
+				if (preSt && isTerminalProjectState(preSt)) {
+					const termStatus = terminalStatusOf(preSt);
+					refreshUi(ctx as ExtensionContext, found, preSt, true);
+					return notify(`该项目已处于终态 (${termStatus}): ${preSt.project.id}，终态不可改为 stopped`, "error");
+				}
 				const reason = arg.slice(4).trim() || "user stopped";
 				abortAutoBatch(found, reason);
 				cleanupTrackedProcesses(found, { reason: `slash_stop:${reason}` });
@@ -2626,12 +2995,18 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				const st = withLock(found, () => {
 					const s = loadState(found);
 					if (!s) return null;
+					if (isTerminalProjectState(s)) return s;
 					s.project.status = "stopped";
 					s.project.stopReason = reason;
 					saveState(found, s, { reason: "stop" });
 					return s;
 				});
 				if (!st) return notify("state 读取失败", "error");
+				if (isTerminalProjectState(st)) {
+					const termStatus = terminalStatusOf(st);
+					refreshUi(ctx as ExtensionContext, found, st, true);
+					return notify(`该项目已处于终态 (${termStatus}): ${st.project.id}，终态不可改为 stopped`, "error");
+				}
 				logEvent(found, { type: "stop", reason, via: "command" });
 				try {
 					const dist = distillProjectExperience(st, { agentHome: getAgentHome(), negativeOnly: true });
@@ -2653,6 +3028,15 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			}
 			if (arg === "resume" || arg.startsWith("resume ")) {
 				if (!found) return notify("当前目录没有女娲项目", "error");
+				const preSt = loadState(found);
+				if (preSt && isTerminalProjectState(preSt)) {
+					const termStatus = terminalStatusOf(preSt);
+					refreshUi(ctx as ExtensionContext, found, preSt, true);
+					return notify(
+						`该项目已处于终态 (${termStatus}): ${preSt.project.id}，终态不可续跑；新目标请换 root 或 nuwa_init(force=true) 重建`,
+						"error",
+					);
+				}
 				warmBundledKb();
 				if (isPausedState(found)) {
 					setPausedState(found, false, "resumed via /nuwa resume");
@@ -2918,7 +3302,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			if (!root) return;
 			bindSubagentSpawn(sidOf(ctx), ctx.agent?.id, root, getAgentHome());
 			const st = loadState(root);
-			if (!st || st.project.status !== "active") return;
+			if (!st || st.project.status !== "active" || isTerminalProjectState(st)) return;
 
 			const watchdog = new SubagentWatchdog(root);
 			watchdog.checkTimeouts();
@@ -3123,9 +3507,9 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		clearUi(c);
 	});
 
-	pi.on("tool_execution_end", (event, ctx) => {
+	const handleToolEndOrResult = (event: unknown, ctx: ExtensionContext, countLiveCall: boolean): void => {
 		const sid = sidOf(ctx);
-		liveCalls.set(sid, (liveCalls.get(sid) ?? 0) + 1);
+		if (countLiveCall) liveCalls.set(sid, (liveCalls.get(sid) ?? 0) + 1);
 		try {
 			const evObj = (event ?? {}) as Record<string, unknown>;
 			const { toolName, inputObj, command, output } = extractEventOutput(evObj);
@@ -3135,16 +3519,19 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				wd.recordOutput(resolveWatchdogTaskId(wd, ctx));
 			}
 			const normTool = toolName.trim().toLowerCase();
+			const tcId = typeof evObj.toolCallId === "string" ? evObj.toolCallId.trim() : "";
 			if (root && (normTool === "task" || normTool === "subagent" || normTool === "agent" || normTool === "delegate")) {
 				completeWatchdogOnTaskEnd(root, evObj, inputObj, ctx);
-				const tcId = typeof evObj.toolCallId === "string" ? evObj.toolCallId.trim() : "";
-				clearPendingDispatchesByToolCall(root, tcId);
-			} else if (root && normTool === "eval") {
-				const tcId = typeof evObj.toolCallId === "string" ? evObj.toolCallId.trim() : "";
+				reconcilePendingDispatchesOnToolResult(root, tcId, evObj);
+			} else if (root && normTool === "eval" && evObj.isError === true) {
 				clearPendingDispatchesByToolCall(root, tcId);
 			}
 			if (!isTrustedEvidenceEvent(toolName, inputObj)) return;
 			if (!root) return;
+			if (tcId) {
+				if (seenEvidenceToolCallIds.has(`${resolve(root)}::${tcId}`)) return;
+				seenEvidenceToolCallIds.add(`${resolve(root)}::${tcId}`);
+			}
 			if (command || output) {
 				const agentObj = ctx.agent as { name?: string; kind?: string } | undefined;
 				const agentName = agentObj?.name ?? agentObj?.kind;
@@ -3153,6 +3540,14 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		} catch {
 			/* 账本记录异常不阻塞主流程 */
 		}
+	};
+
+	pi.on("tool_execution_end", (event, ctx) => {
+		handleToolEndOrResult(event, ctx, true);
+	});
+
+	pi.on("tool_result", (event, ctx) => {
+		handleToolEndOrResult(event, ctx, false);
 	});
 
 	pi.on("tool_call", (event: ToolCallEvent, ctx) => {
@@ -3161,7 +3556,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			if (!root) return;
 			const st = loadState(root);
 			if (!st) return;
-			const active = st.project.status === "active";
+			const active = st.project.status === "active" && !isTerminalProjectState(st);
 			const main = isMain(ctx);
 			const name = event.toolName;
 			const input = ((event as { input?: Record<string, unknown> }).input ?? {}) as Record<string, unknown>;
@@ -3239,12 +3634,25 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					const toolCallId = typeof evRecord.toolCallId === "string" ? evRecord.toolCallId.trim() : undefined;
 					const isBatchInput = Array.isArray(input.tasks);
 					const rawTasks = isBatchInput ? (input.tasks as Array<Record<string, unknown>>) : [input];
-					const sharedCtx =
+					if (isBatchInput && rawTasks.length === 0) {
+						return { block: true, reason: "nuwa N-007: 批派单 tasks 数组不能为空" };
+					}
+					const targetInfo = {
+						url: st.project.url,
+						host: st.project.host,
+						...(normalizeTaskEgressUrl(resolveConfiguredEgressUrl())
+							? { egress: maskEgressUrl(normalizeTaskEgressUrl(resolveConfiguredEgressUrl())!) }
+							: {}),
+					};
+					const sharedCtxRaw =
 						typeof input.context === "string" || (input.context && typeof input.context === "object")
 							? (input.context as Record<string, unknown> | string)
 							: undefined;
-					const activeEgress = normalizeTaskEgressUrl(resolveConfiguredEgressUrl());
-					let needsRewrite = false;
+					const expandedSharedCtx =
+						sharedCtxRaw !== undefined
+							? expandDispatchContextValue(sharedCtxRaw, targetInfo)
+							: { value: undefined, changed: false };
+					let needsRewrite = expandedSharedCtx.changed;
 					const rewrittenItems = rawTasks.map((it) => (it && typeof it === "object" ? { ...it } : it));
 					const stagedDispatches: PendingToolDispatch[] = [];
 					const normRoot = resolve(root);
@@ -3263,6 +3671,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 										: "";
 						let tStr = rawTaskStr.trim();
 						const taskFile = typeof item?.taskFile === "string" ? item.taskFile.trim() : "";
+						let fromTaskFile = false;
 
 						if (!tStr && !taskFile) {
 							const dv = validateSubagentDispatch({ task: "", targetUrl: st.project.url });
@@ -3270,18 +3679,17 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						}
 						if (!tStr && taskFile) {
 							if (!taskFile.startsWith("local://") && existsSync(taskFile)) {
-								try {
-									const fStat = statSync(taskFile);
-									if (fStat.isFile() && fStat.size <= 512 * 1024) {
-										const fileContent = readFileSync(taskFile, "utf8").trim();
-										if (!fileContent) {
-											const dv = validateSubagentDispatch({ task: "", targetUrl: st.project.url });
-											return { block: true, reason: `nuwa N-007: ${dv.reason ?? "派单 taskFile 为空"}` };
-										}
-										tStr = fileContent;
-									}
-								} catch {
-									/* 若文件不可读则交由 task 工具自身报错，不误判为空 */
+								const tf = readTaskFileForDispatch(taskFile);
+								if (tf.tooLarge) {
+									return { block: true, reason: `nuwa N-007: taskFile 超过 4 MiB 上限 (${taskFile})` };
+								}
+								if (tf.empty) {
+									const dv = validateSubagentDispatch({ task: "", targetUrl: st.project.url });
+									return { block: true, reason: `nuwa N-007: ${dv.reason ?? "派单 taskFile 为空"}` };
+								}
+								if (tf.text) {
+									tStr = tf.text;
+									fromTaskFile = true;
 								}
 							}
 							if (!tStr) {
@@ -3299,14 +3707,11 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						}
 
 						let finalTaskForDispatch = tStr;
-						if (rawTaskStr && DISPATCH_PLACEHOLDER_CASE_RE.test(rawTaskStr)) {
+						const candidateSourceText = rawTaskStr || (fromTaskFile ? tStr : "");
+						if (candidateSourceText && DISPATCH_PLACEHOLDER_CASE_RE.test(candidateSourceText)) {
 							const pkt = buildDispatchPacket({
-								task: rawTaskStr,
-								target: {
-									url: st.project.url,
-									host: st.project.host,
-									...(activeEgress ? { egress: maskEgressUrl(activeEgress) } : {}),
-								},
+								task: candidateSourceText,
+								target: targetInfo,
 							});
 							if (DISPATCH_PLACEHOLDER_CASE_RE.test(pkt.task)) {
 								const dv = validateSubagentDispatch({
@@ -3323,14 +3728,29 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 									if (typeof cloned.task === "string") cloned.task = pkt.task;
 									else if (typeof cloned.prompt === "string") cloned.prompt = pkt.task;
 									else if (typeof cloned.assignment === "string") cloned.assignment = pkt.task;
+									else if (fromTaskFile) {
+										cloned.task = pkt.task;
+										delete cloned.taskFile;
+									}
 								}
 							}
 						}
 
 						const itemAgent = typeof item?.agent === "string" && item.agent.trim() ? item.agent.trim() : "fujiang";
 						const itemName = typeof item?.name === "string" && item.name.trim() ? item.name.trim() : undefined;
-						const itemCtx =
-							item?.context !== undefined ? (item.context as Record<string, unknown> | string) : sharedCtx;
+						let itemCtx: Record<string, unknown> | string | undefined;
+						if (item?.context !== undefined) {
+							const expItemCtx = expandDispatchContextValue(item.context, targetInfo);
+							itemCtx = expItemCtx.value;
+							if (expItemCtx.changed) {
+								needsRewrite = true;
+								const cloned = rewrittenItems[idx];
+								if (cloned && typeof cloned === "object") cloned.context = expItemCtx.value;
+							}
+						} else {
+							itemCtx = expandedSharedCtx.value;
+						}
+
 						const spawnKeyCandidates: string[] = [];
 						if (toolCallId) spawnKeyCandidates.push(`${toolCallId}:${idx}`);
 						if (itemName) spawnKeyCandidates.push(itemName);
@@ -3355,7 +3775,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					pendingToolDispatches.push(...stagedDispatches);
 
 					if (Array.isArray(input.tasks) && input.tasks.length > 1) {
-						const chunked = chunkBatchTasks(input.tasks as BatchTaskItem[], { root });
+						const chunked = chunkBatchTasks(rewrittenItems as BatchTaskItem[], { root });
 						if (chunked.exceeded) {
 							logEvent(root, {
 								type: "batch_spilled",
@@ -3368,48 +3788,121 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 
 					if (needsRewrite) {
 						const revisedInput = isBatchInput
-							? { ...input, tasks: rewrittenItems }
-							: (rewrittenItems[0] as Record<string, unknown>);
+							? {
+									...input,
+									...(expandedSharedCtx.changed ? { context: expandedSharedCtx.value } : {}),
+									tasks: rewrittenItems,
+								}
+							: {
+									...(rewrittenItems[0] as Record<string, unknown>),
+									...(expandedSharedCtx.changed ? { context: expandedSharedCtx.value } : {}),
+								};
 						return { input: revisedInput };
 					}
 				}
 				return;
 			}
 			if (name === "eval") {
-				const code = typeof input.code === "string" ? input.code : "";
-				if (active && main && readCfg().requireFujiang && /\bagent\s*\(/.test(code) && !/\b(?:fujiang|nuwa-verifier)\b/.test(code)) {
+				const rawCode = typeof input.code === "string" ? input.code : "";
+				const targetInfo = {
+					url: st.project.url,
+					host: st.project.host,
+				};
+				const effectiveCode =
+					active && (targetInfo.url || targetInfo.host) && DISPATCH_PLACEHOLDER_CASE_RE.test(rawCode)
+						? expandPlaceholdersPlain(rawCode, targetInfo)
+						: rawCode;
+				const needsEvalRewrite = effectiveCode !== rawCode;
+
+				if (active && main && readCfg().requireFujiang && /\bagent\s*\(/.test(effectiveCode) && !/\b(?:fujiang|nuwa-verifier)\b/.test(effectiveCode)) {
 					return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
 				}
 				if (active) {
-					const sv = checkToolScopeAndRisk("eval", input, projScope, st.project.mode);
+					const evalScopeInput = needsEvalRewrite ? { ...input, code: effectiveCode } : input;
+					const sv = checkToolScopeAndRisk("eval", evalScopeInput, projScope, st.project.mode);
 					if (sv) return sv;
 				}
-				if (active && main && /\b(?:agent|tool\.task)\s*\(/.test(code)) {
+				if (active && main && /\b(?:agent|tool\.task)\s*\(/.test(effectiveCode)) {
 					const evRecord = event as unknown as Record<string, unknown>;
 					const evalToolCallId =
 						typeof evRecord.toolCallId === "string" && evRecord.toolCallId.trim()
 							? evRecord.toolCallId.trim()
 							: undefined;
-					const intentHits = [...code.matchAll(/\b(i\d{3,})\b/g)].map((m) => m[1]).filter(Boolean);
-					const inferredAgent =
-						/\bnuwa-verifier\b/.test(code) && !/\bfujiang\b/.test(code) ? "nuwa-verifier" : "fujiang";
-					const summaryText = `[eval:${inferredAgent}]${intentHits.length ? ` [女娲派单 ${intentHits[0]}]` : ""} ${code.slice(0, 600)}`.trim();
+					const parsedAgentCalls = parseEvalAgentCalls(effectiveCode);
+					for (const pc of parsedAgentCalls) {
+						if (pc.hasEmptyPrompt) {
+							return { block: true, reason: "nuwa N-007: eval 内 agent() prompt 不能为空" };
+						}
+						if (pc.prompt && DISPATCH_EMPTY_CONTEXT_RE.test(pc.prompt)) {
+							const dv = validateSubagentDispatch({
+								task: pc.prompt,
+								targetUrl: st.project.url,
+								resolvedHost: st.project.host,
+							});
+							if (!dv.ok) return { block: true, reason: `nuwa N-007: ${dv.reason}` };
+						}
+					}
+					const normRoot = resolve(root);
+					const sid = sidOf(ctx);
 					const nowMs = Date.now();
 					prunePendingDispatches(nowMs);
-					if (evalToolCallId) clearPendingDispatchesByToolCall(root, evalToolCallId);
-					pendingToolDispatches.push({
-						seq: ++dispatchSeq,
-						root: resolve(root),
-						sessionId: sidOf(ctx),
-						...(evalToolCallId ? { toolCallId: evalToolCallId } : {}),
-						invocationKind: "eval",
-						agent: inferredAgent,
-						index: 0,
-						taskText: summaryText,
-						spawnKeyCandidates: [],
-						reusable: true,
-						createdAt: nowMs,
-					});
+					if (evalToolCallId) clearPendingDispatchesByToolCall(normRoot, evalToolCallId);
+
+					if (parsedAgentCalls.length > 0) {
+						parsedAgentCalls.forEach((pc, idx) => {
+							let taskText = pc.prompt?.trim() ?? "";
+							if (taskText) {
+								if (DISPATCH_PLACEHOLDER_CASE_RE.test(taskText)) {
+									taskText = expandPlaceholdersPlain(taskText, targetInfo);
+								}
+								if (!taskText.startsWith(`[eval:${pc.agent}]`)) {
+									taskText = `[eval:${pc.agent}] ${taskText}`;
+								}
+							}
+							if (!taskText) {
+								const intentHits = [...effectiveCode.matchAll(/\b(i\d{3,})\b/g)].map((m) => m[1]).filter(Boolean);
+								taskText = `[eval:${pc.agent}]${intentHits.length ? ` [女娲派单 ${intentHits[0]}]` : ""} ${effectiveCode.slice(0, 600)}`.trim();
+							}
+							pendingToolDispatches.push({
+								seq: ++dispatchSeq,
+								root: normRoot,
+								sessionId: sid,
+								...(evalToolCallId ? { toolCallId: evalToolCallId } : {}),
+								invocationKind: "eval",
+								agent: pc.agent,
+								...(pc.label ? { name: pc.label } : {}),
+								index: idx,
+								taskText,
+								spawnKeyCandidates: pc.label ? [pc.label] : [],
+								evalWindow: true,
+								createdAt: nowMs,
+							});
+						});
+					}
+
+					if (/\btool\.task\s*\(/.test(effectiveCode) || parsedAgentCalls.length === 0) {
+						const intentHits = [...effectiveCode.matchAll(/\b(i\d{3,})\b/g)].map((m) => m[1]).filter(Boolean);
+						const inferredAgent =
+							/\bnuwa-verifier\b/.test(effectiveCode) && !/\bfujiang\b/.test(effectiveCode) ? "nuwa-verifier" : "fujiang";
+						const summaryText = `[eval:${inferredAgent}]${intentHits.length ? ` [女娲派单 ${intentHits[0]}]` : ""} ${effectiveCode.slice(0, 600)}`.trim();
+						pendingToolDispatches.push({
+							seq: ++dispatchSeq,
+							root: normRoot,
+							sessionId: sid,
+							...(evalToolCallId ? { toolCallId: evalToolCallId } : {}),
+							invocationKind: "eval",
+							agent: inferredAgent,
+							index: parsedAgentCalls.length,
+							taskText: summaryText,
+							spawnKeyCandidates: [],
+							evalWindow: true,
+							reusable: true,
+							createdAt: nowMs,
+						});
+					}
+				}
+				if (needsEvalRewrite) {
+					return { input: { ...input, code: effectiveCode } };
 				}
 				return;
 			}

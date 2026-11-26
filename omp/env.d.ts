@@ -257,6 +257,7 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		on(event: "session_shutdown", handler: (event: unknown, ctx: ExtensionContext) => void): void;
 		on(event: "before_subagent_spawn", handler: (event: Record<string, unknown>, ctx: ExtensionContext) => unknown): void;
 		on(event: "tool_execution_end", handler: (event: unknown, ctx: ExtensionContext) => void): void;
+		on(event: "tool_result", handler: (event: unknown, ctx: ExtensionContext) => void): void;
 		on(
 			event: "tool_call",
 			handler: (

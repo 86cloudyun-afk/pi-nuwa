@@ -493,7 +493,12 @@ export function inspectGraph(
 		project: {
 			id: st.project.id,
 			url: st.project.url,
-			status: st.runtime?.status === "sealed_negative" ? "sealed_negative" : st.project.status,
+			status:
+				st.runtime?.status === "sealed_negative" || st.project.status === "sealed_negative"
+					? "sealed_negative"
+					: st.runtime?.status === "completed" || st.project.status === "completed"
+						? "completed"
+						: st.project.status,
 			phase: st.project.phase,
 			episode: st.project.episode ?? 1,
 		},
@@ -1097,9 +1102,21 @@ export function buildDirective(st: NuwaState, cfg: Cfg, root?: string): string {
 	const threshold = readNoveltyThreshold(cfg);
 	const conv = buildConvergenceAdvice(st, cfg, root);
 	const sealRec = shouldRecommendSeal(st, cfg, root);
-	const effectiveStatus = rt.status === "sealed_negative" ? "sealed_negative" : p.status;
+	const effectiveStatus =
+		rt.status === "sealed_negative" || p.status === "sealed_negative"
+			? "sealed_negative"
+			: rt.status === "completed" || p.status === "completed"
+				? "completed"
+				: p.status;
 	const head = `[女娲 v${VERSION} · 永动续跑 第 ${rt.turns} 轮 · E${ep}] status=${effectiveStatus} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked}(commits=${rt.blockedCommits ?? counts.blocked}) facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}min stall=${rt.stall} noveltyStall=${noveltyStall} idle=${rt.idle} pressure=${Math.round(pressure * 100)}% expand=${rt.expansions ?? 0}`;
 	const goal = `目标: ${p.url} (${p.mode}) — ${p.goal}`;
+	if (effectiveStatus === "sealed_negative" || effectiveStatus === "completed") {
+		const sealNote =
+			effectiveStatus === "sealed_negative"
+				? `项目已负向封盘 (sealed_negative): ${(rt.sealMeta ?? p.sealMeta)?.reason || "攻击面已全面排除"}。禁止继续派单或复活，只读查阅报告即可。`
+				: `项目已验收完成 (completed)。禁止继续派单或复活，只读查阅报告即可。`;
+		return [head, goal, "", sealNote].join("\n");
+	}
 	const hard = [
 		`本轮硬性动作（必须发生，禁止只输出说明文字）:`,
 		`- 至少 1 次 task 批量派单，或至少 1 次 nuwa_commit；`,

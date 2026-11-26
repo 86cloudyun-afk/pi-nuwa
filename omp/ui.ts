@@ -490,7 +490,9 @@ export function buildSnapshot(
 	const effectiveStatus =
 		st.runtime.status === "sealed_negative" || st.project.status === "sealed_negative"
 			? "sealed_negative"
-			: st.project.status;
+			: st.runtime.status === "completed" || st.project.status === "completed"
+				? "completed"
+				: st.project.status;
 	const sealMeta = st.runtime.sealMeta ?? st.project.sealMeta;
 
 	return {
@@ -540,7 +542,10 @@ export function buildSnapshot(
 			totalTokens: (st.runtime.totalTokens ?? 0) + (st.runtime.tokens ?? 0),
 			blockedCommits,
 			repeatRatio,
-			status: st.runtime.status ?? effectiveStatus,
+			status:
+				effectiveStatus === "sealed_negative" || effectiveStatus === "completed"
+					? effectiveStatus
+					: (st.runtime.status ?? effectiveStatus),
 		},
 		infinite: cfg.infinite,
 		recent: buildRecent(entries),
@@ -948,8 +953,12 @@ export function renderFullStatus(rootOrState: string | NuwaState, opts: FullStat
 	const effectiveStatus =
 		st.runtime?.status === "sealed_negative" || st.project.status === "sealed_negative"
 			? "sealed_negative"
-			: st.project.status;
+			: st.runtime?.status === "completed" || st.project.status === "completed"
+				? "completed"
+				: st.project.status;
 	const sealMeta = st.runtime?.sealMeta ?? st.project.sealMeta;
+	const curTokens = st.runtime?.tokens ?? 0;
+	const totalTokensAgg = (st.runtime?.totalTokens ?? 0) + curTokens;
 
 	const phases = UI_PHASES.map((phase) => {
 		const xs = allIntents.filter((i) => i.phase === phase);
@@ -975,7 +984,12 @@ export function renderFullStatus(rootOrState: string | NuwaState, opts: FullStat
 				},
 				runtime: {
 					...st.runtime,
-					status: st.runtime?.status ?? effectiveStatus,
+					status:
+						effectiveStatus === "sealed_negative" || effectiveStatus === "completed"
+							? effectiveStatus
+							: (st.runtime?.status ?? effectiveStatus),
+					tokens: curTokens,
+					totalTokens: totalTokensAgg,
 					noveltyStall: st.runtime?.noveltyStall ?? 0,
 					blockedCommits,
 				},
@@ -1013,7 +1027,7 @@ export function renderFullStatus(rootOrState: string | NuwaState, opts: FullStat
 		`目标: ${st.project.url} (${st.project.mode}) · status=${effectiveStatus} · phase=${st.project.phase} · episode=E${st.project.episode ?? 1}`,
 		`任务目标: ${st.project.goal}`,
 		`探测健康: stage=${probe.stageLabel} · last_ok=${probe.lastOk} · blocked_ratio=${(probe.blockedRatio * 100).toFixed(1)}% · edge_blocked=${probe.edgeBlocked}`,
-		`运行计数: turns=${st.runtime?.turns ?? 0} · stall=${st.runtime?.stall ?? 0} · noveltyStall=${st.runtime?.noveltyStall ?? 0} · idle=${st.runtime?.idle ?? 0} · rejects=${st.runtime?.completionRejects ?? 0}`,
+		`运行计数: turns=${st.runtime?.turns ?? 0} · tokens=${curTokens} · totalTokens=${totalTokensAgg} · stall=${st.runtime?.stall ?? 0} · noveltyStall=${st.runtime?.noveltyStall ?? 0} · idle=${st.runtime?.idle ?? 0} · rejects=${st.runtime?.completionRejects ?? 0}`,
 		`去重与受阻: repeatRatio=${repeatRatio.toFixed(4)} · blockedIntents=${blockedIntents} · blockedCommits=${blockedCommits} · facts=${allFacts.length} · intents=${allIntents.length}`,
 	];
 

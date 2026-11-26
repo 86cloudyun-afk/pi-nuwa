@@ -163,7 +163,8 @@ const HELP_TEXT = `女娲 v6.0 外层无头守护器与环境自检工具 (nuwa-
   --egress-proxy <url>         统一出口代理 URL（http/https 同步注入 HTTP_PROXY/HTTPS_PROXY；socks* 隔离仅注入 NUWA_EGRESS_PROXY/ALL_PROXY 防止 Bun fetch 崩溃）
   --model-proxy <url|direct>   模型 API 专用代理（http/https URL 或 direct/none 表示模型直连而工具继续走 --egress-proxy）
   --no-proxy <hosts>           追加不走代理的直连域名/网段（逗号分隔，写入 NO_PROXY/no_proxy）
-  --resume-stopped, --force    显式允许接管 status=stopped 的操作者停机项目并引导续跑
+  --resume-stopped, --force, --force-resume
+                               显式允许接管 status=stopped 的操作者停机项目并引导续跑
   --migrate-workspace          若 --root 位于 /tmp 等易失目录，启动前自动迁移至持久化工作区后再运行
   --omp-bin <path>             指定 omp 可执行路径（默认: omp，测试可注入 stub）
   --dry-run                    仅打印规划配置与首轮启动命令并退出 0
@@ -411,6 +412,7 @@ function parseArgs(argv) {
 				break;
 			case "--resume-stopped":
 			case "--force":
+			case "--force-resume":
 				opts.resumeStopped = true;
 				break;
 			case "--migrate-workspace":
@@ -2051,14 +2053,59 @@ function planTmpMigrationTargetDaemon(oldRoot, targetHint) {
 	return resolve(join(baseDir, `${slug}-${hash}-${Date.now().toString(36)}`));
 }
 
+function maskProxyUrlDaemon(rawUrl) {
+	const text = String(rawUrl ?? "").trim();
+	if (!text) return undefined;
+	if (/^(?:direct|none)$/i.test(text)) return text.toLowerCase();
+	try {
+		const u = new URL(text);
+		if (u.username || u.password) {
+			u.username = "***";
+			u.password = "***";
+		}
+		return u.toString().replace(/\/+$/, "");
+	} catch {
+		return text;
+	}
+}
+
 /**
  * Issue #53：将位于 /tmp 等易失目录下的女娲工作区原子迁移到持久化工作区目录。
  * 迁移前自动对 .nuwa/nuwa.db 执行 WAL checkpoint，迁移后更新 workspace-meta.json 与 daemon-config.json 中的 root 路径。
  */
 function migrateWorkspaceFromTmpDaemon(oldRoot, targetHint) {
 	const normOld = resolve(oldRoot);
-	if (!existsSync(normOld) || !isVolatileTempPathDaemon(normOld)) {
+	if (!isVolatileTempPathDaemon(normOld)) {
 		return { migrated: false, oldRoot: normOld, newRoot: normOld };
+	}
+	if (!existsSync(normOld)) {
+		// 若该 /tmp 目录本身曾迁移过且已建库在持久化基址中，优先复用同源持久化目录
+		const baseDir = resolveDefaultWorkspacesDirDaemon();
+		const hash = createHash("sha256").update(normOld).digest("hex").slice(0, 8);
+		const slug = slugifyDaemon(targetHint || basename(normOld) || "workspace");
+		const baseCand = resolve(join(baseDir, `${slug}-${hash}`));
+		const metaCand = join(baseCand, ".nuwa", "workspace-meta.json");
+		if (existsSync(metaCand)) {
+			try {
+				const parsed = JSON.parse(readFileSync(metaCand, "utf8"));
+				if (parsed?.migratedFrom === normOld) {
+					return { migrated: true, createdFresh: true, oldRoot: normOld, newRoot: baseCand };
+				}
+			} catch {
+				/* ignore */
+			}
+		}
+		const newRoot = planTmpMigrationTargetDaemon(normOld, targetHint);
+		if (newRoot === normOld) return { migrated: false, oldRoot: normOld, newRoot };
+		mkdirSync(join(newRoot, ".nuwa"), { recursive: true });
+		atomicWriteJsonDaemon(join(newRoot, ".nuwa", "workspace-meta.json"), {
+			schema: 1,
+			root: newRoot,
+			migratedFrom: normOld,
+			migratedAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+		});
+		return { migrated: true, createdFresh: true, oldRoot: normOld, newRoot };
 	}
 	const newRoot = planTmpMigrationTargetDaemon(normOld, targetHint);
 	if (newRoot === normOld) {
@@ -2085,7 +2132,15 @@ function migrateWorkspaceFromTmpDaemon(oldRoot, targetHint) {
 
 	const stagingRoot = `${newRoot}.migrating-${process.pid}-${Date.now()}`;
 	try {
-		cpSync(normOld, stagingRoot, { recursive: true, force: true, preserveTimestamps: true });
+		cpSync(normOld, stagingRoot, {
+			recursive: true,
+			force: true,
+			preserveTimestamps: true,
+			filter: (src) => {
+				const name = basename(src);
+				return name !== "state.lock" && name !== "process-groups.json" && name !== "exec-ledger.lock" && name !== "calibration.lock";
+			},
+		});
 		const stagingNuwa = join(stagingRoot, ".nuwa");
 		if (existsSync(stagingNuwa)) {
 			const metaPath = join(stagingNuwa, "workspace-meta.json");
@@ -2162,7 +2217,7 @@ function buildChildEnv(opts, gen) {
 			/* ignore */
 		}
 	}
-	const effectiveProxy = (opts.egressProxy || process.env.NUWA_EGRESS_PROXY || "").trim();
+	const effectiveProxy = (opts.egressProxy || process.env.NUWA_EGRESS_PROXY || process.env.NUWA_EGRESS || "").trim();
 	const modelProxyRaw = String(opts.modelProxy ?? "").trim();
 	const modelProxyDirect = /^(?:direct|none)$/i.test(modelProxyRaw);
 	const effectiveIsSocks = Boolean(effectiveProxy && /^socks/i.test(effectiveProxy));
@@ -2608,6 +2663,9 @@ function persistDaemonConfig(opts, effectiveTarget, effectiveMode, effectiveGoal
 			fastModel: opts.fastModel || undefined,
 			deepModel: opts.deepModel || undefined,
 			verifyModel: opts.verifyModel || undefined,
+			egressProxy: maskProxyUrlDaemon(opts.egressProxy),
+			modelProxy: maskProxyUrlDaemon(opts.modelProxy),
+			noProxy: opts.noProxy || undefined,
 			sandbox: opts.sandbox,
 			sandboxImage: opts.sandboxImage || undefined,
 			updatedAt: new Date().toISOString(),
@@ -2846,7 +2904,7 @@ async function main() {
 			opts.migrateWorkspace && isVolatileTempPathDaemon(opts.root)
 				? planTmpMigrationTargetDaemon(opts.root, effectiveTarget || basename(opts.root))
 				: null;
-		const envPreview = buildChildEnv(opts, 1);
+		const envPreview = buildChildEnv(plannedMigrationRoot ? { ...opts, root: plannedMigrationRoot } : opts, 1);
 		const prompt = buildPrompt(opts, initialState, 1, {
 			resumingStopped: Boolean(opts.resumeStopped && isStoppedStateDaemon(initialState)),
 		});
@@ -2920,7 +2978,11 @@ async function main() {
 	if (opts.migrateWorkspace && isVolatileTempPathDaemon(opts.root)) {
 		const mig = migrateWorkspaceFromTmpDaemon(opts.root, effectiveTarget || basename(opts.root));
 		if (mig.migrated) {
-			log(`[WorkspaceGuard] 已根据 --migrate-workspace 将工作区从易失目录迁出: ${mig.oldRoot} -> ${mig.newRoot}`);
+			log(
+				mig.createdFresh
+					? `[WorkspaceGuard] 已根据 --migrate-workspace 将易失工作区路径重定位至持久化目录: ${mig.oldRoot} -> ${mig.newRoot}`
+					: `[WorkspaceGuard] 已根据 --migrate-workspace 将工作区从易失目录迁出: ${mig.oldRoot} -> ${mig.newRoot}`,
+			);
 			opts.root = mig.newRoot;
 			opts.migratedFrom = mig.oldRoot;
 			initialState = readDiskState(opts.root);

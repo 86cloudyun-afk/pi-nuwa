@@ -605,6 +605,35 @@ export class NuwaCoreEngine {
 			}
 
 			if (existing && resume) {
+				if (isTerminalProjectStateMcp(existing) && !force) {
+					const termStatus = terminalStatusOfMcp(existing);
+					let finalTerminal = existing;
+					if (existing.project.status !== termStatus || existing.runtime.status !== termStatus) {
+						finalTerminal = withLock(root, () => {
+							const s = loadState(root);
+							if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
+							s.project.status = termStatus;
+							s.runtime.status = termStatus;
+							saveState(root, s, {
+								reason: termStatus === "sealed_negative" ? "resume-sealed-align" : "resume-completed-align",
+							});
+							return s;
+						});
+					}
+					const wsIntegrity = verifyWorkspaceIntegrity(root);
+					this.activeRoot = resolve(root);
+					return toolText(
+						`项目已处于终态 (${termStatus}): ${finalTerminal.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoard(finalTerminal, root)}`,
+						{
+							root,
+							status: termStatus,
+							sealed: termStatus === "sealed_negative",
+							readonly: true,
+							integrity: wsIntegrity.status,
+							...autoStartMeta,
+						},
+					);
+				}
 				if (isPausedState(root)) {
 					setPausedState(root, false, "nuwa_init resume");
 				}
@@ -613,10 +642,13 @@ export class NuwaCoreEngine {
 					if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init");
 					if (isTerminalProjectStateMcp(s)) {
 						const termStatus = terminalStatusOfMcp(s);
-						s.project.ownerSessionId = sid;
-						saveState(root, s, {
-							reason: termStatus === "sealed_negative" ? "resume-sealed-noop" : "resume-completed-noop",
-						});
+						if (s.project.status !== termStatus || s.runtime.status !== termStatus) {
+							s.project.status = termStatus;
+							s.runtime.status = termStatus;
+							saveState(root, s, {
+								reason: termStatus === "sealed_negative" ? "resume-sealed-noop" : "resume-completed-noop",
+							});
+						}
 						return s;
 					}
 					s.project.status = "active";
@@ -658,11 +690,10 @@ export class NuwaCoreEngine {
 					saveState(root, s, { reason: "init" });
 					return s;
 				});
-				const wsIntegrity = verifyWorkspaceIntegrity(root, { recordBaseline: true });
-				writePointer(root, sid);
-				this.bindSession(root, resumed.project.id);
 				if (isTerminalProjectStateMcp(resumed)) {
 					const termStatus = terminalStatusOfMcp(resumed);
+					const wsIntegrity = verifyWorkspaceIntegrity(root);
+					this.activeRoot = resolve(root);
 					return toolText(
 						`项目已处于终态 (${termStatus}): ${resumed.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoard(resumed, root)}`,
 						{
@@ -675,6 +706,9 @@ export class NuwaCoreEngine {
 						},
 					);
 				}
+				const wsIntegrity = verifyWorkspaceIntegrity(root, { recordBaseline: true });
+				writePointer(root, sid);
+				this.bindSession(root, resumed.project.id);
 				return toolText(`已恢复 ${resumed.project.id}\n\n${statusBoard(resumed, root)}`, {
 					root,
 					integrity: wsIntegrity.status,
@@ -751,6 +785,9 @@ export class NuwaCoreEngine {
 			const updated = withLock(root, () => {
 				const s = loadState(root);
 				if (!s) throw new Error("state 不存在；先 nuwa_init");
+				if (isTerminalProjectStateMcp(s)) {
+					throw new Error(`项目已处于终态 (${terminalStatusOfMcp(s)})，禁止继续 nuwa_plan 派生意图`);
+				}
 
 				for (const it of Object.values(s.intents)) {
 					if (it.status === "claimed") {
@@ -938,6 +975,9 @@ export class NuwaCoreEngine {
 			withLock(root, () => {
 				const s = loadState(root);
 				if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+				if (isTerminalProjectStateMcp(s)) {
+					throw new Error(`项目已处于终态 (${terminalStatusOfMcp(s)})，禁止继续认领 nuwa_claim`);
+				}
 				const r = claimIntent(s, id, worker, curCfg.claimTtl, root);
 				expectedKind = r.intent.expectedKind;
 				targetKey = r.intent.targetKey ?? "";
@@ -1269,6 +1309,9 @@ export class NuwaCoreEngine {
 			withLock(root, () => {
 				const s = loadState(root);
 				if (!s) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+				if (isTerminalProjectStateMcp(s)) {
+					throw new Error(`项目已处于终态 (${terminalStatusOfMcp(s)})，禁止继续 nuwa_flag 写入 flag`);
+				}
 				const r = recordFlag(s, value, command, output, challenge, vr.verified);
 				fact = r.fact.id;
 				dup = r.duplicate ?? false;
@@ -1496,7 +1539,9 @@ export class NuwaCoreEngine {
 			const effectiveStatus =
 				st.runtime.status === "sealed_negative" || st.project.status === "sealed_negative"
 					? "sealed_negative"
-					: st.project.status;
+					: st.runtime.status === "completed" || st.project.status === "completed"
+						? "completed"
+						: st.project.status;
 			const curTokens = st.runtime.tokens ?? 0;
 			const totalTokens = (st.runtime.totalTokens ?? 0) + curTokens;
 			const metricsLine = `metrics: repeat_ratio=${rep.repeatRatio.toFixed(2)} · last_ok=${probe.lastOk} · blockedIntents=${blockedIntents} · blockedCommits=${blockedCommits} · tokens=${curTokens} · totalTokens=${totalTokens}${paused ? " · paused=true" : ""}`;
@@ -1631,6 +1676,9 @@ export class NuwaCoreEngine {
 			const st = withLock(root, () => {
 				const s = loadState(root);
 				if (!s) throw new Error("state 不存在；先 nuwa_init");
+				if (isTerminalProjectStateMcp(s)) {
+					throw new Error(`项目已处于终态 (${terminalStatusOfMcp(s)})，禁止继续 nuwa_expand 扩展攻击面`);
+				}
 				const r = autoPlan(s, curCfg);
 				rejectedReasons = [...r.rejectedReasons];
 
@@ -1693,6 +1741,13 @@ export class NuwaCoreEngine {
 			if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 			const st = loadState(root);
 			if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
+			if (isTerminalProjectStateMcp(st)) {
+				const termStatus = terminalStatusOfMcp(st);
+				return toolText(
+					`项目已处于终态 (${termStatus}): ${st.project.id}（终态不可通过 nuwa_stop 降级为 stopped/paused）`,
+					{ root, stopped: false, paused: false, terminal: true, status: termStatus },
+				);
+			}
 
 			const rawReason = p.reason === undefined ? "manual stop/pause" : String(p.reason);
 			if (p.pause === true) {
