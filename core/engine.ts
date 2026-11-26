@@ -107,7 +107,7 @@ import {
 } from "../omp/graph";
 import { resolveReportPhaseTransition, type ReportPhaseTransition } from "../omp/reincarnate";
 import { buildSnapshot, extractProbeHealth, renderBoardLines, renderFullStatus, themeStyle } from "../omp/ui";
-import { injectEgressIntoScript } from "../omp/autoexec";
+import { injectEgressIntoScript, loadAutoRules } from "../omp/autoexec";
 import { defaultScopeForTarget, isHostInScope } from "../omp/scope";
 import {
 	evaluatePositiveEvidenceGate,
@@ -131,7 +131,7 @@ import {
 	type ChunkBatchResult,
 } from "../omp/lineage";
 import { distillProjectExperience, ensureBundledKb, kbLookupSafe } from "../omp/kb";
-import { redactVaultSecrets } from "../omp/session-vault";
+import { loadSessionVault, redactVaultSecrets } from "../omp/session-vault";
 import {
 	buildFalsePositiveNote,
 	extractVerifyTargetFactId,
@@ -424,6 +424,41 @@ export function loadStateZeroWrite(root: string): NuwaState | null {
 	}
 
 	return null;
+}
+
+/**
+ * 严格零磁盘写入渲染状态看板（专用于 `nuwa_status`、终态只读 `nuwa_init` 与 `/nuwa status`）：
+ * 预先使用纯只读 `loadAutoRules` 校验项目/全局 `autoexec.json`；若配置损坏包含 `error`，
+ * 则在内存中补齐角色计数与规则源并省略透传 `root`，彻底阻断 `checkAndLogAutoRuleSource` 调用 `logEvent` 写盘。
+ */
+export function statusBoardZeroWrite(st: NuwaState, root?: string, agentHome?: string): string {
+	if (!root) return statusBoard(st);
+	const normRoot = resolve(root);
+	const defaultHome = getAgentHome();
+	const effectiveHome = agentHome && agentHome.trim() ? resolve(agentHome.trim()) : defaultHome;
+	const checkEffective = loadAutoRules(normRoot, effectiveHome);
+	const checkDefault = effectiveHome === resolve(defaultHome) ? checkEffective : loadAutoRules(normRoot, defaultHome);
+	if (!checkEffective.error && !checkDefault.error) {
+		return statusBoard(st, normRoot);
+	}
+	let roleNames = st.project.activeRoles ?? [];
+	try {
+		roleNames = Object.keys(loadSessionVault(normRoot).roles);
+	} catch {
+		/* ignore */
+	}
+	const safeClone: NuwaState = {
+		...st,
+		project: {
+			...st.project,
+			activeRoles: roleNames,
+		},
+		runtime: {
+			...st.runtime,
+			rulesSource: checkEffective.source,
+		},
+	};
+	return statusBoard(safeClone, undefined);
 }
 
 /** 释放指定项目下残留的自动批认领意图。 */
@@ -858,7 +893,7 @@ export class NuwaUnifiedEngine {
 					this.activeRoot = resolve(root);
 					this.refreshUi(hooks, root, existing, true);
 					return toolText(
-						`该项目已处于终态 (${termStatus}): ${existing.project.id}（属于其他会话 ${existing.project.ownerSessionId}，已降级为只读查看；如需接管重建请传 force=true）\n\n${statusBoard(existing, root)}`,
+						`该项目已处于终态 (${termStatus}): ${existing.project.id}（属于其他会话 ${existing.project.ownerSessionId}，已降级为只读查看；如需接管重建请传 force=true）\n\n${statusBoardZeroWrite(existing, root, this.resolveAgentHome(hooks))}`,
 						{ root, readonly: true, status: termStatus, sealed: termStatus === "sealed_negative", ...autoStartMeta },
 					);
 				}
@@ -913,7 +948,7 @@ export class NuwaUnifiedEngine {
 					this.activeRoot = resolve(root);
 					this.refreshUi(hooks, root, finalTerminal, true);
 					return toolText(
-						`项目已处于终态 (${termStatus}): ${finalTerminal.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoard(finalTerminal, root)}`,
+						`项目已处于终态 (${termStatus}): ${finalTerminal.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoardZeroWrite(finalTerminal, root, this.resolveAgentHome(hooks))}`,
 						{
 							root,
 							status: termStatus,
@@ -988,7 +1023,7 @@ export class NuwaUnifiedEngine {
 					this.activeRoot = resolve(root);
 					this.refreshUi(hooks, root, resumed, true);
 					return toolText(
-						`项目已处于终态 (${termStatus}): ${resumed.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoard(resumed, root)}`,
+						`项目已处于终态 (${termStatus}): ${resumed.project.id}（终态不可通过 resume 复活；如需重新评估请换 root 或 nuwa_init(force=true) 重建）\n\n${statusBoardZeroWrite(resumed, root, this.resolveAgentHome(hooks))}`,
 						{
 							root,
 							status: termStatus,
@@ -1019,7 +1054,7 @@ export class NuwaUnifiedEngine {
 				}
 				return toolText(
 					`项目已存在: ${existing.project.id} status=${existing.project.status} phase=${existing.project.phase}\n` +
-						`用 nuwa_init(resume=true) 继续，或 nuwa_init(force=true) 重建（旧 state 自动备份）。\n\n${statusBoard(existing, root)}`,
+						`用 nuwa_init(resume=true) 继续，或 nuwa_init(force=true) 重建（旧 state 自动备份）。\n\n${statusBoardZeroWrite(existing, root, this.resolveAgentHome(hooks))}`,
 					{ root, existing: true, ...autoStartMeta },
 				);
 			}
@@ -1911,7 +1946,7 @@ export class NuwaUnifiedEngine {
 			const curTokens = st.runtime.tokens ?? 0;
 			const totalTokens = (st.runtime.totalTokens ?? 0) + curTokens;
 			const metricsLine = `metrics: repeat_ratio=${rep.repeatRatio.toFixed(2)} · last_ok=${probe.lastOk} · blockedIntents=${blockedIntents} · blockedCommits=${blockedCommits} · tokens=${curTokens} · totalTokens=${totalTokens}${paused ? " · paused=true" : ""}`;
-			return toolText(`${statusBoard(st, root)}\n${metricsLine}`, {
+			return toolText(`${statusBoardZeroWrite(st, root, this.resolveAgentHome(hooks))}\n${metricsLine}`, {
 				root,
 				readonly: true,
 				status: effectiveStatus,
@@ -1932,7 +1967,11 @@ export class NuwaUnifiedEngine {
 		try {
 			const root = this.resolveRoot(p.root, hooks);
 			if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
-			let st = (Boolean(p.write) || Boolean(p.finalize_phase) ? loadState(root) : loadStateZeroWrite(root)) ?? loadState(root);
+			const roProbe = loadStateZeroWrite(root);
+			let st =
+				roProbe && isTerminalProjectState(roProbe)
+					? roProbe
+					: ((Boolean(p.write) || Boolean(p.finalize_phase) ? loadState(root) : roProbe) ?? loadState(root));
 			if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 			const fmtRaw = p.format === undefined ? "md" : String(p.format);
 			if (!VALID_REPORT_FORMATS.has(fmtRaw)) {
@@ -1978,26 +2017,68 @@ export class NuwaUnifiedEngine {
 
 			let phaseTransitionOut: ReportPhaseTransition | undefined;
 			if (write || finalizePhaseFlag) {
-				const curCfg = readCfg();
-				st = withLock(root, () => {
-					const s = loadState(root) ?? st!;
-					if (write) s.runtime.reportWritten = true;
-					if (finalizePhaseFlag && s.project.phase === "report") {
-						const fin = finalizeReportPhase(s, curCfg, {
-							root,
-							reportWritten: Boolean(write || s.runtime.reportWritten),
-							autoSeal: true,
-						});
-						phaseTransitionOut = fin.transition;
-					} else if (s.project.phase === "report") {
-						phaseTransitionOut = resolveReportPhaseTransition(s, {
-							reportWritten: Boolean(write || s.runtime.reportWritten),
-							maxEpisodes: curCfg.maxEpisodes,
+				if (isTerminalProjectState(st)) {
+					const termSt = terminalStatusOf(st);
+					if (st.project.phase === "report") {
+						phaseTransitionOut = {
+							action: termSt === "completed" ? "complete" : "seal_negative",
+							reason: `项目已处于终态 (${termSt})，禁止通过 finalize_phase 降级或覆写封盘元数据`,
+							canAdvanceEpisode: false,
+						};
+					}
+					if (write && !st.runtime.reportWritten) {
+						st = withLock(root, () => {
+							const s = loadState(root) ?? st!;
+							if (!s.runtime.reportWritten) {
+								s.runtime.reportWritten = true;
+								saveState(root, s);
+							}
+							return s;
 						});
 					}
-					saveState(root, s);
-					return s;
-				});
+				} else {
+					const curCfg = readCfg();
+					st = withLock(root, () => {
+						const s = loadState(root) ?? st!;
+						if (isTerminalProjectState(s)) {
+							const termSt = terminalStatusOf(s);
+							if (s.project.phase === "report") {
+								phaseTransitionOut = {
+									action: termSt === "completed" ? "complete" : "seal_negative",
+									reason: `项目已处于终态 (${termSt})，禁止通过 finalize_phase 降级或覆写封盘元数据`,
+									canAdvanceEpisode: false,
+								};
+							}
+							if (write && !s.runtime.reportWritten) {
+								s.runtime.reportWritten = true;
+								saveState(root, s);
+							}
+							return s;
+						}
+						const needWriteFlag = write && !s.runtime.reportWritten;
+						if (write) s.runtime.reportWritten = true;
+						if (finalizePhaseFlag && s.project.phase === "report") {
+							const fin = finalizeReportPhase(s, curCfg, {
+								root,
+								reportWritten: Boolean(write || s.runtime.reportWritten),
+								autoSeal: true,
+							});
+							phaseTransitionOut = fin.transition;
+							saveState(root, s);
+						} else {
+							if (s.project.phase === "report") {
+								phaseTransitionOut = resolveReportPhaseTransition(s, {
+									reportWritten: Boolean(write || s.runtime.reportWritten),
+									maxEpisodes: curCfg.maxEpisodes,
+								});
+							}
+							if (needWriteFlag) {
+								saveState(root, s);
+							}
+						}
+						return s;
+					});
+				}
 				this.refreshUi(hooks, root, st, true);
 			}
 
@@ -2157,7 +2238,7 @@ export class NuwaUnifiedEngine {
 						`- 临时挂起（免确认即时软暂停） → nuwa_stop(pause=true, reason="...")\n` +
 						`- 硬化无漏洞合法封盘 → nuwa_complete(seal=true, reason="...")\n` +
 						`- 想换攻击面 → nuwa_expand()\n` +
-						`- 人工硬停机 → nuwa_stop(reason="...", confirm="STOP")\n\n${statusBoard(st, root)}`,
+						`- 人工硬停机 → nuwa_stop(reason="...", confirm="STOP")\n\n${statusBoardZeroWrite(st, root, this.resolveAgentHome(hooks))}`,
 					{ root, stopped: false },
 				);
 			}
@@ -2260,6 +2341,17 @@ export class NuwaUnifiedEngine {
 			}
 		};
 
+		const guardTerminalMutation = (actionLabel: string): SlashCommandResult | null => {
+			if (!found) return null;
+			const cur = loadStateZeroWrite(found);
+			if (cur && isTerminalProjectState(cur)) {
+				const tStatus = terminalStatusOf(cur);
+				this.refreshUi(hooks, found, cur, true);
+				return emit(`该项目已处于终态 (${tStatus}): ${cur.project.id}，禁止执行 ${actionLabel} 改写已封盘图谱`, "error");
+			}
+			return null;
+		};
+
 		if (arg === "doctor" || arg.startsWith("doctor ")) {
 			return emit(buildDoctorSummary(found));
 		}
@@ -2276,9 +2368,14 @@ export class NuwaUnifiedEngine {
 			return emit(r.msg, r.level);
 		}
 		if (arg === "hybrid" || arg.startsWith("hybrid ")) {
+			const hybridSub = arg.slice(6).trim();
+			if (/^plan(?:\s|$)/i.test(hybridSub)) {
+				const blocked = guardTerminalMutation("/nuwa hybrid plan");
+				if (blocked) return blocked;
+			}
 			const r = executeHybridCommand(found, arg.slice(6));
-			if (arg.slice(6).trim().toLowerCase().startsWith("plan") && found) {
-				const stAfter = loadState(found);
+			if (/^plan(?:\s|$)/i.test(hybridSub) && found) {
+				const stAfter = loadStateZeroWrite(found) ?? loadState(found);
 				if (stAfter) this.refreshUi(hooks, found, stAfter, true);
 			}
 			return emit(r.msg, r.level);
@@ -2292,9 +2389,13 @@ export class NuwaUnifiedEngine {
 		if (arg === "seal" || arg.startsWith("seal ")) {
 			if (!found) return emit("当前目录没有女娲项目", "error");
 			const preCheck = loadStateZeroWrite(found) ?? loadState(found);
-			if (preCheck && isTerminalProjectState(preCheck) && terminalStatusOf(preCheck) === "completed") {
+			if (preCheck && isTerminalProjectState(preCheck)) {
+				const tStatus = terminalStatusOf(preCheck);
 				this.refreshUi(hooks, found, preCheck, true);
-				return emit(`该项目已完成验收 (status=completed): ${preCheck.project.id}，不可降级篡改为 sealed_negative`, "error");
+				if (tStatus === "completed") {
+					return emit(`该项目已完成验收 (status=completed): ${preCheck.project.id}，不可降级篡改为 sealed_negative`, "error");
+				}
+				return emit(`该项目已处于负向封盘终态 (status=sealed_negative): ${preCheck.project.id}，禁止重复封盘覆写原因`, "error");
 			}
 			const reason = arg.slice(4).trim() || "人工通过 /nuwa seal 执行负向封盘";
 			try {
@@ -2452,6 +2553,10 @@ export class NuwaUnifiedEngine {
 
 		if (arg === "session" || arg.startsWith("session ")) {
 			const subSession = arg.slice(7).trim();
+			if (subSession && subSession.toLowerCase() !== "list") {
+				const blocked = guardTerminalMutation(`/nuwa session ${subSession.split(/\s+/)[0]}`);
+				if (blocked) return blocked;
+			}
 			if (subSession === "health" || subSession.startsWith("health ")) {
 				const r = await executeSessionHealthCommand(found, subSession.slice(6));
 				const stAfter = found ? loadStateZeroWrite(found) : null;
@@ -2464,6 +2569,8 @@ export class NuwaUnifiedEngine {
 
 		if (arg === "authdiff" || arg.startsWith("authdiff ")) {
 			if (!found) return emit("当前目录没有女娲项目", "error");
+			const blocked = guardTerminalMutation("/nuwa authdiff");
+			if (blocked) return blocked;
 			try {
 				const rawPaths = arg.slice(8).trim();
 				const explicitPaths = rawPaths ? rawPaths.split(/\s+/).filter(Boolean) : undefined;
@@ -2477,6 +2584,11 @@ export class NuwaUnifiedEngine {
 		}
 
 		if (arg === "oob" || arg.startsWith("oob ")) {
+			const oobSub = arg.slice(3).trim();
+			if (oobSub && oobSub.toLowerCase() !== "list") {
+				const blocked = guardTerminalMutation(`/nuwa oob ${oobSub.split(/\s+/)[0]}`);
+				if (blocked) return blocked;
+			}
 			const r = await executeOobCommand(found, arg.slice(3));
 			const stAfter = found ? loadStateZeroWrite(found) : null;
 			if (found && stAfter) this.refreshUi(hooks, found, stAfter, true);
@@ -2484,6 +2596,8 @@ export class NuwaUnifiedEngine {
 		}
 
 		if (arg === "assets" || arg.startsWith("assets ")) {
+			const blocked = guardTerminalMutation("/nuwa assets");
+			if (blocked) return blocked;
 			const r = executeAssetsCommand(found);
 			const stAfter = found ? loadStateZeroWrite(found) : null;
 			if (found && stAfter) this.refreshUi(hooks, found, stAfter, true);
@@ -2539,6 +2653,8 @@ export class NuwaUnifiedEngine {
 
 		if (arg === "spa" || arg.startsWith("spa ")) {
 			if (!found) return emit("当前目录没有女娲项目", "error");
+			const blocked = guardTerminalMutation("/nuwa spa");
+			if (blocked) return blocked;
 			try {
 				const r = await runSpaSurfaceWorkflow(found);
 				const stAfter = loadStateZeroWrite(found);
@@ -2552,6 +2668,11 @@ export class NuwaUnifiedEngine {
 		}
 
 		if (arg === "scope" || arg.startsWith("scope ")) {
+			const scopeSub = arg.slice(5).trim();
+			if (scopeSub && scopeSub.toLowerCase() !== "show" && scopeSub.toLowerCase() !== "list") {
+				const blocked = guardTerminalMutation("/nuwa scope");
+				if (blocked) return blocked;
+			}
 			const r = executeScopeCommand(found, arg.slice(5));
 			return emit(r.msg, r.level);
 		}
@@ -2705,7 +2826,7 @@ export class NuwaUnifiedEngine {
 		if (!arg || arg === "status") {
 			if (!found) return emit("用法: /nuwa 打 http://10.0.0.5:8080 拿 flag｜/nuwa 看板");
 			const st = loadStateZeroWrite(found);
-			return emit(st ? statusBoard(st, found) : "state 读取失败", st ? "info" : "error");
+			return emit(st ? statusBoardZeroWrite(st, found, this.resolveAgentHome(hooks)) : "state 读取失败", st ? "info" : "error");
 		}
 
 		// 自然语言任务直连开工/并入意图

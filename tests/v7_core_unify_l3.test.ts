@@ -25,6 +25,7 @@ import {
 	DispatchBridgeStore,
 	MAX_OMP_TASK_FILE_BYTES,
 	expandDispatchContextValue,
+	expandEvalCodePlaceholders,
 	expandPlaceholdersPlain,
 	handleBeforeSubagentSpawn,
 	handleToolCallDispatch,
@@ -39,7 +40,7 @@ import { readFactEvidenceLog, recordToolExecution } from "../omp/evidence";
 import { upsertSessionRole } from "../omp/session-vault";
 import { saveStateToSqlite, sqliteDbPath } from "../omp/sqlite-store";
 import { SubagentWatchdog, loadState, saveState, withLock } from "../omp/storage";
-import { runL3LiveSuite } from "../benchmarks/l3-live/run-l3-eval";
+import { runL3LiveSuite, scanSecretsInWorkspaceAndLogs } from "../benchmarks/l3-live/run-l3-eval";
 import { requestViaSocks5Http, startLocalSocks5Server } from "../benchmarks/l3-live/socks5-server";
 
 const tmpDirs: string[] = [];
@@ -813,4 +814,333 @@ describe("L3 真实进程树门禁 runL3LiveSuite() 端到端三场景全绿验�
 		expect(helpOut).toContain("l3-hardened-seal-noop");
 		expect(helpOut).toContain("l3-stopped-resume-migrate");
 	}, 60_000);
+});
+
+describe("Boost 异构审查 #73 全量边界反例回归（P1-1 ~ P1-7）", () => {
+	test("P1-1 & P1-2: nuwa_report(finalize_phase=true) 严禁降级/覆写终态、斜杠命令终态拦截与损坏 autoexec.json 下 100% 零写盘", async () => {
+		const agentHome = makeWorkspace("nuwa-v7-r73-home-");
+		setEnvTemp("PI_AGENT_HOME", agentHome);
+
+		// 1a-1: status=completed 且 phase=report 时调 nuwa_report(finalize_phase=true) 严禁降级为 sealed_negative
+		const compWs = makeWorkspace("nuwa-v7-r73-comp-");
+		const compEng = new NuwaUnifiedEngine({ cwd: compWs, sessionId: "sess-r73-comp", agentHome });
+		await compEng.callTool("nuwa_init", { target: "http://127.0.0.1:19401", mode: "ctf", root: compWs });
+		const fCmd = "curl -sS http://127.0.0.1:19401/flag";
+		const fOut = "flag{r73_completed_immutable}";
+		recordToolExecution(compWs, { tool: "bash", command: fCmd, output: fOut });
+		await compEng.callTool("nuwa_flag", { value: fOut, command: fCmd, output: fOut, root: compWs });
+		await compEng.callTool("nuwa_complete", { root: compWs });
+		withLock(compWs, () => {
+			const s = loadState(compWs)!;
+			s.project.phase = "report";
+			s.runtime.reportWritten = true;
+			saveState(compWs, s);
+		});
+		const repOnCompleted = await compEng.callTool("nuwa_report", {
+			write: true,
+			finalize_phase: true,
+			root: compWs,
+		});
+		expect(repOnCompleted.isError).toBe(false);
+		const afterCompReport = loadStateZeroWrite(compWs)!;
+		expect(afterCompReport.project.status).toBe("completed");
+		expect(afterCompReport.runtime.status).toBe("completed");
+
+		// 1a-2 & 1b: 已封盘 sealed_negative 项目调 nuwa_report(finalize_phase=true) 不覆写原 sealMeta.reason，且 /nuwa spa|authdiff|hybrid plan|assets|seal 全部拦截
+		const sealWs = makeWorkspace("nuwa-v7-r73-seal-");
+		writeFileSync(
+			join(sealWs, "app.ts"),
+			'app.get("/api/internal/secret", (req, res) => res.json({ ok: true }));\n',
+			"utf8",
+		);
+		const sealEng = new NuwaUnifiedEngine({ cwd: sealWs, sessionId: "sess-r73-seal", agentHome });
+		await sealEng.callTool("nuwa_init", { target: "http://127.0.0.1:19402", mode: "pentest", root: sealWs });
+		await sealEng.callTool("nuwa_complete", {
+			seal: true,
+			reason: "ORIGINAL_SEAL_REASON_MUST_KEEP",
+			excluded_surface: ["/health"],
+			root: sealWs,
+		});
+		withLock(sealWs, () => {
+			const s = loadState(sealWs)!;
+			s.project.phase = "report";
+			s.runtime.reportWritten = true;
+			saveState(sealWs, s);
+		});
+		const factsBefore = Object.keys(loadStateZeroWrite(sealWs)!.facts).length;
+		const intentsBefore = Object.keys(loadStateZeroWrite(sealWs)!.intents).length;
+
+		const repOnSealed = await sealEng.callTool("nuwa_report", {
+			write: true,
+			finalize_phase: true,
+			root: sealWs,
+		});
+		expect(repOnSealed.isError).toBe(false);
+		const afterSealReport = loadStateZeroWrite(sealWs)!;
+		expect(afterSealReport.project.status).toBe("sealed_negative");
+		expect(afterSealReport.project.sealMeta?.reason).toBe("ORIGINAL_SEAL_REASON_MUST_KEEP");
+		expect(afterSealReport.runtime.sealMeta?.reason).toBe("ORIGINAL_SEAL_REASON_MUST_KEEP");
+
+		for (const cmd of ["spa", "authdiff /admin", "hybrid plan", "assets", "oob gen oob.internal", "scope +host a.com", "seal OVERWRITE"]) {
+			const r = await sealEng.executeSlashCommand(cmd);
+			expect(r.level).toBe("error");
+		}
+		expect(Object.keys(loadStateZeroWrite(sealWs)!.facts).length).toBe(factsBefore);
+		expect(Object.keys(loadStateZeroWrite(sealWs)!.intents).length).toBe(intentsBefore);
+		expect(loadStateZeroWrite(sealWs)!.project.sealMeta?.reason).toBe("ORIGINAL_SEAL_REASON_MUST_KEEP");
+
+		// 只读 /nuwa hybrid（不带 plan）仍可正常只读预览且不改图谱
+		const roHybrid = await sealEng.executeSlashCommand("hybrid");
+		expect(roHybrid.level).toBe("info");
+		expect(Object.keys(loadStateZeroWrite(sealWs)!.intents).length).toBe(intentsBefore);
+
+		// P1-2: 存在语法损坏的 .nuwa/autoexec.json 时，纯 SQLite 后端下 nuwa_status 与终态只读 nuwa_init 仍 100% 零写盘
+		const badAutoWs = makeWorkspace("nuwa-v7-r73-badauto-");
+		const badAutoEng = new NuwaUnifiedEngine({ cwd: badAutoWs, sessionId: "sess-r73-badauto", agentHome });
+		await badAutoEng.callTool("nuwa_init", { target: "http://127.0.0.1:19403", mode: "pentest", root: badAutoWs });
+		await badAutoEng.callTool("nuwa_complete", {
+			seal: true,
+			reason: "测试损坏 autoexec 下零写盘",
+			root: badAutoWs,
+		});
+		const stForDb = loadState(badAutoWs)!;
+		saveStateToSqlite(badAutoWs, stForDb);
+		rmSync(join(badAutoWs, ".nuwa", "state.json"), { force: true });
+		writeFileSync(join(badAutoWs, ".nuwa", "autoexec.json"), "{bad json syntax", "utf8");
+
+		setEnvTemp("NUWA_STORAGE_BACKEND", "sqlite");
+		const dbFile = sqliteDbPath(badAutoWs);
+		const journalFile = join(badAutoWs, ".nuwa", "journal.jsonl");
+		const filesSnap0 = readdirSync(join(badAutoWs, ".nuwa")).sort();
+		const dbMtime0 = statSync(dbFile).mtimeMs;
+		const journalSize0 = existsSync(journalFile) ? statSync(journalFile).size : 0;
+		await Bun.sleep(20);
+
+		const stRes = await badAutoEng.callTool("nuwa_status", { root: badAutoWs });
+		expect(stRes.isError).toBe(false);
+		const initRoRes = await badAutoEng.callTool("nuwa_init", { root: badAutoWs, resume: true });
+		expect(initRoRes.isError).toBe(false);
+		const slashRoRes = await badAutoEng.executeSlashCommand("status");
+		expect(slashRoRes.level).toBe("info");
+
+		expect(statSync(dbFile).mtimeMs).toBe(dbMtime0);
+		expect(existsSync(journalFile) ? statSync(journalFile).size : 0).toBe(journalSize0);
+		expect(readdirSync(join(badAutoWs, ".nuwa")).sort()).toEqual(filesSnap0);
+		setEnvTemp("NUWA_STORAGE_BACKEND", undefined);
+	});
+
+	test("P1-3 ~ P1-7: eval JS 词法安全展开、环境变量零截断、相对路径与 700KiB taskFile、注释与 N-004 拦截、无 index 乱序及 SQLite 扫密", () => {
+		const agentHome = makeWorkspace("nuwa-v7-r73-b-home-");
+		setEnvTemp("PI_AGENT_HOME", agentHome);
+		const ws = makeWorkspace("nuwa-v7-r73-b-ws-");
+		const callerOtherCwd = makeWorkspace("nuwa-v7-r73-other-cwd-");
+		const origCwd = process.cwd();
+
+		const engine = new NuwaUnifiedEngine({ cwd: ws, sessionId: "sess-r73-b", agentHome });
+		return (async () => {
+			await engine.callTool("nuwa_init", { target: "http://127.0.0.1:19300", mode: "pentest", root: ws });
+			await engine.callTool("nuwa_plan", {
+				phase: "surface",
+				intents: [{ title: "并行意图 B", detail: "测试无 index 乱序配对" }],
+				root: ws,
+			});
+
+			const store = new DispatchBridgeStore();
+			const mainCtx = {
+				cwd: ws,
+				sessionId: "sess-r73-b",
+				agent: { kind: "main", id: "main-0", name: "main", depth: 0 },
+				sessionManager: { getSessionId: () => "sess-r73-b" },
+			};
+			const targetInfo = { url: "http://127.0.0.1:19300", host: "127.0.0.1" };
+
+			// P1-3b: $USER / $URL / $TARGET_ID / $HOSTNAME 严禁被截断误伤
+			expect(
+				expandPlaceholdersPlain("echo $USER $URL $TARGET_ID $HOSTNAME https://TARGET/api", targetInfo),
+			).toBe("echo $USER $URL $TARGET_ID $HOSTNAME http://127.0.0.1:19300/api");
+			const expCtx = expandDispatchContextValue({ cmd: "echo $USER on [TARGET]" }, targetInfo);
+			expect((expCtx.value as Record<string, unknown>).cmd).toBe("echo $USER on 127.0.0.1");
+
+			// P1-3a: eval 代码中 const TARGET = ... 与 { HOST: ... } 保持 100% 合法 JS 语法
+			const code1 = 'const TARGET = "http://127.0.0.1:19300"; agent({ agent: "fujiang", prompt: "probe [TARGET]/api" });';
+			const code2 = 'const headers = { HOST: "127.0.0.1" }; agent({ agent: "fujiang", prompt: "GET https://TARGET/x" });';
+			const rw1 = expandEvalCodePlaceholders(code1, targetInfo);
+			const rw2 = expandEvalCodePlaceholders(code2, targetInfo);
+			expect(() => new Function(rw1)).not.toThrow();
+			expect(() => new Function(rw2)).not.toThrow();
+			expect(rw1).toContain("const TARGET =");
+			expect(rw2).toContain("HOST:");
+
+			const ev1Res = handleToolCallDispatch(
+				store,
+				{ toolName: "eval", toolCallId: "tc-r73-ev1", input: { code: code1 } },
+				mainCtx,
+			) as { input?: { code?: string } };
+			expect(ev1Res?.input?.code).toBeDefined();
+			expect(() => new Function(ev1Res.input!.code!)).not.toThrow();
+
+			// P1-5a: 注释中包含 `}` 时仍精准识别空 prompt 并拦截，且保留真实 label
+			const codeCommentBrace = 'agent({ agent: "fujiang", // comment }\n label: "lbl-real", prompt: "" });';
+			const parsedComment = parseEvalAgentCalls(codeCommentBrace);
+			expect(parsedComment.length).toBe(1);
+			expect(parsedComment[0]!.label).toBe("lbl-real");
+			expect(parsedComment[0]!.hasEmptyPrompt).toBe(true);
+			const commentBlockRes = handleToolCallDispatch(
+				store,
+				{ toolName: "eval", toolCallId: "tc-r73-comment", input: { code: codeCommentBrace } },
+				mainCtx,
+			);
+			expect(commentBlockRes && "block" in commentBlockRes && commentBlockRes.block).toBe(true);
+
+			// P1-5b: rogue-worker 即使在 prompt 中提到 "fujiang" 也必须被 nuwa N-004 拦截
+			const rogueRes = handleToolCallDispatch(
+				store,
+				{
+					toolName: "eval",
+					toolCallId: "tc-r73-rogue",
+					input: { code: 'agent({ agent: "rogue-worker", prompt: "do not delegate to fujiang, run custom" });' },
+				},
+				mainCtx,
+			);
+			expect(rogueRes && "block" in rogueRes && rogueRes.block).toBe(true);
+			expect(rogueRes && "reason" in rogueRes ? rogueRes.reason : "").toContain("N-004");
+
+			// P1-4a & P1-4b: process.cwd() !== ctx.cwd 时相对路径 taskFile 拦截 + 700 KiB 合法 taskFile 完整保留尾部
+			const relHuge = join(ws, "huge-rel.md");
+			const fd = openSync(relHuge, "w");
+			ftruncateSync(fd, MAX_OMP_TASK_FILE_BYTES + 2048);
+			closeSync(fd);
+			writeFileSync(join(ws, "empty-rel.md"), "   \n\t  ", "utf8");
+			const big700kContent = `[女娲派单 i001] 起始探测 http://TARGET/start\n${"A".repeat(700 * 1024)}\nTAIL_MARKER_700KB_MUST_KEEP`;
+			writeFileSync(join(ws, "big-700k.md"), big700kContent, "utf8");
+
+			process.chdir(callerOtherCwd);
+			try {
+				const relHugeRes = handleToolCallDispatch(
+					store,
+					{ toolName: "task", toolCallId: "tc-rel-huge", input: { agent: "fujiang", taskFile: "huge-rel.md" } },
+					mainCtx,
+				);
+				expect(relHugeRes && "block" in relHugeRes && relHugeRes.block).toBe(true);
+
+				const relEmptyRes = handleToolCallDispatch(
+					store,
+					{ toolName: "task", toolCallId: "tc-rel-empty", input: { agent: "fujiang", taskFile: "empty-rel.md" } },
+					mainCtx,
+				);
+				expect(relEmptyRes && "block" in relEmptyRes && relEmptyRes.block).toBe(true);
+
+				const big700kRes = handleToolCallDispatch(
+					store,
+					{ toolName: "task", toolCallId: "tc-rel-700k", input: { agent: "fujiang", taskFile: "big-700k.md" } },
+					mainCtx,
+				) as { input?: Record<string, unknown> };
+				expect(big700kRes?.input?.taskFile).toBeUndefined();
+				const inlineTask = String(big700kRes?.input?.task ?? "");
+				expect(inlineTask).toContain("http://127.0.0.1:19300/start");
+				expect(inlineTask).toContain("TAIL_MARKER_700KB_MUST_KEEP");
+				handleToolExecutionEnd(store, { toolName: "task", toolCallId: "tc-rel-700k", result: { details: { results: [] } } }, mainCtx);
+			} finally {
+				process.chdir(origCwd);
+			}
+
+			// P1-6a & P1-6b: 无 index 的 progress[] 一对一顺序绑定 + 派生前报错的无关 task 绝不误杀在途 bg-alive-worker
+			const wd = new SubagentWatchdog(ws);
+			wd.startTask({ taskId: "bg-alive-worker", agent: "fujiang" });
+			expect(wd.activeCount()).toBe(1);
+
+			// 主线程新发另一条 task 在派生前同步报错返回 (isError: true, details: {})
+			handleToolCallDispatch(
+				store,
+				{ toolName: "task", toolCallId: "tc-sync-err", input: { agent: "fujiang", task: "[女娲派单 i001] 尚未派生即失败的任务" } },
+				mainCtx,
+			);
+			handleToolExecutionEnd(
+				store,
+				{
+					toolName: "task",
+					toolCallId: "tc-sync-err",
+					isError: true,
+					input: { agent: "fujiang", task: "[女娲派单 i001] 尚未派生即失败的任务" },
+					result: { details: {} },
+				},
+				mainCtx,
+			);
+			// 即使没有经过 handleToolCallDispatch 直接触发无 tcId 的报错事件，也严禁误杀 bg-alive-worker
+			handleToolExecutionEnd(
+				store,
+				{
+					toolName: "task",
+					isError: true,
+					input: { agent: "fujiang" },
+					result: { details: {} },
+				},
+				mainCtx,
+			);
+			expect(wd.activeCount()).toBe(1);
+			expect(wd.getTask("bg-alive-worker")?.status).toBe("running");
+
+			// 批量派发 2 条任务，progress[] 不带 index 字段，乱序派生 rand-one 先、rand-zero 后
+			handleToolCallDispatch(
+				store,
+				{
+					toolName: "task",
+					toolCallId: "tc-no-index",
+					input: {
+						tasks: [
+							{ agent: "fujiang", task: "[女娲派单 i001] TASK_ALPHA_ZERO" },
+							{ agent: "fujiang", task: "[女娲派单 i002] TASK_BETA_ONE" },
+						],
+					},
+				},
+				mainCtx,
+			);
+			handleToolExecutionEnd(
+				store,
+				{
+					toolName: "task",
+					toolCallId: "tc-no-index",
+					result: {
+						details: {
+							async: { state: "running" },
+							progress: [
+								{ id: "rand-zero", status: "pending" },
+								{ id: "rand-one", status: "pending" },
+							],
+							results: [],
+						},
+					},
+				},
+				mainCtx,
+			);
+
+			const spOne = handleBeforeSubagentSpawn(
+				store,
+				{ type: "before_subagent_spawn", agent: "fujiang", invocationKind: "task", spawnKey: "rand-one" },
+				mainCtx,
+			);
+			const spZero = handleBeforeSubagentSpawn(
+				store,
+				{ type: "before_subagent_spawn", agent: "fujiang", invocationKind: "task", spawnKey: "rand-zero" },
+				mainCtx,
+			);
+			expect(spOne && !("block" in spOne) ? spOne.task : "").toContain("TASK_BETA_ONE");
+			expect(spZero && !("block" in spZero) ? spZero.task : "").toContain("TASK_ALPHA_ZERO");
+
+			// P1-7a: 敏感凭据写入二进制 SQLite .nuwa/nuwa.db 时，scanSecretsInWorkspaceAndLogs 必须精准检出 > 0
+			const leakWs = makeWorkspace("nuwa-v7-r73-sqlite-leak-");
+			const leakEng = new NuwaUnifiedEngine({ cwd: leakWs, sessionId: "sess-leak", agentHome });
+			await leakEng.callTool("nuwa_init", { target: "http://127.0.0.1:19409", mode: "ctf", root: leakWs });
+			const leakedSecret = "SQLITE_RAW_SECRET_TOKEN_99112233";
+			const leakState = loadState(leakWs)!;
+			leakState.project.goal = `goal with ${leakedSecret}`;
+			saveStateToSqlite(leakWs, leakState);
+			rmSync(join(leakWs, ".nuwa", "state.json"), { force: true });
+			rmSync(join(leakWs, ".nuwa", "journal.jsonl"), { force: true });
+			expect(readFileSync(sqliteDbPath(leakWs)).includes(Buffer.from(leakedSecret, "utf8"))).toBe(true);
+			expect(scanSecretsInWorkspaceAndLogs(leakWs, [], [leakedSecret])).toBeGreaterThan(0);
+
+			store.shutdownSession(ws, "sess-r73-b");
+		})();
+	});
 });

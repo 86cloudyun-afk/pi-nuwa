@@ -168,13 +168,21 @@ export async function startLocalSocks5Server(opts?: LocalSocks5ServerOptions): P
 			if (upstream && !upstream.destroyed) upstream.destroy();
 		};
 
-		const failWithReply = (rep: number) => {
+		const endAndDestroyClient = (payload: Buffer) => {
 			stage = "closed";
+			if (client.destroyed) return;
 			try {
-				client.end(buildSocks5Reply(rep, 0));
+				client.once("finish", () => {
+					if (!client.destroyed) client.destroy();
+				});
+				client.end(payload);
 			} catch {
 				client.destroy();
 			}
+		};
+
+		const failWithReply = (rep: number) => {
+			endAndDestroyClient(buildSocks5Reply(rep, 0));
 		};
 
 		const processBuffer = () => {
@@ -201,12 +209,7 @@ export async function startLocalSocks5Server(opts?: LocalSocks5ServerOptions): P
 					if (authCfg) {
 						if (!hasUserPass) {
 							authFailureCount += 1;
-							try {
-								client.end(Buffer.from([0x05, 0xff]));
-							} catch {
-								client.destroy();
-							}
-							stage = "closed";
+							endAndDestroyClient(Buffer.from([0x05, 0xff]));
 							return;
 						}
 						client.write(Buffer.from([0x05, 0x02]));
@@ -215,12 +218,7 @@ export async function startLocalSocks5Server(opts?: LocalSocks5ServerOptions): P
 					}
 
 					if (!hasNoAuth) {
-						try {
-							client.end(Buffer.from([0x05, 0xff]));
-						} catch {
-							client.destroy();
-						}
-						stage = "closed";
+						endAndDestroyClient(Buffer.from([0x05, 0xff]));
 						return;
 					}
 					client.write(Buffer.from([0x05, 0x00]));
@@ -254,12 +252,7 @@ export async function startLocalSocks5Server(opts?: LocalSocks5ServerOptions): P
 						continue;
 					}
 					authFailureCount += 1;
-					try {
-						client.end(Buffer.from([0x01, 0x01]));
-					} catch {
-						client.destroy();
-					}
-					stage = "closed";
+					endAndDestroyClient(Buffer.from([0x01, 0x01]));
 					return;
 				}
 
@@ -339,6 +332,10 @@ export async function startLocalSocks5Server(opts?: LocalSocks5ServerOptions): P
 						client.write(buildSocks5Reply(0x00, dstPort));
 						if (pendingAppBytes.length > 0) {
 							targetSock.write(pendingAppBytes);
+						}
+						if (buf.length > 0) {
+							targetSock.write(buf);
+							buf = Buffer.alloc(0);
 						}
 						client.pipe(targetSock);
 						targetSock.pipe(client);

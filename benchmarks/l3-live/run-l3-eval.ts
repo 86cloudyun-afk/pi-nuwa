@@ -36,6 +36,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { gunzipSync } from "node:zlib";
 import { NuwaUnifiedEngine } from "../../core/engine";
 import { recordToolExecution } from "../../omp/evidence";
 import { upsertSessionRole } from "../../omp/session-vault";
@@ -213,38 +214,48 @@ async function runDaemonProcess(
 function collectFilesRecursive(dir: string, out: string[] = []): string[] {
 	if (!existsSync(dir)) return out;
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
-		// 跳过会话保险箱自身的加密/本地凭据存储文件，审计其余全部报告、状态、日志、配置与证据包
+		// 跳过会话保险箱自身的加密/本地凭据存储文件，审计其余全部报告、状态、SQLite 库（.db/-wal/-shm）、压缩归档（.gz）、日志与证据包
 		if (entry.name === "vault.json" || entry.name.endsWith(".headers")) continue;
 		const full = join(dir, entry.name);
 		if (entry.isDirectory()) {
 			collectFilesRecursive(full, out);
-		} else if (entry.isFile() && !entry.name.endsWith(".gz") && !entry.name.endsWith(".db")) {
+		} else if (entry.isFile()) {
 			out.push(full);
 		}
 	}
 	return out;
 }
 
-function scanSecretsInWorkspaceAndLogs(
+export function scanSecretsInWorkspaceAndLogs(
 	root: string,
 	extraTexts: readonly string[],
 	secrets: readonly string[],
 ): number {
-	const files = collectFilesRecursive(join(root, ".nuwa"));
-	const texts: string[] = [...extraTexts];
-	for (const fp of files) {
-		try {
-			texts.push(readFileSync(fp, "utf8"));
-		} catch {
-			/* ignore */
-		}
-	}
+	const validSecrets = secrets.filter((s) => typeof s === "string" && s.length >= 8);
+	if (validSecrets.length === 0) return 0;
+	const secretPairs = validSecrets.map((s) => ({ str: s, buf: Buffer.from(s, "utf8") }));
 	let leaks = 0;
-	for (const text of texts) {
-		for (const secret of secrets) {
-			if (secret && secret.length >= 8 && text.includes(secret)) {
+
+	for (const text of extraTexts) {
+		for (const { str } of secretPairs) {
+			if (text.includes(str)) {
 				leaks += 1;
 			}
+		}
+	}
+
+	const files = collectFilesRecursive(join(root, ".nuwa"));
+	for (const fp of files) {
+		try {
+			const rawBuf = readFileSync(fp);
+			const targetBuf = fp.endsWith(".gz") ? gunzipSync(rawBuf) : rawBuf;
+			for (const { buf } of secretPairs) {
+				if (targetBuf.indexOf(buf) !== -1) {
+					leaks += 1;
+				}
+			}
+		} catch {
+			/* ignore transient or unreadable file */
 		}
 	}
 	return leaks;
@@ -559,11 +570,28 @@ export async function runL3LiveSuite(opts?: RunL3LiveOptions): Promise<L3Benchma
 					);
 					assertL3(existsSync(join(ws, ".nuwa", "REPORT.md")), "封盘后必须自动同步生成 REPORT.md");
 
-					const stateFile = join(ws, ".nuwa", "state.json");
-					const mtimeBeforeReentry = statSync(stateFile).mtimeMs;
+					const nuwaDir = join(ws, ".nuwa");
+					const captureNuwaWriteSnapshot = () => {
+						const entries = existsSync(nuwaDir) ? readdirSync(nuwaDir).sort() : [];
+						const watchedFiles = ["state.json", "nuwa.db", "nuwa.db-wal", "nuwa.db-shm", "journal.jsonl"];
+						const fileStats: Record<string, { mtimeMs: number; size: number }> = {};
+						for (const name of watchedFiles) {
+							const p = join(nuwaDir, name);
+							if (existsSync(p)) {
+								const stInfo = statSync(p);
+								fileStats[name] = { mtimeMs: stInfo.mtimeMs, size: stInfo.size };
+							}
+						}
+						return { entries, fileStats };
+					};
+					const snapBeforeReentry = captureNuwaWriteSnapshot();
+					assertL3(
+						Boolean(snapBeforeReentry.fileStats["state.json"] || snapBeforeReentry.fileStats["nuwa.db"]),
+						"封盘后必须至少存在 state.json 或 nuwa.db 权威状态文件",
+					);
 					await Bun.sleep(20);
 
-					// 验证单核引擎 nuwa_init(resume=true) 同会话与跨会话重入均保持只读零写盘、零复活
+					// 验证单核引擎 nuwa_init(resume=true) 与 nuwa_status 在 JSON / SQLite / Dual 下重入均保持只读零写盘、零复活
 					const unifyEng = new NuwaUnifiedEngine({
 						cwd: ws,
 						projectRoot: ws,
@@ -572,7 +600,14 @@ export async function runL3LiveSuite(opts?: RunL3LiveOptions): Promise<L3Benchma
 					});
 					const roRes = await unifyEng.callTool("nuwa_init", { root: ws, resume: true });
 					assertL3(!roRes.isError && roRes.details.readonly === true && roRes.details.status === "sealed_negative", "nuwa_init(resume=true) 必须保持只读 sealed_negative");
-					assertL3(statSync(stateFile).mtimeMs === mtimeBeforeReentry, "终态非 force 重入必须严格零写盘");
+					const stBoardRes = await unifyEng.callTool("nuwa_status", { root: ws });
+					assertL3(!stBoardRes.isError && stBoardRes.details.readonly === true, "nuwa_status 必须保持只读返回");
+					const snapAfterReentry = captureNuwaWriteSnapshot();
+					assertL3(
+						JSON.stringify(snapAfterReentry.entries) === JSON.stringify(snapBeforeReentry.entries) &&
+							JSON.stringify(snapAfterReentry.fileStats) === JSON.stringify(snapBeforeReentry.fileStats),
+						`终态非 force 重入与 nuwa_status 必须严格零写盘（before=${JSON.stringify(snapBeforeReentry.fileStats)}, after=${JSON.stringify(snapAfterReentry.fileStats)}）`,
+					);
 
 					const telemetryCountBeforeRun2 = readTelemetryRecords(telemetryPath).length;
 

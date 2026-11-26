@@ -64,7 +64,7 @@ export const DISPATCH_EMPTY_CONTEXT_RE =
 	/\b(?:no\s+assigned\s+task|awaiting\s+work\s+item|no\s+task\s+provided|empty\s+task)\b/i;
 
 export const DISPATCH_PLACEHOLDER_CASE_RE =
-	/\[(?:TARGET|HOST|DOMAIN|URL|TARGET_URL)\]|https?:\/\/(?:TARGET|HOST|DOMAIN)(?::\d+)?|\$\{?(?:TARGET|HOST|DOMAIN|U)\}?/;
+	/\[(?:TARGET|HOST|DOMAIN|URL|TARGET_URL)\]|https?:\/\/(?:TARGET|HOST|DOMAIN)(?::\d+)?(?![A-Za-z0-9_])|\$\{(?:TARGET|HOST|DOMAIN|U)\}|\$(?:TARGET|HOST|DOMAIN|U)(?![A-Za-z0-9_])/;
 
 export const PENDING_DISPATCH_TTL_MS = 5 * 60_000;
 export const EVAL_DISPATCH_WINDOW_TTL_MS = 60_000;
@@ -114,6 +114,7 @@ export interface ActiveSubagentSpawn {
 	spawnId: string;
 	root: string;
 	agent: string;
+	toolCallId?: string;
 	intentId?: string;
 	rawTask: string;
 	injectedTask: string;
@@ -138,6 +139,7 @@ export type BeforeSubagentSpawnResult =
 
 export interface ParsedEvalAgentCall {
 	agent: string;
+	agentExplicit: boolean;
 	prompt?: string;
 	label?: string;
 	hasEmptyPrompt: boolean;
@@ -202,11 +204,11 @@ function getDispatchRegistry(root: string): DispatchReceiptRegistry {
 }
 
 /**
- * 读取 `taskFile` 文件内容（强制 4 MiB 硬上限防 OOM，最大截取 512 KiB 派单预览）。
+ * 读取 `taskFile` 文件内容（强制 4 MiB 硬上限防 OOM，`text` 提供 512 KiB 缓冲预览，`fullText` 保留完整正文供内联展开）。
  */
 export function readTaskFileForDispatch(
 	filePath: string,
-): { exists: boolean; unreadable?: boolean; empty?: boolean; tooLarge?: boolean; text: string } {
+): { exists: boolean; unreadable?: boolean; empty?: boolean; tooLarge?: boolean; text: string; fullText?: string } {
 	try {
 		const fStat = statSync(filePath);
 		if (!fStat.isFile()) return { exists: false, text: "" };
@@ -221,6 +223,7 @@ export function readTaskFileForDispatch(
 			exists: true,
 			empty: false,
 			text: trimmed.length > TASK_FILE_PREVIEW_BYTES ? trimmed.slice(0, TASK_FILE_PREVIEW_BYTES) : trimmed,
+			fullText: trimmed,
 		};
 	} catch {
 		return { exists: false, unreadable: true, text: "" };
@@ -228,7 +231,7 @@ export function readTaskFileForDispatch(
 }
 
 /**
- * 纯无头占位符展开器（专门用于 `context` 纯 URL/字典字段及 `eval` JS 代码，绝不插入多行派单说明头）。
+ * 纯无头占位符展开器（专门用于 `context` 纯 URL/字典字段及字符串字面量，绝不插入多行说明头、绝不截断误伤 `$USER`/`$URL`/`$TARGET_ID`/`$HOSTNAME`，亦不做裸词替换）。
  */
 export function expandPlaceholdersPlain(
 	raw: string,
@@ -239,17 +242,240 @@ export function expandPlaceholdersPlain(
 	const resolvedHost = String(targetInfo.host ?? "").trim();
 	if (targetUrl) {
 		body = body
-			.replace(/https?:\/\/(?:TARGET|HOST|DOMAIN)(?::\d+)?/g, targetUrl)
-			.replace(/\$\{?U\}?/g, targetUrl)
+			.replace(/https?:\/\/(?:TARGET|HOST|DOMAIN)(?::\d+)?(?![A-Za-z0-9_])/g, targetUrl)
+			.replace(/\$\{U\}|\$U(?![A-Za-z0-9_])/g, targetUrl)
 			.replace(/\[(?:TARGET_URL|URL)\]/g, targetUrl);
 	}
 	if (resolvedHost) {
 		body = body
 			.replace(/\[(?:TARGET|HOST|DOMAIN)\]/g, resolvedHost)
-			.replace(/\$\{?(?:TARGET|HOST|DOMAIN)\}?/g, resolvedHost)
-			.replace(/\b(?:TARGET|HOST|DOMAIN)\b/g, resolvedHost);
+			.replace(/\$\{(?:TARGET|HOST|DOMAIN)\}|\$(?:TARGET|HOST|DOMAIN)(?![A-Za-z0-9_])/g, resolvedHost);
 	}
 	return body;
+}
+
+/**
+ * 保留引号字符串字面量的同时剥离 JS 单行 `//` 与块级 `/* ... *\/` 注释（非换行字符替换为空格以保持偏移与行号不变）。
+ */
+export function stripJsCommentsPreservingStrings(code: string): string {
+	let out = "";
+	let i = 0;
+	const len = code.length;
+	let quote: string | null = null;
+	let escaped = false;
+
+	while (i < len) {
+		const ch = code[i]!;
+		const next = i + 1 < len ? code[i + 1]! : "";
+		if (quote) {
+			out += ch;
+			if (escaped) {
+				escaped = false;
+			} else if (ch === "\\") {
+				escaped = true;
+			} else if (ch === quote) {
+				quote = null;
+			}
+			i++;
+			continue;
+		}
+		if (ch === '"' || ch === "'" || ch === "`") {
+			quote = ch;
+			out += ch;
+			i++;
+			continue;
+		}
+		if (ch === "/" && next === "/") {
+			out += "  ";
+			i += 2;
+			while (i < len && code[i] !== "\n") {
+				out += " ";
+				i++;
+			}
+			continue;
+		}
+		if (ch === "/" && next === "*") {
+			out += "  ";
+			i += 2;
+			while (i < len) {
+				if (code[i] === "*" && i + 1 < len && code[i + 1] === "/") {
+					out += "  ";
+					i += 2;
+					break;
+				}
+				out += code[i] === "\n" ? "\n" : " ";
+				i++;
+			}
+			continue;
+		}
+		out += ch;
+		i++;
+	}
+	return out;
+}
+
+/**
+ * 针对 `eval` JS 源码的词法安全占位符展开器：
+ * 严格跳过引号外的 JS 标识符、对象键与注释（确保 `const TARGET = ...`、`{ HOST: ... }` 等合法代码零语法破坏），
+ * 仅对字符串/模板字面量内部的显式占位符执行无头替换。
+ */
+export function expandEvalCodePlaceholders(
+	code: string,
+	targetInfo: { url: string; host: string },
+): string {
+	if (!code || !DISPATCH_PLACEHOLDER_CASE_RE.test(code)) return code;
+	let out = "";
+	let i = 0;
+	const len = code.length;
+
+	while (i < len) {
+		const ch = code[i]!;
+		const next = i + 1 < len ? code[i + 1]! : "";
+
+		if (ch === "/" && next === "/") {
+			const start = i;
+			i += 2;
+			while (i < len && code[i] !== "\n") i++;
+			out += code.slice(start, i);
+			continue;
+		}
+		if (ch === "/" && next === "*") {
+			const start = i;
+			i += 2;
+			while (i < len && !(code[i] === "*" && i + 1 < len && code[i + 1] === "/")) i++;
+			if (i < len) i += 2;
+			out += code.slice(start, i);
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			const quoteChar = ch;
+			let inner = "";
+			i++;
+			let escaped = false;
+			let closed = false;
+			while (i < len) {
+				const c = code[i]!;
+				if (escaped) {
+					inner += c;
+					escaped = false;
+					i++;
+					continue;
+				}
+				if (c === "\\") {
+					inner += c;
+					escaped = true;
+					i++;
+					continue;
+				}
+				if (c === quoteChar) {
+					closed = true;
+					i++;
+					break;
+				}
+				inner += c;
+				i++;
+			}
+			if (!closed) {
+				out += quoteChar + inner;
+			} else {
+				const expanded = DISPATCH_PLACEHOLDER_CASE_RE.test(inner)
+					? expandPlaceholdersPlain(inner, targetInfo)
+					: inner;
+				out += quoteChar + expanded + quoteChar;
+			}
+			continue;
+		}
+		if (ch === "`") {
+			out += "`";
+			i++;
+			let seg = "";
+			let escaped = false;
+			while (i < len) {
+				const c = code[i]!;
+				if (escaped) {
+					seg += c;
+					escaped = false;
+					i++;
+					continue;
+				}
+				if (c === "\\") {
+					seg += c;
+					escaped = true;
+					i++;
+					continue;
+				}
+				if (c === "`") {
+					out += DISPATCH_PLACEHOLDER_CASE_RE.test(seg) ? expandPlaceholdersPlain(seg, targetInfo) : seg;
+					out += "`";
+					i++;
+					seg = "";
+					break;
+				}
+				if (c === "$" && i + 1 < len && code[i + 1] === "{") {
+					out += DISPATCH_PLACEHOLDER_CASE_RE.test(seg) ? expandPlaceholdersPlain(seg, targetInfo) : seg;
+					seg = "";
+					i += 2;
+					let braceDepth = 1;
+					let expr = "";
+					let exprQuote: string | null = null;
+					let exprEsc = false;
+					while (i < len && braceDepth > 0) {
+						const ec = code[i]!;
+						if (exprQuote) {
+							expr += ec;
+							if (exprEsc) exprEsc = false;
+							else if (ec === "\\") exprEsc = true;
+							else if (ec === exprQuote) exprQuote = null;
+							i++;
+							continue;
+						}
+						if (ec === '"' || ec === "'" || ec === "`") {
+							exprQuote = ec;
+							expr += ec;
+							i++;
+							continue;
+						}
+						if (ec === "{") {
+							braceDepth++;
+							expr += ec;
+							i++;
+							continue;
+						}
+						if (ec === "}") {
+							braceDepth--;
+							if (braceDepth === 0) {
+								i++;
+								break;
+							}
+							expr += ec;
+							i++;
+							continue;
+						}
+						expr += ec;
+						i++;
+					}
+					const trimmedExpr = expr.trim();
+					if (/^(?:U|TARGET|HOST|DOMAIN)$/.test(trimmedExpr)) {
+						const tokenExpanded = expandPlaceholdersPlain(`\${${trimmedExpr}}`, targetInfo);
+						out += tokenExpanded;
+					} else {
+						out += `\${${expandEvalCodePlaceholders(expr, targetInfo)}}`;
+					}
+					continue;
+				}
+				seg += c;
+				i++;
+			}
+			if (seg) {
+				out += DISPATCH_PLACEHOLDER_CASE_RE.test(seg) ? expandPlaceholdersPlain(seg, targetInfo) : seg;
+			}
+			continue;
+		}
+
+		out += ch;
+		i++;
+	}
+	return out;
 }
 
 /**
@@ -309,19 +535,20 @@ function extractEvalStringProp(objText: string, prop: string): { found: boolean;
 }
 
 /**
- * 解析 `eval` 代码块内的全部 `agent({ agent, label, prompt })` 调用。
+ * 解析 `eval` 代码块内的全部 `agent({ agent, label, prompt })` 调用（先剥离单行 `//` 与块级 `/* *\/` 注释以防注释内 `}` 截断绕过）。
  */
 export function parseEvalAgentCalls(code: string): ParsedEvalAgentCall[] {
+	const cleanCode = stripJsCommentsPreservingStrings(code);
 	const results: ParsedEvalAgentCall[] = [];
 	const callRe = /\bagent\s*\(\s*\{/g;
 	let match: RegExpExecArray | null;
-	while ((match = callRe.exec(code)) !== null) {
+	while ((match = callRe.exec(cleanCode)) !== null) {
 		let idx = match.index + match[0].length;
 		let depth = 1;
 		let quote: string | null = null;
 		let escaped = false;
-		while (idx < code.length && depth > 0) {
-			const ch = code[idx]!;
+		while (idx < cleanCode.length && depth > 0) {
+			const ch = cleanCode[idx]!;
 			if (escaped) {
 				escaped = false;
 				idx++;
@@ -344,14 +571,16 @@ export function parseEvalAgentCalls(code: string): ParsedEvalAgentCall[] {
 			idx++;
 		}
 		if (depth !== 0) continue;
-		const body = code.slice(match.index + match[0].length, idx);
+		const body = cleanCode.slice(match.index + match[0].length, idx);
 		const ag = extractEvalStringProp(body, "agent");
 		const pr = extractEvalStringProp(body, "prompt");
 		const tk = pr.found ? pr : extractEvalStringProp(body, "task");
 		const lb = extractEvalStringProp(body, "label");
 		const nm = lb.found ? lb : extractEvalStringProp(body, "name");
+		const agentExplicit = ag.found && ag.value.trim().length > 0;
 		results.push({
-			agent: ag.found && ag.value.trim() ? ag.value.trim() : "fujiang",
+			agent: agentExplicit ? ag.value.trim() : "fujiang",
+			agentExplicit,
 			...(tk.found ? { prompt: tk.value } : {}),
 			...(nm.found && nm.value.trim() ? { label: nm.value.trim() } : {}),
 			hasEmptyPrompt: tk.found && tk.value.trim().length === 0,
@@ -509,7 +738,9 @@ export class DispatchBridgeStore {
 			if (typeof res.index === "number") settledIndices.add(res.index);
 		}
 
-		for (const prog of progressArr) {
+		const boundEntrySeqs = new Set<number>();
+		for (let pPos = 0; pPos < progressArr.length; pPos++) {
+			const prog = progressArr[pPos];
 			if (!prog || typeof prog !== "object") continue;
 			const progId =
 				typeof prog.id === "string" && prog.id.trim()
@@ -530,13 +761,35 @@ export class DispatchBridgeStore {
 			}
 
 			if (progId && toolCallId) {
-				const targetEntry = this.pendingToolDispatches.find(
-					(e) =>
-						resolve(e.root) === normRoot &&
-						e.toolCallId === toolCallId &&
-						(progIdx >= 0 ? e.index === progIdx : true),
-				);
+				let targetEntry: PendingToolDispatch | undefined;
+				if (progIdx >= 0) {
+					targetEntry = this.pendingToolDispatches.find(
+						(e) => resolve(e.root) === normRoot && e.toolCallId === toolCallId && e.index === progIdx,
+					);
+				} else {
+					targetEntry =
+						this.pendingToolDispatches.find(
+							(e) =>
+								resolve(e.root) === normRoot &&
+								e.toolCallId === toolCallId &&
+								e.spawnKeyCandidates.includes(progId),
+						) ??
+						this.pendingToolDispatches.find(
+							(e) =>
+								resolve(e.root) === normRoot &&
+								e.toolCallId === toolCallId &&
+								!boundEntrySeqs.has(e.seq) &&
+								e.index === pPos,
+						) ??
+						this.pendingToolDispatches.find(
+							(e) =>
+								resolve(e.root) === normRoot &&
+								e.toolCallId === toolCallId &&
+								!boundEntrySeqs.has(e.seq),
+						);
+				}
 				if (targetEntry) {
+					boundEntrySeqs.add(targetEntry.seq);
 					if (!targetEntry.spawnKeyCandidates.includes(progId)) {
 						targetEntry.spawnKeyCandidates.unshift(progId);
 					}
@@ -728,8 +981,24 @@ function completeWatchdogOnTaskEnd(
 
 	if (asyncRunning && matchedIds.size === 0) return;
 
-	// 同步无显式 spawnId 场景：通过 intentId 或完整派单文本严格一对一配对
+	const tcId = typeof evObj.toolCallId === "string" ? evObj.toolCallId.trim() : "";
+
+	// 同步无显式 spawnId 场景：通过 toolCallId、intentId 或完整派单文本严格一对一配对
 	if (matchedIds.size === 0) {
+		if (tcId) {
+			for (const [sidKey, sp] of store.activeSpawns.entries()) {
+				if (resolve(sp.root) === normRoot && sp.toolCallId === tcId) {
+					matchedIds.add(sidKey);
+				}
+			}
+			const hasUnspawnedPendingForTc = store.pendingToolDispatches.some(
+				(e) => resolve(e.root) === normRoot && e.toolCallId === tcId,
+			);
+			if (matchedIds.size === 0 && hasUnspawnedPendingForTc) {
+				return;
+			}
+		}
+
 		const taskTexts: string[] = [];
 		const addTaskText = (v: unknown) => {
 			if (typeof v === "string" && v.trim()) taskTexts.push(v.trim());
@@ -755,7 +1024,7 @@ function completeWatchdogOnTaskEnd(
 			}
 		}
 
-		if (intentIds.size > 0) {
+		if (matchedIds.size === 0 && intentIds.size > 0) {
 			for (const [sidKey, sp] of store.activeSpawns.entries()) {
 				if (resolve(sp.root) !== normRoot) continue;
 				if (sp.intentId && intentIds.has(sp.intentId)) {
@@ -782,7 +1051,10 @@ function completeWatchdogOnTaskEnd(
 			}
 		}
 
-		if (matchedIds.size === 0) {
+		// 防误杀守卫：若当前事件报错（未派生即失败）或已携带明确标识（tcId / explicitIds / intentIds / taskTexts）却未命中，严禁按 agent 名盲杀后台无关在途看门狗
+		const hasSpecificIdentity =
+			Boolean(tcId) || explicitIds.size > 0 || intentIds.size > 0 || taskTexts.length > 0;
+		if (matchedIds.size === 0 && !hasSpecificIdentity && evObj.isError !== true) {
 			const agentArg =
 				typeof safeInput.agent === "string"
 					? safeInput.agent.trim()
@@ -950,15 +1222,19 @@ export function handleToolCallDispatch(
 									: "";
 					let tStr = rawTaskStr.trim();
 					const taskFile = typeof item?.taskFile === "string" ? item.taskFile.trim() : "";
+					const taskFileBaseDir = ctx.cwd && ctx.cwd.trim() ? resolve(ctx.cwd) : normRoot;
+					const resolvedTaskFile =
+						taskFile && !taskFile.startsWith("local://") ? resolve(taskFileBaseDir, taskFile) : taskFile;
 					let fromTaskFile = false;
+					let taskFileFullText = "";
 
 					if (!tStr && !taskFile) {
 						const dv = validateSubagentDispatch({ task: "", targetUrl: st.project.url });
 						return { block: true, reason: `nuwa N-007: ${dv.reason ?? "派单 task 为空"}` };
 					}
 					if (!tStr && taskFile) {
-						if (!taskFile.startsWith("local://") && existsSync(taskFile)) {
-							const tf = readTaskFileForDispatch(taskFile);
+						if (!taskFile.startsWith("local://") && existsSync(resolvedTaskFile)) {
+							const tf = readTaskFileForDispatch(resolvedTaskFile);
 							if (tf.tooLarge) {
 								return { block: true, reason: `nuwa N-007: taskFile 超过 4 MiB 上限 (${taskFile})` };
 							}
@@ -968,6 +1244,7 @@ export function handleToolCallDispatch(
 							}
 							if (tf.text) {
 								tStr = tf.text;
+								taskFileFullText = tf.fullText ?? tf.text;
 								fromTaskFile = true;
 							}
 						}
@@ -986,7 +1263,7 @@ export function handleToolCallDispatch(
 					}
 
 					let finalTaskForDispatch = tStr;
-					const candidateSourceText = rawTaskStr || (fromTaskFile ? tStr : "");
+					const candidateSourceText = rawTaskStr || (fromTaskFile ? taskFileFullText : "");
 					if (candidateSourceText && DISPATCH_PLACEHOLDER_CASE_RE.test(candidateSourceText)) {
 						const pkt = buildDispatchPacket({
 							task: candidateSourceText,
@@ -1000,7 +1277,10 @@ export function handleToolCallDispatch(
 							});
 							if (!dv.ok) return { block: true, reason: `nuwa N-007: ${dv.reason}` };
 						} else {
-							finalTaskForDispatch = pkt.task;
+							finalTaskForDispatch =
+								fromTaskFile && pkt.task.length > TASK_FILE_PREVIEW_BYTES
+									? pkt.task.slice(0, TASK_FILE_PREVIEW_BYTES)
+									: pkt.task;
 							needsRewrite = true;
 							const cloned = rewrittenItems[idx];
 							if (cloned && typeof cloned === "object") {
@@ -1088,31 +1368,41 @@ export function handleToolCallDispatch(
 				url: st.project.url,
 				host: st.project.host,
 			};
-			// 先将 eval 代码中的 [TARGET] / https://TARGET 占位符展开，再进入子代理名策略与 Scope 护栏检查
+			// 仅对 eval 字符串/模板字面量中的显式占位符做词法安全展开（保护引号外 JS 标识符与对象键），再进入子代理名白名单与 Scope 护栏检查
 			const effectiveCode =
 				active && (targetInfo.url || targetInfo.host) && DISPATCH_PLACEHOLDER_CASE_RE.test(rawCode)
-					? expandPlaceholdersPlain(rawCode, targetInfo)
+					? expandEvalCodePlaceholders(rawCode, targetInfo)
 					: rawCode;
 			const needsEvalRewrite = effectiveCode !== rawCode;
+			const strippedEvalCode = stripJsCommentsPreservingStrings(effectiveCode);
+			const hasAgentCallInEval = /\bagent\s*\(/.test(strippedEvalCode);
+			const parsedAgentCalls = hasAgentCallInEval ? parseEvalAgentCalls(strippedEvalCode) : [];
 
-			if (
-				active &&
-				main &&
-				readCfg().requireFujiang &&
-				/\bagent\s*\(/.test(effectiveCode) &&
-				!/\b(?:fujiang|nuwa-verifier)\b/.test(effectiveCode)
-			) {
-				return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
+			if (active && main && readCfg().requireFujiang && hasAgentCallInEval) {
+				const allowedAgents = new Set(["fujiang", "nuwa-verifier"]);
+				const rawAgentCallCount = [...strippedEvalCode.matchAll(/\bagent\s*\(/g)].length;
+				if (parsedAgentCalls.length > 0) {
+					const hasDisallowedCall = parsedAgentCalls.some(
+						(pc) => !pc.agentExplicit || !allowedAgents.has(pc.agent),
+					);
+					if (hasDisallowedCall) {
+						return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
+					}
+					if (rawAgentCallCount > parsedAgentCalls.length && !/\b(?:fujiang|nuwa-verifier)\b/.test(strippedEvalCode)) {
+						return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
+					}
+				} else if (!/\b(?:fujiang|nuwa-verifier)\b/.test(strippedEvalCode)) {
+					return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
+				}
 			}
 			if (active) {
 				const evalScopeInput = needsEvalRewrite ? { ...input, code: effectiveCode } : input;
 				const sv = checkToolScopeAndRisk("eval", evalScopeInput, projScope, st.project.mode);
 				if (sv) return sv;
 			}
-			if (active && main && /\b(?:agent|tool\.task)\s*\(/.test(effectiveCode)) {
+			if (active && main && /\b(?:agent|tool\.task)\s*\(/.test(strippedEvalCode)) {
 				const evalToolCallId =
 					typeof event.toolCallId === "string" && event.toolCallId.trim() ? event.toolCallId.trim() : undefined;
-				const parsedAgentCalls = parseEvalAgentCalls(effectiveCode);
 				for (const pc of parsedAgentCalls) {
 					if (pc.hasEmptyPrompt) {
 						return { block: true, reason: "nuwa N-007: eval 内 agent() prompt 不能为空" };
@@ -1165,7 +1455,7 @@ export function handleToolCallDispatch(
 					});
 				}
 
-				if (/\btool\.task\s*\(/.test(effectiveCode) || parsedAgentCalls.length === 0) {
+				if (/\btool\.task\s*\(/.test(strippedEvalCode) || parsedAgentCalls.length === 0) {
 					const intentHits = [...effectiveCode.matchAll(/\b(i\d{3,})\b/g)].map((m) => m[1]).filter(Boolean);
 					const inferredAgent =
 						/\bnuwa-verifier\b/.test(effectiveCode) && !/\bfujiang\b/.test(effectiveCode)
@@ -1350,6 +1640,7 @@ export function handleBeforeSubagentSpawn(
 			spawnId,
 			root,
 			agent: agentName || "fujiang",
+			...(matchedPending?.toolCallId ? { toolCallId: matchedPending.toolCallId } : {}),
 			...(routeCtx.intentId ? { intentId: routeCtx.intentId } : {}),
 			rawTask: trimmedRawTask,
 			injectedTask: preInjectedTask,
