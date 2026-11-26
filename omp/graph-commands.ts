@@ -15,6 +15,7 @@ import {
 	type ScopePolicy,
 } from "./types";
 import {
+	atomicWrite,
 	cell,
 	checkAndLogAutoRuleSource,
 	getAgentHome,
@@ -87,7 +88,27 @@ import {
 	extractCodeAttackSurface,
 	extractFromSourceMap,
 } from "./hybrid-audit";
+import { loadAutoRules } from "./autoexec";
 import { ALLOWED_SUBAGENT_MODELS, DEFAULT_SUBAGENT_MODEL } from "./lineage";
+import { redactVaultSecrets } from "./session-vault";
+import {
+	NUWA_SPECIALIST_SQUAD,
+	SPECIALIST_ROLES,
+	classifyIntentForSpecialist,
+	recommendSpecialistAndModel,
+} from "./specialist-squad";
+import {
+	applyChainResultToBeliefGraph,
+	compileChainToTrafficSequence,
+	executeAttackChainVerification,
+	extractFactCapabilities,
+	synthesizeAttackChains,
+} from "./chain-composer";
+import {
+	captureCdpSessionTraffic,
+	resolveChromeExecutable,
+	runCdpSignedAuthDiff,
+} from "./cdp-bridge";
 
 const VERSION = NUWA_VERSION;
 
@@ -334,18 +355,21 @@ export function buildDoctorSummary(foundRoot: string | null): string {
 		sbCfg.mode === "docker" ? probeDockerAvailable({ dockerBin: sbCfg.dockerBin, image: sbCfg.image }) : null;
 
 	const repoAgentsDir = resolve(import.meta.dir, "..", "agents");
-	const hasFujiang =
-		existsSync(join(agentHome, "agents", "fujiang.md")) || existsSync(join(repoAgentsDir, "fujiang.md"));
-	const hasVerifier =
-		existsSync(join(agentHome, "agents", "nuwa-verifier.md")) || existsSync(join(repoAgentsDir, "nuwa-verifier.md"));
+	const squadStatus = SPECIALIST_ROLES.map((role) => {
+		const fname = `${role}.md`;
+		const ok = existsSync(join(agentHome, "agents", fname)) || existsSync(join(repoAgentsDir, fname));
+		return `${role}=${ok ? "OK" : "MISSING"}`;
+	}).join(" · ");
 	const backend = resolveStorageBackend(foundRoot ?? undefined);
+	const chromeBin = resolveChromeExecutable();
 
 	const lines = [
 		`[女娲 v${VERSION} 环境体检]`,
 		`- Agent Home: ${agentHome}`,
-		`- 存储后端: mode=${backend} (NUWA_STORAGE_BACKEND=json|sqlite|dual)`,
-		`- 便携知识库: ${kb.exists ? "READY" : "MISSING"} (${kb.dbPath}) · cards=${kb.cards} cves=${kb.cves} techniques=${kb.techniques} experiences=${kb.experiences}`,
-		`- 子代理模板: fujiang=${hasFujiang ? "OK" : "MISSING"} · nuwa-verifier=${hasVerifier ? "OK" : "MISSING"}`,
+		`- 存储后端: mode=${backend} (NUWA_STORAGE_BACKEND=sqlite|json|dual，v7.0 默认 sqlite)`,
+		`- 便携知识库: ${kb.exists ? "READY" : "MISSING"} (${kb.dbPath}) · kb_items=${kb.kbItems ?? 0} cards=${kb.cards} cves=${kb.cves} techniques=${kb.techniques} experiences=${kb.experiences}`,
+		`- 5+1 专精小队模板: ${squadStatus}`,
+		`- 原生 CDP 浏览器: ${chromeBin ? `READY (${chromeBin})` : "MISSING"}`,
 		`- 本地工具链: available=[${tc.available.join(", ") || "无"}] · missing=[${tc.missing.join(", ") || "无"}]`,
 		`- 容器沙盒: mode=${sbCfg.mode}${dockerProbe ? ` · docker=${dockerProbe.available ? "READY" : `UNAVAILABLE(${dockerProbe.reason ?? "unknown"})`}` : ""}`,
 	];
@@ -1097,6 +1121,347 @@ export function executeMcpCommand(
 	return { msg: lines.join("\n"), level: "info" };
 }
 
+/**
+ * 执行 `/nuwa squad`：纯只读零磁盘写入展示 5+1 专精特种小队配置、模板状态及当前项目前沿意图的校准联合路由建议。
+ */
+export function executeSquadCommand(
+	found: string | null,
+	subArg = "",
+): { msg: string; level: "info" | "error" } {
+	const agentHome = getAgentHome();
+	const repoAgentsDir = resolve(import.meta.dir, "..", "agents");
+	const roleFilter = subArg.trim().toLowerCase();
+
+	const squadLines = SPECIALIST_ROLES.filter((r) => !roleFilter || r.includes(roleFilter)).map((role) => {
+		const prof = NUWA_SPECIALIST_SQUAD[role];
+		const tplOk =
+			existsSync(join(agentHome, "agents", `${role}.md`)) || existsSync(join(repoAgentsDir, `${role}.md`));
+		return `- ${role} [${prof.label}] · tier=${prof.preferredModelTier} · category=${prof.defaultTaskCategory} · template=${tplOk ? "READY" : "MISSING"}`;
+	});
+
+	if (squadLines.length === 0) {
+		return { msg: `未找到匹配的专精小队角色: ${subArg.trim()}`, level: "error" };
+	}
+
+	const headerLines = [
+		`[女娲 v${VERSION} 5+1 专精特种小队路由面板]`,
+		...squadLines,
+	];
+
+	if (found) {
+		const normRoot = resolve(found);
+		const st = loadStateStrictlyReadOnly(normRoot);
+		if (st) {
+			const calibRecords = hasCalibrationRecords(normRoot) ? loadCalibrationRecords(normRoot) : [];
+			const settledCount = calibRecords.filter((r) => r.settled).length;
+			const openIntents = Object.values(st.intents)
+				.filter((i) => i.status === "open" || i.status === "claimed")
+				.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id))
+				.slice(0, 8);
+
+			headerLines.push(
+				``,
+				`[当前项目专精派单路由预览 · project=${st.project.id} · 已结算校准样本=${settledCount}]`,
+			);
+			if (openIntents.length === 0) {
+				headerLines.push(`- (当前无待派发开放意图)`);
+			} else {
+				for (const it of openIntents) {
+					const rec =
+						settledCount > 0
+							? recommendSpecialistAndModel(it, st, calibRecords)
+							: (() => {
+									const cls = classifyIntentForSpecialist(it, st);
+									return {
+										recommendedRole: cls.role,
+										recommendedModel: DEFAULT_SUBAGENT_MODEL,
+										reason: cls.reason,
+									};
+								})();
+					const safeTitle = redactVaultSecrets(normOneLine(it.title, 72), normRoot);
+					const safeRationale = redactVaultSecrets(normOneLine(rec.reason, 96), normRoot);
+					headerLines.push(
+						`- ${it.id} [${it.phase}] ${safeTitle} → 推荐角色=${rec.recommendedRole} · 模型=${rec.recommendedModel} (${safeRationale})`,
+					);
+				}
+			}
+		}
+	}
+
+	return { msg: headerLines.join("\n"), level: "info" };
+}
+
+/**
+ * 执行 `/nuwa chains [list [limit] | verify [chainId]]`：
+ * - 默认 `list` 为 100% 纯只读零磁盘写入，基于当前事实图与信念后验合成并展示 2～4 跳组合攻击链（全量脱敏）；
+ * - 显式 `verify` 执行有状态合规只读重放，命中生成 `candidate` 复合漏洞并派发双盲复验，受阻精准回灌 `brokenAtStep` 至信念图。
+ */
+export async function executeChainsCommand(
+	found: string | null,
+	subArg = "",
+): Promise<{ msg: string; level: "info" | "error" }> {
+	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
+	const normRoot = resolve(found);
+	const rawSub = subArg.trim();
+	const parts = rawSub ? rawSub.split(/\s+/) : [];
+	const action = (parts[0] ?? "list").toLowerCase();
+
+	if (action === "verify") {
+		const pre = loadStateStrictlyReadOnly(normRoot);
+		if (!pre) return { msg: "state 读取失败", level: "error" };
+		if (pre.project.scheme === "local") {
+			return { msg: "本地模式项目不支持 HTTP 多跳攻击链网络重放验证", level: "error" };
+		}
+		const bGraphRead = loadBeliefGraphReadOnly(normRoot) ?? initBeliefGraphFromState(pre);
+		const chains = synthesizeAttackChains(pre, { beliefGraph: bGraphRead });
+		if (chains.length === 0) {
+			return { msg: "当前事实图尚未形成可合成的 2～4 跳互补攻击链", level: "info" };
+		}
+		const targetChainId = parts[1]?.trim();
+		const targetChain = targetChainId ? chains.find((c) => c.id === targetChainId) : chains[0];
+		if (!targetChain) {
+			return { msg: `未找到指定攻击链: ${targetChainId}`, level: "error" };
+		}
+		const scope =
+			pre.project.scope ?? defaultScopeForTarget(pre.project.url || pre.project.target, pre.project.mode);
+		const execRes = await executeAttackChainVerification(targetChain, normRoot, scope, {
+			baseUrl: pre.project.url || pre.project.target,
+			state: pre,
+		});
+
+		let savedFactId = "";
+		let verifyIid = "";
+		withLock(normRoot, () => {
+			const s = loadState(normRoot);
+			if (!s) return;
+			const bGraph = initBeliefGraphFromState(s, loadBeliefGraphReadOnly(normRoot) ?? undefined);
+			applyChainResultToBeliefGraph(execRes, bGraph, s, { applyToState: true });
+			atomicWrite(beliefGraphPath(normRoot), `${JSON.stringify(bGraph, null, 2)}\n`);
+
+			if (execRes.verified && execRes.candidateFact) {
+				const cf = execRes.candidateFact;
+				const dup = cf.key ? Object.values(s.facts).find((x) => x.key === cf.key) : undefined;
+				if (!dup) {
+					const fid = nextFactId(s);
+					const stored: Fact = {
+						...cf,
+						id: fid,
+						verified: false,
+						verifyStage: "candidate",
+						evidenceSeq: getLatestLedgerSeq(normRoot),
+					};
+					s.facts[fid] = stored;
+					savedFactId = fid;
+					const vSpec = buildDoubleBlindVerifyIntentSpec(s, stored);
+					if (vSpec) {
+						const added = appendIntentSpecs(s, [vSpec]);
+						verifyIid = added[0] ?? "";
+					}
+					syncAssetsFromFacts(s);
+				} else {
+					savedFactId = dup.id;
+				}
+			}
+			saveState(normRoot, s);
+			logEvent(normRoot, {
+				type: "chain_verify",
+				chainId: targetChain.id,
+				verified: execRes.verified,
+				...(typeof execRes.brokenAtStep === "number" ? { brokenAtStep: execRes.brokenAtStep } : {}),
+				...(savedFactId ? { candidateFact: savedFactId } : {}),
+			});
+		});
+
+		if (execRes.verified) {
+			return {
+				msg: redactVaultSecrets(
+					`多跳攻击链验证打穿: ${targetChain.id} (${targetChain.steps.length} 跳)${savedFactId ? ` · 暂存候选漏洞 ${savedFactId}` : ""}${verifyIid ? ` · 已派发双盲复验 ${verifyIid}` : ""}`,
+					normRoot,
+				),
+				level: "info",
+			};
+		}
+		return {
+			msg: redactVaultSecrets(
+				`多跳攻击链验证受阻: ${targetChain.id} · brokenAtStep=${execRes.brokenAtStep ?? "-"} · brokenFact=${execRes.brokenFactId ?? "-"} · 原因=${execRes.reason || "未满足利用条件"}（已回灌信念图衰减）`,
+				normRoot,
+			),
+			level: "info",
+		};
+	}
+
+	// 默认只读视图（严格零磁盘写入）
+	const st = loadStateStrictlyReadOnly(normRoot);
+	if (!st) return { msg: "state 读取失败", level: "error" };
+	const limitNum =
+		action === "list"
+			? Math.max(1, Math.min(20, Number(parts[1]) || 8))
+			: Math.max(1, Math.min(20, Number(parts[0]) || 8));
+	const diskGraph = loadBeliefGraphReadOnly(normRoot) ?? initBeliefGraphFromState(st);
+	const capList = Object.values(st.facts)
+		.map((f) => extractFactCapabilities(f))
+		.filter((c) => c.eligible && (c.provides.length > 0 || c.requires.length > 0));
+	const chains = synthesizeAttackChains(st, { beliefGraph: diskGraph, maxChains: limitNum });
+
+	const outLines = [
+		`[女娲 v${VERSION} 多跳攻击链合成视图 · project=${st.project.id}]`,
+		`- 具备能力标签的活跃事实: ${capList.length} 条 · 可合成 2～4 跳攻击链: ${chains.length} 条`,
+	];
+	if (chains.length === 0) {
+		outLines.push(`- 当前尚无满足前置→后置互补关系的组合攻击链（随着侦察发现路由/票据/低权凭据将自动合成）。`);
+	} else {
+		for (const c of chains.slice(0, limitNum)) {
+			const stepDesc = c.steps
+				.map((s) => `${s.factId}(${s.method} ${s.endpoint || "/"})`)
+				.join(" -> ");
+			let previewSteps = 0;
+			if (st.project.scheme !== "local" && st.project.url) {
+				try {
+					previewSteps = compileChainToTrafficSequence(c, st.project.url).length;
+				} catch {
+					previewSteps = c.steps.length;
+				}
+			}
+			outLines.push(
+				`- ${c.id} [depth=${c.steps.length} · utility=${c.utilityScore.toFixed(3)} · trafficSteps=${previewSteps}]: ${redactVaultSecrets(stepDesc, normRoot)}`,
+			);
+		}
+		outLines.push(`用法提示: 执行 /nuwa chains verify <chainId> 可发起只读合规多跳重放验证。`);
+	}
+	return { msg: redactVaultSecrets(outLines.join("\n"), normRoot), level: "info" };
+}
+
+/**
+ * 执行 `/nuwa cdp [status | capture [url] | authdiff [paths...]]`：
+ * - 默认 `status` 为 100% 纯只读零磁盘写入，展示本机 Headless Chrome 就绪状态、已录制 CDP 流量与脱敏会话摘要；
+ * - 显式 `capture` / `authdiff` 在 Scope 护栏保护下执行受控浏览器实时流量捕获与页面内借壳加签只读差分。
+ */
+export async function executeCdpCommand(
+	found: string | null,
+	subArg = "",
+): Promise<{ msg: string; level: "info" | "error" }> {
+	const chromeBin = resolveChromeExecutable();
+	const trimmed = subArg.trim();
+	const parts = trimmed ? trimmed.split(/\s+/) : [];
+	const sub = (parts[0] ?? "status").toLowerCase();
+
+	if (!trimmed || sub === "status") {
+		const lines = [
+			`[女娲 v${VERSION} 原生 CDP 流量桥接状态]`,
+			`- Headless Chrome 可执行文件: ${chromeBin ? `READY (${chromeBin})` : "NOT_FOUND (可通过 NUWA_CHROME_BIN 指定)"}`,
+			`- 安全边界: CDP Fetch 拦截层强制执行 N-007 Scope 校验，越界请求直接 Fetch.failRequest 阻断；页面加签探针严格锁定 GET/HEAD/OPTIONS 只读方法且全链路凭据脱敏。`,
+		];
+		if (found) {
+			const normRoot = resolve(found);
+			const st = loadStateStrictlyReadOnly(normRoot);
+			if (st) {
+				const rec = new TrafficRecorder(normRoot);
+				const cdpEntries = rec.query({ limit: 50 }).filter((e) => e.tags?.some((t) => /cdp/i.test(t)));
+				const roles = Object.keys(loadSessionVault(normRoot).roles);
+				lines.push(
+					`- 当前项目: ${st.project.id} (${st.project.url}) · CDP 已录制脱敏流量=${cdpEntries.length} 条 · 会话角色=[${roles.join(", ") || "无"}]`,
+				);
+			}
+		}
+		lines.push(`- 子命令: /nuwa cdp status | /nuwa cdp capture [url] | /nuwa cdp authdiff [/api/path1 /api/path2]`);
+		return { msg: found ? redactVaultSecrets(lines.join("\n"), resolve(found)) : lines.join("\n"), level: "info" };
+	}
+
+	if (!found) return { msg: "当前目录没有女娲项目", level: "error" };
+	const normRoot = resolve(found);
+	const st = loadStateStrictlyReadOnly(normRoot);
+	if (!st) return { msg: "state 读取失败", level: "error" };
+	if (st.project.scheme === "local") {
+		return { msg: "本地目录模式项目不支持 CDP Web 流量捕获", level: "error" };
+	}
+	if (!chromeBin) {
+		return { msg: "未探测到可用的 Chrome/Chromium 可执行文件（请设置 NUWA_CHROME_BIN）", level: "error" };
+	}
+	const scope = st.project.scope ?? defaultScopeForTarget(st.project.url || st.project.target, st.project.mode);
+
+	if (sub === "capture") {
+		const targetUrl = parts[1]?.trim() || st.project.url;
+		const cap = await captureCdpSessionTraffic(targetUrl, normRoot, scope);
+		withLock(normRoot, () => {
+			const s = loadState(normRoot);
+			if (!s) return;
+			s.project.activeRoles = Object.keys(loadSessionVault(normRoot).roles).sort();
+			saveState(normRoot, s);
+			logEvent(normRoot, {
+				type: "cdp_capture",
+				recorded: cap.entries.length,
+				blockedOutOfScope: cap.blockedRequests.length,
+				ingestedRoles: cap.syncedRoles,
+			});
+		});
+		return {
+			msg: redactVaultSecrets(
+				`CDP 实时流量捕获完成: 录制合规请求=${cap.entries.length} 条 · 阻断越界请求=${cap.blockedRequests.length} 条 · 同步会话角色=[${cap.syncedRoles.join(", ") || "无"}]`,
+				normRoot,
+			),
+			level: cap.ok ? "info" : "error",
+		};
+	}
+
+	if (sub === "authdiff") {
+		const explicitPaths = parts.slice(1).filter(Boolean);
+		const candidatePaths =
+			explicitPaths.length > 0
+				? explicitPaths
+				: Object.values(st.facts)
+						.flatMap((f) => f.meta?.paths ?? [])
+						.filter((p) => p.startsWith("/"))
+						.slice(0, 8);
+		if (candidatePaths.length === 0) {
+			return { msg: "用法: /nuwa cdp authdiff </api/path1> [/api/path2 ...]", level: "error" };
+		}
+		const diffRes = await runCdpSignedAuthDiff(st.project.url, candidatePaths, normRoot, scope);
+		const addedFids: string[] = [];
+		if (diffRes.fact) {
+			const af = diffRes.fact;
+			withLock(normRoot, () => {
+				const s = loadState(normRoot);
+				if (!s) return;
+				const fKey = `cdp-authdiff:${sha(`${af.title}|${af.command}`)}`;
+				if (!Object.values(s.facts).some((x) => x.key === fKey)) {
+					const fid = nextFactId(s);
+					const stored: Fact = {
+						id: fid,
+						kind: "vuln",
+						title: redactVaultSecrets(normOneLine(af.title, 120), normRoot),
+						detail: redactVaultSecrets(af.detail, normRoot),
+						command: redactVaultSecrets(af.command, normRoot),
+						output: redactVaultSecrets(af.output, normRoot),
+						key: fKey,
+						createdAt: nowIso(),
+						verified: false,
+						verifyStage: "candidate",
+						evidenceSeq: getLatestLedgerSeq(normRoot),
+					};
+					s.facts[fid] = stored;
+					addedFids.push(fid);
+					const vSpec = buildDoubleBlindVerifyIntentSpec(s, stored);
+					if (vSpec) appendIntentSpecs(s, [vSpec]);
+				}
+				if (addedFids.length > 0) {
+					syncAssetsFromFacts(s);
+					saveState(normRoot, s);
+					logEvent(normRoot, { type: "cdp_authdiff", findings: diffRes.findings.length, facts: addedFids });
+				}
+			});
+		}
+		return {
+			msg: redactVaultSecrets(
+				`CDP 页面借壳加签鉴权差分完成: 测试路径=${candidatePaths.length} · 命中异常=${diffRes.findings.length} 条${addedFids.length ? ` · 暂存候选漏洞=${addedFids.join(", ")}` : ""}`,
+				normRoot,
+			),
+			level: diffRes.ok ? "info" : "error",
+		};
+	}
+
+	return { msg: "用法: /nuwa cdp [status | capture [url] | authdiff [paths...]]", level: "error" };
+}
+
 function countsByKind(st: NuwaState): Record<string, number> {
 	const out: Record<string, number> = {};
 	for (const f of Object.values(st.facts)) out[f.kind] = (out[f.kind] ?? 0) + 1;
@@ -1118,7 +1483,25 @@ function phaseStats(st: NuwaState): Array<{ phase: Phase; open: number; claimed:
 }
 
 function detectAutoRulesSource(root?: string, st?: NuwaState): string {
-	return checkAndLogAutoRuleSource(root, st);
+	const agentHome = getAgentHome();
+	if (root && root.trim()) {
+		try {
+			const loaded = loadAutoRules(root, agentHome);
+			if (loaded.error) {
+				return checkAndLogAutoRuleSource(root);
+			}
+			return loaded.source;
+		} catch {
+			/* ignore */
+		}
+	}
+	const rs = st?.runtime?.rulesSource;
+	if (rs === "project" || rs === "global" || rs === "builtin") return rs;
+	try {
+		return loadAutoRules(undefined, agentHome).source;
+	} catch {
+		return "builtin";
+	}
 }
 
 export function statusBoard(st: NuwaState, root?: string): string {

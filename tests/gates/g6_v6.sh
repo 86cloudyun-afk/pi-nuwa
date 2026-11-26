@@ -22,9 +22,10 @@ else
 fi
 
 echo "[g6] 4/5 跨宿主 MCP Server (bin/nuwa-mcp) 与 L2 离线微基准硬门禁验收"
+EXPECTED_VER="$(sed -nE "s/^export[[:space:]]+const[[:space:]]+VERSION[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'].*/\1/p" omp/nuwa.ts | head -n 1)"
 MCP_VER="$(env -u BUN_OPTIONS ./bin/nuwa-mcp --version 2>&1 || true)"
-if [[ "$MCP_VER" != *"6.0.0"* ]]; then
-  echo "FAIL: bin/nuwa-mcp --version 异常: $MCP_VER" >&2
+if [[ -z "$EXPECTED_VER" || "$MCP_VER" != *"$EXPECTED_VER"* ]]; then
+  echo "FAIL: bin/nuwa-mcp --version 异常: $MCP_VER (expected $EXPECTED_VER)" >&2
   fail=1
 else
   echo "PASS: bin/nuwa-mcp --version -> $MCP_VER"

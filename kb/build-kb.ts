@@ -15,6 +15,7 @@ import { Database } from "bun:sqlite";
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
+import { ingestV7SeedPack } from "../omp/kb-v2";
 
 export interface SeedCard {
 	key: string;
@@ -53,6 +54,8 @@ export interface BuildKbOptions {
 	outPath: string;
 	seedDir?: string;
 	nucleiDir?: string;
+	/** 是否自动并入 kb/seed-v7-pack.json（默认 true）。 */
+	includeV7SeedPack?: boolean;
 }
 
 export interface BuildKbStats {
@@ -66,6 +69,7 @@ export interface BuildKbStats {
 	templates: number;
 	templateCveMaps: number;
 	experiences: number;
+	kbItems: number;
 	nucleiScanned: number;
 	nucleiAddedCves: number;
 	builtAt: string;
@@ -376,6 +380,10 @@ function inferProductFromTags(tags: string, name: string): string {
 }
 
 function tableCount(db: Database, table: string): number {
+	const has = db
+		.query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?")
+		.get(table) as { name?: string } | null;
+	if (!has?.name) return 0;
 	const row = db.query(`SELECT COUNT(*) AS cnt FROM ${table}`).get() as { cnt?: number } | null;
 	return Number(row?.cnt ?? 0);
 }
@@ -452,6 +460,7 @@ export function readKbStats(dbPath: string): BuildKbStats {
 			templates: tableCount(db, "template"),
 			templateCveMaps: tableCount(db, "template_cve_map"),
 			experiences: tableCount(db, "experience"),
+			kbItems: tableCount(db, "kb_items"),
 			nucleiScanned: Number(
 				(db.query("SELECT value FROM kb_meta WHERE key = ?").get("nuclei_scanned") as { value?: string } | null)
 					?.value ?? 0,
@@ -660,13 +669,20 @@ export function buildKb(opts: BuildKbOptions): BuildKbStats {
 			).run();
 
 			const setMeta = db.query("INSERT OR REPLACE INTO kb_meta (key, value) VALUES (?, ?)");
-			setMeta.run("schema_version", "4");
+			setMeta.run("schema_version", "7");
 			setMeta.run("built_at", builtAt);
 			setMeta.run("seed_dir", seedDir);
 			setMeta.run("nuclei_scanned", String(nucleiScanned));
 			setMeta.run("nuclei_added_cves", String(nucleiAddedCves));
 		});
 		rebuildFts();
+
+		// 5. v7.0 自动摄入 seed-v7-pack.json 构建统一混合语义索引（总条目 >= 520）
+		const v7PackPath = join(seedDir, "seed-v7-pack.json");
+		if (opts.includeV7SeedPack !== false && existsSync(v7PackPath)) {
+			ingestV7SeedPack(db, v7PackPath, { seedDir });
+		}
+
 		finalizeWritableKbDb(db);
 
 		return {
@@ -680,6 +696,7 @@ export function buildKb(opts: BuildKbOptions): BuildKbStats {
 			templates: tableCount(db, "template"),
 			templateCveMaps: tableCount(db, "template_cve_map"),
 			experiences: tableCount(db, "experience"),
+			kbItems: tableCount(db, "kb_items"),
 			nucleiScanned,
 			nucleiAddedCves,
 			builtAt,
@@ -762,7 +779,7 @@ if (import.meta.main) {
 			console.log(JSON.stringify(result, null, 2));
 		} else {
 			console.log(
-				`[kb-build] 已构建 ${result.dbPath} (cards=${result.cards}, cves=${result.cves}, pocs=${result.pocs}, techniques=${result.techniques}, kev=${result.kevs}, epss=${result.epss}, templates=${result.templates}, experience=${result.experiences})`,
+				`[kb-build] 已构建 ${result.dbPath} (kb_items=${result.kbItems}, cards=${result.cards}, cves=${result.cves}, pocs=${result.pocs}, techniques=${result.techniques}, kev=${result.kevs}, epss=${result.epss}, templates=${result.templates}, experience=${result.experiences})`,
 			);
 		}
 	} catch (err) {

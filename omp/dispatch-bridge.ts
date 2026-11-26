@@ -59,6 +59,7 @@ import {
 } from "./sandbox";
 import { resolveBeliefNodeId } from "./belief-search";
 import { recordPrediction } from "./calibration";
+import { SPECIALIST_ROLES, VALID_SPECIALIST_ROLES, type SpecialistRole } from "./specialist-squad";
 
 export const DISPATCH_EMPTY_CONTEXT_RE =
 	/\b(?:no\s+assigned\s+task|awaiting\s+work\s+item|no\s+task\s+provided|empty\s+task)\b/i;
@@ -1379,20 +1380,23 @@ export function handleToolCallDispatch(
 			const parsedAgentCalls = hasAgentCallInEval ? parseEvalAgentCalls(strippedEvalCode) : [];
 
 			if (active && main && readCfg().requireFujiang && hasAgentCallInEval) {
-				const allowedAgents = new Set(["fujiang", "nuwa-verifier"]);
+				const allowedAgents = VALID_SPECIALIST_ROLES as ReadonlySet<string>;
+				const allowedRe = new RegExp(`\\b(?:${SPECIALIST_ROLES.join("|")})\\b`);
 				const rawAgentCallCount = [...strippedEvalCode.matchAll(/\bagent\s*\(/g)].length;
+				const blockReason =
+					'nuwa N-004: eval 里的 agent() 必须显式指定合法专精代理（如 agent: "fujiang" 或 "nuwa-verifier" / "nuwa-scout" / "nuwa-spa-reverser" / "nuwa-auth-breaker" / "nuwa-code-auditor"）';
 				if (parsedAgentCalls.length > 0) {
 					const hasDisallowedCall = parsedAgentCalls.some(
 						(pc) => !pc.agentExplicit || !allowedAgents.has(pc.agent),
 					);
 					if (hasDisallowedCall) {
-						return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
+						return { block: true, reason: blockReason };
 					}
-					if (rawAgentCallCount > parsedAgentCalls.length && !/\b(?:fujiang|nuwa-verifier)\b/.test(strippedEvalCode)) {
-						return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
+					if (rawAgentCallCount > parsedAgentCalls.length && !allowedRe.test(strippedEvalCode)) {
+						return { block: true, reason: blockReason };
 					}
-				} else if (!/\b(?:fujiang|nuwa-verifier)\b/.test(strippedEvalCode)) {
-					return { block: true, reason: 'nuwa N-004: eval 里的 agent() 必须显式 agent: "fujiang" 或 "nuwa-verifier"' };
+				} else if (!allowedRe.test(strippedEvalCode)) {
+					return { block: true, reason: blockReason };
 				}
 			}
 			if (active) {
@@ -1457,10 +1461,10 @@ export function handleToolCallDispatch(
 
 				if (/\btool\.task\s*\(/.test(strippedEvalCode) || parsedAgentCalls.length === 0) {
 					const intentHits = [...effectiveCode.matchAll(/\b(i\d{3,})\b/g)].map((m) => m[1]).filter(Boolean);
-					const inferredAgent =
-						/\bnuwa-verifier\b/.test(effectiveCode) && !/\bfujiang\b/.test(effectiveCode)
-							? "nuwa-verifier"
-							: "fujiang";
+					const inferredAgent: SpecialistRole =
+						SPECIALIST_ROLES.find(
+							(r) => r !== "fujiang" && new RegExp(`\\b${r}\\b`).test(effectiveCode) && !/\bfujiang\b/.test(effectiveCode),
+						) ?? "fujiang";
 					const summaryText = `[eval:${inferredAgent}]${intentHits.length ? ` [女娲派单 ${intentHits[0]}]` : ""} ${effectiveCode.slice(0, 600)}`.trim();
 					store.pendingToolDispatches.push({
 						seq: store.nextDispatchSeq(),
@@ -1675,7 +1679,7 @@ export function handleBeforeSubagentSpawn(
 					modelId: effModelId,
 					predictedConfidence: Math.max(0.01, Math.min(0.99, Number(posterior.toFixed(4)))),
 					estimatedTokens: 4000,
-					note: `spawn:${agentName || "fujiang"}:${routeCtx.intentKey ?? routeCtx.intentId}`,
+					note: `spawn:${agentName || "fujiang"}:specialistRole=${VALID_SPECIALIST_ROLES.has(agentName as SpecialistRole) ? agentName : "fujiang"}:${routeCtx.intentKey ?? routeCtx.intentId}`,
 				});
 			} catch {
 				/* 重复 spawnId 或只读环境异常不阻断子代理派生 */

@@ -25,14 +25,23 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { Database } from "bun:sqlite";
-import type { Phase } from "./types";
+import type { NuwaState, Phase } from "./types";
 import {
 	calibrationLedgerPath,
 	hasCalibrationRecords,
 	loadCalibrationRecords,
 	recommendAdaptiveModelRoute,
+	type CalibrationRecord,
 	type CalibrationTaskCategory,
 } from "./calibration";
+import {
+	VALID_SPECIALIST_ROLES,
+	recommendSpecialistAndModel,
+	type RecommendSpecialistOptions,
+	type SpecialistAndModelRecommendation,
+	type SpecialistIntentLike,
+	type SpecialistRole,
+} from "./specialist-squad";
 import { openSqliteReadonlyZeroWrite } from "./sqlite-store";
 
 export const DEFAULT_SUBAGENT_MODEL = "gemini-4-neon-xhigh";
@@ -838,14 +847,17 @@ export function inferCalibrationTaskCategory(input: {
 	) {
 		return "verify";
 	}
-	if (keys.some((k) => /auth|session|bola|bfla|idor|jwt|login/i.test(k))) {
+	if (agentName === "nuwa-auth-breaker" || keys.some((k) => /auth|session|bola|bfla|idor|jwt|login/i.test(k))) {
 		return "auth";
 	}
-	if (keys.some((k) => /spa|js|bundle|sourcemap|frontend/i.test(k))) {
+	if (agentName === "nuwa-spa-reverser" || keys.some((k) => /spa|js|bundle|sourcemap|frontend|cdp/i.test(k))) {
 		return "js-audit";
 	}
-	if (keys.some((k) => /hybrid|whitebox|sast|code|audit/i.test(k))) {
+	if (agentName === "nuwa-code-auditor" || keys.some((k) => /hybrid|whitebox|sast|code|audit/i.test(k))) {
 		return "whitebox";
+	}
+	if (agentName === "nuwa-scout") {
+		return "recon";
 	}
 	if (phase === "exploit" || phase === "post" || phase === "vuln") {
 		return "exploit";
@@ -880,6 +892,12 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 	let baseModel: string | undefined;
 	if (isVerifyTask) {
 		baseModel = verifyModel ?? deepModel;
+	} else if (agentName === "nuwa-scout") {
+		baseModel = fastModel ?? deepModel;
+	} else if (agentName === "nuwa-code-auditor") {
+		baseModel = deepModel ?? verifyModel;
+	} else if (agentName === "nuwa-spa-reverser" || agentName === "nuwa-auth-breaker") {
+		baseModel = deepModel ?? fastModel;
 	} else {
 		const isReflectTask = Boolean(input.hasReflect) || keys.some((k) => k.startsWith("reflect:"));
 		if (phase === "vuln" || phase === "exploit" || isReflectTask) {
@@ -895,7 +913,7 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 
 	if (!baseModel) return undefined;
 
-	// v6.0 校准驱动自适应模型路由：当提供 root 且存在多候选模型与历史校准样本时自动降权高误报模型
+	// v7.0 专精小队 + 校准驱动联合模型路由：结合 specialistRole × taskCategory × model 历史机械战绩择优
 	if (input.root && (process.env.NUWA_CALIBRATION ?? "1").trim() !== "0") {
 		const pool = [
 			...new Set(
@@ -908,6 +926,26 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 			try {
 				const records = loadCalibrationRecords(input.root);
 				if (records.some((r) => r.settled)) {
+					if (VALID_SPECIALIST_ROLES.has(agentName as SpecialistRole)) {
+						const squadRec = recommendSpecialistAndModel(
+							{
+								key: keys[0] ?? "",
+								phase: (phase || "recon") as Phase,
+								worker: agentName,
+							},
+							null,
+							records,
+							{
+								allowedModels: pool,
+								defaultModel: baseModel,
+								fastModel,
+								deepModel: deepModel ?? verifyModel,
+								verifyModel: verifyModel ?? deepModel,
+								lockSpecialistRole: true,
+							},
+						);
+						return squadRec.recommendedModel;
+					}
 					const decision = recommendAdaptiveModelRoute(records, {
 						allowedModels: pool,
 						defaultModel: baseModel,
@@ -922,6 +960,26 @@ export function routeSubagentModel(input: SubagentModelRouteInput = {}): string 
 	}
 
 	return baseModel;
+}
+
+/**
+ * 为单条意图推荐最佳 5+1 专精小队角色与适配模型（纯只读零磁盘写入，无校准记录时自动使用零样本意图画像分类）。
+ */
+export function recommendIntentSpecialist(
+	intent: SpecialistIntentLike | null | undefined,
+	state?: Partial<NuwaState> | null,
+	root?: string,
+	opts?: RecommendSpecialistOptions,
+): SpecialistAndModelRecommendation {
+	let records: CalibrationRecord[] = [];
+	if (root && (process.env.NUWA_CALIBRATION ?? "1").trim() !== "0" && hasCalibrationRecords(root)) {
+		try {
+			records = loadCalibrationRecords(root);
+		} catch {
+			records = [];
+		}
+	}
+	return recommendSpecialistAndModel(intent, state ?? null, records, opts);
 }
 
 // ============================================================================

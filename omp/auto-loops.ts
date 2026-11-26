@@ -48,6 +48,24 @@ import { normOneLine, nowIso, sha } from "./storage";
 import { buildDoubleBlindVerifyIntentSpec, type VerifyIntentSpec } from "./verifier-gate";
 import type { AutoFact } from "./autoexec";
 import type { Fact, Intent, NuwaState, ScopePolicy } from "./types";
+import {
+	applyChainResultToBeliefGraph,
+	executeAttackChainVerification,
+	synthesizeAttackChains,
+	type AttackChainSpec,
+	type ChainExecutionResult,
+	type ExecuteChainVerificationOptions,
+} from "./chain-composer";
+import {
+	captureCdpSessionTraffic,
+	resolveChromeExecutable,
+	runCdpSignedAuthDiff,
+	type CaptureCdpTrafficOptions,
+	type CaptureCdpTrafficResult,
+	type RunCdpSignedAuthDiffOptions,
+	type RunCdpSignedAuthDiffResult,
+} from "./cdp-bridge";
+import type { BeliefGraph, BeliefPropagationResult } from "./belief-search";
 
 // ============================================================================
 // 共享持久化状态（冷却哈希与节流状态，0o600 落盘，绝不含任何明文凭据）
@@ -1599,4 +1617,145 @@ export async function runAutonomousOobPoll(
 		evidenceAutoFacts,
 		verifyIntentSpecs,
 	};
+}
+
+// ============================================================================
+// v7.0 多跳攻击链自主合成验证闭环与受控原生 CDP 桥接闭环
+// ============================================================================
+
+export interface RunAutonomousChainOptions extends ExecuteChainVerificationOptions {
+	/** 单轮最多执行有状态验证的攻击链条数（默认 2）。 */
+	maxVerifyChains?: number;
+	/** 可选关联信念图：自动将验证命中 `breakthrough_signal` 或中断 `brokenAtStep` 回灌至信念图。 */
+	beliefGraph?: BeliefGraph;
+}
+
+export interface AutonomousChainLoopResult {
+	synthesizedChains: AttackChainSpec[];
+	executedResults: ChainExecutionResult[];
+	candidateFacts: Fact[];
+	verifyIntentSpecs: VerifyIntentSpec[];
+	beliefUpdates: BeliefPropagationResult[];
+	brokenChains: Array<{
+		chainId: string;
+		brokenAtStep: number;
+		brokenFactId?: string;
+		observation?: string;
+	}>;
+}
+
+/**
+ * 自主合成并验证高优多跳攻击链（2～4 跳），并将命中跃迁信号（`breakthrough_signal`）
+ * 或中间中断步骤（`brokenAtStep`）精准回灌至 `belief-search.ts` 信念图。
+ */
+export async function runAutonomousChainVerification(
+	state: NuwaState,
+	root: string,
+	scope: ScopePolicy,
+	opts?: RunAutonomousChainOptions,
+): Promise<AutonomousChainLoopResult> {
+	const out: AutonomousChainLoopResult = {
+		synthesizedChains: [],
+		executedResults: [],
+		candidateFacts: [],
+		verifyIntentSpecs: [],
+		beliefUpdates: [],
+		brokenChains: [],
+	};
+	if (!state || state.project?.scheme === "local") return out;
+
+	const normRoot = resolve(root);
+	const chains = synthesizeAttackChains(state, {
+		beliefGraph: opts?.beliefGraph,
+	});
+	out.synthesizedChains = chains;
+	if (chains.length === 0) return out;
+
+	const maxVerify = Math.max(1, Math.min(5, Math.floor(opts?.maxVerifyChains ?? 2)));
+	const existingChainKeys = new Set(
+		Object.values(state.facts ?? {})
+			.map((f) => f.key ?? "")
+			.filter(Boolean),
+	);
+
+	const candidates = chains
+		.filter((c) => !existingChainKeys.has(`chain:${c.id}`))
+		.slice(0, maxVerify);
+
+	for (const chain of candidates) {
+		const execRes = await executeAttackChainVerification(chain, normRoot, scope, {
+			baseUrl: state.project.url || state.project.target,
+			state,
+			...opts,
+		});
+		out.executedResults.push(execRes);
+
+		if (execRes.verified && execRes.candidateFact) {
+			out.candidateFacts.push(execRes.candidateFact);
+			const vSpec = buildDoubleBlindVerifyIntentSpec(state, execRes.candidateFact);
+			if (vSpec) {
+				out.verifyIntentSpecs.push(vSpec);
+			}
+		} else if (typeof execRes.brokenAtStep === "number") {
+			out.brokenChains.push({
+				chainId: chain.id,
+				brokenAtStep: execRes.brokenAtStep,
+				...(execRes.brokenFactId ? { brokenFactId: execRes.brokenFactId } : {}),
+				...(execRes.beliefObservation?.type ? { observation: execRes.beliefObservation.type } : {}),
+			});
+		}
+
+		if (opts?.beliefGraph) {
+			const prop = applyChainResultToBeliefGraph(execRes, opts.beliefGraph, state, { applyToState: false });
+			if (prop) {
+				out.beliefUpdates.push(prop);
+			}
+		}
+	}
+
+	return out;
+}
+
+export interface RunAutonomousCdpOptions {
+	enableCapture?: boolean;
+	enableSignedAuthDiff?: boolean;
+	paths?: string[];
+	captureOptions?: CaptureCdpTrafficOptions;
+	authDiffOptions?: RunCdpSignedAuthDiffOptions;
+}
+
+export interface AutonomousCdpLoopResult {
+	available: boolean;
+	chromePath: string | null;
+	captureResult?: CaptureCdpTrafficResult;
+	signedAuthDiffResult?: RunCdpSignedAuthDiffResult;
+}
+
+/**
+ * 受控原生 CDP 自主流量捕获与页面内借壳加签鉴权差分闭环（全链路遵守 Scope 护栏与零明文脱敏）。
+ */
+export async function runAutonomousCdpLoop(
+	state: NuwaState,
+	root: string,
+	scope: ScopePolicy,
+	opts?: RunAutonomousCdpOptions,
+): Promise<AutonomousCdpLoopResult> {
+	const chromePath = resolveChromeExecutable();
+	if (!chromePath || !state || state.project?.scheme === "local") {
+		return { available: Boolean(chromePath), chromePath };
+	}
+	const normRoot = resolve(root);
+	const targetUrl = state.project.url || state.project.target;
+	const res: AutonomousCdpLoopResult = { available: true, chromePath };
+
+	if (opts?.enableCapture) {
+		res.captureResult = await captureCdpSessionTraffic(targetUrl, normRoot, scope, opts.captureOptions);
+	}
+	if (opts?.enableSignedAuthDiff) {
+		const targetPaths = opts.paths && opts.paths.length > 0 ? opts.paths : collectTestableAuthPaths(state, { maxPaths: 8 });
+		if (targetPaths.length > 0) {
+			res.signedAuthDiffResult = await runCdpSignedAuthDiff(targetUrl, targetPaths, normRoot, scope, opts.authDiffOptions);
+		}
+	}
+	return res;
 }

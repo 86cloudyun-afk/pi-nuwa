@@ -1,95 +1,62 @@
-# pi-nuwa · 女娲模式 v6.0.0（下一代自主认知安全评估与跨宿主原生引擎）
+# pi-nuwa · 女娲模式 v7.0.0（单核合一、专精特种小队、原生 CDP 加签差分与多跳攻击链引擎）
 
-把「长任务不会停、证据不造假、范围不越界、信念与信息增益驱动搜索、反自证机械校准路由、认证态/OOB 自主闭环、结构化流量重放变异、黑白盒双向混合审计、SQLite WAL 并发持久化与跨宿主 MCP 标准协议」做成零外部 npm 依赖的 `omp` 原生扩展 + 独立跨宿主 MCP Server + 外层无头守护器。
+把「单核合一跨宿主执行、SQLite WAL 默认并发存储、5+1 专精特种小队联合校准路由、KB 2.0 混合语义与反自证经验治理、原生 CDP 页面借壳加签差分、2～4 跳能力互补攻击链合成验证、只读零写盘与全链路凭据零明文泄露」做成零外部 npm 依赖的 `omp` 原生扩展 + 跨宿主标准 MCP Server + 外层无头守护器。
 
-**女娲模式 v6.0.0 = 执行纪律（`SKILL.md`）+ 模块化原生运行时（30 个 `omp/*.ts` 模块，严格保持 12 个 `nuwa_*` 工具）+ 独立核心与跨宿主 MCP Server（`core/` + `bin/nuwa-mcp`）+ 随仓便携 SQLite FTS5 知识库（`kb/`）+ 合规双子代理（`fujiang` + `nuwa-verifier`）+ L1/L2 离线合成评测靶场（`benchmarks/`）+ 外层无头守护器（`bin/nuwa-autonomous`）。**
+**女娲模式 v7.0.0 = 单一权威执行核（`core/engine.ts`）+ 精简组装与派单桥接（`omp/nuwa.ts` `< 1,000` 行 + `omp/dispatch-bridge.ts`，35 个 `omp/*.ts` 模块，严格保持 12 个 `nuwa_*` 工具）+ 跨宿主 MCP Server（`core/mcp-server.ts` + `bin/nuwa-mcp`）+ KB 2.0 混合语义知识库（`>= 520` 条，`kb/`）+ 5+1 专精特种小队（6 个 `agents/*.md`）+ L1/L2/L3 全层级评测靶场（`benchmarks/`）+ 外层无头守护器（`bin/nuwa-autonomous`）。**
 
-## v6.0.0 核心能力跃升
+## v7.0.0 六大核心能力跃升
 
-在 100% 保持 12 个 `nuwa_*` 核心工具名称与既有行为向后兼容的基础上，v6.0.0 完成了六大认知与工程引擎升级：
+在 100% 保持 12 个 `nuwa_*` 核心工具名称、参数契约与全部历史导出向后兼容的基础上，v7.0.0 完成了六大架构收敛与实战能力跃升：
 
-1. **SQLite WAL 权威状态存储与全文检索（`omp/sqlite-store.ts` + `omp/storage.ts`）**：支持 `NUWA_STORAGE_BACKEND=json|sqlite|dual` 无缝切换，10 张规范表 + WAL 多连接并发写入无锁超时 + 坏库自动隔离/回退保护 + `queryFactsByText` 中英文/路径/CVE 全文检索，自动保留 `state.json` 兼容快照且全库零明文凭据泄露。
-2. **不确定性感知信念图与预期信息增益（VoI）前沿搜索（`omp/belief-search.ts` + `omp/graph-planner.ts`）**：对每个事实/意图/假设维护共轭 Beta 后验、香农熵与一步预期熵减（VoI）；发现 `.js.map` 源码泄露、`cred` 凭据或确认漏洞时自动触发关联子树先验跃升重排，双盲复验驳回或 WAF 阻断时沿拓扑级联衰减剪枝低收益分支，并输出收敛与 `sealed_negative` 封盘建议（`/nuwa belief`）。
-3. **反自证机械对账校准核与自适应模型路由（`omp/calibration.ts` + `omp/lineage.ts`）**：硬性拦截任何模型/代理自评结算（`SELF_CERTIFICATION_FORBIDDEN`），仅接受 `verifier-gate`、`exec-ledger`、`autoexec`、`benchmark`、`human` 机械核验源单次结算；实时核算 Brier Score、10-bin ECE、误报率与 Token ROI，在冷启动保护与严格白名单边界内自动降权高误报模型（`/nuwa calibrate`）。
-4. **自主 AuthDiff / OOB 闭环驱动（`omp/auto-loops.ts` + `omp/graph.ts`）**：批处理收尾自动检测多角色/新凭据触发只读鉴权差分（Auto-BOLA/BFLA -> `candidate` -> 双盲复验），并在配置 `scope.oobDomains` 时自动识别盲 SSRF/XXE/SSTI/反序列化高危面播撒去重 Canary、按 30s 节流轮询回收回调实锤。
-5. **结构化 HTTP 流量工作台与黑白盒混合审计（`omp/traffic-workbench.ts` + `omp/hybrid-audit.ts`）**：内置 `0o600` 全字段脱敏 `TrafficRecorder`、支持 Cookie Jar 与变量提取替换的多步重放 `replayTrafficSequence`、并发 `<= 8` 的五类纯只读契约探针 `runStructuredMutations`（`/nuwa traffic`）；零外部依赖静态提取 TS/JS/Next.js/Python/Go 与 `.js.map` 路由鉴权及危险汇点，双向桥接黑盒核验意图与源码行号锚点（`/nuwa hybrid`）。
-6. **图引擎无环拆解、跨宿主 MCP Server 与 L2 基准门禁（`omp/graph*.ts` + `core/*` + `bin/nuwa-mcp` + `benchmarks/run-l2-eval.ts`）**：原巨石 `omp/graph.ts` 无环拆解为 `graph-planner.ts`、`graph-commands.ts`、`graph.ts`（`< 2,500` 行）；`bin/nuwa-mcp` 基于标准 JSON-RPC 2.0 over stdio 向 Claude Code / Cursor / Codex 等任意宿主暴露完整 12 工具与护栏（`/nuwa mcp`）；配套 L2 五场景离线合成靶场与 `g6_v6.sh` 硬门禁。
+1. **单核合一与主入口极致瘦身（`core/engine.ts` + `omp/dispatch-bridge.ts` + `omp/nuwa.ts` + `core/mcp-server.ts`）**：`NuwaUnifiedEngine` 统一承载全部 12 个 `nuwa_*` 工具与 28 个 `/nuwa` 斜杠命令，`omp/nuwa.ts` 瘦身至 `< 1,000` 行，`core/mcp-server.ts` 全面委托单核消除分叉；`DispatchBridgeStore` 零私有全局态闭环 `omp 18.16.0` 异步乱序派单、`taskFile` 与 `eval` 词法安全展开及 `SubagentWatchdog` 精确回收。
+2. **SQLite WAL 默认存储转正与双核心不变量（`omp/sqlite-store.ts` + `omp/storage.ts`）**：`NUWA_STORAGE_BACKEND` 未设置时默认返回 `"sqlite"`（保留 `sqlite | json | dual` 显式切换）；严格保证对仅有 `.nuwa/state.json`（无 `nuwa.db`）的遗留目录执行任何只读状态/命令/评估操作时 **零磁盘写入**（不创建 `nuwa.db`/`-wal`/`-shm`），发生写入时自动无损迁移并同步维护 `.nuwa/state.json` 兼容快照。
+3. **原生 CDP 流量桥接与页面内借壳加签差分（`omp/cdp-bridge.ts` + `/nuwa cdp`）**：零第三方依赖拉起本机 Headless Chrome 直连 CDP `WebSocket`，拦截层强制 `N-007` Scope 校验（主动 `Fetch.failRequest` 阻断越界外连），实时脱敏写入 `TrafficRecorder` 并同步认证头至 `SessionVault`；在受控同源页面内借壳调用前端原生加签钩子执行纯只读 `GET/HEAD/OPTIONS` 契约差分，免逆向穿透动态 HMAC/时间戳/Nonce 识别 BOLA/BFLA。
+4. **多跳攻击链能力合成与有状态验证（`omp/chain-composer.ts` + `/nuwa chains`）**：基于 `provides -> requires` 能力标签在有界深度 `2..4` 跳与严格防环约束下合成组合攻击链，编译为带动态变量提取的只读 `TrafficStep[]` 重放验证；打穿全链自动产出 `candidate` 复合漏洞并触发信念图 `breakthrough_signal`，中间第 `k` 跳受阻精准回灌 `brokenAtStep` 衰减下游分支。
+5. **5+1 专精特种小队与 KB 2.0 混合语义治理（`omp/specialist-squad.ts` + `omp/kb-v2.ts` + `/nuwa squad`）**：提供 `nuwa-scout`、`nuwa-spa-reverser`、`nuwa-auth-breaker`、`nuwa-code-auditor`、`nuwa-verifier` + `fujiang` 六大专精模板与校准联合路由；自动摄入 `kb/seed-v7-pack.json` 构建 `>= 520` 条知识库，`nuwa_kb` 默认启用 `hybridKbSearch`（FTS5 + 中英同义扩展 + TF-IDF + N-gram + SimHash），知识蒸馏联动 `governDistilledExperience` 执行反自证优胜劣汰。
+6. **L3 真实进程树 SOCKS5h 靶场与第 8 道阶段门禁（`benchmarks/l3-live/*` + `tests/gates/g7_v7.sh`）**：通过 `Bun.spawn` 真实拉起 `bin/nuwa-autonomous` 与内置 TCP `SOCKS5h` 服务器跑通异步派单实锤、硬化零洞封盘防复活与 `/tmp` 停止项目自动迁移接管三大场景。
 
-## 模块组成
+## 核心模块组成
 
 | 路径 | 职责 |
 |---|---|
-| `omp/nuwa.ts` | 组装入口（部署为 `index.ts`）：12 个 `nuwa_*` 工具、`/nuwa` 全量斜杠子命令、生命周期与护栏钩子、v6 全量兼容导出 |
-| `omp/types.ts` | 共享类型契约与单一版本常量 `NUWA_VERSION = "6.0.0"` |
-| `omp/storage.ts` / `omp/sqlite-store.ts` | JSON / SQLite WAL / Dual 双模存储底座、文件锁、FTS5 全文检索、进程组回收、软暂停、子代理看门狗与工作区完整性校验 |
-| `omp/graph.ts` / `omp/graph-planner.ts` / `omp/graph-commands.ts` | 无环三层图状态机：6 阶段种子、三元组去重、信念前沿排序、双盲复验与剪枝、机械校准结算、自主闭环与斜杠命令视图 |
-| `omp/belief-search.ts` | 共轭 Beta 信念图、预期信息增益（VoI）排序、拓扑级联衰减剪枝、跃迁信号提权与收敛/封盘推荐 |
-| `omp/calibration.ts` | 反自证预测登记与机械核验对账账本、Brier/ECE/FPR/ROI 统计与自适应模型路由决策器 |
-| `omp/auto-loops.ts` | 冷却防重自主多角色鉴权差分闭环与受 `scope.oobDomains` 门控的自主 OOB Canary 播撒/节流轮询闭环 |
-| `omp/traffic-workbench.ts` | `0o600` 零明文泄露流量录制检索、多步状态变量提取重放与五类只读契约差分变异探针 |
-| `omp/hybrid-audit.ts` | TS/JS/Python/Go 与 `.js.map` 静态路由及风险汇点提取、白盒→黑盒核验意图桥接、黑盒发现→源码行锚点反向关联 |
-| `core/protocol.ts` / `core/mcp-server.ts` / `bin/nuwa-mcp` | 宿主无关核心引擎 `NuwaCoreEngine` 与跨宿主标准 MCP JSON-RPC 2.0 stdio 服务端（支持 Content-Length 与 NDJSON） |
-| `omp/lineage.ts` | 主从会话血缘绑定、派单守卫、6KB 批派单分片溢写、在途目标去重与校准驱动动态模型路由 |
-| `omp/scope.ts` / `omp/sandbox.ts` / `docker/` | 跨运行时范围护栏（`N-007` 含内联脚本拦截与层标签）、零信任 Docker/Sidecar 沙盒（`N-009`）、抗 DNS 重绑定 Egress Proxy 与出口熔断池 |
-| `omp/evidence.ts` / `omp/verifier-gate.ts` | 单调序列可信执行证据账本、五项命中指标与假阳性复核门禁、双盲独立复验闸门 |
-| `omp/autoexec.ts` / `omp/browser-recon.ts` | 出口注入与 Gate 预检、Soft-404 多语言/RSC 去噪、持久化浏览器挑战门识别停机与 SPA 接口感知 |
-| `omp/session-vault.ts` / `omp/auth-diff.ts` / `omp/oob.ts` | `0o600` 多角色会话保险箱与凭据掩码脱敏、多角色只读鉴权差分矩阵、一等 OOB 回调通道 |
-| `omp/kb.ts` / `omp/hypothesis.ts` / `omp/reporting.ts` | 随仓 SQLite FTS5 便携知识库与经验蒸馏、多资产假设图推理、Markdown/JSON/SARIF 2.1.0/时间线归档/PoC 脱敏证据包导出 |
-| `omp/profiles.ts` / `omp/reincarnate.ts` / `omp/ui*.ts` | 五领域 Profile 解耦、跨世代换血交接、三层常驻可视面与原生 TUI 看板 |
-| `benchmarks/` | L1 10 场景确定性基准（`run-eval.ts`）+ v6.0 L2 5 场景合成靶场与校准评分卡（`run-l2-eval.ts` + `l2-range/`） |
-| `bin/nuwa-autonomous` | 外层无头守护器（跨世代换血、看门狗、Token/USD 封顶、脱敏 Webhook/死信队列、`doctor [--json]`） |
+| `core/engine.ts` / `core/protocol.ts` / `core/mcp-server.ts` | 单一权威执行引擎 `NuwaUnifiedEngine`、12 工具 Schema 协议契约与跨宿主标准 MCP JSON-RPC 2.0 stdio 服务端 |
+| `omp/nuwa.ts` / `omp/dispatch-bridge.ts` | 精简组装入口（`< 1,000` 行，部署为 `index.ts`）与零全局态异步派单缓冲/占位符词法展开/看门狗桥接器 |
+| `omp/storage.ts` / `omp/sqlite-store.ts` | 默认 SQLite WAL 权威存储（兼容 `json`/`dual`）、遗留只读零写盘守卫、`state.json` 兼容快照同步、FTS5 检索与进程组回收 |
+| `omp/cdp-bridge.ts` | 零依赖 Headless Chrome CDP 客户端、拦截层 Scope 阻断、实时流量脱敏录制与页面内借壳动态加签只读鉴权差分（`/nuwa cdp`） |
+| `omp/chain-composer.ts` | 前置-后置能力抽取、2～4 跳防环攻击链合成、只读 `TrafficStep[]` 编译、有状态重放验证与 `brokenAtStep` 信念回灌（`/nuwa chains`） |
+| `omp/specialist-squad.ts` / `agents/*.md` | 5+1 专精特种小队画像、确定性意图分类与反自证机械战绩联合模型路由器（`/nuwa squad`） |
+| `omp/kb-v2.ts` / `omp/kb.ts` / `kb/*` | KB 2.0 大规模种子融合（`>= 520` 条）、中英同义混合语义检索 `hybridKbSearch` 与机械校准驱动经验治理 `governDistilledExperience` |
+| `omp/graph.ts` / `omp/graph-planner.ts` / `omp/graph-commands.ts` | 无环三层图状态机（`omp/graph.ts < 2,500` 行）：信念前沿重排、专精角色标注、双盲复验、自主闭环与斜杠命令视图 |
+| `omp/belief-search.ts` / `omp/calibration.ts` | 共轭 Beta 信念图 + VoI 搜索剪枝、反自证预测登记与机械核验对账账本（Brier/ECE/FPR/ROI） |
+| `omp/traffic-workbench.ts` / `omp/hybrid-audit.ts` | `0o600` 脱敏流量录制重放与只读契约变异、TS/JS/Python/Go/`.js.map` 黑白盒双向审计桥接 |
+| `benchmarks/` | L1 10 场景基准（`run-eval.ts`）+ L2 5 场景有状态基准（`run-l2-eval.ts`）+ L3 3 场景真实进程树 SOCKS5h 靶场（`l3-live/run-l3-eval.ts`） |
 
-## 一键部署与跨宿主接入
+## 一键部署与快速使用
 
 ```bash
-git clone https://github.com/86cloudyun-afk/pi-nuwa.git
-cd pi-nuwa
-env -u BUN_OPTIONS ./install.sh                 # 一键部署 30 模块 + nuwa-mcp + 构建便携 kb.db + 子代理与守护器
-env -u BUN_OPTIONS ./install.sh --force-agents  # 强制刷新已存在的子代理模板
-env -u BUN_OPTIONS ./install.sh --clean-kb      # 全新重建纯净 kb.db
-./install.sh --rollback                         # 一键回滚至上一版备份
-
-# 部署后环境体检与 MCP 版本核验
-~/.local/bin/nuwa-autonomous doctor
-~/.local/bin/nuwa-mcp --version
+env -u BUN_OPTIONS ./install.sh --force-agents --clean-kb  # 一键部署全模块 + nuwa-mcp + 6个专精模板 + 构建 kb.db (>=520条)
+~/.local/bin/nuwa-autonomous doctor                        # 环境健康体检
+~/.local/bin/nuwa-mcp --version                            # 核验跨宿主 MCP Server 版本 (7.0.0)
 ```
 
-## 快速使用
-
-### 1. 交互式会话命令与 v6.0 新增只读视图
+### 常用斜杠命令与 v7.0 新增视图
 
 ```text
 /nuwa 打 http://TARGET:PORT 拿 flag
-/nuwa 审计当前项目源码安全漏洞                 # 本地白盒 audit 模式自动绑定当前目录
-/nuwa status / board / inspect / query         # 只读看板、全屏 TUI 与零写入图谱/归档检索
-/nuwa belief [limit]                           # [v6.0] 查看贝叶斯信念图、Top VoI 排序、剪枝节点与收敛转向建议
-/nuwa calibrate [category]                     # [v6.0] 查看反自证校准账本（Brier/ECE/FPR/ROI）与自适应路由评估
-/nuwa traffic [limit] [host=...] [status=200]  # [v6.0] 只读检索结构化脱敏 HTTP 流量工作台
-/nuwa hybrid [dirOrMap | plan [dirOrMap]]      # [v6.0] 提取白盒/SourceMap 路由风险并双向关联黑盒发现
-/nuwa mcp                                      # [v6.0] 查看跨宿主 nuwa-mcp 状态与 mcpServers 接入配置
-/nuwa scope / session / spa / authdiff / oob / assets
-/nuwa report [md|json|sarif|timeline|bundle] / export / seal / pause / resume / stop / doctor
+/nuwa status / board / inspect / query                     # 严格零写盘看板、TUI 与图谱/归档诊断
+/nuwa cdp [status | capture [url] | authdiff [paths...]]   # [v7.0] 原生 CDP 桥接状态、实时脱敏抓包与页面内加签差分
+/nuwa chains [list [limit] | verify [chainId]]             # [v7.0] 查看可合成 2～4 跳攻击链并执行只读有状态重放验证
+/nuwa squad [role]                                         # [v7.0] 查看 5+1 专精特种小队状态与当前前沿意图联合路由建议
+/nuwa belief / calibrate / traffic / hybrid / mcp          # 信念图、校准账本、脱敏流量工作台、黑白盒桥接与 MCP 配置
 ```
 
-### 2. 跨宿主 MCP Server（Claude Code / Cursor / Codex）
-
-```json
-{
-  "mcpServers": {
-    "pi-nuwa": {
-      "command": "/root/.local/bin/nuwa-mcp",
-      "args": ["--project", "/path/to/workspace"]
-    }
-  }
-}
-```
-
-## 测试、评测靶场与阶段门禁
+## 测试、三层靶场与八道阶段门禁
 
 ```bash
-python3 tests/version_check.py --require-install-echo  # 单一版本事实来源与 install.sh 回显一致性校验
-python3 tests/contract_check.py --v2-only              # 30 模块无环契约、12 工具不变量与离线 bun build 门禁
-env -u BUN_OPTIONS bun benchmarks/run-l2-eval.ts       # 运行 v6.0 L2 五场景合成靶场与五大硬门禁评分卡
-./run-tests.sh                                         # 全量单元/集成测试与 g0..g6 阶段门禁一键回归
-bash tests/gates/g6_v6.sh                              # 单独执行 v6.0 阶段门禁
+python3 tests/version_check.py --require-install-echo                  # 7.0.0 版本单一事实来源与 install.sh 回显校验
+NUWA_REQUIRE_TSC=1 python3 tests/contract_check.py --v2-only           # 12/12 契约、全仓严格 tsc 与离线构建门禁
+env -u BUN_OPTIONS bun benchmarks/run-l2-eval.ts --deterministic       # L2 五场景有状态合成靶场 (5/5)
+env -u BUN_OPTIONS bun benchmarks/l3-live/run-l3-eval.ts               # L3 三场景真实进程树与 SOCKS5h 门禁靶场 (3/3)
+bash tests/gates/g7_v7.sh                                              # 单独执行 v7.0 第 8 道阶段门禁
+./tests/gates/run.sh                                                   # 执行 g0..g7 全八道历史与当前阶段门禁
 ```

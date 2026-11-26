@@ -6,40 +6,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-	NUWA_VERSION,
-	PHASE_ORDER,
-	type AutoFactMeta,
-	type Cfg,
-	type CommitInput,
-	type Fact,
-	type FactKind,
-	type Intent,
-	type IntentStatus,
-	type Mode,
-	type NuwaState,
-	type Phase,
-	type PolicyVerdict,
-	type ScopePolicy,
-	type SealMeta,
-	type SurfaceDomain,
-	type VerifyStage,
+	NUWA_VERSION, PHASE_ORDER, type AutoFactMeta, type Cfg, type CommitInput, type Fact, type FactKind,
+	type Intent, type IntentStatus, type Mode, type NuwaState, type Phase, type PolicyVerdict,
+	type ScopePolicy, type SealMeta, type SurfaceDomain, type VerifyStage,
 } from "./types";
 import {
-	cell,
-	createInitialState,
-	getAgentHome,
-	loadState,
-	logEvent,
-	nextFactId,
-	normOneLine,
-	nowIso,
-	readCfg,
-	recordInvalidAutoRuleOnce,
-	resolveStorageBackend,
-	saveState,
-	sha,
-	sqliteDbPath,
-	withLock,
+	cell, createInitialState, getAgentHome, loadState, logEvent, nextFactId, normOneLine, nowIso,
+	readCfg, recordInvalidAutoRuleOnce, resolveStorageBackend, saveState, sha, sqliteDbPath, withLock,
 } from "./storage";
 import {
 	prepareNextGeneration,
@@ -97,9 +70,13 @@ import { loadStateFromSqlite } from "./sqlite-store";
 import {
 	planAutonomousOobProbes,
 	runAutonomousAuthDiff,
+	runAutonomousCdpLoop,
+	runAutonomousChainVerification,
 	runAutonomousOobPoll,
 	shouldAutoTriggerAuthDiff,
 } from "./auto-loops";
+import { SPECIALIST_ROLES, VALID_SPECIALIST_ROLES } from "./specialist-squad";
+import { extractFactCapabilities, synthesizeAttackChains } from "./chain-composer";
 import {
 	initBeliefGraphFromState,
 	propagateBeliefUpdate,
@@ -111,49 +88,13 @@ import {
 	safeSettlePrediction,
 } from "./calibration";
 import {
-	addFallbackIntent,
-	addIntent,
-	appendIntentSpecs,
-	applyEmptyGuard,
-	attempted,
-	autoPlan,
-	budgetPressure,
-	buildConvergenceAdvice,
-	buildIntentDedupKey,
-	canDeriveCrossSurface,
-	claimAutoBatch,
-	claimedFresh,
-	compactFacts,
-	compactIntents,
-	computeRepeatRatio,
-	type ConvergenceAdvice,
-	countNovelFacts,
-	deriveFromFacts,
-	expandGraph,
-	extractIntentTargetKey,
-	frontierList,
-	inferExpectedKind,
-	inferSurfaceDomain,
-	isTargetInBlockedCooldown,
-	kbLookup,
-	loadOrInitBeliefGraph,
-	maybeAdvance,
-	normalizeTargetKey,
-	phaseIndex,
-	planIntents,
-	proofKinds,
-	readEnvCooldownMs,
-	readNoveltyThreshold,
-	recordAttemptedIntent,
-	releaseStaleClaims,
-	renderDetail,
-	saveBeliefGraph,
-	seedEpisode,
-	seedPhase,
-	shouldRecommendSeal,
-	sigOf,
-	stopReason,
-	tickNoveltyStall,
+	addFallbackIntent, addIntent, appendIntentSpecs, applyEmptyGuard, attempted, autoPlan, budgetPressure,
+	buildConvergenceAdvice, buildIntentDedupKey, canDeriveCrossSurface, claimAutoBatch, claimedFresh, compactFacts,
+	compactIntents, computeRepeatRatio, type ConvergenceAdvice, countNovelFacts, deriveFromFacts, expandGraph,
+	extractIntentTargetKey, frontierList, inferExpectedKind, inferSurfaceDomain, isTargetInBlockedCooldown,
+	kbLookup, loadOrInitBeliefGraph, maybeAdvance, normalizeTargetKey, phaseIndex, planIntents, proofKinds,
+	readEnvCooldownMs, readNoveltyThreshold, recordAttemptedIntent, releaseStaleClaims, renderDetail, saveBeliefGraph,
+	seedEpisode, seedPhase, shouldRecommendSeal, sigOf, stopReason, tickNoveltyStall,
 } from "./graph-planner";
 import { pickPrimaryVaultRole, reportMarkdown, statusBoard } from "./graph-commands";
 
@@ -1132,12 +1073,12 @@ export function buildDirective(st: NuwaState, cfg: Cfg, root?: string): string {
 				`本批派单（并行 ${Math.min(items.length, batchSize)}）:`,
 				...items.map(
 					(it) =>
-						`- ${it.intent.id} [${it.intent.phase}] ${it.intent.title}${it.stale ? " (stale 重新认领)" : ""} attempts=${it.intent.attempts}`,
+						`- ${it.intent.id} [${it.intent.phase}] ${it.intent.title}${it.stale ? " (stale 重新认领)" : ""} attempts=${it.intent.attempts}${it.recommendedSpecialist ? ` → 推荐专精=${it.recommendedSpecialist}` : ""}`,
 				),
 				``,
 				`执行协议（照抄）:`,
-				`1. 对每条 intent 调 nuwa_claim(id="${items[0].intent.id}", worker="fujiang") 取 packet；其余 id 用上表替换（verify-vuln:* 双盲复验意图推荐派给 nuwa-verifier）。`,
-				`2. 一次 task 调用批量派单：每个 task 必须 agent:"fujiang"（或双盲复验用 agent:"nuwa-verifier"）；task 正文 = packet 的「执行内容」+「输出契约」+「已知事实」，原样复制。`,
+				`1. 对每条 intent 调 nuwa_claim(id="${items[0].intent.id}", worker="${items[0].recommendedSpecialist || "fujiang"}") 取 packet；其余 id 与专精角色用上表替换（verify-vuln:* 双盲复验意图派给 nuwa-verifier）。`,
+				`2. 一次 task 调用批量派单：每个 task 按上表推荐指定专精代理（${SPECIALIST_ROLES.join(" / ")}）；task 正文 = packet 的「执行内容」+「输出契约」+「已知事实」，原样复制。`,
 				`3. 子代理回 5 行后，主线程逐条 nuwa_commit(id="<同 claim 的 id>", kind=..., title=..., detail=..., command="<完整命令>", output="<关键回显>")。命令与回显必须来自实际执行。`,
 				`4. 拿到 flag 立刻 nuwa_flag(value="...", command="...", output="...")，不要等批次结束。`,
 				`5. 全部 commit 后再调 nuwa_status；不要输出“本轮战报/已完成/收工”。`,
@@ -1246,11 +1187,11 @@ export function checkTaskPolicy(input: Record<string, unknown>, active: boolean,
 		}
 	}
 	for (const item of raw) {
-		const agent = typeof item?.agent === "string" ? item.agent : "";
-		if (agent !== "fujiang" && agent !== "nuwa-verifier") {
+		const agent = typeof item?.agent === "string" ? item.agent.trim() : "";
+		if (!VALID_SPECIALIST_ROLES.has(agent as (typeof SPECIALIST_ROLES)[number])) {
 			return {
 				block: true,
-				reason: `nuwa N-004: 女娲项目进行中，task 必须 agent:"fujiang" 或 "nuwa-verifier"（当前="${agent || "未指定"}"）`,
+				reason: `nuwa N-004: 女娲项目进行中，task 必须指定合法专精小队代理 agent:"fujiang" 或 "nuwa-verifier" / "nuwa-scout" / "nuwa-spa-reverser" / "nuwa-auth-breaker" / "nuwa-code-auditor"（当前="${agent || "未指定"}"）`,
 			};
 		}
 	}
@@ -1836,7 +1777,38 @@ export function executeCommitWithGates(
 			}
 		}
 
-		// v6.0 接线 1：信念图贝叶斯后验传播、突破跃迁提权与复验驳回子树剪枝
+		// v6.0/v7.0 接线 1：信念图贝叶斯后验传播、多跳攻击链合成派生与 brokenAtStep / breakthrough_signal 回灌
+		let newlySynthesizedChainIds: string[] = [];
+		if (!p.blocked && r.fact && s.project.scheme !== "local") {
+			try {
+				const fCap = extractFactCapabilities(r.fact);
+				if (fCap.eligible && (fCap.provides.length > 0 || fCap.requires.length > 0)) {
+					const synChains = synthesizeAttackChains(s, { maxChains: 3 });
+					for (const ch of synChains) {
+						if (!ch.factIds.includes(r.fact.id)) continue;
+						const chKey = `chain:verify:${ch.id}`;
+						const addedCh = appendIntentSpecs(s, [
+							{
+								key: chKey,
+								phase: s.project.phase === "recon" ? "vuln" : s.project.phase,
+								title: `多跳组合攻击链验证 (${ch.steps.length} 跳: ${ch.factIds.join("->")})`,
+								detail: `基于前置-后置能力互补图自动合成 ${ch.steps.length} 跳组合链 (${ch.id}, utility=${ch.utilityScore.toFixed(3)})，执行纯只读有状态提取重放核验。`,
+								priority: 91,
+								from: [...ch.factIds],
+								expectedKind: "vuln",
+							},
+						]);
+						if (addedCh.length > 0) newlySynthesizedChainIds.push(...addedCh);
+					}
+				}
+			} catch {
+				/* 攻击链辅助合成异常不阻断主状态提交 */
+			}
+		}
+		if (newlySynthesizedChainIds.length > 0) {
+			extraLines.push(`已合成派生多跳组合攻击链核验意图: ${newlySynthesizedChainIds.join(" ")}`);
+		}
+
 		if ((process.env.NUWA_BELIEF_SEARCH ?? "1").trim() !== "0") {
 			try {
 				const bGraph = initBeliefGraphFromState(s, loadOrInitBeliefGraph(root, s));
@@ -1873,6 +1845,7 @@ export function executeCommitWithGates(
 					r.fact &&
 					(r.fact.kind === "cred" ||
 						r.fact.kind === "flag" ||
+						newlySynthesizedChainIds.length > 0 ||
 						/\.js\.map\b|sourcemap/i.test(`${r.fact.title} ${r.fact.detail}`))
 				) {
 					propagateBeliefUpdate(bGraph, s, {
@@ -1887,8 +1860,13 @@ export function executeCommitWithGates(
 						: /\b(timeout|timed?\s*out|etimedout|deadline)\b/i.test(noteStr)
 							? "timeout"
 							: "soft404_miss";
+					const brokenStepMatch = /\bbrokenAtStep\s*=\s*(\d+)/i.exec(noteStr);
+					const brokenFactFromChain =
+						brokenStepMatch && targetIntent?.from?.[Number(brokenStepMatch[1])]
+							? targetIntent.from[Number(brokenStepMatch[1])]
+							: undefined;
 					propagateBeliefUpdate(bGraph, s, {
-						nodeId: rawId,
+						nodeId: brokenFactFromChain || rawId,
 						observation: obsType,
 						applyToState: false,
 						reason: safeNote,
@@ -2079,6 +2057,60 @@ export async function runPostBatchAutonomousLoops(
 			}
 		} catch {
 			/* 自主 OOB 异常不阻断主流程 */
+		}
+	}
+
+	// 3. v7.0 多跳攻击链自动合成验证与受控原生 CDP 闭环（含 brokenAtStep / breakthrough_signal 回灌信念图）
+	if (!opts?.signal?.aborted) {
+		try {
+			const curForChain = loadState(normRoot);
+			if (curForChain) {
+				const bGraph = initBeliefGraphFromState(curForChain, loadOrInitBeliefGraph(normRoot, curForChain));
+				const chainRes = await runAutonomousChainVerification(curForChain, normRoot, sc, {
+					beliefGraph: bGraph,
+					maxVerifyChains: 1,
+				});
+				if (chainRes.executedResults.length > 0) {
+					withLock(normRoot, () => {
+						const s = loadState(normRoot);
+						if (!s) return;
+						const addedChainFids: string[] = [];
+						for (const cf of chainRes.candidateFacts) {
+							if (cf.key && Object.values(s.facts).some((x) => x.key === cf.key)) continue;
+							const fid = nextFactId(s);
+							const stored: Fact = {
+								...cf,
+								id: fid,
+								verified: false,
+								verifyStage: "candidate",
+								evidenceSeq: getLatestLedgerSeq(normRoot),
+							};
+							s.facts[fid] = stored;
+							addedChainFids.push(fid);
+							const vSpec = buildDoubleBlindVerifyIntentSpec(s, stored);
+							if (vSpec) appendIntentSpecs(s, [vSpec]);
+						}
+						saveBeliefGraph(normRoot, s, bGraph);
+						if (addedChainFids.length > 0) {
+							syncAssetsFromFacts(s);
+							saveState(normRoot, s);
+							opts?.onStateChanged?.(s);
+						}
+						if (addedChainFids.length > 0 || chainRes.brokenChains.length > 0) {
+							logEvent(normRoot, {
+								type: "auto_chain_verify",
+								candidateFacts: addedChainFids,
+								brokenChains: chainRes.brokenChains,
+							});
+						}
+					});
+				}
+				if ((process.env.NUWA_AUTO_CDP ?? "0").trim() === "1" && !opts?.signal?.aborted) {
+					await runAutonomousCdpLoop(curForChain, normRoot, sc, { enableCapture: true });
+				}
+			}
+		} catch {
+			/* 自主攻击链/CDP 闭环异常不阻断主流程 */
 		}
 	}
 

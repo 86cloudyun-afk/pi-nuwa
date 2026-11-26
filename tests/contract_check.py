@@ -153,8 +153,14 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
         "omp/reporting.ts",
         "omp/ui.ts",
         "omp/ui-native.ts",
+        "omp/cdp-bridge.ts",
+        "omp/chain-composer.ts",
+        "omp/specialist-squad.ts",
+        "omp/kb-v2.ts",
+        "omp/dispatch-bridge.ts",
         "omp/env.d.ts",
         "core/protocol.ts",
+        "core/engine.ts",
         "core/mcp-server.ts",
         "bin/nuwa-mcp",
         "tsconfig.json",
@@ -162,12 +168,18 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
         "kb/seed-cards.json",
         "kb/seed-cves.json",
         "kb/seed-techniques.json",
+        "kb/seed-v7-pack.json",
         "kb/build-kb.ts",
         "benchmarks/targets.json",
         "benchmarks/run-eval.ts",
         "benchmarks/run-l2-eval.ts",
+        "benchmarks/l3-live/run-l3-eval.ts",
         "agents/fujiang.md",
         "agents/nuwa-verifier.md",
+        "agents/nuwa-scout.md",
+        "agents/nuwa-spa-reverser.md",
+        "agents/nuwa-auth-breaker.md",
+        "agents/nuwa-code-auditor.md",
         "config/autoexec.example.json",
         "docker/Dockerfile.sandbox",
         "bin/nuwa-autonomous",
@@ -341,12 +353,14 @@ import { join } from "node:path";
 const agentHome = mkdtempSync(join(tmpdir(), "nuwa-contract-home-"));
 process.env.PI_AGENT_HOME = agentHome;
 const ompDir = process.env.NUWA_OMP_DIR!;
-const escaped = ompDir.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+const coreDir = join(ompDir, "..", "core");
+const escapedOmp = ompDir.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
+const escapedCore = coreDir.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&");
 const transpiler = new Bun.Transpiler({ loader: "ts" });
 Bun.plugin({
   name: "nuwa-contract-async-ext",
   setup(build) {
-    build.onLoad({ filter: new RegExp(`^${escaped}/.*\\\\.ts$`) }, async (args) => {
+    build.onLoad({ filter: new RegExp(`^(?:${escapedOmp}|${escapedCore})/.*\\\\.ts$`) }, async (args) => {
       const text = await Bun.file(args.path).text();
       return { contents: transpiler.transformSync(text), loader: "js" };
     });

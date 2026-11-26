@@ -30,7 +30,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { maskSecretValue, redactVaultSecrets } from "./session-vault";
-import { NuwaSqliteStore, resolveStorageBackend, sqliteDbPath } from "./sqlite-store";
+import { NuwaSqliteStore, migrateJsonToSqlite, resolveStorageBackend, sqliteDbPath } from "./sqlite-store";
 
 export type CalibrationSettlementSource =
 	| "verifier-gate"
@@ -739,9 +739,19 @@ function validateNonNegativeNumber(val: unknown, fieldName: string): number {
 
 function syncCalibrationRecordToSqlite(root: string, record: CalibrationRecord): void {
 	const backend = resolveStorageBackend(root);
-	if (backend !== "sqlite" && backend !== "dual" && !existsSync(sqliteDbPath(root))) return;
+	const dbFile = sqliteDbPath(root);
+	const hasDb = existsSync(dbFile);
+	if (backend !== "sqlite" && backend !== "dual" && !hasDb) return;
+	const stateJsonFile = join(resolve(root), ".nuwa", "state.json");
+	if (!hasDb && !existsSync(stateJsonFile)) {
+		// 尚未创建任何项目状态（如纯校准算法独立测试目录）时不误创建半空 nuwa.db，待项目初始化/迁移时自动全量摄入 calibration.jsonl
+		return;
+	}
 	let store: NuwaSqliteStore | null = null;
 	try {
+		if (!hasDb && existsSync(stateJsonFile)) {
+			migrateJsonToSqlite(root);
+		}
 		store = new NuwaSqliteStore(root);
 		store.upsertCalibrationRecord({
 			predictionId: record.predictionId,

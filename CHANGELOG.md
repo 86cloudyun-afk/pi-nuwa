@@ -1,5 +1,27 @@
 # Changelog
 
+## 7.0.0 — 2026-11-26
+
+单核合一收敛、SQLite WAL 默认转正、5+1 专精特种小队、KB 2.0 混合语义治理、原生 CDP 页面借壳加签差分、多跳攻击链能力合成与 L3 真实进程树靶场大版本：在严格保持 12 个 `nuwa_*` 工具名称与全部历史导出 100% 向后兼容的前提下，将 `omp/nuwa.ts` 从 3,990 行瘦身至 `< 700` 行，消除 `omp` 与 `MCP` 双核分叉，全面打通六大 v7 核心引擎与第 8 道阶段门禁 `g7_v7.sh`。
+
+### 六大核心跃升与架构收敛
+
+- **单核合一与主入口极致瘦身（`core/engine.ts` + `omp/dispatch-bridge.ts` + `omp/nuwa.ts` + `core/mcp-server.ts`）**：
+  - 新增宿主无关单一权威执行引擎 `NuwaUnifiedEngine`（`core/engine.ts`），统一承载全部 12 个 `nuwa_*` 工具、28 个 `/nuwa` 斜杠子命令及 `#53/#54/#55` 终态防复活/防降级、反自证校准结算、只读零写盘与出口代理掩码守卫；`omp/nuwa.ts`（`< 700` 行，严格 `< 1,000` 行红线）与 `core/mcp-server.ts`（`NuwaCoreEngine`）全面委托单核执行，彻底终结双写分叉。
+  - 新增零私有全局态异步派单桥接引擎 `omp/dispatch-bridge.ts`（`DispatchBridgeStore`），完整处理 `omp 18.16.0` `async.state === "running"` 乱序派单竞态、4 MiB `taskFile` 读取与占位符替换、`eval` 词法安全占位符展开与注释剥离平衡解析，以及 `SubagentWatchdog` 一对一精准回收。
+- **SQLite WAL 默认后端转正与双核心不变量（`omp/sqlite-store.ts` + `omp/storage.ts`）**：
+  - `resolveStorageBackend` 在未设置 `NUWA_STORAGE_BACKEND` 时默认转正返回 `"sqlite"`，并完整保留显式 `"sqlite" | "json" | "dual"` 切换能力。
+  - 严格坚守「遗留 JSON 只读零写盘」（仅有 `.nuwa/state.json` 无 `nuwa.db` 时执行任何只读状态/命令/诊断操作绝不创建 `nuwa.db`/`-wal`/`-shm`）与「兼容快照同步」（默认 `sqlite` 模式发生写入时自动幂等迁移历史 JSON 状态并同步维护 `.nuwa/state.json` 兼容快照）。
+- **原生 CDP 流量桥接与页面内借壳加签差分（`omp/cdp-bridge.ts` + `/nuwa cdp`）**：
+  - 零第三方依赖自动探测本机 Headless Chrome 直连原生 `WebSocket` CDP JSON-RPC（异常与退出时进程组强制清理零残留）；`captureCdpSessionTraffic` 在拦截层强制执行 `N-007` Scope 校验（主动 `Fetch.failRequest` 阻断越界外连），脱敏录制至 `TrafficRecorder` 并同步认证凭据入 `SessionVault`；`executeInPageSignedProbe` 与 `runCdpSignedAuthDiff` 在同源受控页面上下文调用前端原生加签钩子执行纯只读 `GET/HEAD/OPTIONS` 鉴权差分，免逆向穿透动态 HMAC/时间戳/Nonce 签名识别 BOLA/BFLA。
+- **多跳攻击链能力合成与有状态验证回灌（`omp/chain-composer.ts` + `omp/auto-loops.ts` + `omp/graph.ts` + `/nuwa chains`）**：
+  - 基于前置-后置能力标签（`extractFactCapabilities`）在有界深度 `2..4` 跳与严格防环约束下合成组合攻击链（`synthesizeAttackChains`），自动编译为带动态变量提取替换的只读 `TrafficStep[]`（`compileChainToTrafficSequence`）并执行有状态验证（`executeAttackChainVerification`）；全链打穿时产出 `candidate` 复合漏洞并触发信念图 `breakthrough_signal`，中间第 `k` 跳受阻时精准定界 `brokenAtStep` 与 `brokenFactId` 回灌 `belief-search.ts` 级联衰减。
+- **5+1 专精特种小队与 KB 2.0 混合语义知识治理（`omp/specialist-squad.ts` + `agents/*.md` + `omp/kb-v2.ts` + `kb/seed-v7-pack.json` + `/nuwa squad`）**：
+  - 交付 `nuwa-scout`、`nuwa-spa-reverser`、`nuwa-auth-breaker`、`nuwa-code-auditor`、`nuwa-verifier` + `fujiang` 共 6 个专精角色模板与联合路由器 `recommendSpecialistAndModel`，与 `omp/lineage.ts`、`omp/graph-planner.ts`、`omp/dispatch-bridge.ts` 全链路贯通。
+  - `kb/build-kb.ts` 与 `omp/kb.ts` 自动摄入 `kb/seed-v7-pack.json` 构建 `>= 520` 条统一知识库；`nuwa_kb` 默认启用 `hybridKbSearch`（FTS5 + 中英同义扩展 + TF-IDF 余弦 + 字符 N-gram + 64-bit SimHash），`distillProjectExperience` 联动 `governDistilledExperience` 基于机械核验记录自动晋升 `promoted` 或冻结 `quarantined` 退化经验卡。
+- **L3 真实进程树 SOCKS5h 靶场与第 8 道阶段门禁（`benchmarks/l3-live/*` + `tests/gates/g7_v7.sh`）**：
+  - 新增零外部依赖 `socks5-server.ts`、`mock-omp-bin.ts` 与 `run-l3-eval.ts`，真实通过 `Bun.spawn` 拉起 `bin/nuwa-autonomous` 进程树验证异步派单+SOCKS5h 实锤、硬化零洞封盘防复活、`/tmp` 停止项目自动迁移接管三大实战场景；`install.sh` 升级一键部署全套 v7 模块、6 个小队模板并强校验 `kb.db >= 520` 条。
+
 ## 6.0.0 — 2026-11-26
 
 下一代自主认知安全引擎、架构解耦与跨宿主协议标准化大版本：在 100% 保持 12 个 `nuwa_*` 核心工具名称与既有契约零破坏的前提下，完成巨石 `omp/graph.ts` 无环三层拆解，全面交付 **SQLite WAL 权威状态存储与全文检索引擎**、**自主 AuthDiff/OOB 闭环驱动**、**贝叶斯信念与预期信息增益（VoI）前沿搜索引擎**、**反自证机械对账校准核与自适应模型路由**、**结构化 HTTP 流量工作台与只读契约变异器**、**多语言黑白盒混合审计双向桥接**、**独立核心协议层与跨宿主 MCP Server（`bin/nuwa-mcp`）**，以及 **L2 离线合成五场景微基准与校准硬门禁**。

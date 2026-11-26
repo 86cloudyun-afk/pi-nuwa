@@ -301,7 +301,8 @@ afterEach(async () => {
 describe("v6.0 SQLite WAL 权威状态存储引擎 (omp/sqlite-store.ts)", () => {
 	test("初始化 PRAGMA、10 张规范表结构与存储后端策略解析", () => {
 		const root = makeTmpDir();
-		expect(resolveStorageBackend(root, {})).toBe("json");
+		// v7.0 起未配置环境变量时默认转正为 sqlite，同时保留显式 json/sqlite/dual 切换
+		expect(resolveStorageBackend(root, {})).toBe("sqlite");
 		expect(resolveStorageBackend(root, { NUWA_STORAGE_BACKEND: "sqlite" })).toBe("sqlite");
 		expect(resolveStorageBackend(root, { NUWA_STORAGE_BACKEND: "dual" })).toBe("dual");
 		expect(resolveStorageBackend(root, { NUWA_STORAGE_BACKEND: "json" })).toBe("json");
@@ -351,10 +352,18 @@ describe("v6.0 SQLite WAL 权威状态存储引擎 (omp/sqlite-store.ts)", () =>
 		const original = buildSampleState();
 
 		// 1. 先落盘存量 JSON 状态与 journal / exec-ledger / calibration / traffic
-		saveState(root, structuredClone(original), { reason: "init" });
-		const savedJsonState = loadState(root)!;
-		journalAppend(root, { type: "fact_add", factId: "F1", note: "历史侦察事件" });
-		journalAppend(root, { type: "intent_done", intentId: "I1", note: "完成订单核验" });
+		const prevBackend = process.env.NUWA_STORAGE_BACKEND;
+		let savedJsonState: ReturnType<typeof loadState>;
+		process.env.NUWA_STORAGE_BACKEND = "json";
+		try {
+			saveState(root, structuredClone(original), { reason: "init" });
+			savedJsonState = loadState(root)!;
+			journalAppend(root, { type: "fact_add", factId: "F1", note: "历史侦察事件" });
+			journalAppend(root, { type: "intent_done", intentId: "I1", note: "完成订单核验" });
+		} finally {
+			if (prevBackend === undefined) delete process.env.NUWA_STORAGE_BACKEND;
+			else process.env.NUWA_STORAGE_BACKEND = prevBackend;
+		}
 		writeFileSync(
 			join(root, ".nuwa", "exec-ledger.jsonl"),
 			`${JSON.stringify({
@@ -1555,25 +1564,32 @@ describe("v6.0.0 Boost 自检加固回归（文件锁原子落锁与 SQLite Jour
 	test("migrateJsonToSqlite 迁移含 prediction+settlement 事件流的 calibration.jsonl 不丢结算，且无 jsonl 时时间线可从 SQLite 生成", () => {
 		const root = makeTmpDir("nuwa-mig-calib-");
 		const st = buildSampleState("http://127.0.0.1:18088", "pentest");
-		saveState(root, st);
-		recordPrediction(root, {
-			predictionId: "pred-mig-1",
-			intentId: "i001",
-			taskCategory: "recon",
-			modelId: "model-fast",
-			predictedConfidence: 0.7,
-			estimatedTokens: 800,
-			note: "init pred",
-		});
-		settlePrediction(root, {
-			predictionId: "pred-mig-1",
-			outcome: 0,
-			isFalsePositive: true,
-			actualTokens: 900,
-			durationMs: 250,
-			source: "verifier-gate",
-			note: "settled fp",
-		});
+		const prevBackendPrep = process.env.NUWA_STORAGE_BACKEND;
+		process.env.NUWA_STORAGE_BACKEND = "json";
+		try {
+			saveState(root, st);
+			recordPrediction(root, {
+				predictionId: "pred-mig-1",
+				intentId: "i001",
+				taskCategory: "recon",
+				modelId: "model-fast",
+				predictedConfidence: 0.7,
+				estimatedTokens: 800,
+				note: "init pred",
+			});
+			settlePrediction(root, {
+				predictionId: "pred-mig-1",
+				outcome: 0,
+				isFalsePositive: true,
+				actualTokens: 900,
+				durationMs: 250,
+				source: "verifier-gate",
+				note: "settled fp",
+			});
+		} finally {
+			if (prevBackendPrep === undefined) delete process.env.NUWA_STORAGE_BACKEND;
+			else process.env.NUWA_STORAGE_BACKEND = prevBackendPrep;
+		}
 
 		const mig = migrateJsonToSqlite(root);
 		expect(mig.ok).toBe(true);

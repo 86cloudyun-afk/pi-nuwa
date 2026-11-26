@@ -529,7 +529,7 @@ describe("3. kb/seed-v7-pack.json 种子资产门禁与 ingestV7SeedPack 幂等�
 		const dbPath = join(dir, "kb.db");
 
 		// 先按 v4 buildKb 建基础 140 条库并写入 1 条历史蒸馏经验
-		const v4Stats = buildKb({ outPath: dbPath, seedDir: KB_DIR });
+		const v4Stats = buildKb({ outPath: dbPath, seedDir: KB_DIR, includeV7SeedPack: false });
 		expect(v4Stats.cards + v4Stats.cves + v4Stats.techniques).toBe(140);
 
 		const initDb = new Database(dbPath);

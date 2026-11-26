@@ -1,6 +1,15 @@
-# 女娲模式演进路线图（v0.3 → v6.0）
+# 女娲模式演进路线图（v0.3 → v7.0）
 
-## 当前里程碑：v6.0.0（2026-11-26 已交付）
+## 当前里程碑：v7.0.0（2026-11-26 已交付）
+
+- **单核合一与主入口瘦身（`core/engine.ts` + `omp/dispatch-bridge.ts` + `omp/nuwa.ts`）**：将 12 个 `nuwa_*` 工具与 28 个 `/nuwa` 子命令统一收敛至 `NuwaUnifiedEngine`，`omp/nuwa.ts` 瘦身至 `< 1,000` 行，`core/mcp-server.ts` 全面委托单核消除双写分叉，异步乱序派单与 `eval` 词法展开由 `DispatchBridgeStore` 独立承载。
+- **SQLite WAL 默认存储转正**：`resolveStorageBackend` 默认返回 `"sqlite"`（保留 `sqlite|json|dual` 显式切换），同时严格满足「遗留 JSON 只读零写盘」与「写入自动同步 `.nuwa/state.json` 兼容快照」两大不变量。
+- **原生 CDP 流量桥接与页面借壳加签差分（`omp/cdp-bridge.ts` + `/nuwa cdp`）**：零依赖拉起本机 Headless Chrome 直连 CDP WebSocket，拦截层强制 Scope 阻断越界请求、脱敏录制流量并同步认证态，页面内借壳调用前端加签钩子免逆向识别动态签名 BOLA/BFLA。
+- **多跳攻击链能力合成与验证回灌（`omp/chain-composer.ts` + `/nuwa chains`）**：前置-后置能力抽取、2～4 跳有界防环合成、只读 `TrafficStep[]` 编译与有状态重放验证，打穿产出 `candidate` 复合漏洞，受阻精准回灌 `brokenAtStep` 至信念图。
+- **5+1 专精特种小队与 KB 2.0 混合语义治理（`omp/specialist-squad.ts` + `omp/kb-v2.ts` + `/nuwa squad`）**：交付 6 个专精角色模板与战绩联合路由器；自动摄入 `kb/seed-v7-pack.json`（`kb.db >= 520` 条），`nuwa_kb` 默认启用中英同义混合语义检索，经验蒸馏接入 `governDistilledExperience` 反自证治理。
+- **L3 真实进程树 SOCKS5h 靶场与第 8 道门禁（`benchmarks/l3-live/*` + `tests/gates/g7_v7.sh`）**：真实子进程树跑通异步派单+SOCKS5h 隧道实锤、封盘防复活与 `/tmp` 迁移接管三大场景，全量 `g0..g7` 八道阶段门禁全绿。
+
+## 历史里程碑：v6.0.0（2026-11-26 已交付）
 
 - **图引擎巨石拆解与无环模块化**：将原 5,141 行 `omp/graph.ts` 拆解为 `omp/graph-planner.ts`、`omp/graph-commands.ts`、`omp/graph.ts`（`< 2,500` 行），维持 12 个 `nuwa_*` 工具名称与全量导出 100% 兼容。
 - **SQLite WAL 权威存储与全文检索（`omp/sqlite-store.ts`）**：支持 `NUWA_STORAGE_BACKEND=json|sqlite|dual`、10 张规范表与 FTS5 混合检索、4 路并发无锁超时写入、坏库自动诊断回退与 `state.json` 兼容快照导出。

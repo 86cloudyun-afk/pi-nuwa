@@ -113,6 +113,23 @@ const V6_EXT_MODULES = [
 	"hybrid-audit.ts",
 ];
 
+const V7_EXT_MODULES = [
+	"cdp-bridge.ts",
+	"chain-composer.ts",
+	"specialist-squad.ts",
+	"kb-v2.ts",
+	"dispatch-bridge.ts",
+];
+
+const SQUAD_AGENT_FILES = [
+	"fujiang.md",
+	"nuwa-verifier.md",
+	"nuwa-scout.md",
+	"nuwa-spa-reverser.md",
+	"nuwa-auth-breaker.md",
+	"nuwa-code-auditor.md",
+];
+
 const DOCTOR_PROBE_TOOLS = [
 	"curl",
 	"openssl",
@@ -128,9 +145,9 @@ const DOCTOR_PROBE_TOOLS = [
 	"jq",
 ];
 
-const KB_TABLES = ["card", "cve", "poc", "technique", "kev", "epss", "experience"];
+const KB_TABLES = ["kb_items", "card", "cve", "poc", "technique", "kev", "epss", "experience"];
 
-const HELP_TEXT = `女娲 v6.0 外层无头守护器与环境自检工具 (nuwa-autonomous)
+const HELP_TEXT = `女娲 v7.0 外层无头守护器与环境自检工具 (nuwa-autonomous)
 
 用法:
   nuwa-autonomous --target <目标> [选项]
@@ -1044,9 +1061,16 @@ function checkAgentTemplates(agentHome) {
 
 	const fujiang = checkOne("fujiang.md");
 	const nuwaVerifier = checkOne("nuwa-verifier.md");
+	const squad = {};
 	const missing = [];
-	if (!fujiang.exists) missing.push("fujiang.md");
-	if (!nuwaVerifier.exists) missing.push("nuwa-verifier.md");
+	for (const af of SQUAD_AGENT_FILES) {
+		const res = checkOne(af);
+		squad[af] = res;
+		if (!res.exists && (af === "fujiang.md" || af === "nuwa-verifier.md")) {
+			missing.push(af);
+		}
+	}
+	const squadMissing = SQUAD_AGENT_FILES.filter((af) => !squad[af]?.exists);
 
 	return {
 		ok: missing.length === 0,
@@ -1054,6 +1078,8 @@ function checkAgentTemplates(agentHome) {
 		dir: agentsDir,
 		fujiang,
 		nuwaVerifier,
+		squad,
+		squadMissing,
 		missing,
 		...(missing.length > 0 ? { reason: `缺少子代理模板: ${missing.join(", ")}` } : {}),
 	};

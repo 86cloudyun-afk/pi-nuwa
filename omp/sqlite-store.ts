@@ -784,42 +784,25 @@ export function sqliteDbPath(root: string): string {
 }
 
 /**
- * 读取 `NUWA_STORAGE_BACKEND` 环境变量解析生效存储后端：
+ * 读取 `NUWA_STORAGE_BACKEND` 环境变量解析生效存储后端（v7.0 SQLite WAL 正式转正为默认后端）：
  * - `sqlite` / `wal` / `db` -> `"sqlite"`
  * - `dual` / `both` / `hybrid` -> `"dual"`
  * - `json` / `file` / `legacy` -> `"json"`
- * - 未配置或 `auto`：若传入项目目录且 `.nuwa/nuwa.db` 已存在（非空）则返回 `"sqlite"`，否则平滑回退 `"json"` 兼容历史项目。
+ * - 未配置或 `auto`：默认返回 `"sqlite"`（只读路径对仅有 `.nuwa/state.json` 无 `nuwa.db` 的遗留项目严格保持零写盘只读兼容，发生写入时自动无损迁移并同步维护 `state.json` 兼容快照）。
  */
 export function resolveStorageBackend(
 	rootOrOpts?: string | { root?: string; env?: Record<string, string | undefined> },
 	envOverride?: Record<string, string | undefined>,
 ): StorageBackend {
-	const root =
-		typeof rootOrOpts === "string"
-			? rootOrOpts
-			: rootOrOpts && typeof rootOrOpts === "object"
-				? rootOrOpts.root
-				: undefined;
 	const env =
 		envOverride ??
 		(rootOrOpts && typeof rootOrOpts === "object" && rootOrOpts.env ? rootOrOpts.env : process.env);
 
 	const raw = String(env.NUWA_STORAGE_BACKEND ?? "").trim().toLowerCase();
-	if (raw === "sqlite" || raw === "wal" || raw === "db") return "sqlite";
-	if (raw === "dual" || raw === "both" || raw === "hybrid") return "dual";
 	if (raw === "json" || raw === "file" || raw === "legacy") return "json";
-
-	if (root && root.trim()) {
-		try {
-			const dbFile = sqliteDbPath(root);
-			if (existsSync(dbFile) && statSync(dbFile).size > 0) {
-				return "sqlite";
-			}
-		} catch {
-			/* 无法读取则平滑回退 json */
-		}
-	}
-	return "json";
+	if (raw === "dual" || raw === "both" || raw === "hybrid") return "dual";
+	if (raw === "sqlite" || raw === "wal" || raw === "db") return "sqlite";
+	return "sqlite";
 }
 
 // ============================================================================
@@ -1528,7 +1511,7 @@ export class NuwaSqliteStore {
 			);
 			setMeta.run("schema_version", String(SQLITE_SCHEMA_VERSION), ts);
 			setMeta.run("nuwa_schema", String(state.schema ?? SCHEMA), ts);
-			setMeta.run("nuwa_version", String(state.version ?? "6.0.0"), ts);
+			setMeta.run("nuwa_version", String(state.version ?? "7.0.0"), ts);
 			setMeta.run("project_json", JSON.stringify(projectCopy), ts);
 			setMeta.run("seq_json", JSON.stringify(seqCopy), ts);
 			setMeta.run("runtime_json", JSON.stringify(runtimeCopy), ts);
@@ -1736,7 +1719,7 @@ export class NuwaSqliteStore {
 		if (!project) return null;
 
 		const schema = Number(meta.get("nuwa_schema") ?? SCHEMA) || SCHEMA;
-		const version = meta.get("nuwa_version") ?? "6.0.0";
+		const version = meta.get("nuwa_version") ?? "7.0.0";
 		const seq = safeJsonParse<{ fact: number; intent: number }>(meta.get("seq_json"), { fact: 0, intent: 0 });
 		const runtime = safeJsonParse<Runtime>(meta.get("runtime_json"), {} as Runtime);
 

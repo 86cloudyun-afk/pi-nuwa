@@ -77,6 +77,8 @@ import {
 	executeAuthDiffWorkflow,
 	executeBeliefCommand,
 	executeCalibrateCommand,
+	executeCdpCommand,
+	executeChainsCommand,
 	executeCommitWithGates,
 	executeHybridCommand,
 	executeMcpCommand,
@@ -84,6 +86,7 @@ import {
 	executeScopeCommand,
 	executeSessionCommand,
 	executeSessionHealthCommand,
+	executeSquadCommand,
 	executeTrafficCommand,
 	extractIntentTargetKey,
 	extractTarget,
@@ -215,6 +218,9 @@ export const NUWA_SUBCOMMANDS = [
 	"traffic",
 	"hybrid",
 	"mcp",
+	"cdp",
+	"chains",
+	"squad",
 ] as const;
 
 export type NuwaSubcommand = (typeof NUWA_SUBCOMMANDS)[number];
@@ -1295,10 +1301,16 @@ export class NuwaUnifiedEngine {
 				items
 					.map(
 						(it) =>
-							`${it.intent.id}\t${it.intent.phase}\t${it.intent.title}\tfrom=${it.intent.from.join(",") || "-"}\tattempts=${it.intent.attempts}${it.stale ? "\tstale" : ""}`,
+							`${it.intent.id}\t${it.intent.phase}\t${it.intent.title}\tfrom=${it.intent.from.join(",") || "-"}\tattempts=${it.intent.attempts}${it.recommendedSpecialist ? `\tspecialist=${it.recommendedSpecialist}` : ""}${it.stale ? "\tstale" : ""}`,
 					)
 					.join("\n"),
-				{ root, ids: items.map((i) => i.intent.id) },
+				{
+					root,
+					ids: items.map((i) => i.intent.id),
+					specialists: Object.fromEntries(
+						items.map((i) => [i.intent.id, i.recommendedSpecialist ?? "fujiang"]),
+					),
+				},
 			);
 		} catch (e) {
 			return toolError(e);
@@ -1742,7 +1754,12 @@ export class NuwaUnifiedEngine {
 				cleanupTrackedProcesses(root, { reason: "nuwa_complete:seal" });
 				if (isPausedState(root)) setPausedState(root, false, "sealed_negative");
 				try {
-					distillProjectExperience(sealed.state, { agentHome: this.resolveAgentHome(hooks), negativeOnly: true });
+					const calibRecs = hasCalibrationRecords(root) ? loadCalibrationRecords(root) : [];
+					distillProjectExperience(sealed.state, {
+						agentHome: this.resolveAgentHome(hooks),
+						negativeOnly: true,
+						calibrationRecords: calibRecs,
+					});
 				} catch {
 					/* 蒸馏异常不阻断封盘 */
 				}
@@ -1817,7 +1834,11 @@ export class NuwaUnifiedEngine {
 			let distillLine = "";
 			let distilledCount = 0;
 			try {
-				const dist = distillProjectExperience(updated, { agentHome: this.resolveAgentHome(hooks) });
+				const calibRecs = hasCalibrationRecords(root) ? loadCalibrationRecords(root) : [];
+				const dist = distillProjectExperience(updated, {
+					agentHome: this.resolveAgentHome(hooks),
+					calibrationRecords: calibRecs,
+				});
 				distilledCount = dist.updated;
 				logEvent(root, {
 					type: "experience_distill",
@@ -2264,7 +2285,12 @@ export class NuwaUnifiedEngine {
 			}
 			logEvent(root, { type: "stop_manual", reason, cleanedProcesses: procCleanup.cleaned.length });
 			try {
-				const dist = distillProjectExperience(updated, { agentHome: this.resolveAgentHome(hooks), negativeOnly: true });
+				const calibRecs = hasCalibrationRecords(root) ? loadCalibrationRecords(root) : [];
+				const dist = distillProjectExperience(updated, {
+					agentHome: this.resolveAgentHome(hooks),
+					negativeOnly: true,
+					calibrationRecords: calibRecs,
+				});
 				if (dist.updated > 0) {
 					logEvent(root, {
 						type: "experience_distill",
@@ -2382,6 +2408,36 @@ export class NuwaUnifiedEngine {
 		}
 		if (arg === "mcp" || arg.startsWith("mcp ")) {
 			const r = executeMcpCommand(found, arg.slice(3));
+			return emit(r.msg, r.level);
+		}
+		if (arg === "squad" || arg.startsWith("squad ")) {
+			const r = executeSquadCommand(found, arg.slice(5));
+			return emit(r.msg, r.level);
+		}
+		if (arg === "chains" || arg.startsWith("chains ")) {
+			const chainSub = arg.slice(6).trim();
+			if (/^verify(?:\s|$)/i.test(chainSub)) {
+				const blocked = guardTerminalMutation("/nuwa chains verify");
+				if (blocked) return blocked;
+			}
+			const r = await executeChainsCommand(found, arg.slice(6));
+			if (/^verify(?:\s|$)/i.test(chainSub) && found) {
+				const stAfter = loadStateZeroWrite(found);
+				if (stAfter) this.refreshUi(hooks, found, stAfter, true);
+			}
+			return emit(r.msg, r.level);
+		}
+		if (arg === "cdp" || arg.startsWith("cdp ")) {
+			const cdpSub = arg.slice(3).trim();
+			if (/^(?:capture|authdiff)(?:\s|$)/i.test(cdpSub)) {
+				const blocked = guardTerminalMutation(`/nuwa cdp ${cdpSub.split(/\s+/)[0]}`);
+				if (blocked) return blocked;
+			}
+			const r = await executeCdpCommand(found, arg.slice(3));
+			if (/^(?:capture|authdiff)(?:\s|$)/i.test(cdpSub) && found) {
+				const stAfter = loadStateZeroWrite(found);
+				if (stAfter) this.refreshUi(hooks, found, stAfter, true);
+			}
 			return emit(r.msg, r.level);
 		}
 
@@ -2739,7 +2795,12 @@ export class NuwaUnifiedEngine {
 			}
 			logEvent(found, { type: "stop", reason, via: "command" });
 			try {
-				const dist = distillProjectExperience(st, { agentHome: this.resolveAgentHome(hooks), negativeOnly: true });
+				const calibRecs = hasCalibrationRecords(found) ? loadCalibrationRecords(found) : [];
+				const dist = distillProjectExperience(st, {
+					agentHome: this.resolveAgentHome(hooks),
+					negativeOnly: true,
+					calibrationRecords: calibRecs,
+				});
 				if (dist.updated > 0) {
 					logEvent(found, {
 						type: "experience_distill",

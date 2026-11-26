@@ -649,7 +649,19 @@ export function journalAppend(root: string, rec: Record<string, unknown>): void 
 	try {
 		const backend = resolveStorageBackend(root);
 		if (backend === "sqlite" || backend === "dual") {
-			appendJournalSqlite(root, rec);
+			const dbFile = sqliteDbPath(root);
+			const hasDb =
+				existsSync(dbFile) &&
+				(() => {
+					try {
+						return statSync(dbFile).size > 0;
+					} catch {
+						return false;
+					}
+				})();
+			if (hasDb) {
+				appendJournalSqlite(root, rec);
+			}
 		}
 	} catch {
 		/* SQLite journal 写入异常不阻塞主流程 */

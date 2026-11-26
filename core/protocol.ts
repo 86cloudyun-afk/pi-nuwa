@@ -13,7 +13,7 @@ export const JSONRPC_VERSION = "2.0" as const;
 export const NUWA_MCP_PROTOCOL_VERSION = "2024-11-05" as const;
 
 export const NUWA_CORE_SERVER_NAME = "nuwa-mcp" as const;
-export const NUWA_CORE_SERVER_VERSION = "6.0.0" as const;
+export const NUWA_CORE_SERVER_VERSION = "7.0.0" as const;
 
 /** 标准 JSON-RPC 2.0 错误码常量。 */
 export const JSONRPC_ERROR_CODES = {

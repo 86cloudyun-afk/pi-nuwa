@@ -1,13 +1,13 @@
 /**
- * 女娲 v6.0 共享类型定义。
+ * 女娲 v7.0 共享类型定义。
  *
  * 汇总核心状态机、范围护栏、证据账本、多领域 Profile、会话保险箱、
  * 双盲复验闸门、零信任沙盒、封盘终态、表面分域去重、信念图搜索、
- * 机械对账校准核、SQLite WAL 存储与世代轮转的公共类型，
+ * 机械对账校准核、专精特种小队、多跳攻击链、原生 CDP 桥接、SQLite WAL 存储与世代轮转的公共类型，
  * 供各子模块 `import type` 使用，并由 `omp/nuwa.ts` 完整 re-export 以保持 100% 向后兼容。
  */
 
-export const NUWA_VERSION = "6.0.0";
+export const NUWA_VERSION = "7.0.0";
 export const PHASE_ORDER = ["recon", "surface", "vuln", "exploit", "post", "report"] as const;
 
 export type ProfileMode = "ctf" | "pentest" | "audit" | "coding" | "ops";
@@ -448,6 +448,12 @@ export interface FrontierItem {
 	intent: Intent;
 	stale: boolean;
 	missing: string[];
+	/** v7.0 专精特种小队推荐角色（如 nuwa-scout / nuwa-spa-reverser / nuwa-auth-breaker / nuwa-code-auditor / nuwa-verifier / fujiang）。 */
+	recommendedSpecialist?: string;
+	/** v7.0 联合校准推荐模型 ID。 */
+	recommendedModel?: string;
+	/** v7.0 专精路由简要理由。 */
+	specialistReason?: string;
 }
 
 export interface ExpansionResult {

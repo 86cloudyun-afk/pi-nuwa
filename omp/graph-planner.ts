@@ -61,6 +61,8 @@ import {
 	type BeliefGraph,
 	type SearchPivotRecommendation,
 } from "./belief-search";
+import { hasCalibrationRecords, loadCalibrationRecords, type CalibrationRecord } from "./calibration";
+import { classifyIntentForSpecialist, recommendSpecialistAndModel } from "./specialist-squad";
 
 export function kbLookup(query: string, kind: KbLookupKind, limit = 5): string {
 	return kbLookupSafe(query, kind, limit, { agentHome: getAgentHome() });
@@ -1783,7 +1785,35 @@ export function frontierList(st: NuwaState, limit = 20, claimTtl = 900, root?: s
 		return it.priority + boost + (beliefDeltaMap.get(it.id) ?? 0);
 	};
 	out.sort((a, b) => effectivePriority(b.intent) - effectivePriority(a.intent) || a.intent.id.localeCompare(b.intent.id));
-	return out.slice(0, Math.max(1, limit));
+	const topItems = out.slice(0, Math.max(1, limit));
+
+	// v7.0 纯只读零写盘标注 5+1 专精特种小队推荐角色与适配模型
+	let calibRecords: CalibrationRecord[] | null = null;
+	const effRoot = root || getLoadedStateRoot(st);
+	if (effRoot && (process.env.NUWA_CALIBRATION ?? "1").trim() !== "0" && hasCalibrationRecords(effRoot)) {
+		try {
+			calibRecords = loadCalibrationRecords(effRoot);
+		} catch {
+			calibRecords = null;
+		}
+	}
+	for (const item of topItems) {
+		try {
+			if (calibRecords && calibRecords.some((r) => r.settled)) {
+				const rec = recommendSpecialistAndModel(item.intent, st, calibRecords);
+				item.recommendedSpecialist = rec.recommendedRole;
+				item.recommendedModel = rec.recommendedModel;
+				item.specialistReason = rec.reason;
+			} else {
+				const cls = classifyIntentForSpecialist(item.intent, st);
+				item.recommendedSpecialist = cls.role;
+				item.specialistReason = cls.reason;
+			}
+		} catch {
+			item.recommendedSpecialist = "fujiang";
+		}
+	}
+	return topItems;
 }
 
 /** 已认领但未过 TTL 的意图：这些不是 frontier，但必须先 commit 才能推进。 */

@@ -4,7 +4,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 # 本版本已交付的阶段门禁：只增不减
-DELIVERED=(0_baseline 1_r1 2_r2r7 3_v4 4_v5 5_v51 6_v6)
+DELIVERED=(0_baseline 1_r1 2_r2r7 3_v4 4_v5 5_v51 6_v6 7_v7)
 EXPECTED="gates/expected"
 RELEASED="gates/released.json"
 

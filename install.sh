@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# pi-nuwa v6.0 安装器：一键部署 omp 原生扩展全模块、独立核心与跨宿主 MCP Server (nuwa-mcp)、
-# 随仓便携知识库 kb.db、合规子代理模板（fujiang + nuwa-verifier）、nuwa-pentest skill 与无头守护器 nuwa-autonomous。
+# pi-nuwa v7.0 安装器：一键部署 omp 原生扩展全模块、单核合一引擎与跨宿主 MCP Server (nuwa-mcp)、
+# KB 2.0 混合语义便携知识库 kb.db (>=520条)、5+1 专精小队代理模板（6个）、nuwa-pentest skill 与无头守护器 nuwa-autonomous。
 #
 # 退出码：0 成功 / 1 依赖或自检缺失 / 2 参数错误 / 3 回滚失败
 set -euo pipefail
@@ -55,6 +55,11 @@ EXT_MODULES=(
   "omp/oob.ts"
   "omp/hypothesis.ts"
   "omp/reporting.ts"
+  "omp/cdp-bridge.ts"
+  "omp/chain-composer.ts"
+  "omp/specialist-squad.ts"
+  "omp/kb-v2.ts"
+  "omp/dispatch-bridge.ts"
   "omp/env.d.ts"
 )
 
@@ -63,12 +68,17 @@ KB_FILES=(
   "kb/seed-cards.json"
   "kb/seed-cves.json"
   "kb/seed-techniques.json"
+  "kb/seed-v7-pack.json"
   "kb/build-kb.ts"
 )
 
 AGENT_TEMPLATES=(
   "fujiang.md"
   "nuwa-verifier.md"
+  "nuwa-scout.md"
+  "nuwa-spa-reverser.md"
+  "nuwa-auth-breaker.md"
+  "nuwa-code-auditor.md"
 )
 
 while [[ $# -gt 0 ]]; do
@@ -140,6 +150,7 @@ done
 [[ -f "$REPO_DIR/skills/nuwa-pentest/SKILL.md" ]] || die "仓库缺少 skills/nuwa-pentest/SKILL.md" 1
 [[ -f "$REPO_DIR/bin/nuwa-autonomous" ]] || die "仓库缺少 bin/nuwa-autonomous" 1
 [[ -f "$REPO_DIR/core/protocol.ts" ]] || die "仓库缺少 core/protocol.ts" 1
+[[ -f "$REPO_DIR/core/engine.ts" ]] || die "仓库缺少 core/engine.ts" 1
 [[ -f "$REPO_DIR/core/mcp-server.ts" ]] || die "仓库缺少 core/mcp-server.ts" 1
 [[ -f "$REPO_DIR/bin/nuwa-mcp" ]] || die "仓库缺少 bin/nuwa-mcp" 1
 
@@ -177,29 +188,32 @@ if [[ -d "$EXT_DIR" ]]; then
 fi
 
 rm -rf "$EXT_DIR"
-mkdir -p "$EXT_DIR/kb" "$EXT_DIR/config"
+mkdir -p "$EXT_DIR/config"
 cp "$REPO_DIR/omp/nuwa.ts" "$EXT_DIR/index.ts" || die "扩展主入口复制失败" 1
 for mod in "${EXT_MODULES[@]}"; do
   base="$(basename "$mod")"
   cp "$REPO_DIR/$mod" "$EXT_DIR/$base" || die "$base 复制失败" 1
 done
-for kbf in "${KB_FILES[@]}"; do
-  cp "$REPO_DIR/$kbf" "$EXT_DIR/kb/$(basename "$kbf")" || die "$kbf 复制失败" 1
-done
 cp "$REPO_DIR/config/autoexec.example.json" "$EXT_DIR/config/autoexec.example.json" || die "autoexec.example.json 复制失败" 1
-say "  已安装 nuwa-omp v${INSTALLED_VER}（index.ts + ${#EXT_MODULES[@]} 个模块 + kb/ + config/，12 个 nuwa_* 工具）"
 
-# 部署 v6.0 独立核心协议层与跨宿主 MCP Server ($AGENT_HOME/nuwa-core)
+# 部署 v7.0 单核合一核心层与跨宿主 MCP Server ($AGENT_HOME/nuwa-core)，并对齐扩展与 kb 双向相对导入路径
 CORE_DIR="$AGENT_HOME/nuwa-core"
 rm -rf "$CORE_DIR"
-mkdir -p "$CORE_DIR/core" "$CORE_DIR/bin"
+mkdir -p "$CORE_DIR/core" "$CORE_DIR/bin" "$CORE_DIR/kb"
 cp "$REPO_DIR/core/protocol.ts" "$CORE_DIR/core/protocol.ts" || die "core/protocol.ts 复制失败" 1
+cp "$REPO_DIR/core/engine.ts" "$CORE_DIR/core/engine.ts" || die "core/engine.ts 复制失败" 1
 cp "$REPO_DIR/core/mcp-server.ts" "$CORE_DIR/core/mcp-server.ts" || die "core/mcp-server.ts 复制失败" 1
+for kbf in "${KB_FILES[@]}"; do
+  cp "$REPO_DIR/$kbf" "$CORE_DIR/kb/$(basename "$kbf")" || die "$kbf 复制失败" 1
+done
 cp "$REPO_DIR/bin/nuwa-mcp" "$CORE_DIR/bin/nuwa-mcp" || die "bin/nuwa-mcp 复制失败" 1
 chmod +x "$CORE_DIR/bin/nuwa-mcp"
 ln -sfn "$EXT_DIR" "$CORE_DIR/omp"
+ln -sfn "$CORE_DIR/kb" "$EXT_DIR/kb"
+ln -sfn "$CORE_DIR/core" "$AGENT_HOME/extensions/core"
 ln -sfn "$EXT_DIR/index.ts" "$EXT_DIR/nuwa.ts"
-say "  已部署独立核心与跨宿主 MCP Server: $CORE_DIR/bin/nuwa-mcp"
+say "  已安装 nuwa-omp v${INSTALLED_VER}（index.ts + ${#EXT_MODULES[@]} 个模块 + core/ + kb/ + config/，12 个 nuwa_* 工具）"
+say "  已部署单核合一引擎与跨宿主 MCP Server: $CORE_DIR/bin/nuwa-mcp"
 
 # v1 的 nuwa-loop 会与新运行时抢 session_stop/tool_call；默认退役，避免双跑。
 if [[ -d "$AGENT_HOME/extensions/nuwa-loop" ]]; then
@@ -217,10 +231,24 @@ if [[ "$CLEAN_KB" -eq 1 ]]; then
   rm -f "$KB_OUT" "${KB_OUT}-shm" "${KB_OUT}-wal"
   say "  已按 --clean-kb 清理旧知识库，准备全新构建"
 fi
-KB_BUILD_OUT="$(env -u BUN_OPTIONS bun "$EXT_DIR/kb/build-kb.ts" --out "$KB_OUT" 2>&1)" || die "便携知识库构建失败: $KB_BUILD_OUT" 1
+KB_BUILD_OUT="$(env -u BUN_OPTIONS bun "$EXT_DIR/kb/build-kb.ts" --out "$KB_OUT" --stats 2>&1)" || die "便携知识库构建失败: $KB_BUILD_OUT" 1
 rm -f "${KB_OUT}-shm" "${KB_OUT}-wal"
 [[ -s "$KB_OUT" ]] || die "便携知识库未成功生成: $KB_OUT" 1
-say "  知识库就绪: $KB_OUT"
+KB_ITEMS_COUNT="$(
+  TARGET_KB="$KB_OUT" env -u BUN_OPTIONS bun -e '
+    import { Database } from "bun:sqlite";
+    const db = new Database(process.env.TARGET_KB!, { readonly: true });
+    try {
+      const row = db.query("SELECT COUNT(*) AS cnt FROM kb_items").get() as { cnt?: number } | null;
+      const cnt = Number(row?.cnt ?? 0);
+      if (cnt < 520) throw new Error(`kb_items count=${cnt} < 520`);
+      console.log(cnt);
+    } finally {
+      db.close();
+    }
+  ' 2>&1
+)" || die "KB 2.0 便携知识库条目数校验未达标 (< 520): $KB_ITEMS_COUNT" 1
+say "  知识库就绪: $KB_OUT (kb_items=${KB_ITEMS_COUNT} >= 520)"
 
 mkdir -p "$AGENT_HOME/skills"
 rm -rf "$AGENT_HOME/skills/nuwa-pentest"
@@ -317,18 +345,20 @@ rm -f "$AGENT_HOME/cache/nuwa-current.d/install-smoke"* "${KB_OUT}-shm" "${KB_OU
 
 # 运行时加载冒烟（复刻 omp 异步 Bun.plugin，使用独立临时会话目录避免污染真实 cache/kb.db，同时校验无 -shm/-wal 下的真实 kb.db 命中与血缘越界拦截）
 SMOKE_OUT="$(
-  REAL_KB_OUT="$KB_OUT" EXT_DIR="$EXT_DIR" EXPECT_VER="$INSTALLED_VER" env -u BUN_OPTIONS bun -e '
+  REAL_KB_OUT="$KB_OUT" EXT_DIR="$EXT_DIR" CORE_DIR="$CORE_DIR" EXPECT_VER="$INSTALLED_VER" env -u BUN_OPTIONS bun -e '
     import { existsSync, mkdtempSync, rmSync } from "node:fs";
     import { tmpdir } from "node:os";
     import { join } from "node:path";
     const extDir = process.env.EXT_DIR!;
+    const coreDir = process.env.CORE_DIR!;
     const realKbOut = process.env.REAL_KB_OUT!;
-    const escaped = extDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedExt = extDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedCore = coreDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const transpiler = new Bun.Transpiler({ loader: "ts" });
     Bun.plugin({
       name: "nuwa-install-async-smoke",
       setup(build) {
-        build.onLoad({ filter: new RegExp(`^${escaped}/.*\\.ts$`) }, async (args) => {
+        build.onLoad({ filter: new RegExp(`^(?:${escapedExt}|${escapedCore})/.*\\.ts$`) }, async (args) => {
           const text = await Bun.file(args.path).text();
           return { contents: transpiler.transformSync(text), loader: "js" };
         });
@@ -434,10 +464,10 @@ DOCTOR_KB_SUMMARY="$(
     });
     const payload = JSON.parse((res.stdout || "").trim() || "{}");
     const kb = payload?.checks?.kb;
-    if (!kb?.ok || !(Number(kb?.totalRecords ?? 0) > 300) || !(Number(kb?.counts?.card ?? 0) >= 36)) {
+    if (!kb?.ok || !(Number(kb?.counts?.kb_items ?? 0) >= 520) || !(Number(kb?.totalRecords ?? 0) >= 520) || !(Number(kb?.counts?.card ?? 0) >= 36)) {
       throw new Error(`doctor KB check failed: ${JSON.stringify(kb)}`);
     }
-    console.log(`ok totalRecords=${kb.totalRecords} card=${kb.counts.card} cve=${kb.counts.cve}`);
+    console.log(`ok kb_items=${kb.counts.kb_items} totalRecords=${kb.totalRecords} card=${kb.counts.card} cve=${kb.counts.cve}`);
   ' 2>&1
 )" || die "无伴生文件状态下 doctor 知识库验收失败: $DOCTOR_KB_SUMMARY" 1
 say "  doctor 知识库验收: $DOCTOR_KB_SUMMARY"

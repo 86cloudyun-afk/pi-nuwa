@@ -123,12 +123,12 @@ afterEach(() => {
 });
 
 describe("v6.0.0 架构不变量与 omp/graph.ts 巨石无环拆解兼容门面", () => {
-	test("严格保持 12 个 nuwa_* 工具、版本号 6.0.0、omp/graph.ts < 2500 行且全量导出零丢失", () => {
+	test("严格保持 12 个 nuwa_* 工具、版本号 7.0.0、omp/graph.ts < 2500 行且全量导出零丢失", () => {
 		const ws = makeWorkspace();
 		const h = setupHarness(ws);
 
-		expect(nuwaMod.VERSION).toBe("6.0.0");
-		expect(nuwaMod.NUWA_VERSION).toBe("6.0.0");
+		expect(nuwaMod.VERSION).toBe("7.0.0");
+		expect(nuwaMod.NUWA_VERSION).toBe("7.0.0");
 		expect(h.tools.size).toBe(12);
 		expect([...h.tools.keys()].sort()).toEqual([...EXPECTED_12_TOOLS].sort());
 

@@ -12,6 +12,14 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import type { CalibrationRecord } from "./calibration";
+import {
+	governDistilledExperience,
+	hybridKbSearch,
+	ingestV7SeedPack,
+	upsertDistilledExperienceCard,
+	type ExperienceGovernanceResult,
+} from "./kb-v2";
 import type { Fact, FactKind, Intent, NuwaState, Phase } from "./types";
 
 export type KbLookupKind = "auto" | "product" | "cve" | "technique" | "poc";
@@ -40,6 +48,7 @@ export interface KbStats {
 	epss: number;
 	templates: number;
 	experiences: number;
+	kbItems?: number;
 	schemaVersion: string;
 	builtAt: string;
 }
@@ -55,11 +64,15 @@ export interface EnsureKbResult {
 
 export interface KbLookupOptions extends KbCommonOptions {
 	includeExperience?: boolean;
+	/** 是否默认启用 KB 2.0 混合语义检索（默认 true）。 */
+	useHybrid?: boolean;
 }
 
 export interface DistillOptions extends KbCommonOptions {
 	/** 仅蒸馏负向避坑经验（适用于人工停止或超时未完成项目，防止正向成功计数虚高）。 */
 	negativeOnly?: boolean;
+	/** 可选关联项目的机械校准记录，用于在经验蒸馏后自动触发 `governDistilledExperience` 优胜劣汰治理。 */
+	calibrationRecords?: readonly CalibrationRecord[];
 }
 
 export interface DistillResult {
@@ -70,6 +83,7 @@ export interface DistillResult {
 	positive: number;
 	negative: number;
 	skipped: number;
+	governance?: ExperienceGovernanceResult;
 }
 
 export interface BoostOptions {
@@ -337,6 +351,7 @@ function readStatsFromDb(db: Database, dbPath: string): KbStats {
 		epss: safeTableCount(db, "epss"),
 		templates: safeTableCount(db, "template"),
 		experiences: safeTableCount(db, "experience"),
+		kbItems: safeTableCount(db, "kb_items"),
 		schemaVersion,
 		builtAt,
 	};
@@ -494,6 +509,10 @@ export function ensureBundledKb(dbPath?: string, opts?: EnsureKbOptions): Ensure
 	const db = new Database(target);
 	try {
 		compileSeedIntoDb(db, seedDir);
+		const v7PackPath = join(seedDir, "seed-v7-pack.json");
+		if (existsSync(v7PackPath)) {
+			ingestV7SeedPack(db, v7PackPath, { seedDir, agentHome: opts?.agentHome });
+		}
 		const stats = readStatsFromDb(db, target);
 		finalizeWritableKbDb(db);
 		return {
@@ -549,7 +568,7 @@ function escapeLike(input: string): string {
 }
 
 function hasSqlMetaChars(input: string): boolean {
-	return /['";=()]|--|\/\*|\*\/|\b(?:union|select|drop|delete|insert|update|alter|pragma|attach|detach)\b/i.test(input);
+	return /['";=()]|--|\/\*|\*\/|%_%|\bNEAR\/\d+|\b(?:union|select|drop|delete|insert|update|alter|pragma|attach|detach)\b/i.test(input);
 }
 
 /** 仅允许由字母数字短横线下划线组成的干净词项构造 FTS5 安全字面量查询。 */
@@ -739,7 +758,7 @@ export function kbLookupSafe(
 			return rows.length ? rows.map((r) => `${r.cve_id}  ${r.url}`).join("\n") : `未命中 PoC: ${q}`;
 		}
 
-		// 4. product / auto：优先命中产品审计卡，其次回退 CVE 检索
+		// 4. product / auto：先执行毫秒级参数化产品审计卡检索，未命中或 auto 复合语义查询时自动启用 KB 2.0 混合语义检索引擎
 		const lowerQ = q.toLowerCase();
 		let cards = db
 			.query(
@@ -799,11 +818,50 @@ export function kbLookupSafe(
 			}
 		}
 
-		if (cards.length) {
-			const cardText = cards.map((c) => `## ${c.key} — ${c.title}\n${c.body}`).join("\n\n");
-			const techKeys = cards.map((c) => String(c.tech_key ?? "")).filter(Boolean);
+		// KB 2.0 混合语义检索引擎（融合 FTS5 + 中英同义扩展 + TF-IDF + N-gram + SimHash，自动过滤 quarantined）
+		const shouldRunHybrid =
+			opts?.useHybrid !== false &&
+			!hasSqlMetaChars(q) &&
+			hasTable(db, "kb_items") &&
+			(cards.length === 0 || (kind === "auto" && cards.length < n && /[\s\u4e00-\u9fff]/u.test(q)));
+		const hybridHits = shouldRunHybrid
+			? hybridKbSearch(db, q, {
+					limit: n,
+					...(kind === "product" ? { kind: "card" } : {}),
+				}).filter(
+					(h) =>
+						h.score >= 0.14 &&
+						(h.ftsScore > 0 || h.tfidfCosine >= 0.12 || h.synonymBoost > 0),
+				)
+			: [];
+
+		if (hybridHits.length > 0 && cards.length === 0) {
+			const hybridText = hybridHits
+				.map(
+					(h) =>
+						`## [${h.kind.toUpperCase()}] ${h.id} — ${h.title} (tech=${h.tech}, severity=${h.severity}, score=${h.score.toFixed(3)}${h.status === "promoted" ? ", ★promoted" : ""})\n${h.summary}\n核验要点: ${h.payload_or_check}`,
+				)
+				.join("\n\n");
+			const techKeys = hybridHits.map((h) => h.tech).filter(Boolean);
 			const expBlock = includeExp ? formatExperienceHints(db, techKeys) : "";
-			return `${cardText}${expBlock}`;
+			return `${hybridText}${expBlock}`;
+		}
+
+		if (cards.length) {
+			const cardKeys = new Set(cards.map((c) => String(c.key ?? "").toLowerCase()));
+			const extraHybrid = hybridHits
+				.filter((h) => !cardKeys.has(h.id.toLowerCase()) && !cardKeys.has(`v7-${h.id.toLowerCase()}`))
+				.slice(0, Math.max(1, Math.min(3, n)));
+			const cardText = cards.map((c) => `## ${c.key} — ${c.title}\n${c.body}`).join("\n\n");
+			const hybridBlock = extraHybrid.length
+				? `\n\n【KB 2.0 混合语义补充】\n${extraHybrid.map((h) => `- [${h.kind}] ${h.id} (${h.tech}, score=${h.score.toFixed(2)}${h.status === "promoted" ? ", ★" : ""}): ${h.title} — ${h.payload_or_check}`).join("\n")}`
+				: "";
+			const techKeys = [
+				...cards.map((c) => String(c.tech_key ?? "")),
+				...extraHybrid.map((h) => h.tech),
+			].filter(Boolean);
+			const expBlock = includeExp ? formatExperienceHints(db, techKeys) : "";
+			return `${cardText}${hybridBlock}${expBlock}`;
 		}
 
 		// 未命中卡片时回退 CVE 参数化查询 + FTS5
@@ -1717,6 +1775,7 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 	const db = new Database(targetPath);
 	const now = new Date().toISOString();
 	let updated = 0;
+	let governance: ExperienceGovernanceResult | undefined;
 
 	try {
 		if (!hasTable(db, "experience")) {
@@ -1738,6 +1797,14 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 			   pitfall_note = excluded.pitfall_note,
 			   updated_at = excluded.updated_at`,
 		);
+
+		const distilledToSync: Array<{
+			techKey: string;
+			intentKey: string;
+			phase: Phase;
+			safeHelpful: string;
+			safePitfall: string;
+		}> = [];
 
 		const tx = db.transaction(() => {
 			for (const item of agg.values()) {
@@ -1768,10 +1835,49 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 					safePitfall,
 					now,
 				);
+				distilledToSync.push({
+					techKey: item.techKey,
+					intentKey: item.intentKey,
+					phase: item.phase,
+					safeHelpful,
+					safePitfall,
+				});
 				updated += 1;
 			}
 		});
 		tx();
+
+		// v7.0 同步蒸馏经验卡至 KB 2.0 `kb_items` 并结合机械校准账本执行优胜劣汰治理
+		try {
+			for (const dItem of distilledToSync) {
+				const summaryParts = [
+					dItem.safeHelpful ? `有效模式: ${dItem.safeHelpful}` : "",
+					dItem.safePitfall ? `避坑提示: ${dItem.safePitfall}` : "",
+				].filter(Boolean);
+				if (summaryParts.length > 0) {
+					upsertDistilledExperienceCard(
+						db,
+						{
+							tech: dItem.techKey,
+							intentKey: dItem.intentKey,
+							phase: dItem.phase,
+							title: `[蒸馏经验] ${dItem.techKey} :: ${dItem.intentKey}`,
+							summary: summaryParts.join(" | "),
+							payload_or_check: dItem.safeHelpful || dItem.safePitfall,
+						},
+						{ agentHome: opts?.agentHome, seedDir: opts?.seedDir },
+					);
+				}
+			}
+			if (opts?.calibrationRecords && opts.calibrationRecords.length > 0) {
+				governance = governDistilledExperience(db, opts.calibrationRecords);
+			} else if (distilledToSync.length > 0 && hasTable(db, "kb_items")) {
+				governance = governDistilledExperience(db, []);
+			}
+		} catch {
+			/* KB 2.0 经验治理同步异常不阻断基础经验表落盘 */
+		}
+
 		finalizeWritableKbDb(db);
 	} finally {
 		db.close();
@@ -1785,6 +1891,7 @@ export function distillProjectExperience(st: NuwaState, opts?: DistillOptions): 
 		positive,
 		negative,
 		skipped,
+		...(governance ? { governance } : {}),
 	};
 }
 
