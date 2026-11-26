@@ -1,0 +1,11 @@
+#!/usr/bin/env bun
+/**
+ * bin/nuwa-mcp — 女娲 v6.0 跨宿主 MCP 协议服务可执行入口。
+ *
+ * 支持直接 `./bin/nuwa-mcp [--project <dir>] [--version] [--help]`
+ * 或 `bun bin/nuwa-mcp ...` 启动 `core/mcp-server.ts`。
+ */
+import { runNuwaMcpCli } from "../core/mcp-server";
+
+const exitCode = await runNuwaMcpCli(process.argv.slice(2));
+process.exit(exitCode);
