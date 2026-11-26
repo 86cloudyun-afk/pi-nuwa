@@ -26,9 +26,10 @@ declare namespace NodeJS {
 		readable?: boolean;
 		on(event: string, listener: (...args: any[]) => void): this;
 		once(event: string, listener: (...args: any[]) => void): this;
-		off(event: string, listener: (...args: any[]) => void): this;
-		pause(): this;
-		resume(): this;
+		off?(event: string, listener: (...args: any[]) => void): this;
+		removeListener?(event: string, listener: (...args: any[]) => void): this;
+		pause?(): this;
+		resume?(): this;
 		setEncoding?(encoding: string): this;
 		destroy?(error?: Error): this;
 	}

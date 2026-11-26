@@ -858,7 +858,12 @@ function hasTable(db: Database, name: string): boolean {
 
 function isReadonlyCantOpenError(err: unknown): boolean {
 	const msg = String(err instanceof Error ? err.message : err ?? "").toLowerCase();
-	return msg.includes("sqlite_cantopen") || msg.includes("unable to open database file");
+	return (
+		msg.includes("sqlite_cantopen") ||
+		msg.includes("unable to open database file") ||
+		msg.includes("sqlite_readonly") ||
+		msg.includes("attempt to write a readonly database")
+	);
 }
 
 function configureAndInitDb(db: Database, dbFile: string, readonly: boolean): void {
@@ -942,6 +947,7 @@ function openReadonlyMemorySnapshot(dbFile: string): Database {
 
 /**
  * 在隔离临时目录安全重放未 checkpoint 的 `-wal` 后读入纯内存只读快照：
+ * 仅复制主库与 `-wal`（刻意不复制 `-shm` wal-index，由 SQLite 自动从 `-wal` 校验重建干净索引），
  * 既 100% 保留 `-wal` 最新提交状态，又确保对原 `.nuwa` 目录零写操作、零新建 `-shm`/`-wal`。
  */
 function openReadonlyWalIsolatedSnapshot(dbFile: string): Database {
@@ -954,11 +960,6 @@ function openReadonlyWalIsolatedSnapshot(dbFile: string): Database {
 		if (existsSync(walSrc)) {
 			copyFileSync(walSrc, `${snapDb}-wal`);
 			chmodSync(`${snapDb}-wal`, 0o600);
-		}
-		const shmSrc = `${dbFile}-shm`;
-		if (existsSync(shmSrc)) {
-			copyFileSync(shmSrc, `${snapDb}-shm`);
-			chmodSync(`${snapDb}-shm`, 0o600);
 		}
 		const rwSnap = new Database(snapDb, { readwrite: true });
 		try {

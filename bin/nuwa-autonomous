@@ -832,10 +832,6 @@ function openReadonlyWalIsolatedSnapDaemon(filePath) {
 			copyFileSync(`${filePath}-wal`, `${snapDb}-wal`);
 			chmodSync(`${snapDb}-wal`, 0o600);
 		}
-		if (existsSync(`${filePath}-shm`)) {
-			copyFileSync(`${filePath}-shm`, `${snapDb}-shm`);
-			chmodSync(`${snapDb}-shm`, 0o600);
-		}
 		const rwSnap = new Database(snapDb, { readwrite: true });
 		try {
 			rwSnap.exec("PRAGMA busy_timeout = 3000;");

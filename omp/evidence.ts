@@ -737,7 +737,13 @@ function collectArtifactTexts(projectId: string): string[] {
 	const safeId = String(projectId ?? "").trim();
 	if (!safeId || /[\\/]|\.\./.test(safeId)) return [];
 	const baseDir = join("/tmp/nuwa", safeId);
-	if (!existsSync(baseDir)) return [];
+	try {
+		if (!existsSync(baseDir)) return [];
+		const baseStat = lstatSync(baseDir);
+		if (baseStat.isSymbolicLink() || !baseStat.isDirectory()) return [];
+	} catch {
+		return [];
+	}
 
 	const texts: string[] = [];
 	let totalBytes = 0;

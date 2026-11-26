@@ -1162,12 +1162,13 @@ function safeTargetUrl(raw: string, mode: Mode = "ctf"): string {
 }
 
 /** target 为空表示“不按目标过滤”；有 target 时只认同一个规范化 URL（兼容 coding/ops/audit 本地模式）。 */
-function sameTarget(dir: string, targetUrl: string): boolean {
-	if (!targetUrl) return true;
+function sameTarget(dir: string, targetOrUrl: string): boolean {
+	const raw = (targetOrUrl ?? "").trim();
+	if (!raw) return true;
 	const url = stateUrl(dir);
 	if (!url) return true;
 	const mode = stateMode(dir) ?? "ctf";
-	return url === safeTargetUrl(targetUrl, mode);
+	return url === safeTargetUrl(raw, mode);
 }
 
 export function readSessionPointer(sessionId: string): { root?: string; sessionId?: string } | null {
@@ -1225,7 +1226,7 @@ function rootForSession(dir: string, sessionId: string): "use" | "skip" | "rejec
 /** cwd 向上找 .nuwa/state.json → NUWA_PROJECT → 当前会话指针；别的会话占着共享根时，落到本会话指针。 */
 export function findRoot(cwd: string, sessionId = "", target = ""): string | null {
 	const start = resolve(cwd || process.cwd());
-	const want = target ? safeTargetUrl(target) : "";
+	const want = (target ?? "").trim();
 	let d = start;
 	for (;;) {
 		if (d !== start && isSharedCwd(d)) break;
@@ -1259,7 +1260,7 @@ export function findRoot(cwd: string, sessionId = "", target = ""): string | nul
 /** 只向上找 cwd 树里的 .nuwa，不接管指针；共享根不向下继承，目标不同即拒绝。 */
 export function findLocalRoot(cwd: string, sessionId = "", target = ""): string | null {
 	const start = resolve(cwd || process.cwd());
-	const want = target ? safeTargetUrl(target) : "";
+	const want = (target ?? "").trim();
 	let d = start;
 	for (;;) {
 		if (d !== start && isSharedCwd(d)) break;

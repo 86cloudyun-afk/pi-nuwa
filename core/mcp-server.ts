@@ -453,17 +453,28 @@ export class NuwaCoreEngine {
 					probeRoot = resolve(this.cwd);
 				}
 			}
-			if (!probeRoot && resume && !explicitRawMode && targetArg) {
+			if (!probeRoot && !explicitRawMode && targetArg) {
 				const envProj = process.env.NUWA_PROJECT?.trim();
 				const ptr = readSessionPointer(sid);
-				const candList = [
-					findLocalRoot(this.cwd, sid),
-					hasProjectState(resolve(this.cwd)) ? resolve(this.cwd) : null,
-					envProj && hasProjectState(resolve(envProj)) ? resolve(envProj) : null,
-					ptr?.root ? resolve(ptr.root) : null,
-				];
-				for (const localCand of candList) {
-					if (!localCand) continue;
+				const cwdResolved = resolve(this.cwd);
+				const candSet = new Set<string>();
+				const addCand = (pCand: string | null | undefined) => {
+					if (!pCand) return;
+					const resolvedCand = resolve(pCand);
+					if (hasProjectState(resolvedCand)) candSet.add(resolvedCand);
+				};
+				addCand(findLocalRoot(this.cwd, sid));
+				if (!isSharedCwd(cwdResolved)) addCand(cwdResolved);
+				if (envProj) addCand(envProj);
+				if (ptr?.root) addCand(ptr.root);
+				for (const candMode of ["ctf", "ops", "coding", "audit", "pentest"] as const) {
+					try {
+						addCand(defaultProjectRoot(this.cwd, targetArg, sid, candMode));
+					} catch {
+						/* 非该模式合法目标则跳过 */
+					}
+				}
+				for (const localCand of candSet) {
 					const localSt = loadState(localCand);
 					if (!localSt) continue;
 					try {
@@ -2076,24 +2087,21 @@ export async function startStdioMcpServer(opts?: StartStdioMcpServerOptions): Pr
 				chain.then(() => rejectDone(err), rejectDone);
 			};
 			const cleanupListeners = () => {
-				const compat = input as NodeJS.ReadableStream & {
-					removeListener?: (event: string, listener: (...args: any[]) => void) => unknown;
-				};
 				if (typeof input.off === "function") {
 					input.off("data", onData);
 					input.off("end", onEnd);
 					input.off("error", onError);
-				} else if (typeof compat.removeListener === "function") {
-					compat.removeListener("data", onData);
-					compat.removeListener("end", onEnd);
-					compat.removeListener("error", onError);
+				} else if (typeof input.removeListener === "function") {
+					input.removeListener("data", onData);
+					input.removeListener("end", onEnd);
+					input.removeListener("error", onError);
 				}
 			};
 
 			input.on("data", onData);
 			input.on("end", onEnd);
 			input.on("error", onError);
-			if (typeof (input as NodeJS.ReadableStream & { resume?: () => void }).resume === "function") {
+			if (typeof input.resume === "function") {
 				input.resume();
 			}
 		});

@@ -1651,6 +1651,30 @@ describe("v6.0.0 Boost 自检加固回归（文件锁原子落锁与 SQLite Jour
 		} finally {
 			chmodSync(snapNuwa, 0o755);
 		}
+
+		// 即使存在损坏/只读 0o444 的陈旧 -shm 伴生文件且目录为 0o555，隔离快照不得复制脏 -shm 且仍应从 -wal 重放最新状态
+		const poisonedTmp = makeTmpDir("nuwa-wal-poison-shm-");
+		const poisonedNuwa = join(poisonedTmp, ".nuwa");
+		mkdirSync(poisonedNuwa, { recursive: true });
+		const poisonedDb = join(poisonedNuwa, "nuwa.db");
+		writeFileSync(poisonedDb, readFileSync(snapDb));
+		writeFileSync(`${poisonedDb}-wal`, readFileSync(`${snapDb}-wal`));
+		// 写入损坏的 32B 脏 -shm 模拟跨进程/异常残留索引
+		writeFileSync(`${poisonedDb}-shm`, Buffer.alloc(32, 0xff));
+		chmodSync(poisonedDb, 0o444);
+		chmodSync(`${poisonedDb}-wal`, 0o444);
+		chmodSync(`${poisonedDb}-shm`, 0o444);
+		chmodSync(poisonedNuwa, 0o555);
+		try {
+			const loadedPoisoned = loadStateFromSqlite(poisonedTmp, { fallbackToJson: false })!;
+			expect(loadedPoisoned).not.toBeNull();
+			expect(loadedPoisoned.project.goal).toBe("UNCHECKPOINTED_WAL_GOAL");
+		} finally {
+			chmodSync(poisonedNuwa, 0o755);
+			chmodSync(poisonedDb, 0o644);
+			chmodSync(`${poisonedDb}-wal`, 0o644);
+			chmodSync(`${poisonedDb}-shm`, 0o644);
+		}
 	});
 
 	test("withCalibrationLock 4 进程并发 recordPrediction 不丢不乱序且防篡改空锁文件", async () => {

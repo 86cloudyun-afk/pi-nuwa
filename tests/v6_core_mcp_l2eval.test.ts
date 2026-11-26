@@ -12,6 +12,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
 import {
 	JSONRPC_ERROR_CODES,
 	NUWA_CORE_TOOLS,
@@ -322,6 +323,47 @@ describe("core/mcp-server.ts 协议帧解析、错误边界与只读契约", () 
 		const okFrame3 = extractNextMcpFrame(Buffer.from(writtenFrames[2]!, "utf8"), true)!;
 		expect(okFrame3.framing).toBe("content-length");
 		expect(JSON.parse(okFrame3.rawJson).id).toBe(3);
+
+		// 4) 仅实现 on/once/removeListener（无 off 与 resume）的兼容 NodeJS.ReadableStream 在 end 时通过 removeListener 清理监听
+		const emitter = new EventEmitter();
+		const compatStream: NodeJS.ReadableStream = {
+			readable: true,
+			on(ev: string, fn: (...args: any[]) => void) {
+				emitter.on(ev, fn);
+				return this;
+			},
+			once(ev: string, fn: (...args: any[]) => void) {
+				emitter.once(ev, fn);
+				return this;
+			},
+			removeListener(ev: string, fn: (...args: any[]) => void) {
+				emitter.removeListener(ev, fn);
+				return this;
+			},
+		};
+		const compatOut: string[] = [];
+		const compatPromise = startStdioMcpServer({
+			engine,
+			input: compatStream,
+			output: {
+				write(chunk: string | Uint8Array): boolean {
+					compatOut.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+					return true;
+				},
+			},
+			errorOutput: { write: () => true },
+			redirectConsoleToStderr: false,
+		});
+		expect(emitter.listenerCount("data")).toBe(1);
+		expect(emitter.listenerCount("end")).toBe(1);
+		expect(emitter.listenerCount("error")).toBe(1);
+		emitter.emit("data", `${JSON.stringify(createJsonRpcRequest("compat-1", "ping"))}\n`);
+		emitter.emit("end");
+		await compatPromise;
+		expect(emitter.listenerCount("data")).toBe(0);
+		expect(emitter.listenerCount("end")).toBe(0);
+		expect(emitter.listenerCount("error")).toBe(0);
+		expect(JSON.parse(compatOut[0]!.trim()).id).toBe("compat-1");
 	});
 });
 

@@ -302,7 +302,7 @@ def check_v2_contract(repo_root: Path) -> tuple[bool, list[dict]]:
             tsc_bin = find_tsc_bin(repo_root)
             if tsc_bin:
                 tsc_proc = subprocess.run(
-                    [tsc_bin, "-p", str(repo_root / "tsconfig.json")],
+                    [tsc_bin, "-p", str(repo_root / "tsconfig.json"), "--noEmit"],
                     cwd=str(repo_root),
                     env=env,
                     capture_output=True,

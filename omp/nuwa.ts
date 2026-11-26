@@ -478,6 +478,13 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 		if (ctx.agent?.kind === "sub") return;
 		const wd = new SubagentWatchdog(root);
 		const running = wd.listTasks({ status: "running" });
+		const normRoot = resolve(root);
+		const runningIdSet = new Set(running.map((r) => r.taskId));
+		for (const [sidKey, sp] of activeSpawns.entries()) {
+			if (resolve(sp.root) === normRoot && !runningIdSet.has(sidKey)) {
+				activeSpawns.delete(sidKey);
+			}
+		}
 		if (running.length === 0) return;
 		const safeInput = inputObj && typeof inputObj === "object" ? inputObj : {};
 
@@ -547,7 +554,6 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				}
 			}
 
-			const normRoot = resolve(root);
 			// 1) 优先按显式/注入 intentId 精确匹配
 			if (intentIds.size > 0) {
 				for (const [sidKey, sp] of activeSpawns.entries()) {
@@ -570,7 +576,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						if (resolve(sp.root) !== normRoot || matchedIds.has(sidKey)) continue;
 						if (txt === sp.rawTask || txt === sp.injectedTask) {
 							matchedIds.add(sidKey);
-							if (!isBatchCall) break;
+							break;
 						}
 					}
 					if (!isBatchCall && matchedIds.size > 0) break;
@@ -780,17 +786,28 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 						probeRoot = resolve(ctx.cwd);
 					}
 				}
-				if (!probeRoot && p.resume && !explicitMode && p.target) {
+				if (!probeRoot && !explicitMode && p.target) {
 					const envProj = process.env.NUWA_PROJECT?.trim();
 					const ptr = readSessionPointer(sid);
-					const candList = [
-						findLocalRoot(ctx.cwd, sid),
-						hasProjectState(resolve(ctx.cwd)) ? resolve(ctx.cwd) : null,
-						envProj && hasProjectState(resolve(envProj)) ? resolve(envProj) : null,
-						ptr?.root ? resolve(ptr.root) : null,
-					];
-					for (const localCand of candList) {
-						if (!localCand) continue;
+					const cwdResolved = resolve(ctx.cwd);
+					const candSet = new Set<string>();
+					const addCand = (pCand: string | null | undefined) => {
+						if (!pCand) return;
+						const resolvedCand = resolve(pCand);
+						if (hasProjectState(resolvedCand)) candSet.add(resolvedCand);
+					};
+					addCand(findLocalRoot(ctx.cwd, sid));
+					if (!isSharedCwd(cwdResolved)) addCand(cwdResolved);
+					if (envProj) addCand(envProj);
+					if (ptr?.root) addCand(ptr.root);
+					for (const candMode of ["ctf", "ops", "coding", "audit", "pentest"] as const) {
+						try {
+							addCand(defaultProjectRoot(ctx.cwd, p.target, sid, candMode));
+						} catch {
+							/* 非该模式合法目标则跳过 */
+						}
+					}
+					for (const localCand of candSet) {
 						const localSt = loadState(localCand);
 						if (!localSt) continue;
 						const localMode = localSt.project.mode;

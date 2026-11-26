@@ -8,6 +8,7 @@ import { NUWA_CORE_TOOLS } from "../core/protocol";
 import { NuwaCoreEngine } from "../core/mcp-server";
 import { deriveFromFacts } from "../omp/graph-planner";
 import { resolveLineageRoot } from "../omp/lineage";
+import { findLocalRoot, findRoot } from "../omp/storage";
 import { validateVerificationCommit } from "../omp/verifier-gate";
 import { openNuwaDb } from "../omp/sqlite-store";
 
@@ -1395,6 +1396,93 @@ process.exit(0);
 		expect(mcpResume.isError).toBe(false);
 		expect(mcpResume.details?.root).toBe(codingRoot);
 		expect(nuwaMod.loadState(codingRoot)?.project.mode).toBe("coding");
+	});
+
+	test("非共享 cwd 省略 mode 与 resume 复用不误建 ctf 假项目、共享指针覆盖后精确找回 ops 及批量同文子代理一对一释放", async () => {
+		// 1) 非共享 cwd 下初始化 ops 项目后，省略 mode 且不传 resume 重调 nuwa_init 必须命中原项目（不误建 .nuwa-tasks/*-80）
+		const localWs = makeWorkspace("nuwa-local-no-resume-");
+		const hLocal = setupHarness(localWs, "sess-local-ops");
+		const initLocal = await hLocal.call("nuwa_init", {
+			target: "billing-core-svc",
+			mode: "ops",
+			goal: "本地 ops 缺省探测测试",
+		});
+		expect(initLocal.isError).toBeFalsy();
+		expect(initLocal.details.root).toBe(resolve(localWs));
+		expect(findLocalRoot(localWs, "sess-local-ops", "billing-core-svc")).toBe(resolve(localWs));
+		expect(findRoot(localWs, "sess-local-ops", "billing-core-svc")).toBe(resolve(localWs));
+
+		const reinitLocal = await hLocal.call("nuwa_init", {
+			target: "billing-core-svc",
+		});
+		expect(reinitLocal.isError).toBeFalsy();
+		expect(reinitLocal.details.root).toBe(resolve(localWs));
+		expect(reinitLocal.details.existing).toBe(true);
+		expect(existsSync(join(localWs, ".nuwa-tasks"))).toBe(false);
+
+		// NuwaCoreEngine 在本地目录（不绑定 projectRoot）同样不误建 .nuwa-tasks
+		const localMcpWs = makeWorkspace("nuwa-local-mcp-no-resume-");
+		const localMcpHome = makeWorkspace("nuwa-local-mcp-home-");
+		const engLocal = new NuwaCoreEngine({ cwd: localMcpWs, sessionId: "sess-mcp-local", agentHome: localMcpHome });
+		const initMcpLocal = await engLocal.callTool("nuwa_init", {
+			target: "order-worker-svc",
+			mode: "coding",
+			goal: "本地 MCP coding 探测测试",
+		});
+		expect(initMcpLocal.isError).toBe(false);
+		expect(initMcpLocal.details?.root).toBe(resolve(localMcpWs));
+		const reinitMcpLocal = await engLocal.callTool("nuwa_init", {
+			target: "order-worker-svc",
+		});
+		expect(reinitMcpLocal.isError).toBe(false);
+		expect(reinitMcpLocal.details?.root).toBe(resolve(localMcpWs));
+		expect(reinitMcpLocal.details?.existing).toBe(true);
+		expect(existsSync(join(localMcpWs, ".nuwa-tasks"))).toBe(false);
+
+		// 2) 共享 cwd 下同会话先初始化 ops，再初始化另一个 ctf 项目覆盖 session pointer 后，省略 mode 调 resume 仍找回原 ops 项目
+		const sharedCwd = tmpdir();
+		const hShared = setupHarness(sharedCwd, "sess-ptr-overwrite");
+		const s1 = await hShared.call("nuwa_init", { target: "ledger-ops-svc", mode: "ops" });
+		const s1Root = s1.details.root as string;
+		await hShared.call("nuwa_init", { target: "http://127.0.0.1:19876", mode: "ctf" });
+		const s1Resume = await hShared.call("nuwa_init", { target: "ledger-ops-svc", resume: true });
+		expect(s1Resume.isError).toBeFalsy();
+		expect(s1Resume.details.root).toBe(s1Root);
+		expect(nuwaMod.loadState(s1Root)?.project.mode).toBe("ops");
+
+		const sharedMcpHome = makeWorkspace("nuwa-shared-mcp-ptr-home-");
+		setEnvTemp("PI_AGENT_HOME", sharedMcpHome);
+		const engShared = new NuwaCoreEngine({
+			cwd: sharedCwd,
+			sessionId: "sess-mcp-ptr-overwrite",
+			agentHome: sharedMcpHome,
+		});
+		const m1 = await engShared.callTool("nuwa_init", { target: "auth-gateway-svc", mode: "ops" });
+		const m1Root = m1.details?.root as string;
+		await engShared.callTool("nuwa_init", { target: "http://127.0.0.1:19877", mode: "ctf" });
+		const m1Resume = await engShared.callTool("nuwa_init", { target: "auth-gateway-svc", resume: true });
+		expect(m1Resume.isError).toBe(false);
+		expect(m1Resume.details?.root).toBe(m1Root);
+		expect(nuwaMod.loadState(m1Root)?.project.mode).toBe("ops");
+
+		// 3) 批量 tasks 回调遇到同文本多并发任务时，单条任务项只应一对一释放一条，不得超额连带释放
+		const batchWs = makeWorkspace("nuwa-wd-batch-1to1-");
+		const hBatch = setupHarness(batchWs, "sess-wd-batch");
+		await hBatch.call("nuwa_init", { target: "http://127.0.0.1:18399", mode: "pentest", root: batchWs });
+		const onSpawn = hBatch.hooks.get("before_subagent_spawn")![0]!;
+		const onEnd = hBatch.hooks.get("tool_execution_end")![0]!;
+		const dupText = "inspect /health endpoint readiness";
+		const spA = onSpawn({ agent: "fujiang", task: dupText }, hBatch.ctx) as { spawnId: string };
+		const spB = onSpawn({ agent: "fujiang", task: dupText }, hBatch.ctx) as { spawnId: string };
+		expect(new nuwaMod.SubagentWatchdog(batchWs).activeCount()).toBe(2);
+		onEnd(
+			{ toolName: "task", input: { tasks: [{ agent: "fujiang", task: dupText }] }, result: { stdout: "one done" } },
+			hBatch.ctx,
+		);
+		const wdAfterOne = new nuwaMod.SubagentWatchdog(batchWs);
+		expect(wdAfterOne.activeCount()).toBe(1);
+		expect(wdAfterOne.getTask(spA.spawnId)?.status).toBe("completed");
+		expect(wdAfterOne.getTask(spB.spawnId)?.status).toBe("running");
 	});
 });
 
