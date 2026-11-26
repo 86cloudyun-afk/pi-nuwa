@@ -25,6 +25,8 @@ import { upsertSessionRole } from "../omp/session-vault";
 import {
 	MAX_MUTATION_CONCURRENCY,
 	REDACTED_MARKER,
+	redactTrafficBody,
+	redactTrafficUrl,
 	replayTrafficSequence,
 	runStructuredMutations,
 	TrafficRecorder,
@@ -987,5 +989,289 @@ describe("hybrid-audit 多语言静态路由审计、SourceMap 解析与白盒�
 		const memBridge = bridgeWhiteboxToBlackboxIntents(memSurface, baseUrl);
 		expect(memBridge.intents.some((i) => i.path === "/admin/users/:id")).toBe(false);
 		expect(memBridge.intents.filter((i) => i.path === "/flask/open-report").length).toBe(2);
+	});
+});
+
+describe("Boost 异构审查边界回归验证（#28 全部 P1/P2 反例）", () => {
+	test("P1-1: 跨 Origin 302 重定向自动剥离敏感认证头，且 Cookie Jar 严格执行 RFC 6265 Host-Only 与 Domain 边界", async () => {
+		const capturedRequests: Array<{ url: string; headers: Record<string, string> }> = [];
+		const multiHostScope: ScopePolicy = {
+			allowHosts: ["app.internal.test", "cdn.internal.test", "example.test", "sub.example.test", "other.test"],
+			allowCidrs: [],
+			denyHosts: [],
+			allowSubdomains: true,
+			allowPrivateNetwork: false,
+			allowDestructive: false,
+			allowLoopback: true,
+		};
+
+		const mockFetch = async (
+			url: string,
+			init?: { method?: string; headers?: Record<string, string> },
+		) => {
+			const hdrs = { ...(init?.headers ?? {}) };
+			capturedRequests.push({ url, headers: hdrs });
+			const u = new URL(url);
+
+			// 场景 A：app.internal.test 302 跨 Origin 跳转至 cdn.internal.test
+			if (u.hostname === "app.internal.test" && u.pathname === "/download") {
+				return {
+					status: 302,
+					headers: { location: "http://cdn.internal.test/asset.json" },
+					text: async () => "",
+				};
+			}
+			if (u.hostname === "cdn.internal.test") {
+				return {
+					status: 200,
+					headers: { "content-type": "application/json" },
+					text: async () => JSON.stringify({ asset: "ok" }),
+				};
+			}
+
+			// 场景 B：example.test 同时下发 Host-Only Cookie、合法 Domain Cookie、伪造跨站 Domain Cookie 与单段 TLD Cookie
+			if (u.hostname === "example.test" && u.pathname === "/set-cookies") {
+				return {
+					status: 200,
+					headers: {
+						"set-cookie": [
+							"host_only_sid=ho_secret_111; Path=/; HttpOnly",
+							"shared_org=org_val_222; Domain=example.test; Path=/",
+							"forged_other=evil_333; Domain=other.test; Path=/",
+							"tld_wide=bad_444; Domain=test; Path=/",
+						],
+					},
+					text: async () => "ok",
+				};
+			}
+
+			return {
+				status: 200,
+				headers: {},
+				text: async () => "ok",
+			};
+		};
+
+		const crossOriginRes = await replayTrafficSequence(
+			[
+				{
+					id: "cross_origin_hop",
+					method: "GET",
+					url: "http://app.internal.test/download",
+					headers: {
+						Authorization: "Bearer SecretCrossOriginJwt",
+						"X-API-Key": "SecretCrossOriginApiKey",
+						Accept: "application/json",
+					},
+				},
+			],
+			multiHostScope,
+			{ fetchFn: mockFetch },
+		);
+
+		expect(crossOriginRes.ok).toBe(true);
+		expect(capturedRequests.length).toBe(2);
+		expect(capturedRequests[0]?.headers.Authorization).toBe("Bearer SecretCrossOriginJwt");
+		// 跳转到 cdn.internal.test 时敏感头必须被完全剥离，非敏感头保留
+		expect(capturedRequests[1]?.url).toBe("http://cdn.internal.test/asset.json");
+		expect(capturedRequests[1]?.headers.Authorization).toBeUndefined();
+		expect(capturedRequests[1]?.headers["X-API-Key"]).toBeUndefined();
+		expect(capturedRequests[1]?.headers.Accept).toBe("application/json");
+
+		capturedRequests.length = 0;
+		const cookieRes = await replayTrafficSequence(
+			[
+				{ id: "s1", method: "GET", url: "http://example.test/set-cookies" },
+				{ id: "s2_exact", method: "GET", url: "http://example.test/dashboard" },
+				{ id: "s3_sub", method: "GET", url: "http://sub.example.test/dashboard" },
+				{ id: "s4_other", method: "GET", url: "http://other.test/dashboard" },
+			],
+			multiHostScope,
+			{ fetchFn: mockFetch },
+		);
+
+		expect(cookieRes.ok).toBe(true);
+		// example.test 收到 Host-Only + Domain=example.test
+		expect(capturedRequests[1]?.headers.Cookie).toContain("host_only_sid=ho_secret_111");
+		expect(capturedRequests[1]?.headers.Cookie).toContain("shared_org=org_val_222");
+		// sub.example.test 仅收到显式 Domain=example.test，绝不能收到 Host-Only Cookie
+		expect(capturedRequests[2]?.headers.Cookie).toBe("shared_org=org_val_222");
+		expect(capturedRequests[2]?.headers.Cookie).not.toContain("host_only_sid");
+		// other.test 绝不接收被丢弃的伪造 Domain=other.test 或单段 Domain=test Cookie
+		expect(capturedRequests[3]?.headers.Cookie).toBeUndefined();
+	});
+
+	test("P1-2 & P1-3 & P2: idor_step 相同 bodyHash 零误报，底层信号量并发严格不超限且兼容 concurrency=1", async () => {
+		const scope = buildStrictTestScope();
+		let concurrentNow = 0;
+		let concurrentMax = 0;
+
+		const mockFetch = async (url: string) => {
+			concurrentNow++;
+			if (concurrentNow > concurrentMax) concurrentMax = concurrentNow;
+			// 通过多次微任务挂起与极短延迟放大潜在抢占窗口
+			await Promise.resolve();
+			await Bun.sleep(10);
+			await Promise.resolve();
+			concurrentNow--;
+
+			const u = new URL(url);
+			if (u.pathname.startsWith("/__nuwa_soft404_probe_")) {
+				return { status: 404, headers: {}, text: async () => "not found" };
+			}
+			// 对任意路径 ID 始终返回当前登录用户自己的同一份数据（相同 bodyHash）
+			return {
+				status: 200,
+				headers: { "content-type": "application/json" },
+				text: async () => JSON.stringify({ currentUser: "alice", fixedOrderId: 101 }),
+			};
+		};
+
+		const sameHashRes = await runStructuredMutations(
+			{
+				method: "GET",
+				url: `${baseUrl}/api/self-bound-orders/101`,
+				headers: { Authorization: `Bearer ${VALID_BEARER_ALICE}` },
+			},
+			scope,
+			{
+				modes: ["idor_step"],
+				idorCandidateIds: [102, 103, 104],
+				concurrency: 2,
+				fetchFn: mockFetch,
+			},
+		);
+
+		// 相同 bodyHash 严禁误报 IDOR，且 concurrency=2 下峰值严格 <= 2
+		expect(sameHashRes.results.idor_step.anomalous).toBe(false);
+		expect(sameHashRes.anomalies).toEqual([]);
+		expect(concurrentMax).toBeLessThanOrEqual(2);
+
+		// P2: concurrency=1 时运行 race_probe 不得发生 min/max 区间倒置，峰值严格为 1
+		concurrentMax = 0;
+		const singleConcRace = await runStructuredMutations(
+			{ method: "GET", url: `${baseUrl}/api/self-bound-orders/101` },
+			scope,
+			{
+				modes: ["race_probe"],
+				concurrency: 1,
+				raceCount: 5,
+				fetchFn: mockFetch,
+			},
+		);
+		expect(singleConcRace.effectiveConcurrency).toBe(1);
+		expect(singleConcRace.results.race_probe.probes.length).toBe(1);
+		expect(concurrentMax).toBe(1);
+	});
+
+	test("P1-4: URL Fragment (#access_token=...) 脱敏、回退正文凭据字段补全与响应头/查询参数回显脱敏", () => {
+		const fragUrl = "http://127.0.0.1:8080/oauth/cb#access_token=SuperSecretOAuth999&state=xyz123";
+		const safeFrag = redactTrafficUrl(fragUrl);
+		expect(safeFrag).not.toContain("SuperSecretOAuth999");
+		expect(safeFrag).toContain(`access_token=${REDACTED_MARKER}`);
+		expect(safeFrag).toContain("state=xyz123");
+
+		// 非严格 JSON 片段中的 csrf_token / xsrf_token / session_id / private_token
+		const brokenJsonBody = `{"csrf_token": "csrf_frag_112233", 'private_token': 'glpat_secret_445566', "session_id": "sess_778899", invalid_tail`;
+		const safeBroken = redactTrafficBody(brokenJsonBody) ?? "";
+		expect(safeBroken).not.toContain("csrf_frag_112233");
+		expect(safeBroken).not.toContain("glpat_secret_445566");
+		expect(safeBroken).not.toContain("sess_778899");
+
+		// TrafficRecorder 收集敏感查询参数值与非 Set-Cookie 敏感响应头值，防止在响应体中回显泄露
+		const root = makeTempDir("nuwa-frag-echo-");
+		const recorder = new TrafficRecorder(root);
+		const queryApiKey = "QueryKeyEchoSecret_8877";
+		const respHeaderToken = "RespHeaderTokenSecret_6655";
+
+		recorder.record({
+			method: "GET",
+			url: `${baseUrl}/api/echo?api_key=${queryApiKey}#id_token=FragIdTokSecret_3344`,
+			status: 200,
+			responseHeaders: {
+				"X-Auth-Token": respHeaderToken,
+				"Content-Type": "text/plain",
+			},
+			responseBody: `echoed query=${queryApiKey}, respHdr=${respHeaderToken}, frag=FragIdTokSecret_3344`,
+		});
+
+		const rawJsonl = readFileSync(recorder.indexPath, "utf8");
+		expect(rawJsonl).not.toContain(queryApiKey);
+		expect(rawJsonl).not.toContain(respHeaderToken);
+		expect(rawJsonl).not.toContain("FragIdTokSecret_3344");
+	});
+
+	test("P1-5 & P2: Python 装饰器防串扰、JS 正则单引号/Go 原始串反斜杠词法健壮性、Express 带中间件挂载与女娲 targetKey 兼容", () => {
+		const surface = extractCodeAttackSurface({
+			"py/views.py": [
+				`from flask import Flask`,
+				`app = Flask(__name__)`,
+				`@login_required`,
+				`@app.get("/protected_before")`,
+				`def protected_before():`,
+				`    return "secret"`,
+				``,
+				`@app.get("/open_after_protected")`,
+				`def open_after_protected():`,
+				`    return "public_leak"`,
+				`@login_required`,
+				`@app.get("/protected_after")`,
+				`def protected_after():`,
+				`    return "secret2"`,
+			].join("\n"),
+			"ts/admin_mount.ts": [
+				`import express from "express";`,
+				`const qRe = /'/;`,
+				`// app.get("/commented-after-regex", fakeHandler);`,
+				`const adminRouter = express.Router();`,
+				`app.use("/api/admin", rateLimit(10), requireAuth(), adminRouter);`,
+				`adminRouter.get("/users", listUsers);`,
+			].join("\n"),
+			"go/raw_backtick.go": [
+				`package main`,
+				"const winTrail = `c:\\`",
+				`// r.GET("/commented-in-go", fakeGoHandler)`,
+				`func setup(r *gin.Engine) {`,
+				`  r.GET("/real-go-open", realGoHandler)`,
+				`}`,
+			].join("\n"),
+		});
+
+		// 1. Python 相邻装饰器绝不串扰中间无鉴权路由
+		expect(surface.routes.find((r) => r.path === "/protected_before")?.hasAuthMiddleware).toBe(true);
+		expect(surface.routes.find((r) => r.path === "/open_after_protected")?.hasAuthMiddleware).toBe(false);
+		expect(surface.routes.find((r) => r.path === "/protected_after")?.hasAuthMiddleware).toBe(true);
+
+		// 2. JS 正则单引号与 Go 原始串尾随反斜杠后，单行注释内的假路由均不得被误提取
+		expect(surface.routes.some((r) => r.path.includes("commented-after-regex"))).toBe(false);
+		expect(surface.routes.some((r) => r.path.includes("commented-in-go"))).toBe(false);
+		expect(surface.routes.find((r) => r.path === "/real-go-open")?.line).toBe(5);
+
+		// 3. Express app.use("/api/admin", ..., requireAuth(), adminRouter) 保留完整前缀并继承挂载鉴权
+		const mountedAdminUsers = surface.routes.find((r) => r.path === "/api/admin/users");
+		expect(mountedAdminUsers).toBeDefined();
+		expect(mountedAdminUsers?.hasAuthMiddleware).toBe(true);
+
+		// 4. P2: correlateBlackboxFindingToSource 兼容女娲标准 Fact.targetKey 前缀 "path:..." / "endpoint:..."
+		const corrNuwaTargetKey = correlateBlackboxFindingToSource(
+			{
+				kind: "vuln",
+				title: "未授权接口暴露",
+				targetKey: "path:/open_after_protected",
+			},
+			surface,
+		);
+		expect(corrNuwaTargetKey.matched).toBe(true);
+		expect(corrNuwaTargetKey.file).toBe("py/views.py");
+		expect(corrNuwaTargetKey.line).toBe(8);
+
+		const corrEndpointPrefix = correlateBlackboxFindingToSource(
+			{
+				targetKey: "endpoint:GET /api/admin/users",
+			},
+			surface,
+		);
+		expect(corrEndpointPrefix.matched).toBe(true);
+		expect(corrEndpointPrefix.anchor).toBe("ts/admin_mount.ts:6");
 	});
 });

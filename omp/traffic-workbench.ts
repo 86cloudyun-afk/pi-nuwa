@@ -225,7 +225,7 @@ const JWT_TOKEN_RE = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-
 const BEARER_INLINE_RE = /\b(Bearer|Basic|Token|JWT)\s+([A-Za-z0-9._~+/=-]{6,})/gi;
 const URL_USERINFO_RE = /\b(https?:\/\/)([^/\s:@]+):([^/\s@]+)@/gi;
 const QUERY_KV_SECRET_RE =
-	/([?&](?:access_token|refresh_token|id_token|auth_token|api_key|apikey|token|secret|client_secret|password|passwd|pwd|jwt|session_id|private_token)=)([^&#\s"']+)/gi;
+	/([?&#](?:access_token|refresh_token|id_token|auth_token|api_key|apikey|api_token|csrf_token|xsrf_token|token|secret|client_secret|password|passwd|pwd|auth|jwt|session|session_id|sid|csrf|xsrf|sig|signature|ticket|private_token|key)=)([^&#\s"']+)/gi;
 
 export const REDACTED_MARKER = "[REDACTED]" as const;
 
@@ -485,6 +485,7 @@ interface StoredCookie {
 	name: string;
 	value: string;
 	domain?: string;
+	hostOnly: boolean;
 	path: string;
 }
 
@@ -663,7 +664,7 @@ function redactSetCookieHeaderValue(rawSetCookie: string): string {
 		.join(" | ");
 }
 
-/** 对 URL 执行零明文脱敏（擦除 userinfo、敏感查询参数及已知 Vault 密钥，同时保持其余查询参数完好）。 */
+/** 对 URL 执行零明文脱敏（擦除 userinfo、敏感查询参数、URL Fragment 敏感键值及已知 Vault 密钥，同时保持其余参数完好）。 */
 export function redactTrafficUrl(
 	rawUrl: string,
 	opts?: { root?: string; vault?: SessionVault; extraSecrets?: string[] },
@@ -687,6 +688,36 @@ export function redactTrafficUrl(
 					u.searchParams.delete(k);
 					for (const nv of updated) u.searchParams.append(k, nv);
 				}
+			}
+		}
+		if (u.hash && u.hash.length > 1) {
+			const rawFrag = u.hash.slice(1);
+			const qIdx = rawFrag.indexOf("?");
+			if (qIdx >= 0) {
+				const routePrefix = rawFrag.slice(0, qIdx + 1);
+				const fragParams = new URLSearchParams(rawFrag.slice(qIdx + 1));
+				for (const fk of [...fragParams.keys()]) {
+					if (SENSITIVE_QUERY_PARAM_RE.test(fk)) {
+						fragParams.set(fk, REDACTED_MARKER);
+					} else {
+						const fv = fragParams.get(fk) ?? "";
+						fragParams.set(fk, scrubKnownSecrets(fv, knownSecrets, opts?.vault ?? opts?.root));
+					}
+				}
+				u.hash = `#${routePrefix}${fragParams.toString()}`;
+			} else if (rawFrag.includes("=")) {
+				const fragParams = new URLSearchParams(rawFrag);
+				for (const fk of [...fragParams.keys()]) {
+					if (SENSITIVE_QUERY_PARAM_RE.test(fk)) {
+						fragParams.set(fk, REDACTED_MARKER);
+					} else {
+						const fv = fragParams.get(fk) ?? "";
+						fragParams.set(fk, scrubKnownSecrets(fv, knownSecrets, opts?.vault ?? opts?.root));
+					}
+				}
+				u.hash = `#${fragParams.toString()}`;
+			} else {
+				u.hash = `#${scrubKnownSecrets(rawFrag, knownSecrets, opts?.vault ?? opts?.root)}`;
 			}
 		}
 		let serialized = u.toString();
@@ -798,11 +829,11 @@ export function redactTrafficBody(
 			// 非严格 JSON 回退到正则文本脱敏（兼容双引号与单引号键值）
 			sanitized = raw
 				.replace(
-					/("(?:password|passwd|pwd|secret|client_secret|access_token|accessToken|refresh_token|refreshToken|api_key|apiKey|auth_token|authToken|token|jwt|bearer|private_key|privateKey)"\s*:\s*)"[^"]*"/gi,
+					/("(?:password|passwd|pwd|secret|client_secret|clientSecret|access_token|accessToken|refresh_token|refreshToken|id_token|idToken|api_key|apiKey|apikey|api_token|apiToken|auth_token|authToken|csrf_token|csrfToken|xsrf_token|xsrfToken|session_id|sessionId|session_token|sessionToken|private_token|privateToken|private_key|privateKey|token|jwt|bearer|sid|ticket)"\s*:\s*)"[^"]*"/gi,
 					`$1"${REDACTED_MARKER}"`,
 				)
 				.replace(
-					/('(?:password|passwd|pwd|secret|client_secret|access_token|accessToken|refresh_token|refreshToken|api_key|apiKey|auth_token|authToken|token|jwt|bearer|private_key|privateKey)'\s*:\s*)'[^']*'/gi,
+					/('(?:password|passwd|pwd|secret|client_secret|clientSecret|access_token|accessToken|refresh_token|refreshToken|id_token|idToken|api_key|apiKey|apikey|api_token|apiToken|auth_token|authToken|csrf_token|csrfToken|xsrf_token|xsrfToken|session_id|sessionId|session_token|sessionToken|private_token|privateToken|private_key|privateKey|token|jwt|bearer|sid|ticket)'\s*:\s*)'[^']*'/gi,
 					`$1'${REDACTED_MARKER}'`,
 				);
 		}
@@ -810,15 +841,15 @@ export function redactTrafficBody(
 		// 处理 JSON 片段、单引号对象字面量或 application/x-www-form-urlencoded 敏感键值对
 		sanitized = raw
 			.replace(
-				/("(?:password|passwd|pwd|secret|client_secret|access_token|accessToken|refresh_token|refreshToken|api_key|apiKey|auth_token|authToken|token|jwt|bearer|private_key|privateKey)"\s*:\s*)"[^"]*"/gi,
+				/("(?:password|passwd|pwd|secret|client_secret|clientSecret|access_token|accessToken|refresh_token|refreshToken|id_token|idToken|api_key|apiKey|apikey|api_token|apiToken|auth_token|authToken|csrf_token|csrfToken|xsrf_token|xsrfToken|session_id|sessionId|session_token|sessionToken|private_token|privateToken|private_key|privateKey|token|jwt|bearer|sid|ticket)"\s*:\s*)"[^"]*"/gi,
 				`$1"${REDACTED_MARKER}"`,
 			)
 			.replace(
-				/('(?:password|passwd|pwd|secret|client_secret|access_token|accessToken|refresh_token|refreshToken|api_key|apiKey|auth_token|authToken|token|jwt|bearer|private_key|privateKey)'\s*:\s*)'[^']*'/gi,
+				/('(?:password|passwd|pwd|secret|client_secret|clientSecret|access_token|accessToken|refresh_token|refreshToken|id_token|idToken|api_key|apiKey|apikey|api_token|apiToken|auth_token|authToken|csrf_token|csrfToken|xsrf_token|xsrfToken|session_id|sessionId|session_token|sessionToken|private_token|privateToken|private_key|privateKey|token|jwt|bearer|sid|ticket)'\s*:\s*)'[^']*'/gi,
 				`$1'${REDACTED_MARKER}'`,
 			)
 			.replace(
-				/(^|[&\s])((?:password|passwd|pwd|secret|client_secret|access_token|refresh_token|api_key|apikey|auth_token|token|jwt)=)([^&\s"']+)/gi,
+				/(^|[?&#\s])((?:password|passwd|pwd|secret|client_secret|access_token|refresh_token|id_token|api_key|apikey|api_token|auth_token|csrf_token|xsrf_token|session_id|session_token|private_token|token|jwt|sid|ticket)=)([^&#\s"']+)/gi,
 				`$1$2${REDACTED_MARKER}`,
 			);
 	}
@@ -870,12 +901,35 @@ export class TrafficRecorder {
 			maxChars: this.maxBodySnippetChars,
 		};
 
-		// 自动收集本次请求 URL userinfo 与敏感头中的原始凭据值，防止其在同条响应回显中明文残留
+		// 自动收集本次请求 URL userinfo / 查询参数 / Fragment 与请求/响应敏感头中的原始凭据值，防止其在同条响应回显中明文残留
 		const reqRawSecrets: string[] = [...this.extraSecrets];
+		const pushRawCandidate = (candidate: string | undefined, minLen = 4) => {
+			const c = String(candidate ?? "").trim();
+			if (c.length >= minLen && !GENERIC_NON_SECRET_WORDS.has(c.toLowerCase())) {
+				reqRawSecrets.push(c);
+			}
+		};
 		try {
 			const rawParsed = new URL(input.url);
 			if (rawParsed.password && rawParsed.password.length >= 3) {
-				reqRawSecrets.push(decodeURIComponent(rawParsed.password));
+				pushRawCandidate(decodeURIComponent(rawParsed.password), 3);
+			}
+			for (const [qk, qv] of rawParsed.searchParams.entries()) {
+				if (SENSITIVE_QUERY_PARAM_RE.test(qk)) {
+					pushRawCandidate(qv, 4);
+				}
+			}
+			if (rawParsed.hash && rawParsed.hash.length > 1) {
+				const rawFrag = rawParsed.hash.slice(1);
+				const qPart = rawFrag.includes("?") ? rawFrag.slice(rawFrag.indexOf("?") + 1) : rawFrag;
+				if (qPart.includes("=")) {
+					const fp = new URLSearchParams(qPart);
+					for (const [fk, fv] of fp.entries()) {
+						if (SENSITIVE_QUERY_PARAM_RE.test(fk)) {
+							pushRawCandidate(fv, 4);
+						}
+					}
+				}
 			}
 		} catch {
 			/* ignore */
@@ -888,33 +942,32 @@ export class TrafficRecorder {
 					for (const seg of strVal.split(";")) {
 						const eq = seg.indexOf("=");
 						if (eq > 0) {
-							const cv = seg.slice(eq + 1).trim();
-							if (cv.length >= 4 && !GENERIC_NON_SECRET_WORDS.has(cv.toLowerCase())) {
-								reqRawSecrets.push(cv);
-							}
+							pushRawCandidate(seg.slice(eq + 1), 4);
 						}
 					}
 				} else {
-					const bare = strVal.replace(/^(?:Bearer|Basic|Token|JWT)\s+/i, "").trim();
-					if (bare.length >= 4 && !GENERIC_NON_SECRET_WORDS.has(bare.toLowerCase())) {
-						reqRawSecrets.push(bare);
-					}
+					const bare = strVal.replace(/^(?:Bearer|Basic|Token|JWT|Digest)\s+/i, "").trim();
+					pushRawCandidate(bare, 4);
 				}
 			}
 		}
 		if (input.responseHeaders) {
 			for (const [hk, hv] of Object.entries(input.responseHeaders)) {
-				if (!hv || hk.toLowerCase() !== "set-cookie") continue;
-				const lines = Array.isArray(hv) ? hv : String(hv).split(/\r?\n/);
-				for (const line of lines) {
-					const first = line.split(";")[0]?.trim() ?? "";
-					const eq = first.indexOf("=");
-					if (eq > 0) {
-						const cv = first.slice(eq + 1).trim();
-						if (cv.length >= 4 && !GENERIC_NON_SECRET_WORDS.has(cv.toLowerCase())) {
-							reqRawSecrets.push(cv);
+				if (!hv || !isSensitiveHeaderName(hk)) continue;
+				const lowerHk = hk.toLowerCase();
+				if (lowerHk === "set-cookie") {
+					const lines = Array.isArray(hv) ? hv : String(hv).split(/\r?\n/);
+					for (const line of lines) {
+						const first = line.split(";")[0]?.trim() ?? "";
+						const eq = first.indexOf("=");
+						if (eq > 0) {
+							pushRawCandidate(first.slice(eq + 1), 4);
 						}
 					}
+				} else {
+					const strVal = Array.isArray(hv) ? hv.join(", ") : String(hv);
+					const bare = strVal.replace(/^(?:Bearer|Basic|Token|JWT|Digest)\s+/i, "").trim();
+					pushRawCandidate(bare, 4);
 				}
 			}
 		}
@@ -1266,11 +1319,21 @@ function normalizeResponseHeaders(
 	return { flat, setCookies };
 }
 
+function cookieJarKey(domain: string | undefined, path: string, name: string): string {
+	return `${domain ?? "*"}|${path}|${name}`;
+}
+
+function isIpLiteralHost(host: string): boolean {
+	return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) || host.includes(":");
+}
+
 function ingestSetCookiesIntoJar(
 	jar: Map<string, StoredCookie>,
 	setCookies: string[],
 	requestUrl: URL,
 ): void {
+	const reqHost = requestUrl.hostname.toLowerCase();
+
 	for (const rawLine of setCookies) {
 		if (!rawLine) continue;
 		const segments = rawLine
@@ -1285,7 +1348,7 @@ function ingestSetCookiesIntoJar(
 		const value = first.slice(eq + 1).trim();
 		if (!name) continue;
 
-		let domain: string | undefined;
+		let rawDomainAttr: string | undefined;
 		let path = "/";
 		let expired = false;
 
@@ -1295,26 +1358,72 @@ function ingestSetCookiesIntoJar(
 			const aKey = (aEq > 0 ? attr.slice(0, aEq) : attr).trim().toLowerCase();
 			const aVal = aEq > 0 ? attr.slice(aEq + 1).trim() : "";
 			if (aKey === "domain" && aVal) {
-				domain = aVal.replace(/^\./, "").toLowerCase();
+				rawDomainAttr = aVal.replace(/^\.+/, "").toLowerCase();
 			} else if (aKey === "path" && aVal) {
-				path = aVal;
+				path = aVal.startsWith("/") ? aVal : "/";
 			} else if (aKey === "max-age") {
 				const n = Number(aVal);
 				if (Number.isFinite(n) && n <= 0) expired = true;
 			}
 		}
 
+		let cookieDomain = reqHost;
+		let hostOnly = true;
+
+		if (rawDomainAttr !== undefined) {
+			// RFC 6265 §5.3：拒绝单段顶级域（如 Domain=com / Domain=test）以及与请求主机不匹配的跨站 Domain
+			if (!rawDomainAttr || (!rawDomainAttr.includes(".") && !isIpLiteralHost(rawDomainAttr))) {
+				continue;
+			}
+			if (isIpLiteralHost(reqHost)) {
+				if (rawDomainAttr !== reqHost) continue;
+			} else if (reqHost !== rawDomainAttr && !reqHost.endsWith(`.${rawDomainAttr}`)) {
+				continue;
+			}
+			cookieDomain = rawDomainAttr;
+			hostOnly = false;
+		}
+
+		const key = cookieJarKey(cookieDomain, path, name);
 		if (expired || value === "") {
-			jar.delete(name);
+			jar.delete(key);
 			continue;
 		}
-		jar.set(name, {
+		jar.set(key, {
 			name,
 			value,
-			domain: domain ?? requestUrl.hostname.toLowerCase(),
+			domain: cookieDomain,
+			hostOnly,
 			path,
 		});
 	}
+}
+
+function doesCookieMatchUrl(item: StoredCookie, targetUrl: URL): boolean {
+	const reqHost = targetUrl.hostname.toLowerCase();
+	const reqPath = targetUrl.pathname || "/";
+
+	if (item.domain !== undefined) {
+		if (item.hostOnly) {
+			if (reqHost !== item.domain) return false;
+		} else {
+			if (
+				reqHost !== item.domain &&
+				(isIpLiteralHost(reqHost) || !reqHost.endsWith(`.${item.domain}`))
+			) {
+				return false;
+			}
+		}
+	}
+
+	if (item.path && item.path !== "/") {
+		const pathMatches =
+			reqPath === item.path ||
+			(item.path.endsWith("/") && reqPath.startsWith(item.path)) ||
+			reqPath.startsWith(`${item.path}/`);
+		if (!pathMatches) return false;
+	}
+	return true;
 }
 
 function buildCookieHeaderFromJar(
@@ -1323,20 +1432,9 @@ function buildCookieHeaderFromJar(
 	explicitCookieHeader?: string,
 ): string | undefined {
 	const merged = new Map<string, string>();
-	const reqHost = targetUrl.hostname.toLowerCase();
-	const reqPath = targetUrl.pathname || "/";
 
 	for (const item of jar.values()) {
-		if (item.domain && reqHost !== item.domain && !reqHost.endsWith(`.${item.domain}`)) {
-			continue;
-		}
-		if (item.path && item.path !== "/") {
-			const pathMatches =
-				reqPath === item.path ||
-				(item.path.endsWith("/") && reqPath.startsWith(item.path)) ||
-				reqPath.startsWith(`${item.path}/`);
-			if (!pathMatches) continue;
-		}
+		if (!doesCookieMatchUrl(item, targetUrl)) continue;
 		merged.set(item.name, item.value);
 	}
 
@@ -1424,7 +1522,12 @@ function extractVariablesFromResponse(
 			extractedVal = respHeaders[hk];
 		}
 		if (extractedVal === undefined && spec.cookie) {
-			extractedVal = cookieJar.get(spec.cookie.trim())?.value;
+			const wantCookieName = spec.cookie.trim();
+			for (const item of cookieJar.values()) {
+				if (item.name === wantCookieName) {
+					extractedVal = item.value;
+				}
+			}
 		}
 		if (extractedVal === undefined && spec.jsonPath) {
 			const j = ensureJson();
@@ -1564,7 +1667,12 @@ export async function replayTrafficSequence(
 	if (opts?.initialCookies) {
 		for (const [ck, cv] of Object.entries(opts.initialCookies)) {
 			if (ck && cv !== undefined) {
-				cookieJar.set(ck, { name: ck, value: cv, path: "/" });
+				cookieJar.set(cookieJarKey(undefined, "/", ck), {
+					name: ck,
+					value: cv,
+					hostOnly: false,
+					path: "/",
+				});
 			}
 		}
 	}
@@ -1761,8 +1869,20 @@ export async function replayTrafficSequence(
 					break;
 				}
 
+				const prevOrigin = currentUrlObj.origin;
+				const nextParsed = redirectScopeCheck.parsed;
 				redirectChain.push(nextUrlRaw);
-				currentUrlObj = redirectScopeCheck.parsed;
+				currentUrlObj = nextParsed;
+
+				// 跨 Origin 重定向时强制剥离全部敏感认证/令牌请求头，严防 Authorization / API-Key 跨站泄露
+				if (nextParsed.origin !== prevOrigin) {
+					for (const hk of Object.keys(interpolatedHeaders)) {
+						if (isSensitiveHeaderName(hk)) {
+							delete interpolatedHeaders[hk];
+						}
+					}
+				}
+
 				if (
 					finalStatus === 303 ||
 					((finalStatus === 301 || finalStatus === 302) && currentMethod === "POST")
@@ -1828,8 +1948,8 @@ export async function replayTrafficSequence(
 	}
 
 	const cookiesOut: Record<string, string> = {};
-	for (const [k, item] of cookieJar.entries()) {
-		cookiesOut[k] = item.value;
+	for (const item of cookieJar.values()) {
+		cookiesOut[item.name] = item.value;
 	}
 
 	const allOk =
@@ -2111,7 +2231,7 @@ export async function runStructuredMutations(
 	let soft404Baseline: Soft404BaselineInput | Soft404Baseline | null =
 		opts?.soft404Baseline ?? null;
 
-	// 底层硬信号量门闸：从数学上保证任意时刻在飞探针数严格 <= effectiveConcurrency (<= 8)
+	// 底层硬信号量门闸（直接槽位所有权移交，彻底消除微任务唤醒空窗抢占，保证峰值严格 <= effectiveConcurrency）
 	let activeProbes = 0;
 	const waitQueue: Array<() => void> = [];
 	const acquireProbeSlot = async (): Promise<void> => {
@@ -2122,12 +2242,15 @@ export async function runStructuredMutations(
 		await new Promise<void>((resolveSlot) => {
 			waitQueue.push(resolveSlot);
 		});
-		activeProbes++;
 	};
 	const releaseProbeSlot = (): void => {
-		activeProbes = Math.max(0, activeProbes - 1);
 		const next = waitQueue.shift();
-		if (next) next();
+		if (next) {
+			// 直接将当前已占用槽位原子移交给队首等待协程，activeProbes 不递减也不在恢复时重加
+			next();
+			return;
+		}
+		activeProbes = Math.max(0, activeProbes - 1);
 	};
 
 	const sendGuardedProbe = async (
@@ -2406,7 +2529,7 @@ export async function runStructuredMutations(
 						!p.isSoft404 &&
 						p.bodyBytes > 2 &&
 						!looksLikeErrorJsonEnvelope(p.body) &&
-						(baselineSuccess ? p.bodyHash !== baselineProbe.bodyHash || p.bodyBytes > 0 : true),
+						p.bodyHash !== baselineProbe.bodyHash,
 				);
 
 				const anomalous = baselineSuccess && unauthorizedExposed.length > 0;
@@ -2795,11 +2918,13 @@ export async function runStructuredMutations(
 			});
 		} else if (currentMode === "race_probe") {
 			modeRunners.push(async () => {
+				const maxRaceBurst = Math.max(1, Math.min(MAX_MUTATION_CONCURRENCY, effectiveConcurrency));
+				const minRaceBurst = Math.min(2, maxRaceBurst);
 				const burstCount = clampInt(
 					opts?.raceCount,
-					Math.min(5, effectiveConcurrency),
-					2,
-					Math.min(MAX_MUTATION_CONCURRENCY, effectiveConcurrency),
+					Math.min(5, maxRaceBurst),
+					minRaceBurst,
+					maxRaceBurst,
 				);
 
 				// 受控小并发同时触发，验证幂等性与状态一致性

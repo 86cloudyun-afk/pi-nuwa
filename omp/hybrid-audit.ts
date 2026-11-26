@@ -229,7 +229,7 @@ export interface SourceCorrelationResult {
 // ==================== 内部词法/行号与鉴权识别辅助 ====================
 
 const AUTH_IDENTIFIER_RE =
-	/(?:auth|authenticate|isAuthenticated|requireAuth|requireLogin|login_required|jwt_required|auth_required|permission_required|staff_member_required|admin_required|verifyToken|verifyJwt|checkJwt|passport|authGuard|useGuard|requireRole|requireAdmin|checkPermission|rbac|acl|protect|sessionAuth|bearerAuth|apiKeyAuth|getServerSession|currentUser|getAuth|oauth2_scheme|get_current_user|get_current_active_user|IsAuthenticated|IsAdminUser|BasicAuth|JWTAuth|TokenAuth)/i;
+	/\b(?:auth|authenticate|authenticated|is_authenticated|isAuthenticated|require_auth|requireAuth|requires_auth|require_login|requireLogin|login_required|jwt_required|auth_required|permission_required|staff_member_required|admin_required|verify_token|verifyToken|verify_jwt|verifyJwt|check_jwt|checkJwt|passport|authGuard|AuthGuard|useGuard|UseGuards|requireRole|require_role|requireAdmin|require_admin|checkPermission|check_permission|rbac|RBAC|acl|protect|sessionAuth|session_auth|bearerAuth|apiKeyAuth|getServerSession|currentUser|current_user|getAuth|oauth2_scheme|get_current_user|get_current_active_user|IsAuthenticated|IsAdminUser|BasicAuth|JWTAuth|TokenAuth|JWT)\b|[A-Za-z0-9_]*(?:Auth|JWT|Jwt|OAuth|RBAC)(?:Middleware|Guard|Required|Filter|Interceptor|Dependency|Wrap|Check|Verify|Handler)?\b|[A-Za-z0-9_]*(?:Token|Role|Admin|Session|Login)(?:Middleware|Guard|Required|Filter|Interceptor)\b/;
 
 const EXPLICIT_PUBLIC_EXEMPT_RE =
 	/\b(?:AllowAny|allow_anonymous|publicRoute|skipAuth)\b/i;
@@ -296,6 +296,37 @@ function detectLanguageByPath(filePath: string): SupportedLanguage | null {
 	return null;
 }
 
+const JS_REGEX_PRECEDING_KEYWORDS = new Set([
+	"return",
+	"case",
+	"throw",
+	"typeof",
+	"void",
+	"delete",
+	"in",
+	"of",
+	"instanceof",
+	"await",
+	"yield",
+]);
+
+function canStartJsRegexAt(chars: string[], slashIdx: number): boolean {
+	let p = slashIdx - 1;
+	while (p >= 0 && (chars[p] === " " || chars[p] === "\t" || chars[p] === "\r" || chars[p] === "\n")) {
+		p--;
+	}
+	if (p < 0) return true;
+	const prev = chars[p]!;
+	if ("=(,[!:;&|?{}~+-*%^<>".includes(prev)) return true;
+	if (/[A-Za-z_$]/.test(prev)) {
+		let wordEnd = p;
+		while (p >= 0 && /[A-Za-z0-9_$]/.test(chars[p]!)) p--;
+		const word = chars.slice(p + 1, wordEnd + 1).join("");
+		return JS_REGEX_PRECEDING_KEYWORDS.has(word);
+	}
+	return false;
+}
+
 /**
  * 在保持每个字符索引与换行符 `\n` 位置 100% 不变的前提下，将源码中的行注释与块注释替换为空格，
  * 既彻底避免提取被注释掉的废弃路由，又保证提取出的 `line` 行号精确零偏移。
@@ -333,7 +364,7 @@ function stripCommentsPreservingOffsets(src: string, lang: SupportedLanguage): s
 			if (ch === "'" || ch === '"') {
 				const q = ch;
 				i++;
-				while (i < len && chars[i] !== "\n") {
+				while (i < len && chars[i] !== "\n" && chars[i] !== "\r") {
 					if (chars[i] === "\\") {
 						i += 2;
 						continue;
@@ -357,29 +388,7 @@ function stripCommentsPreservingOffsets(src: string, lang: SupportedLanguage): s
 			continue;
 		}
 
-		// TS / JS / Go 字符串字面量保护
-		if (ch === "'" || ch === '"' || ch === "`") {
-			const q = ch;
-			i++;
-			while (i < len) {
-				if (q !== "`" && chars[i] === "\\") {
-					i += 2;
-					continue;
-				}
-				if (q === "`" && chars[i] === "\\") {
-					i += 2;
-					continue;
-				}
-				if (chars[i] === q) {
-					i++;
-					break;
-				}
-				i++;
-			}
-			continue;
-		}
-
-		// 单行注释 //
+		// 单行注释 //（优先于正则判定）
 		if (ch === "/" && next === "/") {
 			while (i < len && chars[i] !== "\n" && chars[i] !== "\r") {
 				chars[i] = " ";
@@ -402,6 +411,71 @@ function stripCommentsPreservingOffsets(src: string, lang: SupportedLanguage): s
 				}
 				if (chars[i] !== "\n" && chars[i] !== "\r") {
 					chars[i] = " ";
+				}
+				i++;
+			}
+			continue;
+		}
+
+		// TS / JS 正则表达式字面量 `/.../[flags]` 保护（防止 `/https?:\/\/x/` 或 `/'/` 干扰后续注释识别）
+		if ((lang === "typescript" || lang === "javascript") && ch === "/" && canStartJsRegexAt(chars, i)) {
+			let j = i + 1;
+			let inClass = false;
+			let closed = false;
+			while (j < len && chars[j] !== "\n" && chars[j] !== "\r") {
+				const rc = chars[j]!;
+				if (rc === "\\") {
+					j += 2;
+					continue;
+				}
+				if (rc === "[") {
+					inClass = true;
+				} else if (rc === "]" && inClass) {
+					inClass = false;
+				} else if (rc === "/" && !inClass) {
+					closed = true;
+					j++;
+					while (j < len && /[a-z]/i.test(chars[j]!)) j++;
+					break;
+				}
+				j++;
+			}
+			if (closed) {
+				i = j;
+				continue;
+			}
+		}
+
+		// TS / JS / Go 反引号与单/双引号字符串字面量保护
+		if (ch === "`") {
+			i++;
+			while (i < len) {
+				// Go 反引号为原始字符串（不支持反斜杠转义，如 `c:\`）；JS/TS 模板字符串支持 `\` 转义
+				if (lang !== "go" && chars[i] === "\\") {
+					i += 2;
+					continue;
+				}
+				if (chars[i] === "`") {
+					i++;
+					break;
+				}
+				i++;
+			}
+			continue;
+		}
+
+		if (ch === "'" || ch === '"') {
+			const q = ch;
+			i++;
+			// 单/双引号字面量不可无转义跨行，遇到未转义 \n/\r 强制闭合防整文件污染
+			while (i < len && chars[i] !== "\n" && chars[i] !== "\r") {
+				if (chars[i] === "\\") {
+					i += 2;
+					continue;
+				}
+				if (chars[i] === q) {
+					i++;
+					break;
 				}
 				i++;
 			}
@@ -462,6 +536,7 @@ function extractBalancedParens(
 	src: string,
 	openParenIdx: number,
 	maxScanChars = 2400,
+	rawBacktick = false,
 ): { inner: string; endIdx: number } | null {
 	if (src[openParenIdx] !== "(") return null;
 	const limit = Math.min(src.length, openParenIdx + maxScanChars);
@@ -471,8 +546,12 @@ function extractBalancedParens(
 	for (let i = openParenIdx + 1; i < limit; i++) {
 		const ch = src[i]!;
 		if (quote) {
-			if (ch === "\\") {
+			if ((quote !== "`" || !rawBacktick) && ch === "\\") {
 				i++;
+				continue;
+			}
+			if (quote !== "`" && (ch === "\n" || ch === "\r")) {
+				quote = null;
 				continue;
 			}
 			if (ch === quote) {
@@ -497,6 +576,43 @@ function extractBalancedParens(
 		}
 	}
 	return null;
+}
+
+/** 按括号深度为 0 的顶层逗号切分调用参数列表（保留内嵌函数调用如 `requireAuth()` 完整性）。 */
+function splitTopLevelArgs(inner: string): string[] {
+	const parts: string[] = [];
+	let start = 0;
+	let depth = 0;
+	let quote: string | null = null;
+
+	for (let i = 0; i < inner.length; i++) {
+		const ch = inner[i]!;
+		if (quote) {
+			if (ch === "\\") {
+				i++;
+				continue;
+			}
+			if (quote !== "`" && (ch === "\n" || ch === "\r")) {
+				quote = null;
+				continue;
+			}
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "'" || ch === '"' || ch === "`") {
+			quote = ch;
+			continue;
+		}
+		if (ch === "(" || ch === "[" || ch === "{") depth++;
+		else if (ch === ")" || ch === "]" || ch === "}") depth = Math.max(0, depth - 1);
+		else if (ch === "," && depth === 0) {
+			parts.push(inner.slice(start, i).trim());
+			start = i + 1;
+		}
+	}
+	const tail = inner.slice(start).trim();
+	if (tail) parts.push(tail);
+	return parts;
 }
 
 /** 剥离 JS/TS 路由调用末尾处理器函数体 `{ ... }`，仅保留中间件列表与路由选项头（如 Fastify `{ preHandler }`）。 */
@@ -652,33 +768,57 @@ function extractJsTsRoutes(
 			}
 		}
 	}
-	// Express 挂载: app.use('/api', apiRouter)
-	for (const m of content.matchAll(
-		/\b[A-Za-z_$][A-Za-z0-9_$]*\.use\s*\(\s*['"`](\/[^'"`]*)['"`]\s*,\s*([^);\r\n]+)\)/g,
-	)) {
-		const mountPrefix = m[1]!;
-		const tail = m[2]!;
-		const ids = tail.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? [];
-		const targetRouter = ids[ids.length - 1];
-		if (targetRouter) {
-			routerPrefixes.set(targetRouter, mountPrefix);
-		}
-	}
-
-	// 记录 router.use(authMiddleware) / fastify.addHook('onRequest'|'preHandler', auth) 生效起始偏移量
+	// Express 挂载与全局/路径级鉴权中间件扫描（使用括号平衡解析支持 `app.use("/api/admin", requireAuth(), adminRouter)`）
 	const routerAuthFromOffset = new Map<string, number>();
-	for (const m of content.matchAll(
-		/\b([A-Za-z_$][A-Za-z0-9_$]*)\.(?:use|addHook)\s*\(([^;\r\n]{1,200})\)/g,
-	)) {
+	const mountedAuthRouters = new Set<string>();
+	const pathScopedAuthGuards: Array<{ receiver: string; prefix: string; offset: number }> = [];
+
+	for (const m of content.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\.(use|addHook)\s*\(/g)) {
 		const objName = m[1]!;
-		const args = m[2]!;
-		// 若 app.use('/specific', auth) 带有特定子路径前缀则不算全实例无条件鉴权
-		const hasPathArg = /^\s*['"`]\//.test(args) && !/^\s*['"`](?:onRequest|preHandler)['"`]/.test(args);
-		if (!hasPathArg && hasAuthInSnippet(args)) {
+		const methodKind = m[2]!;
+		const callOffset = m.index ?? 0;
+		const openParenIdx = callOffset + m[0].length - 1;
+		const balanced = extractBalancedParens(content, openParenIdx, 2000);
+		if (!balanced) continue;
+
+		const topArgs = splitTopLevelArgs(balanced.inner);
+		if (topArgs.length === 0) continue;
+
+		const firstArg = topArgs[0]!;
+		const pathLitMatch =
+			methodKind === "use" ? /^(['"`])(\/[^'"`\r\n]*)\1$/.exec(firstArg) : null;
+
+		if (pathLitMatch) {
+			const rawMountPrefix = pathLitMatch[2]!;
+			const combinedPrefix = joinUrlRoutePaths(routerPrefixes.get(objName) ?? "", rawMountPrefix);
+			const restArgs = topArgs.slice(1);
+			if (restArgs.length > 0) {
+				const lastArg = restArgs[restArgs.length - 1]!;
+				const isPlainRouterId = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(lastArg);
+				const middleSlice = restArgs.slice(0, -1).join(", ");
+				const parentAlreadyAuthed =
+					mountedAuthRouters.has(objName) ||
+					(routerAuthFromOffset.get(objName) !== undefined &&
+						routerAuthFromOffset.get(objName)! < callOffset);
+
+				if (isPlainRouterId && (restArgs.length >= 2 || !hasAuthInSnippet(lastArg))) {
+					routerPrefixes.set(lastArg, combinedPrefix);
+					if (parentAlreadyAuthed || hasAuthInSnippet(middleSlice)) {
+						mountedAuthRouters.add(lastArg);
+					}
+				}
+				if (hasAuthInSnippet(restArgs.join(", "))) {
+					pathScopedAuthGuards.push({
+						receiver: objName,
+						prefix: combinedPrefix,
+						offset: callOffset,
+					});
+				}
+			}
+		} else if (hasAuthInSnippet(balanced.inner)) {
 			const prev = routerAuthFromOffset.get(objName);
-			const idx = m.index ?? 0;
-			if (prev === undefined || idx < prev) {
-				routerAuthFromOffset.set(objName, idx);
+			if (prev === undefined || callOffset < prev) {
+				routerAuthFromOffset.set(objName, callOffset);
 			}
 		}
 	}
@@ -692,7 +832,7 @@ function extractJsTsRoutes(
 		const callOffset = m.index ?? 0;
 		const openParenIdx = callOffset + m[0].length - 1;
 
-		if (/^(?:axios|http|https|got|superagent|client|fetch|headers|map|cache|store|cookies|params| Reflect|Object|formData|searchParams)$/i.test(receiver)) {
+		if (/^(?:axios|http|https|got|superagent|client|fetch|headers|map|cache|store|cookies|params|Reflect|Object|formData|searchParams)$/i.test(receiver)) {
 			continue;
 		}
 
@@ -710,11 +850,20 @@ function extractJsTsRoutes(
 		const fullPath = joinUrlRoutePaths(prefix, subPath);
 
 		const inheritedAuthOffset = routerAuthFromOffset.get(receiver);
-		const inheritedAuth = inheritedAuthOffset !== undefined && inheritedAuthOffset < callOffset;
+		const pathGuardMatched = pathScopedAuthGuards.some(
+			(g) =>
+				g.receiver === receiver &&
+				g.offset < callOffset &&
+				(fullPath === g.prefix || fullPath.startsWith(`${g.prefix}/`)),
+		);
+		const inheritedAuth =
+			mountedAuthRouters.has(receiver) ||
+			(inheritedAuthOffset !== undefined && inheritedAuthOffset < callOffset) ||
+			pathGuardMatched;
 		const inlineAuth = hasAuthInSnippet(mwPortion);
 		const hasAuth = inheritedAuth || inlineAuth;
 		const mwTokens = extractMiddlewareTokens(mwPortion);
-		if (inheritedAuth) mwTokens.unshift(`${receiver}:global-auth`);
+		if (inheritedAuth) mwTokens.unshift(`${receiver}:inherited-auth`);
 
 		const routeFramework: DetectedFramework =
 			routerFrameworks.get(receiver) ??
@@ -749,7 +898,9 @@ function extractJsTsRoutes(
 		const prefix = routerPrefixes.get(receiver) ?? "";
 		const fullPath = joinUrlRoutePaths(prefix, baseSubPath);
 		const inheritedAuthOffset = routerAuthFromOffset.get(receiver);
-		const inheritedAuth = inheritedAuthOffset !== undefined && inheritedAuthOffset < baseOffset;
+		const inheritedAuth =
+			mountedAuthRouters.has(receiver) ||
+			(inheritedAuthOffset !== undefined && inheritedAuthOffset < baseOffset);
 
 		for (const sub of chainBody.matchAll(/\.(get|post|put|patch|delete)\s*\(([^)]{1,260})\)/gi)) {
 			const method = sub[1]!.toUpperCase();
@@ -783,14 +934,17 @@ function extractPythonRoutes(
 	const routes: ExtractedRoute[] = [];
 	const isFastApi = /\b(?:FastAPI|APIRouter|Depends)\b/.test(content);
 
-	// 识别 APIRouter / Blueprint 前缀及路由器级 dependencies
+	// 识别 APIRouter / Blueprint 前缀及路由器级 dependencies（使用括号平衡扫描防止 Depends(...) 内嵌括号截断）
 	const routerMeta = new Map<string, { prefix: string; hasAuth: boolean; framework: "fastapi" | "flask" }>();
 	for (const m of content.matchAll(
-		/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(APIRouter|Blueprint|FastAPI|Flask)\s*\(([\s\S]{0,300}?)\)/g,
+		/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(APIRouter|Blueprint|FastAPI|Flask)\s*\(/g,
 	)) {
 		const varName = m[1]!;
 		const ctor = m[2]!;
-		const args = m[3] ?? "";
+		const openParenIdx = (m.index ?? 0) + m[0].length - 1;
+		const balanced = extractBalancedParens(content, openParenIdx, 1000);
+		if (!balanced) continue;
+		const args = balanced.inner;
 		const prefixMatch = /\b(?:url_prefix|prefix)\s*=\s*['"]([^'"]+)['"]/.exec(args);
 		routerMeta.set(varName, {
 			prefix: prefixMatch?.[1] ?? "",
@@ -800,6 +954,7 @@ function extractPythonRoutes(
 	}
 
 	// 1. Flask / FastAPI 装饰器路由：@app.route('/x', methods=['GET','POST']) 或 @router.get('/x', dependencies=[Depends(...)])
+	const pyLines = content.split(/\r?\n/);
 	const pyDecoratorHeadRe =
 		/@([A-Za-z_][A-Za-z0-9_]*)\.(route|get|post|put|patch|delete|options|head|api_route)\s*\(/gi;
 	for (const m of content.matchAll(pyDecoratorHeadRe)) {
@@ -815,6 +970,7 @@ function extractPythonRoutes(
 		const subPath = pathArgMatch[1]!;
 		const extraArgs = pathArgMatch[2] ?? "";
 		const line = offsetToLineNumber(lineStarts, decOffset);
+		const endLine = offsetToLineNumber(lineStarts, balanced.endIdx);
 
 		const meta = routerMeta.get(objName);
 		const framework: DetectedFramework = meta?.framework ?? (isFastApi ? "fastapi" : "flask");
@@ -833,18 +989,77 @@ function extractPythonRoutes(
 			methods = [decMethod.toUpperCase()];
 		}
 
-		// 检查相邻装饰器栈、函数参数签名（Depends(...)）及函数首部鉴权守卫
-		const beforeWindow = content.slice(Math.max(0, decOffset - 220), decOffset);
-		const afterStart = balanced.endIdx + 1;
-		const afterWindow = content.slice(afterStart, Math.min(content.length, afterStart + 520));
-		const nextRouteIdx = afterWindow.search(/\n@[A-Za-z_][A-Za-z0-9_]*\.(?:route|get|post|put|patch|delete)/);
-		const boundedAfter = nextRouteIdx >= 0 ? afterWindow.slice(0, nextRouteIdx) : afterWindow;
+		// 严格向上收集紧贴当前路由装饰器的连续 `@` 装饰器行（遇到空行或任何非 `@` 代码行立即停止，杜绝跨函数串扰）
+		const prevDecoratorLines: string[] = [];
+		for (let r = line - 2; r >= 0; r--) {
+			const prevTrimmed = (pyLines[r] ?? "").trim();
+			if (!prevTrimmed || !prevTrimmed.startsWith("@")) break;
+			if (/^@[A-Za-z_][A-Za-z0-9_]*\.(?:route|get|post|put|patch|delete|options|head|api_route)\s*\(/i.test(prevTrimmed)) {
+				break;
+			}
+			prevDecoratorLines.unshift(prevTrimmed);
+		}
+		const prevDecorators = prevDecoratorLines.join("\n");
 
-		const prevDecorators = beforeWindow.split(/\r?\n/).slice(-4).join("\n");
+		// 严格向下收集当前视图函数自身的紧邻装饰器、函数参数签名（Depends）与直属函数体，遇下一顶层 `@`/`def`/`class` 立即截断
+		const afterScopedLines: string[] = [];
+		let seenDef = false;
+		let defIndent = 0;
+		let sigParenDepth = 0;
+		const maxScanRow = Math.min(pyLines.length, endLine + 35);
+
+		for (let r = endLine; r < maxScanRow; r++) {
+			const rawRow = pyLines[r] ?? "";
+			const trimmedRow = rawRow.trim();
+
+			if (!seenDef) {
+				if (!trimmedRow) break;
+				if (trimmedRow.startsWith("@")) {
+					if (/^@[A-Za-z_][A-Za-z0-9_]*\.(?:route|get|post|put|patch|delete|options|head|api_route)\s*\(/i.test(trimmedRow)) {
+						break;
+					}
+					afterScopedLines.push(trimmedRow);
+					continue;
+				}
+				const defMatch = /^(\s*)(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*(\([\s\S]*)$/.exec(rawRow);
+				if (defMatch) {
+					seenDef = true;
+					defIndent = (defMatch[1] ?? "").length;
+					// 仅纳入参数列表部分 `(...)`，避免视图函数自身命名（如 `def auth_dashboard()`）被误认为鉴权中间件
+					afterScopedLines.push(defMatch[2] ?? "");
+					for (const ch of rawRow) {
+						if (ch === "(") sigParenDepth++;
+						else if (ch === ")") sigParenDepth = Math.max(0, sigParenDepth - 1);
+					}
+					continue;
+				}
+				break;
+			}
+
+			// 已进入当前 def 函数：若仍在跨行函数参数括号内则继续读取
+			if (sigParenDepth > 0) {
+				afterScopedLines.push(rawRow);
+				for (const ch of rawRow) {
+					if (ch === "(") sigParenDepth++;
+					else if (ch === ")") sigParenDepth = Math.max(0, sigParenDepth - 1);
+				}
+				continue;
+			}
+
+			if (!trimmedRow) continue;
+			const rowIndent = rawRow.length - rawRow.trimStart().length;
+			if (rowIndent <= defIndent) {
+				// 遇到同级或更外层的下一个 @decorator / def / class / 语句，立即终止当前函数作用域
+				break;
+			}
+			afterScopedLines.push(rawRow);
+		}
+		const boundedAfter = afterScopedLines.join("\n");
+
 		const hasAuth =
 			Boolean(meta?.hasAuth) ||
 			hasAuthInSnippet(extraArgs) ||
-			(/@[A-Za-z0-9_.]/.test(prevDecorators) && hasAuthInSnippet(prevDecorators)) ||
+			(prevDecorators.length > 0 && hasAuthInSnippet(prevDecorators)) ||
 			hasAuthInSnippet(boundedAfter);
 
 		const middlewares: string[] = [];
@@ -915,7 +1130,7 @@ function extractGoRoutes(
 		const groupVar = m[1]!;
 		const parentVar = m[2]!;
 		const openParenIdx = (m.index ?? 0) + m[0].length - 1;
-		const balanced = extractBalancedParens(content, openParenIdx, 600);
+		const balanced = extractBalancedParens(content, openParenIdx, 600, true);
 		if (!balanced) continue;
 		const gMatch = /^\s*["`]([^"`]*)["`]([\s\S]*)$/.exec(balanced.inner);
 		if (!gMatch) continue;
@@ -932,7 +1147,7 @@ function extractGoRoutes(
 	for (const m of content.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\.Use\s*\(/g)) {
 		const groupVar = m[1]!;
 		const openParenIdx = (m.index ?? 0) + m[0].length - 1;
-		const balanced = extractBalancedParens(content, openParenIdx, 600);
+		const balanced = extractBalancedParens(content, openParenIdx, 600, true);
 		if (!balanced) continue;
 		const useArgs = balanced.inner;
 		if (hasAuthInSnippet(useArgs)) {
@@ -957,7 +1172,7 @@ function extractGoRoutes(
 		const rawMethod = m[2]!.toUpperCase();
 		const callOffset = m.index ?? 0;
 		const openParenIdx = callOffset + m[0].length - 1;
-		const balanced = extractBalancedParens(content, openParenIdx, 2000);
+		const balanced = extractBalancedParens(content, openParenIdx, 2000, true);
 		if (!balanced) continue;
 
 		const argMatch = /^\s*["`]([^"`\r\n]+)["`]\s*,\s*([\s\S]+)$/.exec(balanced.inner);
@@ -995,7 +1210,7 @@ function extractGoRoutes(
 	for (const m of content.matchAll(netHttpHeadRe)) {
 		const callOffset = m.index ?? 0;
 		const openParenIdx = callOffset + m[0].length - 1;
-		const balanced = extractBalancedParens(content, openParenIdx, 2000);
+		const balanced = extractBalancedParens(content, openParenIdx, 2000, true);
 		if (!balanced) continue;
 
 		const nhMatch = /^\s*["`](?:(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+)?(\/[^"`\r\n]*)["`]\s*,\s*([\s\S]+)$/.exec(
@@ -1811,7 +2026,11 @@ function extractMethodAndPathFromFinding(finding: BlackboxFindingLike): {
 	}
 
 	if (typeof obj.targetKey === "string" && obj.targetKey.trim()) {
-		const tk = obj.targetKey.trim();
+		// 兼容剥离女娲标准表面分域前缀（如 "path:/api/admin/export"、"endpoint:GET /api/x"、"route:/v1/items"）
+		const tk = obj.targetKey
+			.trim()
+			.replace(/^(?:path|endpoint|route|api|url):+/i, "")
+			.trim();
 		const m = /^(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+(\/\S*)/i.exec(tk);
 		if (m) {
 			if (!method) method = m[1]!.toUpperCase();
