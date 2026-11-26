@@ -23,6 +23,7 @@ import type {
 } from "../omp/types";
 import {
 	atomicWrite,
+	backupExistingProjectState,
 	checkAndLogAutoRuleSource,
 	checkWorkspaceTempWarning,
 	cleanupTrackedProcesses,
@@ -30,6 +31,7 @@ import {
 	findLocalRoot,
 	findRoot,
 	getAgentHome,
+	hasProjectState,
 	isPausedState,
 	isSharedCwd,
 	loadState,
@@ -120,6 +122,7 @@ import {
 	type ArchiveSearchQuery,
 	type WriteEpisodeArchiveResult,
 } from "../omp/reporting";
+import { calibrationLedgerPath, loadCalibrationRecords, safeSettlePrediction } from "../omp/calibration";
 import {
 	JSONRPC_ERROR_CODES,
 	JSONRPC_VERSION,
@@ -261,7 +264,7 @@ function getInflightRegistry(root: string): InflightTargetRegistry {
 function releaseInflightAutoBatch(root: string, reason = "stopped"): string[] {
 	const normRoot = resolve(root);
 	let released: string[] = [];
-	if (existsSync(statePath(normRoot))) {
+	if (hasProjectState(normRoot)) {
 		try {
 			withLock(normRoot, () => {
 				const s = loadState(normRoot);
@@ -364,10 +367,10 @@ export class NuwaCoreEngine {
 		if (typeof explicitRoot === "string" && explicitRoot.trim()) {
 			return resolve(this.cwd, explicitRoot.trim());
 		}
-		if (this.configuredProjectRoot && existsSync(statePath(this.configuredProjectRoot))) {
+		if (this.configuredProjectRoot && hasProjectState(this.configuredProjectRoot)) {
 			return this.configuredProjectRoot;
 		}
-		if (this.activeRoot && existsSync(statePath(this.activeRoot))) {
+		if (this.activeRoot && hasProjectState(this.activeRoot)) {
 			return this.activeRoot;
 		}
 		if (this.configuredProjectRoot) {
@@ -469,7 +472,7 @@ export class NuwaCoreEngine {
 
 			if (migrate) {
 				if (existing && !force) throw new Error("已有 .nuwa 状态；加 force=true 覆盖后再迁移");
-				if (existing && force) renameSync(statePath(root), `${statePath(root)}.bak-${Date.now()}`);
+				if (existing && force) backupExistingProjectState(root);
 				const migrated = withLock(root, () => {
 					const st = migrateSapper(root);
 					st.project.ownerSessionId = sid;
@@ -555,8 +558,8 @@ export class NuwaCoreEngine {
 			}
 
 			if (!rawTarget) throw new Error("target 必填（新建项目时）");
-			if (existing && force && existsSync(statePath(root))) {
-				renameSync(statePath(root), `${statePath(root)}.bak-${Date.now()}`);
+			if (existing && force) {
+				backupExistingProjectState(root);
 			}
 			const goal = typeof p.goal === "string" ? p.goal : "";
 			const st = newState(rawTarget, goal, mode, curCfg, sid, scopeOverride);
@@ -766,7 +769,7 @@ export class NuwaCoreEngine {
 			const st = loadState(root);
 			if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
 			const limit = typeof p.limit === "number" && Number.isFinite(p.limit) ? Math.max(1, Math.floor(p.limit)) : 12;
-			const items = frontierList(st, limit, curCfg.claimTtl);
+			const items = frontierList(st, limit, curCfg.claimTtl, root);
 			if (!items.length) return toolText("frontier 为空。用 nuwa_plan 播种下一阶段，或 nuwa_status 查依赖。", { root, ids: [] });
 			return toolText(
 				items
@@ -940,6 +943,25 @@ export class NuwaCoreEngine {
 					});
 					if (!posGate.ok && posGate.falsePositive) {
 						fpGateResult = posGate;
+						if (!isFree && rawId && existsSync(calibrationLedgerPath(root))) {
+							try {
+								for (const rec of loadCalibrationRecords(root)) {
+									if (!rec.settled && rec.intentId === rawId) {
+										safeSettlePrediction(root, {
+											predictionId: rec.predictionId,
+											outcome: 0,
+											isFalsePositive: true,
+											actualTokens: rec.estimatedTokens || Math.max(0, Number(pre.runtime.tokens ?? 0)),
+											durationMs: 0,
+											source: "verifier-gate",
+											note: `假阳性复核门禁拦截 (${posGate.matchedSignals.join(",")})`,
+										});
+									}
+								}
+							} catch {
+								/* ignore calibration settlement error */
+							}
+						}
 						logEvent(root, {
 							type: "false_positive_intercepted",
 							id: rawId || "free",
@@ -1188,8 +1210,8 @@ export class NuwaCoreEngine {
 				return s;
 			});
 			if (!res.ok) {
-				const convergence = res.convergence ?? buildConvergenceAdvice(updated, curCfg);
-				const sealRec = shouldRecommendSeal(updated, curCfg);
+				const convergence = res.convergence ?? buildConvergenceAdvice(updated, curCfg, root);
+				const sealRec = shouldRecommendSeal(updated, curCfg, root);
 				const convText = convergence.active
 					? `\n${convergence.message}\n收敛出口: nuwa_report(write=true) 后调 nuwa_complete(seal=true, reason="...", excluded_surface=[...])`
 					: "";

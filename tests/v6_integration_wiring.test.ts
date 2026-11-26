@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import * as graphMod from "../omp/graph";
 import * as nuwaMod from "../omp/nuwa";
+import { NuwaCoreEngine } from "../core/mcp-server";
 
 const EXPECTED_12_TOOLS = [
 	"nuwa_init",
@@ -513,3 +514,243 @@ app.get("/api/internal/export-users", async (req, res) => {
 		}
 	});
 });
+
+describe("Boost 异构审查边界回归验证（#37 全部 6 项 P1 与 P2 反例）", () => {
+	test("P1-1: 确认/驳回/404受阻三类提交均真实更新持久化 belief-graph.json 后验并写入 belief_prune 事件", async () => {
+		// 1) 普通 404 受阻提交不应抛异常吞没，belief-graph.json 必须正常落盘
+		const wsBlocked = makeWorkspace("nuwa-p1-1-blk-");
+		const hb = setupHarness(wsBlocked, "s-p1-1-blk");
+		await hb.call("nuwa_init", { target: "http://127.0.0.1:18101", mode: "pentest" });
+		await hb.call("nuwa_claim", { id: "i001", worker: "fujiang" });
+		await hb.call("nuwa_commit", { id: "i001", blocked: true, note: "404 Not Found" });
+		expect(existsSync(nuwaMod.beliefGraphPath(wsBlocked))).toBe(true);
+		const bgBlk = nuwaMod.loadBeliefGraphReadOnly(wsBlocked)!;
+		expect(bgBlk.nodes.i001!.posterior).toBeLessThan(0.5);
+
+		// 2) 双盲确认 confirmed 必须使用 confirmed_hit 提升磁盘后验；双盲驳回 rejected 必须衰减剪枝并写 belief_prune 日志
+		const wsVerify = makeWorkspace("nuwa-p1-1-ver-");
+		const hv = setupHarness(wsVerify, "s-p1-1-ver");
+		await hv.call("nuwa_init", { target: "http://127.0.0.1:18102", mode: "pentest" });
+		const planned = await hv.call("nuwa_plan", {
+			phase: "vuln",
+			intents: [
+				{ title: "候选漏洞 A（待确认）", targetKey: "/api/a", expectedKind: "vuln", surfaceDomain: "path" },
+				{ title: "候选漏洞 B（待驳回）", targetKey: "/api/b", expectedKind: "vuln", surfaceDomain: "path" },
+			],
+		});
+		const [idA, idB] = planned.details.added as [string, string];
+
+		// 提交候选 A 并双盲确认
+		await hv.call("nuwa_claim", { id: idA, worker: "fujiang" });
+		const cmdA1 = "curl -sS http://127.0.0.1:18102/api/a";
+		const outA1 =
+			"HTTP/1.1 200 OK\nContent-Type: application/json\n\n" +
+			JSON.stringify({ leak: "admin_private_config_dump_a1", rows: [1, 2, 3, 4], env: "prod" });
+		nuwaMod.recordToolExecution(wsVerify, { tool: "bash", command: cmdA1, output: outA1, agentName: "fujiang" });
+		const candA = await hv.call("nuwa_commit", {
+			id: idA,
+			kind: "vuln",
+			title: "接口 A 未授权泄露",
+			detail: "泄露配置",
+			command: cmdA1,
+			output: outA1,
+		});
+		const fidA = nuwaMod.loadState(wsVerify)!.intents[idA]!.to!;
+		const postBeforeConfirm = nuwaMod.loadBeliefGraphReadOnly(wsVerify)!.nodes[fidA]!.posterior;
+
+		await Bun.sleep(3);
+		const verIdA = candA.details.verifyIntent as string;
+		await hv.call("nuwa_claim", { id: verIdA, worker: "nuwa-verifier" });
+		const cmdA2 = "curl -sS http://127.0.0.1:18102/api/a?recheck=1";
+		const outA2 =
+			"HTTP/1.1 200 OK\nContent-Type: application/json\n\n" +
+			JSON.stringify({ leak: "admin_private_config_dump_a2_verified", rows: [1, 2, 3, 4], env: "prod" });
+		nuwaMod.recordToolExecution(wsVerify, { tool: "bash", command: cmdA2, output: outA2, agentName: "nuwa-verifier" });
+		const confRes = await hv.call("nuwa_commit", {
+			id: verIdA,
+			kind: "vuln",
+			title: "[Verified] 接口 A 未授权泄露",
+			detail: "独立复验确认",
+			command: cmdA2,
+			output: outA2,
+		});
+		expect(confRes.details.verifyStage).toBe("confirmed");
+		const postAfterConfirm = nuwaMod.loadBeliefGraphReadOnly(wsVerify)!.nodes[fidA]!.posterior;
+		expect(postAfterConfirm).toBeGreaterThan(postBeforeConfirm);
+
+		// 提交候选 B 并双盲驳回
+		await hv.call("nuwa_claim", { id: idB, worker: "fujiang" });
+		const cmdB1 = "curl -sS http://127.0.0.1:18102/api/b";
+		const outB1 =
+			"HTTP/1.1 200 OK\nContent-Type: application/json\n\n" +
+			JSON.stringify({ status: "public_catalog", items: ["x", "y", "z"], trace: "cand_b_payload" });
+		nuwaMod.recordToolExecution(wsVerify, { tool: "bash", command: cmdB1, output: outB1, agentName: "fujiang" });
+		const candB = await hv.call("nuwa_commit", {
+			id: idB,
+			kind: "vuln",
+			title: "疑似接口 B 越权",
+			detail: "待核验",
+			command: cmdB1,
+			output: outB1,
+		});
+		const fidB = nuwaMod.loadState(wsVerify)!.intents[idB]!.to!;
+		const postBeforeReject = nuwaMod.loadBeliefGraphReadOnly(wsVerify)!.nodes[fidB]!.posterior;
+
+		const verIdB = candB.details.verifyIntent as string;
+		await hv.call("nuwa_claim", { id: verIdB, worker: "nuwa-verifier" });
+		await hv.call("nuwa_commit", { id: verIdB, blocked: true, note: "公开目录接口，非越权假阳性" });
+
+		const bgAfterReject = nuwaMod.loadBeliefGraphReadOnly(wsVerify)!;
+		expect(bgAfterReject.nodes[fidB]!.posterior).toBeLessThan(postBeforeReject);
+		expect(bgAfterReject.nodes[fidB]!.pruned).toBe(true);
+		const journalRaw = readFileSync(nuwaMod.journalPath(wsVerify), "utf8");
+		expect(journalRaw).toContain('"type":"belief_prune"');
+	});
+
+	test("P1-2 & P1-3: 信念图跨 loadState / NuwaCoreEngine 持久化重排生效且 compositeScore 归一化不淹没基础优先级", async () => {
+		const ws = makeWorkspace("nuwa-p1-23-");
+		const engine = new NuwaCoreEngine({ projectRoot: ws, cwd: ws, sessionId: "s-p1-23" });
+		await engine.callTool("nuwa_init", { target: "http://127.0.0.1:18103", mode: "pentest" });
+
+		const pRes = await engine.callTool("nuwa_plan", {
+			intents: [
+				{ phase: "vuln", title: "候选探索路径 A (p=60)", targetKey: "/api/boost", priority: 60 },
+				{ phase: "vuln", title: "候选探索路径 B (p=85)", targetKey: "/api/pruned", priority: 85 },
+			],
+		});
+		const [boostId, prunedId] = (pRes.details?.added as [string, string]) ?? [];
+
+		// 1) 未修改信念前，基础整数优先级 85 > 60 严格保持单调顺序（未被百分制 compositeScore 淹没）
+		const stInitial = nuwaMod.loadState(ws)!;
+		const initialOrder = nuwaMod.frontierList(stInitial, 50).map((f) => f.intent.id);
+		expect(initialOrder.indexOf(prunedId)).toBeLessThan(initialOrder.indexOf(boostId));
+
+		// 2) 在持久化 belief-graph.json 上设置跃迁提权与剪枝，然后通过全新 loadState(ws) 与 NuwaCoreEngine 验证
+		const bg = nuwaMod.loadOrInitBeliefGraph(ws, stInitial);
+		bg.nodes[boostId]!.breakthroughBoost = 2.0;
+		bg.nodes[boostId]!.posterior = 0.889;
+		bg.nodes[prunedId]!.pruned = true;
+		nuwaMod.saveBeliefGraph(ws, stInitial, bg);
+
+		const reloadedState = nuwaMod.loadState(ws)!;
+		const reloadedOrder = nuwaMod.frontierList(reloadedState, 50).map((f) => f.intent.id);
+		expect(reloadedOrder.indexOf(boostId)).toBeLessThan(reloadedOrder.indexOf(prunedId));
+
+		const mcpFrontier = await engine.callTool("nuwa_frontier", { limit: 50 });
+		const mcpIds = (mcpFrontier.details?.ids as string[]) ?? [];
+		expect(mcpIds.indexOf(boostId)).toBeLessThan(mcpIds.indexOf(prunedId));
+	});
+
+	test("P1-4 & P1-5: /nuwa mcp 输出合法 --project 与真实 12 工具；纯 SQLite 删 state.json 后 force=true 重建零崩溃", async () => {
+		const ws = makeWorkspace("nuwa-p1-45-");
+		const h = setupHarness(ws, "s-p1-45");
+
+		// P1-4: /nuwa mcp 参数与真实 12 工具校验，且用解析出的 CLI 参数真实启动 bin/nuwa-mcp --version 退出码 0
+		const mcpView = nuwaMod.executeMcpCommand(ws);
+		expect(mcpView.msg).toContain('"--project"');
+		expect(mcpView.msg).not.toContain('"--cwd"');
+		for (const t of EXPECTED_12_TOOLS) {
+			expect(mcpView.msg).toContain(t);
+		}
+		for (const fake of ["nuwa_seal", "nuwa_inspect", "nuwa_scope", "nuwa_session"]) {
+			expect(mcpView.msg).not.toContain(fake);
+		}
+		const repoMcpBin = resolve(import.meta.dir, "..", "bin", "nuwa-mcp");
+		const proc = Bun.spawn([repoMcpBin, "--project", ws, "--version"], { stdout: "pipe", stderr: "pipe" });
+		expect(await proc.exited).toBe(0);
+
+		// P1-5: 纯 SQLite 模式下删除 state.json，调用 nuwa_init(force=true) 与 NuwaCoreEngine force=true 均正常备份重建
+		setEnvTemp("NUWA_STORAGE_BACKEND", "sqlite");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18104", mode: "pentest" });
+		await h.call("nuwa_commit", { free_note: true, kind: "note", title: "旧项目残留记录" });
+		unlinkSync(nuwaMod.statePath(ws));
+		expect(existsSync(nuwaMod.statePath(ws))).toBe(false);
+		expect(nuwaMod.hasProjectState(ws)).toBe(true);
+
+		const reinit1 = await h.call("nuwa_init", {
+			target: "http://127.0.0.1:18105",
+			mode: "pentest",
+			root: ws,
+			force: true,
+		});
+		expect(reinit1.isError).toBeFalsy();
+		expect(Object.keys(nuwaMod.loadState(ws)!.facts).length).toBe(0);
+
+		unlinkSync(nuwaMod.statePath(ws));
+		const mcpEngine = new NuwaCoreEngine({ projectRoot: ws, cwd: ws, sessionId: "s-mcp-force" });
+		const reinit2 = await mcpEngine.callTool("nuwa_init", {
+			target: "http://127.0.0.1:18106",
+			mode: "pentest",
+			root: ws,
+			force: true,
+		});
+		expect(reinit2.isError).toBe(false);
+		expect(readdirSync(join(ws, ".nuwa")).some((n) => n.startsWith("nuwa.db.bak-"))).toBe(true);
+	});
+
+	test("P1-6 & P2: 未经执行账本核验的伪造事实严禁冒充 exec-ledger 结算 outcome=1；真实核验后回写 calibrationSettled", async () => {
+		const ws = makeWorkspace("nuwa-p1-6-");
+		const h = setupHarness(ws, "s-p1-6");
+		await h.call("nuwa_init", { target: "http://127.0.0.1:18107", mode: "pentest" });
+
+		const pRes = await h.call("nuwa_plan", {
+			phase: "surface",
+			intents: [
+				{ title: "无账本伪造端点提交", targetKey: "/fake-ep", expectedKind: "endpoint" },
+				{ title: "真实执行账本核验端点提交", targetKey: "/real-ep", expectedKind: "endpoint" },
+			],
+		});
+		const [fakeIntentId, realIntentId] = pRes.details.added as [string, string];
+
+		// 1) 执行账本为空：登记预测后直接提交伪造 command/output -> 严禁伪造 exec-ledger 结算！
+		const fakePred = nuwaMod.recordPrediction(ws, {
+			intentId: fakeIntentId,
+			taskCategory: "recon",
+			modelId: "test-model",
+			predictedConfidence: 0.8,
+			estimatedTokens: 500,
+		});
+		await h.call("nuwa_claim", { id: fakeIntentId, worker: "fujiang" });
+		await h.call("nuwa_commit", {
+			id: fakeIntentId,
+			kind: "endpoint",
+			title: "口头伪造发现 /fake-ep",
+			command: "curl -sS http://127.0.0.1:18107/fake-ep",
+			output: "HTTP/1.1 200 OK\nhttp_code=200 size_download=128 remote_ip=127.0.0.1 time_total=0.01\n\n{\"ok\":true}",
+		});
+		const afterFake = nuwaMod.loadCalibrationRecords(ws).find((r) => r.predictionId === fakePred.predictionId)!;
+		expect(afterFake.settled).toBe(false);
+		expect(nuwaMod.loadState(ws)!.intents[fakeIntentId]?.calibrationSettled).toBeUndefined();
+
+		// 2) 真实写入执行证据账本后提交 -> 允许以机械源 exec-ledger 结算 outcome=1 并同步更新状态字段
+		const realPred = nuwaMod.recordPrediction(ws, {
+			intentId: realIntentId,
+			taskCategory: "recon",
+			modelId: "test-model",
+			predictedConfidence: 0.85,
+			estimatedTokens: 600,
+		});
+		await h.call("nuwa_claim", { id: realIntentId, worker: "fujiang" });
+		const realCmd = "curl -sS http://127.0.0.1:18107/real-ep";
+		const realOut =
+			"HTTP/1.1 200 OK\nServer: envoy\nhttp_code=200 size_download=256 remote_ip=127.0.0.1 time_total=0.02\n\n{\"service\":\"billing-v2\",\"routes\":[\"/real-ep\"]}";
+		nuwaMod.recordToolExecution(ws, { tool: "bash", command: realCmd, output: realOut, agentName: "fujiang" });
+		await h.call("nuwa_commit", {
+			id: realIntentId,
+			kind: "endpoint",
+			title: "真实探明 /real-ep",
+			command: realCmd,
+			output: realOut,
+		});
+
+		const afterReal = nuwaMod.loadCalibrationRecords(ws).find((r) => r.predictionId === realPred.predictionId)!;
+		expect(afterReal.settled).toBe(true);
+		expect(afterReal.outcome).toBe(1);
+		expect(afterReal.source).toBe("exec-ledger");
+
+		const stFinal = nuwaMod.loadState(ws)!;
+		expect(stFinal.intents[realIntentId]?.calibrationSettled).toBe(true);
+		expect(stFinal.runtime.calibrationSettledCount).toBeGreaterThanOrEqual(1);
+	});
+});
+

@@ -1059,17 +1059,17 @@ export function executeMcpCommand(
 
 	const tools = [
 		"nuwa_init",
-		"nuwa_status",
 		"nuwa_plan",
+		"nuwa_frontier",
 		"nuwa_claim",
 		"nuwa_commit",
 		"nuwa_flag",
 		"nuwa_complete",
-		"nuwa_seal",
-		"nuwa_inspect",
+		"nuwa_status",
+		"nuwa_report",
+		"nuwa_expand",
+		"nuwa_stop",
 		"nuwa_kb",
-		"nuwa_scope",
-		"nuwa_session",
 	];
 
 	const mcpConfig = JSON.stringify(
@@ -1077,7 +1077,7 @@ export function executeMcpCommand(
 			mcpServers: {
 				"pi-nuwa": {
 					command: effectiveBin,
-					args: ["--cwd", cwdHint],
+					args: ["--project", cwdHint],
 				},
 			},
 		},
@@ -1138,7 +1138,7 @@ export function statusBoard(st: NuwaState, root?: string): string {
 		...rows.map((r) => line(` ${r.phase}`, String(r.open), String(r.claimed), String(r.done), String(r.blocked), String(r.total))),
 		head,
 	].join("\n");
-	const frontier = frontierList(st, 8, cfg.claimTtl).map((f) => f.intent.id).join(" ") || "(空)";
+	const frontier = frontierList(st, 8, cfg.claimTtl, root).map((f) => f.intent.id).join(" ") || "(空)";
 	const autoBatch = Object.values(st.intents)
 		.filter((i) => i.status === "claimed" && i.worker === "auto")
 		.map((i) => i.id)
@@ -1183,8 +1183,8 @@ export function statusBoard(st: NuwaState, root?: string): string {
 	const blockedCommits = rt.blockedCommits ?? blockedIntents;
 	const noveltyStall = rt.noveltyStall ?? 0;
 	const effectiveStatus = rt.status === "sealed_negative" ? "sealed_negative" : p.status;
-	const conv = buildConvergenceAdvice(st, cfg);
-	const sealRec = shouldRecommendSeal(st, cfg);
+	const conv = buildConvergenceAdvice(st, cfg, root);
+	const sealRec = shouldRecommendSeal(st, cfg, root);
 
 	const extraMetaParts: string[] = [
 		`repeatRatio=${rep.repeatRatio.toFixed(2)}`,

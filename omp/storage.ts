@@ -704,19 +704,35 @@ export function normalizeState(st: NuwaState): NuwaState {
 	return st;
 }
 
+const loadedStateRoots = new WeakMap<NuwaState, string>();
+
+export function bindLoadedStateRoot(st: NuwaState, root: string): NuwaState {
+	if (st && typeof st === "object" && root) {
+		loadedStateRoots.set(st, resolve(root));
+	}
+	return st;
+}
+
+export function getLoadedStateRoot(st: NuwaState | null | undefined): string | undefined {
+	if (!st || typeof st !== "object") return undefined;
+	return loadedStateRoots.get(st);
+}
+
 /** 纯 JSON 状态加载（供 sqlite-store 迁移与坏库回退无环调用，亦作为 json 模式的底层实现）。 */
 export function loadStateJsonOnly(root: string): NuwaState | null {
 	const direct = readJson<NuwaState>(statePath(root));
-	if (direct && direct.schema === SCHEMA && direct.project) return normalizeState(direct);
+	if (direct && direct.schema === SCHEMA && direct.project) return bindLoadedStateRoot(normalizeState(direct), root);
 	const recovered = recoverFromJournal(root);
 	if (recovered) {
+		const norm = normalizeState(recovered);
 		try {
-			atomicWrite(statePath(root), JSON.stringify(normalizeState(recovered), null, 2));
+			atomicWrite(statePath(root), JSON.stringify(norm, null, 2));
 		} catch {
 			/* 恢复成功即可 */
 		}
+		return bindLoadedStateRoot(norm, root);
 	}
-	return recovered ? normalizeState(recovered) : null;
+	return null;
 }
 
 export function loadState(root: string): NuwaState | null {
@@ -724,7 +740,7 @@ export function loadState(root: string): NuwaState | null {
 	if (backend === "sqlite" || backend === "dual") {
 		try {
 			const fromSql = loadStateFromSqlite(root, { fallbackToJson: true });
-			if (fromSql) return normalizeState(fromSql);
+			if (fromSql) return bindLoadedStateRoot(normalizeState(fromSql), root);
 		} catch {
 			/* 坏库或未建库时回退存量 JSON 兼容读取 */
 		}
@@ -742,6 +758,7 @@ export interface SaveStateOptions {
 
 /** 纯 JSON 原子写盘 + 增量快照。 */
 export function saveStateJsonOnly(root: string, state: NuwaState, opts?: SaveStateOptions): void {
+	bindLoadedStateRoot(state, root);
 	state.project.updatedAt = nowIso();
 	state.runtime.saveCount = (state.runtime.saveCount ?? 0) + 1;
 	const preliminary = JSON.stringify(state, null, 2);
@@ -806,6 +823,38 @@ export function hasProjectState(dir: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * 在 `nuwa_init(force=true)` 重建前安全备份现有项目状态（兼容仅存 `nuwa.db` 无 `state.json` 的纯 SQLite 模式），
+ * 并清理旧 SQLite WAL/SHM 伴生文件，防止 ENOENT 崩溃或旧库数据残留污染新项目。
+ */
+export function backupExistingProjectState(root: string): string[] {
+	const ts = Date.now();
+	const backedUp: string[] = [];
+	const sp = statePath(root);
+	if (existsSync(sp)) {
+		const bakJson = `${sp}.bak-${ts}`;
+		renameSync(sp, bakJson);
+		backedUp.push(bakJson);
+	}
+	const dbFile = sqliteDbPath(root);
+	if (existsSync(dbFile)) {
+		const bakDb = `${dbFile}.bak-${ts}`;
+		renameSync(dbFile, bakDb);
+		backedUp.push(bakDb);
+	}
+	for (const suffix of ["-wal", "-shm"]) {
+		const sidecar = `${dbFile}${suffix}`;
+		if (existsSync(sidecar)) {
+			try {
+				unlinkSync(sidecar);
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+	return backedUp;
 }
 
 /** 共享 cwd 不能直接放 .nuwa，否则同机多个任务会写同一份 state。 */
@@ -2366,7 +2415,7 @@ export function verifyWorkspaceIntegrity(
 	}
 
 	const hasNuwaDir = exists && existsSync(stateDir(normRoot));
-	const hasStateFile = exists && existsSync(statePath(normRoot));
+	const hasStateFile = exists && hasProjectState(normRoot);
 	const meta = hasNuwaDir ? readJson<WorkspaceMetaRecord>(workspaceMetaPath(normRoot)) : null;
 	const { gitPresent, gitHeadValid } = exists
 		? inspectGitMetadata(normRoot)

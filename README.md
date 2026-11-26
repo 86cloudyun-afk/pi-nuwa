@@ -78,7 +78,7 @@ env -u BUN_OPTIONS ./install.sh --clean-kb      # 全新重建纯净 kb.db
   "mcpServers": {
     "pi-nuwa": {
       "command": "/root/.local/bin/nuwa-mcp",
-      "args": ["--cwd", "/path/to/workspace"]
+      "args": ["--project", "/path/to/workspace"]
     }
   }
 }

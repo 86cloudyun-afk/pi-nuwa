@@ -26,6 +26,7 @@ import {
 import {
 	atomicWrite,
 	getAgentHome,
+	getLoadedStateRoot,
 	nextIntentId,
 	normOneLine,
 	nowIso,
@@ -52,6 +53,7 @@ import { loadSessionVault } from "./session-vault";
 import { synthesizeCrossFactHypotheses } from "./hypothesis";
 import { resolveReportPhaseTransition } from "./reincarnate";
 import {
+	computeBetaPosterior,
 	initBeliefGraphFromState,
 	rankFrontierByBelief,
 	recommendSearchPivot,
@@ -97,9 +99,58 @@ export function loadBeliefGraphReadOnly(root: string): BeliefGraph | null {
 
 export function loadOrInitBeliefGraph(root: string | undefined, st: NuwaState): BeliefGraph {
 	const cached = stateBeliefCache.get(st);
-	const disk = root ? loadBeliefGraphReadOnly(root) : null;
+	const effRoot = root || getLoadedStateRoot(st);
+	const disk = effRoot ? loadBeliefGraphReadOnly(effRoot) : null;
 	const existing = disk ?? cached;
-	const graph = initBeliefGraphFromState(st, existing ?? undefined);
+	const graph = mergeWithDiskBeliefGraph(st, existing ?? undefined);
+	stateBeliefCache.set(st, graph);
+	return graph;
+}
+
+/**
+ * 纯只读解析当前状态的信念图（优先命中内存缓存，未命中时从 root 或 loadState 绑定的目录只读加载 .nuwa/belief-graph.json，严禁写盘）。
+ */
+function mergeWithDiskBeliefGraph(st: NuwaState, existing?: BeliefGraph): BeliefGraph {
+	const graph = initBeliefGraphFromState(st, existing);
+	if (!existing?.nodes) return graph;
+	for (const [id, node] of Object.entries(graph.nodes)) {
+		const prev = existing.nodes[id];
+		if (!prev) continue;
+		if (prev.pruned) {
+			node.pruned = true;
+			if (!node.pruneReason && prev.pruneReason) node.pruneReason = prev.pruneReason;
+		}
+		if (typeof prev.breakthroughBoost === "number" && prev.breakthroughBoost > node.breakthroughBoost) {
+			node.breakthroughBoost = prev.breakthroughBoost;
+		}
+		if (typeof prev.observations === "number" && prev.observations > node.observations) {
+			node.observations = prev.observations;
+		}
+		// 兼容外部或测试直接指定 posterior 的持久化信念节点（除非底层事实已被明确 rejected）
+		const srcFact = node.kind === "fact" ? st.facts?.[node.sourceId] : undefined;
+		if (
+			srcFact?.verifyStage !== "rejected" &&
+			typeof prev.posterior === "number" &&
+			Number.isFinite(prev.posterior) &&
+			prev.posterior > 0 &&
+			prev.posterior < 1 &&
+			Math.abs(prev.posterior - computeBetaPosterior(prev.alpha, prev.beta)) > 1e-4
+		) {
+			const weight = Math.max(2, (prev.alpha || 1) + (prev.beta || 1));
+			node.alpha = prev.posterior * weight;
+			node.beta = (1 - prev.posterior) * weight;
+			node.posterior = prev.posterior;
+		}
+	}
+	return graph;
+}
+
+export function resolveBeliefGraphForRead(st: NuwaState, root?: string): BeliefGraph {
+	const cached = stateBeliefCache.get(st);
+	if (cached) return cached;
+	const effRoot = root || getLoadedStateRoot(st);
+	const disk = effRoot ? loadBeliefGraphReadOnly(effRoot) : null;
+	const graph = mergeWithDiskBeliefGraph(st, disk ?? undefined);
 	stateBeliefCache.set(st, graph);
 	return graph;
 }
@@ -676,6 +727,7 @@ export interface SealRecommendation {
 export function shouldRecommendSeal(
 	rtOrState: Runtime | NuwaState,
 	cfg?: Partial<Cfg> & { maxCostUsd?: number; noveltyStallThreshold?: number },
+	root?: string,
 ): SealRecommendation {
 	const isFullState = Boolean(
 		rtOrState && typeof rtOrState === "object" && "project" in rtOrState && "runtime" in rtOrState,
@@ -713,7 +765,7 @@ export function shouldRecommendSeal(
 	if (isFullState && isBeliefSearchEnabled()) {
 		try {
 			const st = rtOrState as NuwaState;
-			const graph = stateBeliefCache.get(st) ?? initBeliefGraphFromState(st);
+			const graph = resolveBeliefGraphForRead(st, root);
 			searchPivot = recommendSearchPivot(st, graph, { noveltyStallThreshold: threshold });
 			if (
 				searchPivot.recommendSeal &&
@@ -753,6 +805,7 @@ export interface ConvergenceAdvice {
 export function buildConvergenceAdvice(
 	stOrRt: NuwaState | Runtime,
 	cfg?: Partial<Cfg>,
+	root?: string,
 ): ConvergenceAdvice {
 	const isFullState = Boolean(stOrRt && typeof stOrRt === "object" && "project" in stOrRt && "runtime" in stOrRt);
 	const rt: Runtime = isFullState ? (stOrRt as NuwaState).runtime : (stOrRt as Runtime);
@@ -777,7 +830,7 @@ export function buildConvergenceAdvice(
 	if (isFullState && isBeliefSearchEnabled()) {
 		try {
 			const st = stOrRt as NuwaState;
-			const graph = stateBeliefCache.get(st) ?? initBeliefGraphFromState(st);
+			const graph = resolveBeliefGraphForRead(st, root);
 			searchPivot = recommendSearchPivot(st, graph);
 		} catch {
 			/* ignore */
@@ -795,7 +848,7 @@ export function buildConvergenceAdvice(
 		};
 	}
 
-	const sealRec = shouldRecommendSeal(stOrRt, cfg);
+	const sealRec = shouldRecommendSeal(stOrRt, cfg, root);
 	const pivotHint = searchPivot?.topDirection
 		? `（若仍有未探明高信息增益方向，仅允许核验 ${searchPivot.topDirection.intentId}: ${searchPivot.topDirection.title}）`
 		: "";
@@ -1664,7 +1717,7 @@ export function planIntents(
 /**
  * 计算待认领前沿队列（融合便携知识库经验提权与 v6.0 贝叶斯信念/VoI 价值排序，纯只读零磁盘写入）。
  */
-export function frontierList(st: NuwaState, limit = 20, claimTtl = 900): FrontierItem[] {
+export function frontierList(st: NuwaState, limit = 20, claimTtl = 900, root?: string): FrontierItem[] {
 	const now = Date.now();
 	const out: FrontierItem[] = [];
 	for (const intent of Object.values(st.intents)) {
@@ -1688,7 +1741,7 @@ export function frontierList(st: NuwaState, limit = 20, claimTtl = 900): Frontie
 	const beliefDeltaMap = new Map<string, number>();
 	if (out.length > 1 && isBeliefSearchEnabled()) {
 		try {
-			const graph = stateBeliefCache.get(st) ?? initBeliefGraphFromState(st);
+			const graph = resolveBeliefGraphForRead(st, root);
 			const ranked = rankFrontierByBelief(st, out, { graph });
 			for (const r of ranked) {
 				const node = graph.nodes[r.nodeId];
@@ -1698,7 +1751,9 @@ export function frontierList(st: NuwaState, limit = 20, claimTtl = 900): Frontie
 				}
 				const boost = node?.breakthroughBoost ?? 0;
 				const obs = node?.observations ?? 0;
-				let delta = (r.compositeScore - 0.5) * 1.6;
+				// rankFrontierByBelief 返回百分制 compositeScore [0, 100+]，先归一化至 [0, 1.5] 防止量纲淹没基础优先级
+				const normComposite = Math.max(0, Math.min(1.5, r.compositeScore / 100));
+				let delta = (normComposite - 0.5) * 1.6;
 				if (boost > 0) {
 					delta += boost * 16 + r.voiScore * 6;
 				} else if (obs > 0) {

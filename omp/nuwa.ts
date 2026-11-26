@@ -33,9 +33,9 @@ import {
 	type VerifyEvidenceInput, type VerifyEvidenceResult, type VerifyStage,
 } from "./types";
 import {
-	SCHEMA, ProcessGroupTracker, SubagentWatchdog, atomicWrite, cell, checkAndLogAutoRuleSource,
+	SCHEMA, ProcessGroupTracker, SubagentWatchdog, atomicWrite, backupExistingProjectState, bindLoadedStateRoot, cell, checkAndLogAutoRuleSource,
 	checkWorkspaceTempWarning, cleanupTrackedProcesses, createInitialState, defaultProjectRoot,
-	findLocalRoot, findRoot, getAgentHome, installProcessCleanupHooks, isPausedState,
+	findLocalRoot, findRoot, getAgentHome, getLoadedStateRoot, installProcessCleanupHooks, isPausedState,
 	isProcessAliveNonZombie, isSharedCwd, journalAppend, journalPath, loadState, lockPath, logEvent, migrateSapper, nextFactId, nextIntentId,
 	normOneLine, normalizeState, normalizeTarget, normalizeTargetForMode, nowIso, pausedStatePath,
 	pidAlive, processTrackerPath, readCfg, readJournalTail, readJson, readPausedState, readSessionPointer,
@@ -250,13 +250,13 @@ export {
 	DEFAULT_PRUNE_THRESHOLD, DEFAULT_SUBAGENT_MODEL, MAX_BETA_PARAM, MAX_MUTATION_CONCURRENCY,
 	MIN_BETA_PARAM, NuwaSqliteCorruptError, NuwaSqliteStore, REDACTED_MARKER, SQLITE_SCHEMA_VERSION,
 	TrafficRecorder, VALID_BELIEF_OBSERVATIONS, VALID_TASK_CATEGORIES, appendJournalSqlite,
-	attachBeliefGraphCache, beliefGraphPath, bridgeWhiteboxToBlackboxIntents, calibrationLedgerPath,
+	attachBeliefGraphCache, backupExistingProjectState, beliefGraphPath, bindLoadedStateRoot, bridgeWhiteboxToBlackboxIntents, calibrationLedgerPath,
 	collectTestableAuthPaths, computeAuthDiffSignature, computeBetaPosterior,
 	computeCalibrationSummary, computeExpectedInfoGain, computeNodeUncertainty,
 	computeOneStepEntropyReduction, correlateBlackboxFindingToSource, executeBeliefCommand,
 	executeCalibrateCommand, executeHybridCommand, executeMcpCommand, executeTrafficCommand,
 	exportStateJsonCompat, extractCodeAttackSurface, extractFromSourceMap, formatCalibrationReport,
-	hasProjectState, inferCalibrationTaskCategory, initBeliefGraphFromState, loadBeliefGraphReadOnly,
+	getLoadedStateRoot, hasProjectState, inferCalibrationTaskCategory, initBeliefGraphFromState, loadBeliefGraphReadOnly,
 	loadCalibrationRecords, loadOrInitBeliefGraph, loadStateFromSqlite, loadStateJsonOnly,
 	migrateJsonToSqlite, openNuwaDb, planAutonomousOobProbes, propagateBeliefUpdate,
 	pruneLowYieldSubtree, queryFactsByText, rankFrontierByBelief, recommendAdaptiveModelRoute,
@@ -471,7 +471,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 			}
 		}
 		let released: string[] = [];
-		if (existsSync(statePath(normRoot))) {
+		if (hasProjectState(normRoot)) {
 			try {
 				withLock(normRoot, () => {
 					const s = loadState(normRoot);
@@ -632,7 +632,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				}
 				if (p.migrate) {
 					if (existing && !p.force) throw new Error("已有 .nuwa 状态；加 force=true 覆盖后再迁移");
-					if (existing && p.force) renameSync(statePath(root), `${statePath(root)}.bak-${Date.now()}`);
+					if (existing && p.force) backupExistingProjectState(root);
 					const migrated = withLock(root, () => {
 						const st = migrateSapper(root);
 						st.project.ownerSessionId = sid;
@@ -706,7 +706,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					);
 				}
 				if (!rawTarget) throw new Error("target 必填（新建项目时）");
-				if (existing && p.force) renameSync(statePath(root), `${statePath(root)}.bak-${Date.now()}`);
+				if (existing && p.force) backupExistingProjectState(root);
 				const st = newState(rawTarget, p.goal ?? "", mode, curCfg, sid, p.scope);
 				st.project.toolchain = probeToolchain();
 				st.project.sandboxMode = readSandboxConfig().mode;
@@ -909,7 +909,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				if (!root) throw new Error("未找到女娲项目；用 NUWA_PROJECT=<根> 指定，或在项目目录 nuwa_init(resume=true) 接管");
 				const st = loadState(root);
 				if (!st) throw new Error("该项目没有 .nuwa/state.json；先 nuwa_init（旧项目用 nuwa_init(migrate=true)）");
-				const items = frontierList(st, p.limit, curCfg.claimTtl);
+				const items = frontierList(st, p.limit, curCfg.claimTtl, root);
 				if (!items.length) return toolText("frontier 为空。用 nuwa_plan 播种下一阶段，或 nuwa_status 查依赖。");
 				return toolText(
 					items
@@ -1392,8 +1392,8 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 				});
 				refreshUi(ctx, root, updated, true);
 				if (!res.ok) {
-					const convergence = res.convergence ?? buildConvergenceAdvice(updated, curCfg);
-					const sealRec = shouldRecommendSeal(updated, curCfg);
+					const convergence = res.convergence ?? buildConvergenceAdvice(updated, curCfg, root);
+					const sealRec = shouldRecommendSeal(updated, curCfg, root);
 					const convText = convergence.active
 						? `\n${convergence.message}\n收敛出口: nuwa_report(write=true) 后调 nuwa_complete(seal=true, reason="...", excluded_surface=[...])`
 						: "";
@@ -2377,7 +2377,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 					s.runtime.totalTurns = Math.max(s.runtime.totalTurns ?? 0, s.runtime.turns - 1) + 1;
 					s.runtime.genTurns = (s.runtime.genTurns ?? 0) + 1;
 					s.runtime.lastSettleAt = Date.now();
-					directive = buildDirective(s, curCfg);
+					directive = buildDirective(s, curCfg, root);
 					s.runtime.lastDirective = directive;
 					saveState(root, s);
 					logEvent(root, { type: "pump", sessionId: sid, turn: s.runtime.turns, phase: s.project.phase });

@@ -50,7 +50,7 @@ import {
 } from "./reincarnate";
 import { extractProbeHealth, renderFullStatus, type FullStatusOptions } from "./ui";
 import { checkNuwaDirTamper, checkScopeAndRisk, defaultScopeForTarget, isHostInScope } from "./scope";
-import { adaptPacketForToolchain, getLatestLedgerSeq, recordToolExecution } from "./evidence";
+import { adaptPacketForToolchain, getLatestLedgerSeq, recordToolExecution, verifyExecutionEvidence } from "./evidence";
 import {
 	deriveKbIntents,
 	getProfile,
@@ -1073,13 +1073,13 @@ export function completeProject(
 	return { ok: true, from: ids };
 }
 
-export function buildDirective(st: NuwaState, cfg: Cfg): string {
+export function buildDirective(st: NuwaState, cfg: Cfg, root?: string): string {
 	const p = st.project;
 	const rt = st.runtime;
 	const pressure = budgetPressure(st, cfg);
 	// 压力高时降档：并行降到 2，减少上下文与调度开销；轮次不减少、推进不停。
 	const batchSize = pressure >= 0.9 ? Math.max(1, Math.min(2, cfg.maxBatch)) : cfg.maxBatch;
-	const items = frontierList(st, batchSize, cfg.claimTtl);
+	const items = frontierList(st, batchSize, cfg.claimTtl, root);
 	const counts = Object.values(st.intents).reduce(
 		(acc, i) => {
 			acc[i.status] += 1;
@@ -1092,8 +1092,8 @@ export function buildDirective(st: NuwaState, cfg: Cfg): string {
 	const ep = p.episode ?? 1;
 	const noveltyStall = rt.noveltyStall ?? 0;
 	const threshold = readNoveltyThreshold(cfg);
-	const conv = buildConvergenceAdvice(st, cfg);
-	const sealRec = shouldRecommendSeal(st, cfg);
+	const conv = buildConvergenceAdvice(st, cfg, root);
+	const sealRec = shouldRecommendSeal(st, cfg, root);
 	const head = `[女娲 v${VERSION} · 永动续跑 第 ${rt.turns} 轮 · E${ep}] status=${p.status} phase=${p.phase} open=${counts.open} claimed=${counts.claimed} done=${counts.done} blocked=${counts.blocked}(commits=${rt.blockedCommits ?? counts.blocked}) facts=${Object.keys(st.facts).length} flags=${flags} | ${mins}min stall=${rt.stall} noveltyStall=${noveltyStall} idle=${rt.idle} pressure=${Math.round(pressure * 100)}% expand=${rt.expansions ?? 0}`;
 	const goal = `目标: ${p.url} (${p.mode}) — ${p.goal}`;
 	const hard = [
@@ -1499,6 +1499,12 @@ function settleCalibrationForCommit(
 
 	const actualTokens = Math.max(0, Number(st.runtime.tokens ?? 0));
 
+	const markSettledOnState = (intentId: string) => {
+		const it = st.intents[intentId];
+		if (it) it.calibrationSettled = true;
+		st.runtime.calibrationSettledCount = (st.runtime.calibrationSettledCount ?? 0) + 1;
+	};
+
 	if (isVerifyVulnIntentKey(params.intentKey)) {
 		// 1. 双盲复验完成时，由 verifier-gate 对原候选漏洞产出的意图做权威真伪对账结算
 		if (params.verifyTargetFactId && (params.verifyStageOut === "confirmed" || params.verifyStageOut === "rejected")) {
@@ -1507,7 +1513,7 @@ function settleCalibrationForCommit(
 				const origPending = pendingByIntent.get(origIntent.id) ?? [];
 				const isConfirmed = params.verifyStageOut === "confirmed";
 				for (const pred of origPending) {
-					safeSettlePrediction(root, {
+					const settled = safeSettlePrediction(root, {
 						predictionId: pred.predictionId,
 						outcome: isConfirmed ? 1 : 0,
 						isFalsePositive: !isConfirmed,
@@ -1518,6 +1524,7 @@ function settleCalibrationForCommit(
 							? `双盲复验确认 (${params.verifyTargetFactId})`
 							: `双盲复验驳回假阳性 (${params.verifyTargetFactId})`,
 					});
+					if (settled.ok) markSettledOnState(origIntent.id);
 				}
 			}
 		}
@@ -1525,7 +1532,7 @@ function settleCalibrationForCommit(
 		const verifyPending = pendingByIntent.get(params.intentId) ?? [];
 		for (const pred of verifyPending) {
 			const hit = params.verifyStageOut === "confirmed" ? 1 : 0;
-			safeSettlePrediction(root, {
+			const settled = safeSettlePrediction(root, {
 				predictionId: pred.predictionId,
 				outcome: hit,
 				isFalsePositive: false,
@@ -1534,6 +1541,7 @@ function settleCalibrationForCommit(
 				source: "verifier-gate",
 				note: `复验任务结案 stage=${params.verifyStageOut ?? "done"}`,
 			});
+			if (settled.ok) markSettledOnState(params.intentId);
 		}
 		return;
 	}
@@ -1546,24 +1554,58 @@ function settleCalibrationForCommit(
 	const targetPending = pendingByIntent.get(params.intentId) ?? [];
 	if (targetPending.length === 0) return;
 
-	const isPositiveHit = Boolean(
-		!params.blocked &&
-			params.fact &&
-			params.fact.kind !== "blocked" &&
-			params.fact.kind !== "note",
-	);
+	if (params.blocked) {
+		for (const pred of targetPending) {
+			const settled = safeSettlePrediction(root, {
+				predictionId: pred.predictionId,
+				outcome: 0,
+				isFalsePositive: false,
+				actualTokens: pred.estimatedTokens || actualTokens,
+				durationMs: 0,
+				source: "exec-ledger",
+				note: `意图受阻结案: ${params.note ?? "blocked"}`,
+			});
+			if (settled.ok) markSettledOnState(params.intentId);
+		}
+		return;
+	}
+
+	// 反自证硬约束：非 verify-vuln 正向提交仅在真正通过机械核验（fact.verified===true 或命中真实执行证据账本）时才允许结算 outcome=1
+	if (!params.fact || params.fact.kind === "blocked" || params.fact.kind === "note") {
+		return;
+	}
+
+	let mechanicallyVerified = params.fact.verified === true;
+	if (!mechanicallyVerified && params.fact.command && params.fact.output) {
+		const ledgerCheck = verifyExecutionEvidence(root, {
+			projectId: st.project.id,
+			kind: params.fact.kind,
+			command: params.fact.command,
+			output: params.fact.output,
+			strict: true,
+		});
+		if (ledgerCheck.ok && ledgerCheck.verified) {
+			mechanicallyVerified = true;
+			params.fact.verified = true;
+		}
+	}
+	if (!mechanicallyVerified) {
+		return;
+	}
+
+	const targetIntent = st.intents[params.intentId];
+	const mechSource = targetIntent?.worker === "auto" ? "autoexec" : "exec-ledger";
 	for (const pred of targetPending) {
-		safeSettlePrediction(root, {
+		const settled = safeSettlePrediction(root, {
 			predictionId: pred.predictionId,
-			outcome: isPositiveHit ? 1 : 0,
+			outcome: 1,
 			isFalsePositive: false,
 			actualTokens: pred.estimatedTokens || actualTokens,
 			durationMs: 0,
-			source: "exec-ledger",
-			note: params.blocked
-				? `意图受阻结案: ${params.note ?? "blocked"}`
-				: `执行账本核验入账 (${params.fact?.kind ?? "note"})`,
+			source: mechSource,
+			note: `机械核验实锤入账 (${params.fact.kind})`,
 		});
+		if (settled.ok) markSettledOnState(params.intentId);
 	}
 }
 
@@ -1767,7 +1809,7 @@ export function executeCommitWithGates(
 		// v6.0 接线 1：信念图贝叶斯后验传播、突破跃迁提权与复验驳回子树剪枝
 		if ((process.env.NUWA_BELIEF_SEARCH ?? "1").trim() !== "0") {
 			try {
-				let bGraph = loadOrInitBeliefGraph(root, s);
+				const bGraph = initBeliefGraphFromState(s, loadOrInitBeliefGraph(root, s));
 				if (verifyStageOut === "rejected" && verifyTargetFid) {
 					const prop = propagateBeliefUpdate(bGraph, s, {
 						nodeId: verifyTargetFid,
@@ -1780,18 +1822,20 @@ export function executeCommitWithGates(
 						applyToState: true,
 						reason: safeNote || "候选事实被双盲复验驳回",
 					});
-					if (prop.blockableOpenIntentIds.length > 0 || subPrune.prunedIntentIds.length > 0) {
+					const prunedNodes = [...new Set([...prop.prunedNodeIds, ...subPrune.prunedNodeIds])];
+					const prunedIntents = [...new Set([...prop.blockableOpenIntentIds, ...subPrune.blockableOpenIntentIds])];
+					if (prunedNodes.length > 0 || prunedIntents.length > 0) {
 						logEvent(root, {
 							type: "belief_prune",
 							factId: verifyTargetFid,
-							prunedIntents: [...new Set([...prop.blockableOpenIntentIds, ...subPrune.prunedIntentIds])],
+							prunedNodes,
+							prunedIntents,
 						});
 					}
 				} else if (verifyStageOut === "confirmed" && verifyTargetFid) {
-					bGraph = initBeliefGraphFromState(s, bGraph);
 					propagateBeliefUpdate(bGraph, s, {
 						nodeId: verifyTargetFid,
-						observation: "confirmed_vuln",
+						observation: "confirmed_hit",
 						reason: safeTitle,
 					});
 				} else if (
@@ -1801,22 +1845,24 @@ export function executeCommitWithGates(
 						r.fact.kind === "flag" ||
 						/\.js\.map\b|sourcemap/i.test(`${r.fact.title} ${r.fact.detail}`))
 				) {
-					bGraph = initBeliefGraphFromState(s, bGraph);
 					propagateBeliefUpdate(bGraph, s, {
 						nodeId: r.fact.id,
 						observation: "breakthrough_signal",
 						reason: r.fact.title,
 					});
 				} else if (p.blocked && rawId) {
-					const isWaf = /\b(waf|403|forbidden|cloudflare)\b/i.test(safeNote ?? "");
+					const noteStr = safeNote ?? "";
+					const obsType = /\b(waf|403|forbidden|cloudflare|rate[-_\s]?limit|429)\b/i.test(noteStr)
+						? "waf_block"
+						: /\b(timeout|timed?\s*out|etimedout|deadline)\b/i.test(noteStr)
+							? "timeout"
+							: "soft404_miss";
 					propagateBeliefUpdate(bGraph, s, {
 						nodeId: rawId,
-						observation: isWaf ? "waf_block" : "clean_negative",
+						observation: obsType,
 						applyToState: false,
 						reason: safeNote,
 					});
-				} else {
-					bGraph = initBeliefGraphFromState(s, bGraph);
 				}
 				saveBeliefGraph(root, s, bGraph);
 			} catch {
@@ -1918,6 +1964,7 @@ export async function runPostBatchAutonomousLoops(
 						if (!s) return;
 						const addedFids: string[] = [];
 						for (const cf of adRes.candidateFacts) {
+							if (cf.key && Object.values(s.facts).some((x) => x.key === cf.key)) continue;
 							const fid = nextFactId(s);
 							const stored: Fact = {
 								...cf,
@@ -2286,7 +2333,7 @@ export function settleSessionStopState(opts: {
 		if (emptyGuard.length) logEvent(opts.root, { type: "empty_guard", blocked: emptyGuard, plan: planned.reason });
 		if (opts.canAutoExec) autoIds = claimAutoBatch(s, opts.curCfg, opts.root);
 
-		directive = buildDirective(s, opts.curCfg);
+		directive = buildDirective(s, opts.curCfg, opts.root);
 		s.runtime.lastDirective = directive;
 		s.runtime.blockStreak += 1;
 		turn = s.runtime.turns;
