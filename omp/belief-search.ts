@@ -113,11 +113,11 @@ export interface BeliefPropagationEvent {
 	nodeId: string;
 	/** 观测事件或类型。 */
 	observation: BeliefObservationType | BeliefObservation;
-	/** 沿图拓扑每跳传播衰减因子（默认 0.65，钳制在 (0.05, 0.98)）。 */
+	/** 沿图拓扑每跳传播衰减因子（默认 0.7，钳制在 (0.05, 0.98)）。 */
 	decayFactor?: number;
 	/** 最大拓扑传播深度（默认 8）。 */
 	maxDepth?: number;
-	/** 低收益自动剪枝阈值（默认 0.18）。 */
+	/** 低收益自动剪枝阈值（默认 0.2）。 */
 	pruneThreshold?: number;
 	/** 是否同步将剪枝命中的下游 `open` 意图在 `state.intents` 中置为 `blocked`（默认 false 仅返回清单）。 */
 	applyToState?: boolean;
@@ -162,6 +162,8 @@ export interface BeliefPropagationResult {
 export interface PruneSubtreeOptions {
 	/** 若指定则仅针对该根节点及其可达下游子树扫描剪枝；未指定则全图扫描。 */
 	rootNodeId?: string;
+	/** 可选多根种子节点列表（如 WAF 同路径前缀关联节点集），将对所有根的可达子图扫描剪枝。 */
+	seedNodeIds?: readonly string[];
 	/** 自定义剪枝原因文案。 */
 	reason?: string;
 	/** 是否同步将命中的 `state.intents` 中 `open` 意图直接置为 `blocked`。 */
@@ -454,6 +456,10 @@ function deriveFactPrior(fact: Fact): {
 	};
 }
 
+function finiteOrDefault(raw: unknown, fallback: number): number {
+	return typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
+}
+
 function deriveHypothesisPrior(hyp: HypothesisNode): {
 	alpha: number;
 	beta: number;
@@ -471,7 +477,7 @@ function deriveHypothesisPrior(hyp: HypothesisNode): {
 			pruneReason: hyp.note || `假设已处于 ${hyp.status} 状态`,
 		};
 	}
-	const gainNorm = clamp((Number(hyp.expectedGain) || 50) / 100, 0.15, 0.95);
+	const gainNorm = clamp(finiteOrDefault(hyp.expectedGain, 50) / 100, 0.02, 0.95);
 	const alpha = 1.0 + 2.2 * gainNorm;
 	const beta = 1.0 + 1.8 * (1 - gainNorm);
 	return { alpha, beta, pruned: false };
@@ -484,8 +490,8 @@ function deriveIntentPrior(intent: Intent, state: NuwaState): {
 	pruneReason?: string;
 	observations: number;
 } {
-	const prioNorm = clamp((Number(intent.priority) || 50) / 100, 0.05, 0.98);
-	const priorMean = clamp(0.2 + 0.62 * prioNorm, 0.15, 0.85);
+	const prioNorm = clamp(finiteOrDefault(intent.priority, 50) / 100, 0, 0.98);
+	const priorMean = clamp(0.18 + 0.64 * prioNorm, 0.15, 0.85);
 	const pseudoTotal = 2.4;
 	let alpha = pseudoTotal * priorMean;
 	let beta = pseudoTotal * (1 - priorMean);
@@ -546,10 +552,10 @@ function countUnexploredDependentSubtree(
 	state: NuwaState | undefined,
 	graph?: BeliefGraph,
 ): number {
-	const visited = new Set<string>([node.id, node.sourceId]);
 	let unexploredCount = 0;
 
 	if (graph) {
+		const visited = new Set<string>([node.id]);
 		const queue: string[] = [...node.childIds];
 		while (queue.length > 0) {
 			const curId = queue.shift()!;
@@ -557,7 +563,6 @@ function countUnexploredDependentSubtree(
 			visited.add(curId);
 			const child = graph.nodes[curId];
 			if (!child) continue;
-			visited.add(child.sourceId);
 
 			if (!child.pruned) {
 				if (child.kind === "intent") {
@@ -584,6 +589,7 @@ function countUnexploredDependentSubtree(
 
 	// 无显式 graph 时直接基于 state.intents / state.hypotheses 依赖关系做防环 BFS
 	if (!state) return node.childIds.length;
+	const visited = new Set<string>([node.id, node.sourceId]);
 
 	const adj = new Map<string, string[]>();
 	const link = (parent: string, child: string) => {
@@ -941,8 +947,9 @@ export function updateBeliefPosterior(
 
 /**
  * 扫描并剪枝低收益节点及其依赖子树：
- * - 当某节点后验 `posterior < threshold`（默认 `0.18`）或已被证伪剪枝时，沿下游 `childIds` 防环传播；
- * - 若下游节点的后验同样低于阈值，或其所有上游前置节点均已被剪枝，自动标记 `pruned = true`；
+ * - 当某节点后验 `posterior < threshold`（默认 `0.2`）或已被证伪剪枝时，沿下游 `childIds` 执行单调不动点传播；
+ * - 若下游节点的后验同样低于阈值，或其所有上游前置节点均已被剪枝（完美覆盖菱形 DAG 多父节点汇合），自动标记 `pruned = true`；
+ * - 即使存在有向环，每个节点最多加入 `prunedSet` 一次，严格保证在 $O(|V|+|E|)$ 内安全终止；
  * - 精准返回可阻塞的下游未执行 `open` 意图清单（严禁触碰 `done`、`claimed`、已 `blocked` 或无关意图）。
  */
 export function pruneLowYieldSubtree(
@@ -957,34 +964,68 @@ export function pruneLowYieldSubtree(
 		0.95,
 	);
 	const ts = nowIso();
-	const prunedSet = new Set<string>();
 
-	const candidateSeeds: BeliefNode[] = [];
-	if (opts?.rootNodeId) {
-		const resolved = resolveBeliefNodeId(graph, opts.rootNodeId);
-		if (resolved && graph.nodes[resolved]) {
-			candidateSeeds.push(graph.nodes[resolved]!);
-		}
-	} else {
-		for (const n of Object.values(graph.nodes).sort((a, b) => a.id.localeCompare(b.id))) {
-			if (n.pruned || n.posterior < effThreshold) {
-				candidateSeeds.push(n);
-			}
+	// 1. 解析扫描子图范围：指定 rootNodeId / seedNodeIds 时防环收集全部可达子图节点，未指定时扫描全图
+	const rawRoots: string[] = [];
+	if (opts?.rootNodeId) rawRoots.push(opts.rootNodeId);
+	if (Array.isArray(opts?.seedNodeIds)) {
+		for (const sid of opts.seedNodeIds) {
+			if (sid) rawRoots.push(sid);
 		}
 	}
 
-	const visited = new Set<string>();
+	let scopeNodes: BeliefNode[];
+	if (rawRoots.length > 0) {
+		const subVisited = new Set<string>();
+		const subQueue: string[] = [];
+		for (const raw of rawRoots) {
+			const resolved = resolveBeliefNodeId(graph, raw);
+			if (resolved && graph.nodes[resolved] && !subVisited.has(resolved)) {
+				subVisited.add(resolved);
+				subQueue.push(resolved);
+			}
+		}
+		scopeNodes = [];
+		while (subQueue.length > 0) {
+			const nid = subQueue.shift()!;
+			const n = graph.nodes[nid];
+			if (!n) continue;
+			scopeNodes.push(n);
+			for (const cid of n.childIds) {
+				if (graph.nodes[cid] && !subVisited.has(cid)) {
+					subVisited.add(cid);
+					subQueue.push(cid);
+				}
+			}
+		}
+		scopeNodes.sort((a, b) => a.id.localeCompare(b.id));
+	} else {
+		scopeNodes = Object.values(graph.nodes).sort((a, b) => a.id.localeCompare(b.id));
+	}
+
+	// 2. 单调不动点级联剪枝：仅在节点确认剪枝加入 prunedSet 时扩散其 childIds，彻底消除多父节点先后顺序漏剪
+	const prunedSet = new Set<string>();
+	const inQueue = new Set<string>();
 	const queue: BeliefNode[] = [];
-	for (const seed of candidateSeeds) {
-		if (seed.pruned || seed.posterior < effThreshold) {
-			queue.push(seed);
+
+	const enqueueNode = (n: BeliefNode | undefined) => {
+		if (!n || prunedSet.has(n.id) || inQueue.has(n.id)) return;
+		inQueue.add(n.id);
+		queue.push(n);
+	};
+
+	for (const n of scopeNodes) {
+		const allParentsPruned =
+			n.parentIds.length > 0 && n.parentIds.every((pid) => Boolean(graph.nodes[pid]?.pruned));
+		if (n.pruned || n.posterior < effThreshold || allParentsPruned) {
+			enqueueNode(n);
 		}
 	}
 
 	while (queue.length > 0) {
 		const cur = queue.shift()!;
-		if (visited.has(cur.id)) continue;
-		visited.add(cur.id);
+		inQueue.delete(cur.id);
+		if (prunedSet.has(cur.id)) continue;
 
 		const allParentsPruned =
 			cur.parentIds.length > 0 && cur.parentIds.every((pid) => Boolean(graph.nodes[pid]?.pruned));
@@ -1005,9 +1046,7 @@ export function pruneLowYieldSubtree(
 		prunedSet.add(cur.id);
 
 		for (const cid of cur.childIds) {
-			if (!visited.has(cid) && graph.nodes[cid]) {
-				queue.push(graph.nodes[cid]!);
-			}
+			enqueueNode(graph.nodes[cid]);
 		}
 	}
 
@@ -1221,7 +1260,7 @@ export function propagateBeliefUpdate(
 
 	if (isNegativeHard || isNegativeSoft) {
 		const pruneRes = pruneLowYieldSubtree(graph, state, pruneThreshold, {
-			rootNodeId: triggerNode.id,
+			seedNodeIds: [...updatedSet],
 			reason: event.reason || obs.note,
 			applyToState: event.applyToState,
 		});
@@ -1348,7 +1387,8 @@ export function rankFrontierByBelief(
 			continue;
 		}
 
-		const priorityScore = clamp((Number(intent.priority) || 50) / 100, 0, 1);
+		const rawPriority = finiteOrDefault(intent.priority, 50);
+		const priorityScore = clamp(rawPriority / 100, 0, 1);
 		const beliefScore = node.posterior;
 		const voiScore = node.expectedInfoGain;
 		const utilityScore = node.utilityScore;
@@ -1454,14 +1494,22 @@ export function recommendSearchPivot(
 		excludePruned: true,
 	});
 
-	// 汇总尚未剪枝但后验偏低的潜在低收益节点与已剪枝 open 意图建议
+	// 汇总仍有待执行 open 意图（或尚未剪枝且非历史终结态）的低收益剪枝建议
 	const pruneSuggestions: PruneSuggestion[] = [];
 	for (const node of Object.values(g.nodes).sort((a, b) => a.posterior - b.posterior || a.id.localeCompare(b.id))) {
 		if (node.posterior >= pruneThreshold && !node.pruned) continue;
 		const relatedIntentIds: string[] = [];
+		let actionable = false;
 		if (node.kind === "intent") {
 			const it = state?.intents?.[node.sourceId];
-			if (it && it.status === "open") relatedIntentIds.push(it.id);
+			if (it) {
+				if (it.status === "open") {
+					relatedIntentIds.push(it.id);
+					actionable = true;
+				}
+			} else if (!node.pruned) {
+				actionable = true;
+			}
 		} else {
 			for (const cid of node.childIds) {
 				const cNode = g.nodes[cid];
@@ -1469,8 +1517,9 @@ export function recommendSearchPivot(
 					uniqPush(relatedIntentIds, cNode.sourceId);
 				}
 			}
+			actionable = relatedIntentIds.length > 0;
 		}
-		if (relatedIntentIds.length > 0 || node.kind === "intent") {
+		if (actionable) {
 			pruneSuggestions.push({
 				nodeId: node.id,
 				title: node.title,
@@ -1485,8 +1534,10 @@ export function recommendSearchPivot(
 
 	// 收集已排除表面供 SealMeta.excludedSurface 无缝衔接
 	const excludedSurfaceSet = new Set<string>();
+	let excludedFactCount = 0;
 	for (const f of Object.values(state?.facts ?? {})) {
 		if (f.kind === "blocked" || f.verifyStage === "rejected") {
+			excludedFactCount += 1;
 			excludedSurfaceSet.add(f.targetKey || f.key || f.title || f.id);
 		}
 	}
@@ -1515,7 +1566,7 @@ export function recommendSearchPivot(
 		rationale: rationalePrefix ? `${rationalePrefix}：${item.explanation}` : item.explanation,
 	});
 
-	// 计算搜索空间收敛度与负向封盘置信度
+	// 计算搜索空间收敛度与负向封盘置信度（零历史探索证据或零停滞零驳回时绝不误报封盘）
 	const allIntents = Object.values(state?.intents ?? {});
 	const totalIntentCount = allIntents.length;
 	const terminalOrPrunedCount = allIntents.filter((it) => {
@@ -1523,11 +1574,12 @@ export function recommendSearchPivot(
 		const nid = resolveBeliefNodeId(g, it.id, "intent");
 		return Boolean(nid && g.nodes[nid]?.pruned);
 	}).length;
+	const hasExplorationEvidence = terminalOrPrunedCount > 0 || excludedFactCount > 0;
 
 	const frontierExhaustion =
 		totalIntentCount > 0
 			? terminalOrPrunedCount / totalIntentCount
-			: rankedActive.length === 0
+			: hasExplorationEvidence && rankedActive.length === 0
 				? 1.0
 				: 0;
 
@@ -1541,23 +1593,31 @@ export function recommendSearchPivot(
 	const rejects = Math.max(0, Number(state?.runtime?.completionRejects ?? 0));
 	const rejectBonus = clamp(rejects * 0.15, 0, 0.3);
 
-	const convergenceConfidence = clamp(
-		0.45 * frontierExhaustion +
-			0.30 * (1 - clamp(maxRemainingVoi, 0, 1)) +
-			0.25 * stallRatio,
-		0,
-		1,
-	);
+	const convergenceConfidence =
+		!hasExplorationEvidence && rankedActive.length === 0
+			? 0
+			: clamp(
+					0.45 * frontierExhaustion +
+						0.30 * (rankedActive.length > 0 ? 1 - clamp(maxRemainingVoi, 0, 1) : frontierExhaustion) +
+						0.25 * stallRatio,
+					0,
+					1,
+				);
 
 	let negativeSealConfidence = 0;
-	if (!confirmedPositive) {
-		const lowBeliefFactor = 1 - clamp(maxRemainingBelief, 0, 1);
-		const rawSeal =
-			0.38 * frontierExhaustion +
-			0.27 * lowBeliefFactor +
-			0.25 * stallRatio +
-			0.10 * (1 - clamp(maxRemainingVoi, 0, 1)) +
+	if (!confirmedPositive && hasExplorationEvidence) {
+		const lowBeliefFactor = rankedActive.length > 0 ? 1 - clamp(maxRemainingBelief, 0, 1) : frontierExhaustion;
+		const lowVoiFactor = rankedActive.length > 0 ? 1 - clamp(maxRemainingVoi, 0, 1) : frontierExhaustion;
+		let rawSeal =
+			0.30 * frontierExhaustion +
+			0.20 * lowBeliefFactor +
+			0.35 * stallRatio +
+			0.08 * lowVoiFactor +
 			rejectBonus;
+		// 零语义停滞且无结案驳回时（如阶段切换间隙队列暂空），封顶 <= 0.60 严禁误触发负向封盘
+		if (noveltyStall === 0 && rejects === 0) {
+			rawSeal = Math.min(0.6, rawSeal);
+		}
 		// 若存在待复验候选漏洞，必须先完成双盲复验才允许封盘，封顶 <= 0.35
 		negativeSealConfidence =
 			candidateFacts.length > 0 ? Math.min(0.35, clamp(rawSeal, 0, 1)) : clamp(rawSeal, 0, 1);
@@ -1573,7 +1633,10 @@ export function recommendSearchPivot(
 		return {
 			action: "verify_candidates",
 			topDirection,
-			alternativeDirections: rankedActive.slice(1, 4).map((r) => toPivotDirection(r)),
+			alternativeDirections: rankedActive
+				.filter((r) => r.intent.id !== verifyItem?.intent.id)
+				.slice(0, 3)
+				.map((r) => toPivotDirection(r)),
 			pruneSuggestions,
 			convergenceConfidence,
 			negativeSealConfidence,
@@ -1584,7 +1647,11 @@ export function recommendSearchPivot(
 	}
 
 	// 2. 高负向封盘置信度 -> 建议 sealed_negative 收口
-	const recommendSeal = !confirmedPositive && negativeSealConfidence >= sealThreshold;
+	const recommendSeal =
+		!confirmedPositive &&
+		hasExplorationEvidence &&
+		(noveltyStall > 0 || rejects > 0) &&
+		negativeSealConfidence >= sealThreshold;
 	if (recommendSeal) {
 		const sealReason =
 			`信念搜索引擎判定攻击面已收敛且无有效突破信号（负向封盘置信度=${negativeSealConfidence.toFixed(3)}，` +
@@ -1600,6 +1667,21 @@ export function recommendSearchPivot(
 			sealReason,
 			excludedSurface,
 			summary: `建议转入负向封盘（sealed_negative）：${sealReason}。`,
+		};
+	}
+
+	// 2.5 全新空状态（尚未规划任何种子意图且无历史探索证据）
+	if (rankedActive.length === 0 && !hasExplorationEvidence) {
+		return {
+			action: "explore_high_voi",
+			topDirection: null,
+			alternativeDirections: [],
+			pruneSuggestions,
+			convergenceConfidence: 0,
+			negativeSealConfidence: 0,
+			recommendSeal: false,
+			excludedSurface,
+			summary: "当前尚未规划可执行前沿意图，建议先执行侦察/表面种子规划以展开攻击信念图。",
 		};
 	}
 

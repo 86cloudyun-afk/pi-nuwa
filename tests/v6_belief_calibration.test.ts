@@ -31,6 +31,7 @@ import {
 	loadCalibrationRecords,
 	recommendAdaptiveModelRoute,
 	recordPrediction,
+	redactCalibrationText,
 	safeSettlePrediction,
 	settlePrediction,
 	validateSettlementSource,
@@ -911,5 +912,300 @@ describe("模块二：omp/calibration.ts 反自证机械对账校准核与自适
 		expect(lowRoiDecision.downgraded).toBe(true);
 		expect(lowRoiDecision.reason).toContain("ROI过低");
 		expect(lowRoiDecision.reason).toContain("白名单");
+	});
+
+	test("Boost 回归测试（belief-search）：菱形 DAG 不动点剪枝、WAF 同前缀 Peer/高后验根子图扫描、空状态防误封盘与 priority=0 单调性", () => {
+		const ts = "2026-11-25T12:00:00.000Z";
+
+		// 1. P1-1 回归：菱形 DAG 多父节点汇合剪枝（fA.childIds = ["iC", "iB"]，iC 同时依赖 fA 与 iB）
+		const stDag = createMockState();
+		stDag.facts.fA = { id: "fA", kind: "endpoint", title: "入口 A", detail: "低后验根", createdAt: ts };
+		stDag.intents.iB = {
+			id: "iB",
+			phase: "vuln",
+			key: "vuln:b",
+			title: "中间节点 B",
+			detail: "依赖 fA",
+			from: ["fA"],
+			status: "open",
+			priority: 85,
+			attempts: 0,
+			createdAt: ts,
+		};
+		stDag.intents.iC = {
+			id: "iC",
+			phase: "exploit",
+			key: "exploit:c",
+			title: "汇合节点 C",
+			detail: "同时依赖 fA 与 iB",
+			from: ["fA"],
+			status: "open",
+			priority: 90,
+			attempts: 0,
+			createdAt: ts,
+		};
+		const gDag = initBeliefGraphFromState(stDag);
+		// 强制构造 fA -> iC 在前、fA -> iB 在后，且 iB -> iC 的菱形拓扑
+		gDag.nodes.fA!.alpha = 0.2;
+		gDag.nodes.fA!.beta = 5.0;
+		gDag.nodes.fA!.posterior = computeBetaPosterior(0.2, 5.0); // ~0.038 < 0.2
+		gDag.nodes.fA!.childIds = ["iC", "iB"];
+		gDag.nodes.iB!.parentIds = ["fA"];
+		gDag.nodes.iB!.childIds = ["iC"];
+		gDag.nodes.iC!.parentIds = ["fA", "iB"];
+
+		const dagPrune = pruneLowYieldSubtree(gDag, stDag, 0.2);
+		expect(gDag.nodes.fA!.pruned).toBe(true);
+		expect(gDag.nodes.iB!.pruned).toBe(true);
+		expect(gDag.nodes.iC!.pruned).toBe(true);
+		expect(dagPrune.blockableOpenIntentIds).toEqual(["iB", "iC"]);
+
+		// 2. P1-2a 回归：WAF 同路径前缀独立 Peer（from=[] 不在 childIds 内）及下游必须同步剪枝
+		const stWaf = createMockState();
+		stWaf.facts.fAdmin = {
+			id: "fAdmin",
+			kind: "endpoint",
+			title: "管理根路径",
+			detail: "/admin",
+			targetKey: "path:/admin",
+			surfaceDomain: "path",
+			createdAt: ts,
+		};
+		stWaf.intents.iPeer = {
+			id: "iPeer",
+			phase: "vuln",
+			key: "vuln:admin:secret",
+			title: "独立同前缀探测 /admin/secret",
+			detail: "from 为空但共享受阻路径前缀",
+			from: [],
+			targetKey: "path:/admin/secret",
+			surfaceDomain: "path",
+			status: "open",
+			priority: 55,
+			attempts: 0,
+			createdAt: ts,
+		};
+		const gWaf = initBeliefGraphFromState(stWaf);
+		const wafProp = propagateBeliefUpdate(gWaf, stWaf, {
+			nodeId: "fAdmin",
+			observation: "waf_block",
+			reason: "WAF 拦截 /admin 前缀",
+		});
+		expect(gWaf.nodes.iPeer!.posterior).toBeLessThan(0.2);
+		expect(gWaf.nodes.iPeer!.pruned).toBe(true);
+		expect(wafProp.blockableOpenIntentIds).toContain("iPeer");
+
+		// 3. P1-2b 回归：指定高后验 rootNodeId 时，仍能完整扫描可达子图剪枝低后验子节点
+		const stSub = createMockState();
+		stSub.facts.fHighRoot = {
+			id: "fHighRoot",
+			kind: "cred",
+			title: "高后验根事实",
+			detail: "confirmed",
+			createdAt: ts,
+		};
+		stSub.intents.iLowChild = {
+			id: "iLowChild",
+			phase: "vuln",
+			key: "vuln:low",
+			title: "低后验子意图",
+			detail: "依赖 fHighRoot",
+			from: ["fHighRoot"],
+			status: "open",
+			priority: 20,
+			attempts: 5,
+			createdAt: ts,
+		};
+		const gSub = initBeliefGraphFromState(stSub);
+		expect(gSub.nodes.fHighRoot!.posterior).toBeGreaterThan(0.7);
+		expect(gSub.nodes.iLowChild!.posterior).toBeLessThan(0.2);
+		const subPrune = pruneLowYieldSubtree(gSub, stSub, 0.2, { rootNodeId: "fHighRoot" });
+		expect(gSub.nodes.fHighRoot!.pruned).toBe(false);
+		expect(gSub.nodes.iLowChild!.pruned).toBe(true);
+		expect(subPrune.blockableOpenIntentIds).toEqual(["iLowChild"]);
+
+		// 4. P1-3 回归：全新空状态与零停滞阶段切换间隙严禁误报 seal_negative
+		const emptyState = createMockState();
+		const emptyPivot = recommendSearchPivot(emptyState);
+		expect(emptyPivot.recommendSeal).toBe(false);
+		expect(emptyPivot.action).not.toBe("seal_negative");
+		expect(emptyPivot.negativeSealConfidence).toBe(0);
+
+		const zeroStallDoneState = createMockState();
+		zeroStallDoneState.runtime.noveltyStall = 0;
+		zeroStallDoneState.runtime.completionRejects = 0;
+		zeroStallDoneState.intents.iDone = {
+			id: "iDone",
+			phase: "recon",
+			key: "recon:seed",
+			title: "刚完成的侦察意图",
+			detail: "零停滞",
+			from: [],
+			status: "done",
+			priority: 60,
+			attempts: 1,
+			createdAt: ts,
+		};
+		const zeroStallPivot = recommendSearchPivot(zeroStallDoneState);
+		expect(zeroStallPivot.recommendSeal).toBe(false);
+		expect(zeroStallPivot.action).not.toBe("seal_negative");
+		// 已 done 历史节点不应污染 pruneSuggestions
+		expect(zeroStallPivot.pruneSuggestions.some((s) => s.nodeId === "iDone")).toBe(false);
+
+		// 5. P2-1 & P2-2 回归：priority=0 严格低于 priority=20，且 verify_candidates 分支备选列表不重复
+		const stPrio = createMockState();
+		stPrio.facts.fCand = {
+			id: "fCand",
+			kind: "vuln",
+			title: "待复验候选",
+			detail: "candidate",
+			verifyStage: "candidate",
+			createdAt: ts,
+		};
+		stPrio.intents.iZero = {
+			id: "iZero",
+			phase: "surface",
+			key: "surface:p0",
+			title: "零优先级任务",
+			detail: "priority=0",
+			from: [],
+			status: "open",
+			priority: 0,
+			attempts: 0,
+			createdAt: ts,
+		};
+		stPrio.intents.iTwenty = {
+			id: "iTwenty",
+			phase: "surface",
+			key: "surface:p20",
+			title: "低优先级任务 20",
+			detail: "priority=20",
+			from: [],
+			status: "open",
+			priority: 20,
+			attempts: 0,
+			createdAt: ts,
+		};
+		stPrio.intents.iTop = {
+			id: "iTop",
+			phase: "exploit",
+			key: "exploit:top",
+			title: "极高加成任务",
+			detail: "排首位测试",
+			from: [],
+			status: "open",
+			priority: 99,
+			attempts: 0,
+			createdAt: ts,
+		};
+		stPrio.intents.iVerify = {
+			id: "iVerify",
+			phase: "vuln",
+			key: "verify-vuln:fCand",
+			title: "双盲复验任务",
+			detail: "排第二测试去重",
+			from: ["fCand"],
+			status: "open",
+			priority: 10,
+			attempts: 2,
+			createdAt: ts,
+		};
+		const gPrio = initBeliefGraphFromState(stPrio);
+		gPrio.nodes.iTop!.breakthroughBoost = 0.6;
+		const rankedPrio = rankFrontierByBelief(stPrio, [stPrio.intents.iZero!, stPrio.intents.iTwenty!], {
+			graph: gPrio,
+		});
+		expect(rankedPrio[0]!.intent.id).toBe("iTwenty");
+		expect(rankedPrio[1]!.intent.id).toBe("iZero");
+		expect(rankedPrio[1]!.priorityScore).toBe(0);
+
+		const candPivot = recommendSearchPivot(stPrio, gPrio);
+		expect(candPivot.action).toBe("verify_candidates");
+		expect(candPivot.topDirection?.intentId).toBe("iVerify");
+		expect(candPivot.alternativeDirections.some((d) => d.intentId === "iVerify")).toBe(false);
+		expect(candPivot.alternativeDirections.some((d) => d.intentId === "iTop")).toBe(true);
+	});
+
+	test("Boost 回归测试（calibration）：非字符串结算源拦截、内存直传 NaN/self 防崩溃防污染与 JSON 引号密钥脱敏", () => {
+		// 1. P1-4c 回归：数组与自定义 toString 对象不得绕过 validateSettlementSource
+		for (const nonStr of [["verifier-gate"], { toString: () => "verifier-gate" }, 123, true, null, undefined]) {
+			expect(() => validateSettlementSource(nonStr)).toThrow(CalibrationError);
+		}
+
+		// 2. P1-4a & P1-4b 回归：内存直传 NaN/Infinity 置信度不崩溃，且内存直传 self/未知源记录不污染汇总与路由
+		const pollutedRecords: any[] = [
+			{
+				predictionId: "nan-1",
+				intentId: "i1",
+				taskCategory: "exploit",
+				modelId: "gemini-clean",
+				predictedConfidence: Number.NaN,
+				estimatedTokens: 1000,
+				createdAt: "2026-11-25T12:00:00Z",
+				settled: true,
+				outcome: 1,
+				isFalsePositive: false,
+				actualTokens: 1000,
+				durationMs: 200,
+				source: "verifier-gate",
+			},
+			// 注入 6 条伪造 source="self" 的误报记录企图拉垮 gemini-clean
+			...Array.from({ length: 6 }, (_, idx) => ({
+				predictionId: `self-fake-${idx}`,
+				intentId: `i-fake-${idx}`,
+				taskCategory: "exploit",
+				modelId: "gemini-clean",
+				predictedConfidence: 0.95,
+				estimatedTokens: 1000,
+				createdAt: "2026-11-25T12:00:00Z",
+				settled: true,
+				outcome: 0,
+				isFalsePositive: true,
+				actualTokens: 1000,
+				durationMs: 200,
+				source: "self",
+			})),
+			// 注入 6 条真实 verifier-gate 实锤记录
+			...Array.from({ length: 6 }, (_, idx) => ({
+				predictionId: `real-ok-${idx}`,
+				intentId: `i-ok-${idx}`,
+				taskCategory: "exploit",
+				modelId: "gemini-clean",
+				predictedConfidence: 0.9,
+				estimatedTokens: 1200,
+				createdAt: "2026-11-25T12:00:00Z",
+				settled: true,
+				outcome: 1,
+				isFalsePositive: false,
+				actualTokens: 1200,
+				durationMs: 300,
+				source: "verifier-gate",
+			})),
+		];
+
+		const summary = computeCalibrationSummary(pollutedRecords);
+		expect(summary.global.settledCount).toBe(6);
+		expect(summary.global.falsePositiveCount).toBe(0);
+		expect(summary.byModel["gemini-clean"]!.settledCount).toBe(6);
+		expect(summary.byModel["gemini-clean"]!.falsePositiveRate).toBe(0);
+
+		const route = recommendAdaptiveModelRoute(pollutedRecords, {
+			allowedModels: ["gemini-clean", "gemini-alt"],
+			defaultModel: "gemini-clean",
+			taskCategory: "exploit",
+			minSamples: 5,
+		});
+		expect(route.downgraded).toBe(false);
+		expect(route.recommendedModel).toBe("gemini-clean");
+
+		// 3. P2-3 回归：JSON 双引号/单引号包裹的密码与密钥及 URL userinfo 必须彻底脱敏
+		const rawJsonSecret =
+			'payload={"password":"MySuperSecretPassword999","api_key":"abc123456789xyz"} url=https://admin:UrlInlinePass888@corp.local/api';
+		const redacted = redactCalibrationText(rawJsonSecret);
+		expect(redacted).not.toContain("MySuperSecretPassword999");
+		expect(redacted).not.toContain("abc123456789xyz");
+		expect(redacted).not.toContain("UrlInlinePass888");
+		expect(redacted).toContain('"password":');
+		expect(redacted).toContain('"api_key":');
 	});
 });

@@ -282,7 +282,15 @@ const INLINE_SECRET_PATTERNS: ReadonlyArray<{ re: RegExp; replacer: (...args: st
 		replacer: (m) => maskSecretValue(m),
 	},
 	{
-		re: /\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|cookie|session[_-]?id)\s*([:=])\s*([^\s,;'"`]{4,})/gi,
+		re: /\b([a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:)([^/\s@]{3,})(@)/gi,
+		replacer: (_m, prefix, pass, at) => `${prefix}${maskSecretValue(pass)}${at}`,
+	},
+	{
+		re: /(["'`]?)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?token|client[_-]?secret|cookie|session[_-]?id)\b\1\s*([:=])\s*(["'`])([^"'`\r\n]{4,})\4/gi,
+		replacer: (_m, qk, k, sep, qv, v) => `${qk}${k}${qk}${sep}${qv}${maskSecretValue(v)}${qv}`,
+	},
+	{
+		re: /\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?token|client[_-]?secret|cookie|session[_-]?id)\s*([:=])\s*([^\s,;&'"`}\]]{4,})/gi,
 		replacer: (_m, k, sep, v) => `${k}${sep}${maskSecretValue(v)}`,
 	},
 ];
@@ -470,7 +478,13 @@ export function redactCalibrationText(text: string | undefined, root?: string): 
  * 对 `"self"` / `"model"` / `"agent"` 及任何非授信来源显式抛出 `CalibrationError`。
  */
 export function validateSettlementSource(source: unknown): CalibrationSettlementSource {
-	const norm = String(source ?? "").trim();
+	if (typeof source !== "string") {
+		throw new CalibrationError(
+			"INVALID_SETTLEMENT_SOURCE",
+			`反自证护栏拦截：结算来源 source 必须为字符串类型，收到 ${typeof source}`,
+		);
+	}
+	const norm = source.trim();
 	if (!norm) {
 		throw new CalibrationError(
 			"INVALID_SETTLEMENT_SOURCE",
@@ -493,7 +507,13 @@ export function validateSettlementSource(source: unknown): CalibrationSettlement
 }
 
 function validateTaskCategory(category: unknown): CalibrationTaskCategory {
-	const norm = String(category ?? "").trim() as CalibrationTaskCategory;
+	if (typeof category !== "string") {
+		throw new CalibrationError(
+			"INVALID_INPUT",
+			`非法任务类别 taskCategory：必须为字符串，收到 ${typeof category}`,
+		);
+	}
+	const norm = category.trim() as CalibrationTaskCategory;
 	if (!VALID_TASK_CATEGORIES.has(norm)) {
 		throw new CalibrationError(
 			"INVALID_INPUT",
@@ -814,14 +834,28 @@ function computeMetricsForSlice(
 		});
 	}
 
-	const totalPredictions = slice.length;
-	const settledRecords = slice.filter(
-		(r) => r && r.settled && (r.outcome === 0 || r.outcome === 1),
+	const validRecords = slice.filter(
+		(r) =>
+			Boolean(r) &&
+			typeof r === "object" &&
+			typeof r.predictedConfidence === "number" &&
+			Number.isFinite(r.predictedConfidence) &&
+			r.predictedConfidence >= 0 &&
+			r.predictedConfidence <= 1,
+	);
+	const totalPredictions = validRecords.length;
+	const settledRecords = validRecords.filter(
+		(r) =>
+			r.settled === true &&
+			(r.outcome === 0 || r.outcome === 1) &&
+			typeof r.source === "string" &&
+			ALLOWED_SETTLEMENT_SOURCES.has(r.source as CalibrationSettlementSource) &&
+			!(r.isFalsePositive === true && r.outcome === 1),
 	);
 	const settledCount = settledRecords.length;
 	const pendingCount = totalPredictions - settledCount;
 
-	const totalEstimatedTokens = slice.reduce(
+	const totalEstimatedTokens = validRecords.reduce(
 		(acc, r) => acc + (Number.isFinite(r.estimatedTokens) ? Math.max(0, r.estimatedTokens) : 0),
 		0,
 	);
