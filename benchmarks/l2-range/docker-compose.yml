@@ -1,0 +1,27 @@
+# 女娲 v6.0 L2 离线合成微基准靶场可选容器编排（严格仅绑定宿主机回环 127.0.0.1，内部隔离网络禁外连）
+# 默认评测（benchmarks/run-l2-eval.ts）可直接在进程内启动 127.0.0.1:0 服务，无需依赖 Docker 守护进程。
+
+services:
+  l2-synthetic-range:
+    image: oven/bun:1-alpine
+    working_dir: /workspace
+    volumes:
+      - ../../:/workspace:ro
+    environment:
+      L2_PORT_BASE: "18200"
+      L2_BIND_HOST: "0.0.0.0"
+    command: ["bun", "benchmarks/l2-range/servers.ts"]
+    ports:
+      - "127.0.0.1:18200-18205:18200-18205"
+    networks:
+      - l2_isolated_loopback
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  l2_isolated_loopback:
+    driver: bridge
+    internal: true
