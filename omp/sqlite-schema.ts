@@ -13,6 +13,7 @@
  * 约束：纯底层模块，严禁运行时 `import "./nuwa"`、`./graph`、`./storage` 或 `./sqlite-store`。
  */
 import type { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { maskSecretValue, redactVaultSecrets, type SessionVault } from "./session-vault";
 import { SCHEMA, nowIso } from "./storage-io";
 import type {
@@ -498,22 +499,20 @@ export function migrateSqliteSchemaV1ToV2(
 	}
 
 	const ts = opts?.now ?? nowIso();
-	if (!hasSqliteTable(db, "meta")) {
-		db.exec(`
-			CREATE TABLE IF NOT EXISTS meta (
-				key TEXT PRIMARY KEY NOT NULL,
-				value TEXT NOT NULL,
-				updated_at TEXT NOT NULL
-			);
-		`);
-	}
-
-	if (missingTables.length > 0) {
-		db.exec(V2_EXTENSION_DDL);
-	}
-
 	const targetVersion = Math.max(previousVersion, SQLITE_SCHEMA_VERSION);
 	const tx = db.transaction(() => {
+		if (!hasSqliteTable(db, "meta")) {
+			db.exec(`
+				CREATE TABLE IF NOT EXISTS meta (
+					key TEXT PRIMARY KEY NOT NULL,
+					value TEXT NOT NULL,
+					updated_at TEXT NOT NULL
+				);
+			`);
+		}
+		if (missingTables.length > 0) {
+			db.exec(V2_EXTENSION_DDL);
+		}
 		db.query("INSERT OR REPLACE INTO meta (key, value, updated_at) VALUES (?, ?, ?)").run(
 			"schema_version",
 			String(targetVersion),
@@ -825,11 +824,11 @@ export function hypothesisFromRow(row: Record<string, any>): HypothesisNode {
 }
 
 // ============================================================================
-// 全表零明文凭据脱敏层（Vault 凭据 + 通用敏感头/口令/JWT 幂等掩码）
+// 全表零明文凭据脱敏层（Vault 凭据 + 通用敏感头/口令/JWT/TOTP/Query 幂等掩码）
 // ============================================================================
 
 const SENSITIVE_FIELD_KEY_RE =
-	/^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-session-token|api[-_]?key|auth[-_]?token|access[-_]?token|refresh[-_]?token|bearer|password|passwd|pwd|secret|client[-_]?secret|private[-_]?key|session[-_]?secret)$/i;
+	/^(?:authorization|proxy[-_]?authorization|auth[-_]?header|cookie|set[-_]?cookie|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?access[-_]?token|x[-_]?session[-_]?token|x[-_]?csrf[-_]?token|x[-_]?xsrf[-_]?token|api[-_]?key|apikey|auth[-_]?token|access[-_]?token|refresh[-_]?token|id[-_]?token|session[-_]?token|csrf[-_]?token|bearer|token|jwt|session[-_]?id|password|passwd|pwd|passphrase|secret|secret[-_]?key|client[-_]?secret|private[-_]?key|session[-_]?secret|signing[-_]?secret|webhook[-_]?secret|totp[-_]?secret|otp[-_]?secret|mfa[-_]?secret|two[-_]?factor[-_]?secret|credential|credentials)$/i;
 
 /** 仅用于 HTTP 请求/响应头字典：排除标准非敏感头后再宽泛匹配敏感头名（与 session-vault.ts 对齐）。 */
 const STANDARD_NON_SENSITIVE_HTTP_HEADER_RE =
@@ -838,13 +837,17 @@ const SENSITIVE_HTTP_HEADER_NAME_RE =
 	/(?:auth|token|key|secret|cookie|session|jwt|csrf|xsrf|pass|cred|sign|bearer|ticket|access)/i;
 
 const GENERIC_AUTH_HEADER_RE =
-	/\b(Authorization|Proxy-Authorization)\s*:\s*(Bearer|Basic|Token|JWT)\s+([A-Za-z0-9._~+/=-]{6,})/gi;
+	/\b(Authorization|Proxy-Authorization)\s*:\s*(Bearer|Basic|Token|JWT)\s+([A-Za-z0-9._~+/=-]{4,})/gi;
 const GENERIC_API_KEY_HEADER_RE =
 	/\b(X-API-Key|X-Auth-Token|X-Access-Token|X-Session-Token|Api-Key|Private-Token|X-Vault-Token|X-CSRF-Token|X-XSRF-Token|X-Gitlab-Token)\s*:\s*([^\s\r\n'",;]{4,})/gi;
 const GENERIC_COOKIE_HEADER_RE =
 	/\b(Cookie|Set-Cookie)\s*:\s*([^\r\n]+)/gi;
+const JSON_SENSITIVE_KV_RE =
+	/(["'])(authorization|proxy[-_]?authorization|auth[-_]?header|cookie|set[-_]?cookie|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?access[-_]?token|x[-_]?session[-_]?token|api[-_]?key|apikey|auth[-_]?token|access[-_]?token|refresh[-_]?token|id[-_]?token|session[-_]?token|csrf[-_]?token|bearer|token|jwt|session[-_]?id|password|passwd|pwd|passphrase|secret|secret[-_]?key|client[-_]?secret|private[-_]?key|session[-_]?secret|totp[-_]?secret|otp[-_]?secret|mfa[-_]?secret|credential|credentials)\1(\s*:\s*)(["'])([^"'\r\n]{4,})\4/gi;
 const GENERIC_PASSWORD_KV_RE =
-	/\b(password|passwd|pwd|api_key|apikey|secret_key|client_secret|access_token|refresh_token)\s*([:=])\s*(["']?)([^\s\r\n"',;}{[\]&#)>]{4,})\3/gi;
+	/\b(password|passwd|pwd|passphrase|api[-_]?key|apikey|secret|secret[-_]?key|client[-_]?secret|private[-_]?key|session[-_]?secret|totp[-_]?secret|otp[-_]?secret|mfa[-_]?secret|access[-_]?token|refresh[-_]?token|auth[-_]?token|session[-_]?token|id[-_]?token|token|jwt|session[-_]?id|bearer|credential|auth[-_]?header)\s*([:=])\s*(["']?)([^\s\r\n"',;}{[\]&#)>]{4,})\3/gi;
+const URL_SENSITIVE_QUERY_RE =
+	/([?&])(token|access[-_]?token|refresh[-_]?token|auth[-_]?token|id[-_]?token|session[-_]?token|api[-_]?key|apikey|key|secret|secret[-_]?key|client[-_]?secret|password|passwd|pwd|pass|auth|jwt|session[-_]?id|sid|sig|signature|totp[-_]?secret|otp[-_]?secret|mfa[-_]?secret|credential)=([^&#\s"'\r\n]{4,})/gi;
 const URL_USERINFO_RE =
 	/(\b(?:https?|ftp|sftp|ftps|ws|wss|redis|rediss|mysql|postgres(?:ql)?|mongodb(?:\+srv)?|amqp|amqps|socks(?:4a?|5h?)?):\/\/)([^\/\s:@?#]+)?:([^\/\s@?#]+)@/gi;
 const RAW_JWT_RE = /\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,})\b/g;
@@ -863,8 +866,41 @@ const COOKIE_ATTRS = new Set([
 	"version",
 ]);
 
+/**
+ * 幂等规范化凭据指纹：
+ * - 若已符合 `sha256:<32~64位hex>` 格式，统一小写后原样保留（多次读写更新绝不二次哈希变异）；
+ * - 否则计算 SHA-256 并格式化为 `sha256:<32位hex>`，杜绝明文凭据进入指纹列。
+ */
+export function normalizeCredentialFingerprint(raw: string): string {
+	const trimmed = String(raw ?? "").trim();
+	if (/^sha256:[0-9a-f]{32,64}$/i.test(trimmed)) {
+		return `sha256:${trimmed.slice("sha256:".length).toLowerCase()}`;
+	}
+	const hex = createHash("sha256").update(trimmed, "utf8").digest("hex").slice(0, 32);
+	return `sha256:${hex}`;
+}
+
+/**
+ * 严格判定字符串是否已处于完整掩码态：
+ * - 仅认可纯星号（`***` 及以上）、标准占位符（`[REDACTED]` / `<redacted>`）或 `maskSecretValue` 生成的短掩码（前 1~4 字符 + `***` + 后 0~2 字符）；
+ * - 严防 `p@ss***SecretLeak9988` 等夹带 `***` 的混合长明文绕过脱敏。
+ */
 export function alreadyMasked(val: string): boolean {
-	return val.includes("***") || /^\*{4,}$/.test(val.trim());
+	const trimmed = String(val ?? "").trim();
+	if (!trimmed) return true;
+	if (/^\*{3,}$/.test(trimmed)) return true;
+	if (/^(?:\[REDACTED\]|<redacted>)$/i.test(trimmed)) return true;
+	return /^[^\s*]{1,4}\*{3,}[^\s*]{0,2}$/.test(trimmed);
+}
+
+function maskSensitiveFieldString(rawVal: string, vault: SessionVault): string {
+	const afterVault = redactVaultSecrets(rawVal, vault);
+	const authScheme = /^(Bearer|Basic|Token|JWT)\s+(.+)$/i.exec(afterVault.trim());
+	if (authScheme?.[1] && authScheme[2]) {
+		const tok = authScheme[2].trim();
+		return alreadyMasked(tok) ? `${authScheme[1]} ${tok}` : `${authScheme[1]} ${maskSecretValue(tok)}`;
+	}
+	return alreadyMasked(afterVault) ? afterVault : maskSecretValue(afterVault);
 }
 
 function maskCookieHeaderLine(cookieVal: string): string {
@@ -889,6 +925,35 @@ function redactGenericSecrets(text: string): string {
 	if (!text) return text;
 	let out = text;
 
+	out = out.replace(URL_USERINFO_RE, (_m, scheme: string, user: string | undefined, pass: string) => {
+		const userPart = user ?? "";
+		if (alreadyMasked(pass)) return `${scheme}${userPart}:${pass}@`;
+		return `${scheme}${userPart}:${maskSecretValue(pass)}@`;
+	});
+
+	out = out.replace(URL_SENSITIVE_QUERY_RE, (_m, prefix: string, param: string, val: string) => {
+		if (alreadyMasked(val)) return `${prefix}${param}=${val}`;
+		return `${prefix}${param}=${maskSecretValue(val)}`;
+	});
+
+	out = out.replace(
+		JSON_SENSITIVE_KV_RE,
+		(_m, q1: string, key: string, sep: string, q2: string, val: string) => {
+			const lowerKey = key.toLowerCase();
+			if (lowerKey === "cookie" || lowerKey === "set-cookie" || lowerKey === "set_cookie") {
+				return `${q1}${key}${q1}${sep}${q2}${maskCookieHeaderLine(val)}${q2}`;
+			}
+			const authScheme = /^(Bearer|Basic|Token|JWT)\s+(.+)$/i.exec(val.trim());
+			if (authScheme?.[1] && authScheme[2]) {
+				const tok = authScheme[2].trim();
+				const maskedTok = alreadyMasked(tok) ? tok : maskSecretValue(tok);
+				return `${q1}${key}${q1}${sep}${q2}${authScheme[1]} ${maskedTok}${q2}`;
+			}
+			if (alreadyMasked(val)) return `${q1}${key}${q1}${sep}${q2}${val}${q2}`;
+			return `${q1}${key}${q1}${sep}${q2}${maskSecretValue(val)}${q2}`;
+		},
+	);
+
 	out = out.replace(GENERIC_AUTH_HEADER_RE, (_m, hdr: string, scheme: string, tok: string) => {
 		if (alreadyMasked(tok)) return `${hdr}: ${scheme} ${tok}`;
 		return `${hdr}: ${scheme} ${maskSecretValue(tok)}`;
@@ -910,12 +975,6 @@ function redactGenericSecrets(text: string): string {
 			return `${key}${sep}${quote}${maskSecretValue(val)}${quote}`;
 		},
 	);
-
-	out = out.replace(URL_USERINFO_RE, (_m, scheme: string, user: string | undefined, pass: string) => {
-		const userPart = user ?? "";
-		if (alreadyMasked(pass)) return `${scheme}${userPart}:${pass}@`;
-		return `${scheme}${userPart}:${maskSecretValue(pass)}@`;
-	});
 
 	out = out.replace(RAW_JWT_RE, (jwt) => (alreadyMasked(jwt) ? jwt : maskSecretValue(jwt)));
 	out = out.replace(KNOWN_TOKEN_PREFIX_RE, (tok) => (alreadyMasked(tok) ? tok : maskSecretValue(tok)));
@@ -949,15 +1008,7 @@ export function redactHeadersRecord(
 			if (k.trim().toLowerCase() === "cookie" || k.trim().toLowerCase() === "set-cookie") {
 				out[k] = maskCookieHeaderLine(redactVaultSecrets(cleanV, vault));
 			} else {
-				const authScheme = /^(Bearer|Basic|Token|JWT)\s+(.+)$/i.exec(cleanV.trim());
-				if (authScheme?.[1] && authScheme[2]) {
-					const tok = authScheme[2].trim();
-					out[k] = alreadyMasked(tok)
-						? `${authScheme[1]} ${tok}`
-						: `${authScheme[1]} ${maskSecretValue(tok)}`;
-				} else {
-					out[k] = alreadyMasked(cleanV) ? cleanV : maskSecretValue(cleanV);
-				}
+				out[k] = maskSensitiveFieldString(cleanV, vault);
 			}
 		} else {
 			out[k] = redactTextForStorage(cleanV, vault) ?? cleanV;
@@ -978,11 +1029,13 @@ export function redactUnknownForStorage<T>(value: T, vault: SessionVault, depth 
 		const obj = value as Record<string, unknown>;
 		const out: Record<string, unknown> = {};
 		for (const [k, v] of Object.entries(obj)) {
-			if (typeof v === "string" && SENSITIVE_FIELD_KEY_RE.test(k.trim())) {
-				if (k.trim().toLowerCase() === "cookie" || k.trim().toLowerCase() === "set-cookie") {
+			const trimmedKey = k.trim();
+			const lowerKey = trimmedKey.toLowerCase();
+			if (typeof v === "string" && SENSITIVE_FIELD_KEY_RE.test(trimmedKey)) {
+				if (lowerKey === "cookie" || lowerKey === "set-cookie" || lowerKey === "set_cookie") {
 					out[k] = maskCookieHeaderLine(redactVaultSecrets(v, vault));
 				} else {
-					out[k] = alreadyMasked(v) ? v : maskSecretValue(v);
+					out[k] = maskSensitiveFieldString(v, vault);
 				}
 			} else {
 				out[k] = redactUnknownForStorage(v, vault, depth + 1);

@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { describe, expect, test } from "bun:test";
+import { readSqliteStateDaemon } from "../core/autonomous-doctor";
 import { NuwaUnifiedEngine } from "../core/engine";
 import { executeChainsCommand } from "../omp/graph-commands";
 import {
@@ -191,7 +192,7 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 		expect(typeof nuwaMod.openSqliteReadonlyZeroWrite).toBe("function");
 	});
 
-	test("3. SQLite Schema v1 -> v2 平滑无损幂等迁移、4 张新表脱敏存取及 v1/JSON 只读零写盘", async () => {
+	test("3. SQLite Schema v1 -> v2 原子无损幂等迁移、全反例零明文脱敏、credFingerprint 幂等及活跃 -wal/-shm 只读零写盘", async () => {
 		expect(SQLITE_SCHEMA_VERSION).toBe(2);
 		expect(V1_CORE_TABLES.length).toBe(10);
 		expect(V2_EXTENSION_TABLES).toEqual([
@@ -203,19 +204,23 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 		expect(ALL_SQLITE_TABLES.length).toBe(14);
 
 		const tmpRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-sqlite-mig-"));
+		const walLiveRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-wal-live-"));
 		const legacyJsonRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-json-ro-"));
 		try {
-			// --- A. 构造纯 v1 旧版 nuwa.db（仅有 10 张 v1 表且 schema_version = "1"） ---
+			// --- A. 构造纯 v1 旧版 nuwa.db（DELETE 日志模式，仅有 10 张 v1 表且 schema_version = "1"） ---
 			const nuwaDir = join(tmpRoot, ".nuwa");
 			mkdirSync(nuwaDir, { recursive: true });
 			const dbFile = sqliteDbPath(tmpRoot);
+			const ts = "2026-11-20T00:00:00.000Z";
 
-			const rawV1 = new Database(dbFile, { create: true });
-			try {
-				rawV1.exec("PRAGMA journal_mode = DELETE;");
-				rawV1.exec(V1_CORE_DDL);
-				const ts = "2026-11-20T00:00:00.000Z";
-				const insMeta = rawV1.query("INSERT INTO meta (key, value, updated_at) VALUES (?, ?, ?)");
+			const seedLegacyV1Db = (targetDbFile: string, mode: "DELETE" | "WAL") => {
+				const db = new Database(targetDbFile, { create: true });
+				db.exec(`PRAGMA journal_mode = ${mode};`);
+				if (mode === "WAL") {
+					db.exec("PRAGMA wal_autocheckpoint = 0;");
+				}
+				db.exec(V1_CORE_DDL);
+				const insMeta = db.query("INSERT INTO meta (key, value, updated_at) VALUES (?, ?, ?)");
 				insMeta.run("schema_version", "1", ts);
 				insMeta.run("nuwa_schema", "1", ts);
 				insMeta.run("nuwa_version", "7.0.0", ts);
@@ -255,33 +260,28 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 					}),
 					ts,
 				);
-				rawV1
-					.query(
-						`INSERT INTO facts (id, kind, title, detail, command, output, created_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					)
-					.run("f001", "endpoint", "发现 /api/v1/orders", "HTTP 200 JSON", "curl -s /api/v1/orders", '{"ok":true}', ts);
-				rawV1
-					.query(
-						`INSERT INTO facts_fts (fact_id, kind, title, detail, command, output, fact_key, target_key)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-					)
-					.run("f001", "endpoint", "发现 /api/v1/orders", "HTTP 200 JSON", "curl -s /api/v1/orders", '{"ok":true}', "", "/api/v1/orders");
-				rawV1
-					.query(
-						`INSERT INTO intents (id, phase, intent_key, title, detail, from_json, status, priority, attempts, created_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					)
-					.run("i001", "surface", "surface:api", "API 契约梳理", "枚举端点", '["f001"]', "open", 85, 0, ts);
-			} finally {
-				rawV1.close();
-			}
+				db.query(
+					`INSERT INTO facts (id, kind, title, detail, command, output, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				).run("f001", "endpoint", "发现 /api/v1/orders", "HTTP 200 JSON", "curl -s /api/v1/orders", '{"ok":true}', ts);
+				db.query(
+					`INSERT INTO facts_fts (fact_id, kind, title, detail, command, output, fact_key, target_key)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				).run("f001", "endpoint", "发现 /api/v1/orders", "HTTP 200 JSON", "curl -s /api/v1/orders", '{"ok":true}', "", "/api/v1/orders");
+				db.query(
+					`INSERT INTO intents (id, phase, intent_key, title, detail, from_json, status, priority, attempts, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				).run("i001", "surface", "surface:api", "API 契约梳理", "枚举端点", '["f001"]', "open", 85, 0, ts);
+				return db;
+			};
 
-			// 确认此时没有任何 v2 扩展表
+			const rawV1 = seedLegacyV1Db(dbFile, "DELETE");
+			rawV1.close();
+
+			// --- B1. 仅有 v1 旧表的历史 nuwa.db 只读打开：零写盘、不报错 ---
 			const snapBeforeRo = snapshotDirectoryFiles(nuwaDir);
 			expect(Object.keys(snapBeforeRo)).toEqual(["nuwa.db"]);
 
-			// --- B. 在仅有 v1 旧表的历史 nuwa.db 上执行多种只读操作：零写盘、不报错 ---
 			const zeroRoDb = openSqliteReadonlyZeroWrite(dbFile);
 			try {
 				expect(readSqliteSchemaVersion(zeroRoDb)).toBe(1);
@@ -295,13 +295,8 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 				zeroRoDb.close();
 			}
 
-			const roLoaded = loadStateFromSqlite(tmpRoot);
-			expect(roLoaded?.project.id).toBe("v1-legacy-proj");
-			expect(roLoaded?.facts.f001?.title).toBe("发现 /api/v1/orders");
-
-			const ftsHits = queryFactsByText(tmpRoot, "orders");
-			expect(ftsHits.length).toBe(1);
-			expect(ftsHits[0]?.fact.id).toBe("f001");
+			expect(loadStateFromSqlite(tmpRoot)?.project.id).toBe("v1-legacy-proj");
+			expect(queryFactsByText(tmpRoot, "orders")[0]?.fact.id).toBe("f001");
 
 			const roStore = new NuwaSqliteStore(tmpRoot, { readonly: true });
 			try {
@@ -313,17 +308,55 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 				roStore.close();
 			}
 
-			const roDbDirect = openNuwaDb(tmpRoot, { readonly: true });
-			roDbDirect.close();
-
+			openNuwaDb(tmpRoot, { readonly: true }).close();
 			const engine = new NuwaUnifiedEngine({ projectRoot: tmpRoot, cwd: tmpRoot });
 			const statusRo = await engine.callTool("nuwa_status", { root: tmpRoot });
 			expect(statusRo.isError).toBe(false);
-			expect(statusRo.content[0]?.text).toContain("http://127.0.0.1:18088");
-			expect(statusRo.content[0]?.text).toContain("v1 legacy migration test");
+			expect(snapshotDirectoryFiles(nuwaDir)).toEqual(snapBeforeRo);
 
-			const snapAfterRo = snapshotDirectoryFiles(nuwaDir);
-			expect(snapAfterRo).toEqual(snapBeforeRo);
+			// --- B2. [#131 P1-2 反例] 历史 v1 nuwa.db 同时存在活跃非空 -wal + -shm 时，全部只读接口严禁改写原目录 nuwa.db-shm ---
+			const walDir = join(walLiveRoot, ".nuwa");
+			mkdirSync(walDir, { recursive: true });
+			const walDbFile = sqliteDbPath(walLiveRoot);
+			// 通过保持一个活跃 WAL 写连接（或子进程异常退出遗留非空 -wal + -shm）制造真实非空 -wal 与 -shm
+			const liveWalWriter = seedLegacyV1Db(walDbFile, "WAL");
+			try {
+				liveWalWriter
+					.query(
+						`INSERT INTO facts (id, kind, title, detail, command, output, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					)
+					.run("f_uncheckpointed", "note", "WAL 未刷盘事实", "live wal fact", "echo wal", "ok", ts);
+
+				expect(existsSync(`${walDbFile}-wal`)).toBe(true);
+				expect(statSync(`${walDbFile}-wal`).size).toBeGreaterThan(0);
+				expect(existsSync(`${walDbFile}-shm`)).toBe(true);
+
+				const snapWalBefore = snapshotDirectoryFiles(walDir);
+				expect(snapWalBefore["nuwa.db-shm"]).toBeDefined();
+
+				const roWal1 = openSqliteReadonlyZeroWrite(walDbFile);
+				try {
+					const row = roWal1.query("SELECT title FROM facts WHERE id = 'f_uncheckpointed'").get() as { title?: string } | null;
+					expect(row?.title).toBe("WAL 未刷盘事实");
+				} finally {
+					roWal1.close();
+				}
+
+				const roWalState = loadStateFromSqlite(walLiveRoot);
+				expect(roWalState?.facts.f_uncheckpointed?.title).toBe("WAL 未刷盘事实");
+
+				const daemonWalState = readSqliteStateDaemon(walLiveRoot);
+				expect(daemonWalState?.facts?.f_uncheckpointed).toBeDefined();
+
+				const roWalStore = new NuwaSqliteStore(walLiveRoot, { readonly: true });
+				roWalStore.close();
+
+				const snapWalAfter = snapshotDirectoryFiles(walDir);
+				expect(snapWalAfter).toEqual(snapWalBefore);
+			} finally {
+				liveWalWriter.close();
+			}
 
 			// --- C. 遗留纯 state.json 目录只读零写盘验证 ---
 			const legacyState = createInitialState(
@@ -335,67 +368,83 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 			saveStateJsonOnly(legacyJsonRoot, legacyState);
 			const legacyNuwaDir = join(legacyJsonRoot, ".nuwa");
 			const snapJsonBefore = snapshotDirectoryFiles(legacyNuwaDir);
-			expect(existsSync(join(legacyNuwaDir, "nuwa.db"))).toBe(false);
-
 			const jsonEngine = new NuwaUnifiedEngine({ projectRoot: legacyJsonRoot, cwd: legacyJsonRoot });
-			const stRes = await jsonEngine.callTool("nuwa_status", { root: legacyJsonRoot });
-			expect(stRes.isError).toBe(false);
-			const frRes = await jsonEngine.callTool("nuwa_frontier", { root: legacyJsonRoot });
-			expect(frRes.isError).toBe(false);
-			const slStatus = await jsonEngine.executeSlashCommand("status");
-			expect(slStatus.level).toBe("info");
-			const slScope = await jsonEngine.executeSlashCommand("scope show");
-			expect(slScope.level).toBe("info");
-			const slChains = await jsonEngine.executeSlashCommand("chains list");
-			expect(slChains.level).toBe("info");
+			expect((await jsonEngine.callTool("nuwa_status", { root: legacyJsonRoot })).isError).toBe(false);
+			expect((await jsonEngine.callTool("nuwa_frontier", { root: legacyJsonRoot })).isError).toBe(false);
+			expect((await jsonEngine.executeSlashCommand("status")).level).toBe("info");
+			expect(snapshotDirectoryFiles(legacyNuwaDir)).toEqual(snapJsonBefore);
 
-			const snapJsonAfter = snapshotDirectoryFiles(legacyNuwaDir);
-			expect(snapJsonAfter).toEqual(snapJsonBefore);
-			expect(existsSync(join(legacyNuwaDir, "nuwa.db"))).toBe(false);
+			// --- D0. [#131 P2 验证] migrateSqliteSchemaV1ToV2 单事务原子回滚保护 ---
+			const atomicTestDb = new Database(":memory:");
+			try {
+				atomicTestDb.exec(V1_CORE_DDL);
+				atomicTestDb
+					.query("INSERT INTO meta (key, value, updated_at) VALUES ('schema_version', '1', ?)")
+					.run(ts);
+				// 植入拒绝更新 schema_version 的触发器，模拟迁移事务末尾写入失败
+				atomicTestDb.exec(`
+					CREATE TRIGGER abort_schema_ver_update
+					BEFORE INSERT ON meta
+					WHEN NEW.key = 'schema_version'
+					BEGIN
+						SELECT RAISE(ABORT, 'simulated meta write failure');
+					END;
+				`);
+				expect(() => migrateSqliteSchemaV1ToV2(atomicTestDb)).toThrow(/simulated meta write failure/);
+				// 单事务回滚后：版本号仍为 1，且 4 张 v2 新表也一并回滚不存在（零半成品状态）
+				expect(readSqliteSchemaVersion(atomicTestDb)).toBe(1);
+				for (const extTbl of V2_EXTENSION_TABLES) {
+					expect(
+						atomicTestDb.query("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(extTbl),
+					).toBeNull();
+				}
+			} finally {
+				atomicTestDb.close();
+			}
 
-			// --- D. 旧 v1 库首次读写打开：自动无损迁移至 Schema v2，多次执行严格幂等 ---
+			// --- D. [#131 P1-1 全反例] v1 -> v2 迁移、credFingerprint 多次读写幂等、14 类明文泄漏反例全量二进制零残留 ---
 			const secretBearer = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbi05OSJ9.superSecretSig998877";
+			const leakSecrets = {
+				jsonPass: "PlainJsonPass_991122",
+				jsonApiKey: "ak_json_secret_334455",
+				jsonAccessToken: "at_json_secret_556677",
+				urlUserPass: "UrlBasicPass_778899",
+				urlQueryTok: "UrlQueryTok_112233",
+				urlQueryKey: "UrlQueryApiKey_445566",
+				totpCamel: "JBSWY3DPEHPK3PXP_CAMEL",
+				totpSnake: "JBSWY3DPEHPK3PXP_SNAKE",
+				otpSecret: "OTP_RAW_SECRET_889900",
+				mfaSecret: "MFA_RAW_SECRET_665544",
+				opaqueToken: "opaq_tok_live_99001122",
+				rawSessionId: "sess_secret_cookie_id_774411",
+				rawCredential: "cred_raw_secret_val_332211",
+				rawSecretKey: "sk_custom_hmac_key_558899",
+				rawAuthHeader: "Bearer custom_hdr_tok_667788",
+				mixedStars: "p@ss***SecretLeak9988",
+			};
 			upsertSessionRole(tmpRoot, { role: "admin", bearer: secretBearer });
 
 			const rwStore = new NuwaSqliteStore(tmpRoot);
 			try {
 				expect(readSqliteSchemaVersion(rwStore.rawDb)).toBe(2);
-				for (const tbl of ALL_SQLITE_TABLES) {
-					const found = rwStore.rawDb
-						.query("SELECT name FROM sqlite_master WHERE type='table' AND name=?")
-						.get(tbl) as { name?: string } | null;
-					expect(found?.name).toBe(tbl);
-				}
+				expect(migrateSqliteSchemaV1ToV2(rwStore.rawDb).migrated).toBe(false);
 
-				// 存量 v1 数据 100% 无损保留
-				const migratedState = rwStore.loadState();
-				expect(migratedState?.project.id).toBe("v1-legacy-proj");
-				expect(migratedState?.facts.f001?.title).toBe("发现 /api/v1/orders");
-				expect(migratedState?.intents.i001?.key).toBe("surface:api");
-
-				// 二次调用 migrateSqliteSchemaV1ToV2 严格幂等
-				const secondMig = migrateSqliteSchemaV1ToV2(rwStore.rawDb);
-				expect(secondMig).toEqual({
-					migrated: false,
-					previousVersion: 2,
-					currentVersion: 2,
-					createdTables: [],
-				});
-
-				// 4 张 v2 扩展表写入与强制脱敏校验
-				rwStore.upsertProtocolFrame({
-					id: "pf-1",
+				// 验证 ExecLedger 追踪用 sessionId 不被误掩码
+				rwStore.appendExecLedger({
+					seq: 1,
 					ts: "2026-11-28T00:00:00.000Z",
-					protocol: "graphql",
-					direction: "request",
-					url: "http://127.0.0.1:18088/graphql",
-					host: "127.0.0.1",
-					operationName: "GetUserOrders",
-					role: "admin",
-					status: 200,
-					headers: { Authorization: `Bearer ${secretBearer}`, "Content-Type": "application/json" },
-					payloadPreview: `{"token":"${secretBearer}"}`,
+					tool: "bash",
+					command: "curl -s http://127.0.0.1:18088/health",
+					sessionId: "cli-trace-session-001",
+					agentName: "main",
+					sha1: "a".repeat(40),
+					normSha1: "b".repeat(40),
+					bytes: 12,
+					snippet: "ok",
 				});
+				expect(rwStore.listExecLedger(10)[0]?.sessionId).toBe("cli-trace-session-001");
+
+				// 1) credFingerprint 读写幂等性 + verifiedEndpoint URL userinfo/query + 伪掩码 mixedStars 反例
 				rwStore.upsertAssetCredential({
 					id: "ac-1",
 					assetId: "asset-api",
@@ -404,18 +453,78 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 					role: "admin",
 					credKind: "bearer",
 					credFingerprint: secretBearer,
-					maskedPreview: secretBearer,
+					maskedPreview: leakSecrets.mixedStars,
 					status: "valid",
-					verifiedEndpoint: "/api/v1/orders",
+					verifiedEndpoint: `http://admin:${leakSecrets.urlUserPass}@127.0.0.1:18088/api/me?token=${leakSecrets.urlQueryTok}&api_key=${leakSecrets.urlQueryKey}`,
 					verifiedStatusCode: 200,
 					createdAt: "2026-11-28T00:00:00.000Z",
 					updatedAt: "2026-11-28T00:00:00.000Z",
+					extra: {
+						totpSecret: leakSecrets.totpCamel,
+						totp_secret: leakSecrets.totpSnake,
+						credential: leakSecrets.rawCredential,
+						secretKey: leakSecrets.rawSecretKey,
+					},
 				});
+
+				const firstReadCred = rwStore.listAssetCredentials({ assetId: "asset-api" })[0]!;
+				expect(firstReadCred.credFingerprint).toMatch(/^sha256:[0-9a-f]{32}$/);
+				const fp1 = firstReadCred.credFingerprint;
+
+				// 读出后更新 status 并连续写回两次，验证 credFingerprint 100% 恒定不变异
+				rwStore.upsertAssetCredential({
+					...firstReadCred,
+					status: "expired",
+					updatedAt: "2026-11-28T00:05:00.000Z",
+				});
+				const secondReadCred = rwStore.listAssetCredentials({ assetId: "asset-api" })[0]!;
+				expect(secondReadCred.credFingerprint).toBe(fp1);
+
+				rwStore.upsertAssetCredential({
+					...secondReadCred,
+					status: "valid",
+					updatedAt: "2026-11-28T00:10:00.000Z",
+				});
+				const thirdReadCred = rwStore.listAssetCredentials({ assetId: "asset-api" })[0]!;
+				expect(thirdReadCred.credFingerprint).toBe(fp1);
+
+				// 2) protocol_frames：JSON 双引号敏感键值、schemaSummary/extra 中的 MFA/OTP/sessionId/authHeader/mixedStars
+				rwStore.upsertProtocolFrame({
+					id: "pf-1",
+					ts: "2026-11-28T00:00:00.000Z",
+					protocol: "graphql",
+					direction: "request",
+					url: `http://127.0.0.1:18088/graphql?token=${leakSecrets.urlQueryTok}&api_key=${leakSecrets.urlQueryKey}`,
+					host: "127.0.0.1",
+					operationName: "LoginMutation",
+					role: "admin",
+					status: 200,
+					headers: { Authorization: `Bearer ${secretBearer}`, "X-Custom-Auth": leakSecrets.mixedStars },
+					payloadPreview: JSON.stringify({
+						password: leakSecrets.jsonPass,
+						api_key: leakSecrets.jsonApiKey,
+						access_token: leakSecrets.jsonAccessToken,
+						mixed: `password=${leakSecrets.mixedStars}`,
+					}),
+					schemaSummary: {
+						otp_secret: leakSecrets.otpSecret,
+						mfa_secret: leakSecrets.mfaSecret,
+						token: leakSecrets.opaqueToken,
+						sessionId: leakSecrets.rawSessionId,
+					},
+					extra: {
+						session_id: leakSecrets.rawSessionId,
+						authHeader: leakSecrets.rawAuthHeader,
+						password: leakSecrets.mixedStars,
+					},
+				});
+
+				// 3) oob_correlations 与 workflow_runs steps 敏感字段全覆盖
 				rwStore.upsertOobCorrelation({
 					canaryId: "cny-001",
 					projectId: "v1-legacy-proj",
 					intentId: "i001",
-					endpoint: "/api/v1/webhook",
+					endpoint: `/api/v1/webhook?api_key=${leakSecrets.urlQueryKey}`,
 					paramName: "callbackUrl",
 					templateHash: "abcd1234",
 					authRole: "admin",
@@ -423,15 +532,16 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 					status: "correlated",
 					callbackTs: "2026-11-28T00:01:00.000Z",
 					callbackSourceIp: "127.0.0.1",
-					callbackDetail: `Authorization: Bearer ${secretBearer}`,
+					callbackDetail: `{"password":"${leakSecrets.jsonPass}","access_token":"${leakSecrets.jsonAccessToken}"}`,
 					createdAt: "2026-11-28T00:00:00.000Z",
 				});
+
 				rwStore.upsertWorkflowRun({
 					runId: "wf-001",
 					workflowKind: "second_order",
 					actionLevel: "L2_SCOPED_STATEFUL",
 					intentId: "i001",
-					targetUrl: "http://127.0.0.1:18088/api/v1/orders",
+					targetUrl: `http://127.0.0.1:18088/api/v1/orders?token=${leakSecrets.urlQueryTok}`,
 					role: "admin",
 					status: "passed",
 					stepCount: 2,
@@ -439,118 +549,171 @@ describe("Wave 0 架构地基拆解、导出兼容性与 SQLite Schema v2 门禁
 					startedAt: "2026-11-28T00:00:00.000Z",
 					finishedAt: "2026-11-28T00:00:01.000Z",
 					summary: `authenticated with ${secretBearer}`,
+					steps: [
+						{
+							step: 1,
+							token: leakSecrets.opaqueToken,
+							totpSecret: leakSecrets.totpCamel,
+							sessionId: leakSecrets.rawSessionId,
+							secretKey: leakSecrets.rawSecretKey,
+							credential: leakSecrets.mixedStars,
+						},
+					],
 				});
-
-				expect(rwStore.listProtocolFrames().length).toBe(1);
-				expect(rwStore.listAssetCredentials().length).toBe(1);
-				expect(rwStore.listOobCorrelations().length).toBe(1);
-				expect(rwStore.listWorkflowRuns().length).toBe(1);
 
 				rwStore.rawDb.exec("PRAGMA wal_checkpoint(TRUNCATE);");
 			} finally {
 				rwStore.close();
 			}
 
-			// 二进制扫描 nuwa.db 确保绝无明文凭据泄漏
+			// 二进制扫描 nuwa.db 原始字节，确认上述全部 17 个敏感明文片段 0 泄漏
 			const dbRawText = readFileSync(dbFile).toString("latin1");
 			expect(dbRawText.includes(secretBearer)).toBe(false);
 			expect(dbRawText.includes("superSecretSig998877")).toBe(false);
+			expect(dbRawText.includes("SecretLeak9988")).toBe(false);
+			for (const [, plainSecret] of Object.entries(leakSecrets)) {
+				expect(dbRawText.includes(plainSecret)).toBe(false);
+			}
 		} finally {
 			rmSync(tmpRoot, { recursive: true, force: true });
+			rmSync(walLiveRoot, { recursive: true, force: true });
 			rmSync(legacyJsonRoot, { recursive: true, force: true });
 		}
 	});
 
 	test(
-		"4. bin/nuwa-autonomous 在仓库态与沙盒安装态（含跨目录无环境变量）均能准确动态加载 core/autonomous-doctor.ts",
+		"4. bin/nuwa-autonomous 仓库态防外部 --agent-home 劫持，且安装态 doctor 严检 8+2 个拆解底层模块缺失",
 		() => {
-		// 1) 仓库态直接运行 doctor --json
-		const repoRun = spawnSync("bun", [join(REPO_ROOT, "bin/nuwa-autonomous"), "doctor", "--json"], {
-			cwd: tmpdir(),
-			encoding: "utf8",
-		});
-		const repoParsed = JSON.parse(repoRun.stdout) as { checks?: Record<string, unknown> };
-		expect(typeof repoParsed.checks?.extension).toBe("object");
+			const sbBase = mkdtempSync(join(tmpdir(), "nuwa-v8-install-doc-"));
+			const hijackHome = join(sbBase, "hijack-old-home");
+			const agentHome = join(sbBase, "agent-home");
+			const binDir = join(sbBase, "bin");
+			const ompStubDir = join(sbBase, "omp-stub");
+			try {
+				mkdirSync(ompStubDir, { recursive: true });
+				const ompStub = join(ompStubDir, "omp");
+				writeFileSync(ompStub, "#!/usr/bin/env bash\necho 'omp 18.16.0'\n", "utf8");
+				chmodSync(ompStub, 0o755);
 
-		// 2) 独立 /tmp 沙盒运行 install.sh 后跨目录执行 installed_bin/nuwa-autonomous doctor --json
-		const sbBase = mkdtempSync(join(tmpdir(), "nuwa-v8-install-doc-"));
-		const agentHome = join(sbBase, "agent-home");
-		const binDir = join(sbBase, "bin");
-		const ompStubDir = join(sbBase, "omp-stub");
-		try {
-			mkdirSync(ompStubDir, { recursive: true });
-			const ompStub = join(ompStubDir, "omp");
-			writeFileSync(ompStub, "#!/usr/bin/env bash\necho 'omp 18.16.0'\n", "utf8");
-			chmodSync(ompStub, 0o755);
+				// --- [#131 P1-3 反例] 在外部 <hijackHome>/nuwa-core/core/autonomous-doctor.ts 植入恶意抛错假模块 ---
+				mkdirSync(join(hijackHome, "nuwa-core", "core"), { recursive: true });
+				writeFileSync(
+					join(hijackHome, "nuwa-core", "core", "autonomous-doctor.ts"),
+					'throw new Error("HIJACKED_BY_EXTERNAL_AGENT_HOME");\n',
+					"utf8",
+				);
 
-			const installEnv: Record<string, string | undefined> = {
-				...process.env,
-				PI_AGENT_HOME: agentHome,
-				NUWA_BIN_DIR: binDir,
-				PATH: `${ompStubDir}:${process.env.PATH ?? ""}`,
-			};
-			delete installEnv.BUN_OPTIONS;
+				// 仓库态同时传入 --agent-home <hijackHome> 与 PI_AGENT_HOME=<hijackHome>：必须优先加载同仓 ../core/autonomous-doctor.ts，绝不被劫持崩溃
+				const repoAntiHijack = spawnSync(
+					"bun",
+					[join(REPO_ROOT, "bin/nuwa-autonomous"), "doctor", "--agent-home", hijackHome, "--omp-bin", ompStub, "--json"],
+					{
+						cwd: tmpdir(),
+						env: {
+							...process.env,
+							PI_AGENT_HOME: hijackHome,
+						},
+						encoding: "utf8",
+					},
+				);
+				expect(repoAntiHijack.stderr).not.toContain("HIJACKED_BY_EXTERNAL_AGENT_HOME");
+				const antiHijackJson = JSON.parse(repoAntiHijack.stdout) as { agentHome: string; checks?: Record<string, any> };
+				expect(antiHijackJson.agentHome).toBe(hijackHome);
+				expect(typeof antiHijackJson.checks?.extension).toBe("object");
 
-			const inst = spawnSync("bash", [join(REPO_ROOT, "install.sh")], {
-				cwd: REPO_ROOT,
-				env: installEnv as NodeJS.ProcessEnv,
-				encoding: "utf8",
-				timeout: 60_000,
-			});
-			expect(inst.status).toBe(0);
+				// --- 独立 /tmp 沙盒运行 install.sh 后跨目录执行 installed_bin/nuwa-autonomous doctor --json ---
+				const installEnv: Record<string, string | undefined> = {
+					...process.env,
+					PI_AGENT_HOME: agentHome,
+					NUWA_BIN_DIR: binDir,
+					PATH: `${ompStubDir}:${process.env.PATH ?? ""}`,
+				};
+				delete installEnv.BUN_OPTIONS;
 
-			const installedBin = join(binDir, "nuwa-autonomous");
-			expect(existsSync(installedBin)).toBe(true);
-			expect(existsSync(join(agentHome, "nuwa-core", "core", "autonomous-doctor.ts"))).toBe(true);
-
-			// 2a) 带 PI_AGENT_HOME 从 /tmp 运行
-			const docWithEnv = spawnSync("bun", [installedBin, "doctor", "--json", "--omp-bin", ompStub], {
-				cwd: tmpdir(),
-				env: installEnv as NodeJS.ProcessEnv,
-				encoding: "utf8",
-			});
-			expect(docWithEnv.status).toBe(0);
-			const jsonWithEnv = JSON.parse(docWithEnv.stdout) as { ok: boolean; exitCode: number };
-			expect(jsonWithEnv.ok).toBe(true);
-			expect(jsonWithEnv.exitCode).toBe(0);
-
-			// 2b) 剥离 PI_AGENT_HOME 环境变量，仅通过 --agent-home 参数跨目录运行
-			const strippedEnv: Record<string, string | undefined> = {
-				...process.env,
-				HOME: sbBase,
-				PATH: `${ompStubDir}:${process.env.PATH ?? ""}`,
-			};
-			delete strippedEnv.PI_AGENT_HOME;
-			delete strippedEnv.NUWA_CORE_DIR;
-			delete strippedEnv.BUN_OPTIONS;
-
-			const docCliFlag = spawnSync(
-				"bun",
-				[installedBin, "doctor", "--agent-home", agentHome, "--omp-bin", ompStub, "--json"],
-				{
-					cwd: tmpdir(),
-					env: strippedEnv as NodeJS.ProcessEnv,
+				const inst = spawnSync("bash", [join(REPO_ROOT, "install.sh")], {
+					cwd: REPO_ROOT,
+					env: installEnv as NodeJS.ProcessEnv,
 					encoding: "utf8",
-				},
-			);
-			expect(docCliFlag.status).toBe(0);
-			const jsonCliFlag = JSON.parse(docCliFlag.stdout) as { ok: boolean; agentHome: string };
-			expect(jsonCliFlag.ok).toBe(true);
-			expect(jsonCliFlag.agentHome).toBe(agentHome);
+					timeout: 60_000,
+				});
+				expect(inst.status).toBe(0);
 
-			// 2c) 既无 PI_AGENT_HOME 也无 --agent-home，依靠同目录 nuwa-mcp 指针解析 CORE_DIR 运行 --help
-			const helpNoEnv = spawnSync("bun", [installedBin, "--help"], {
-				cwd: tmpdir(),
-				env: strippedEnv as NodeJS.ProcessEnv,
-				encoding: "utf8",
-			});
-			expect(helpNoEnv.status).toBe(0);
-			expect(helpNoEnv.stdout).toContain("nuwa-autonomous");
-		} finally {
-			rmSync(sbBase, { recursive: true, force: true });
-		}
-	},
-	30_000,
+				const installedBin = join(binDir, "nuwa-autonomous");
+				expect(existsSync(installedBin)).toBe(true);
+				expect(existsSync(join(agentHome, "nuwa-core", "core", "autonomous-doctor.ts"))).toBe(true);
+
+				// 2a) 完整安装态 doctor --json 正常通过（exitCode=0, ok=true, submodulesMissing=[]）
+				const docWithEnv = spawnSync("bun", [installedBin, "doctor", "--json", "--omp-bin", ompStub], {
+					cwd: tmpdir(),
+					env: installEnv as NodeJS.ProcessEnv,
+					encoding: "utf8",
+				});
+				expect(docWithEnv.status).toBe(0);
+				const jsonWithEnv = JSON.parse(docWithEnv.stdout) as {
+					ok: boolean;
+					exitCode: number;
+					checks: { extension: { submodulesFound: string[]; submodulesMissing: string[]; nuwaCoreMissing: string[] } };
+				};
+				expect(jsonWithEnv.ok).toBe(true);
+				expect(jsonWithEnv.exitCode).toBe(0);
+				expect(jsonWithEnv.checks.extension.submodulesFound.length).toBe(8);
+				expect(jsonWithEnv.checks.extension.submodulesMissing).toEqual([]);
+				expect(jsonWithEnv.checks.extension.nuwaCoreMissing).toEqual([]);
+
+				// 2b) 剥离 PI_AGENT_HOME 环境变量，仅通过 --agent-home 参数跨目录运行
+				const strippedEnv: Record<string, string | undefined> = {
+					...process.env,
+					HOME: sbBase,
+					PATH: `${ompStubDir}:${process.env.PATH ?? ""}`,
+				};
+				delete strippedEnv.PI_AGENT_HOME;
+				delete strippedEnv.NUWA_CORE_DIR;
+				delete strippedEnv.BUN_OPTIONS;
+
+				const docCliFlag = spawnSync(
+					"bun",
+					[installedBin, "doctor", "--agent-home", agentHome, "--omp-bin", ompStub, "--json"],
+					{
+						cwd: tmpdir(),
+						env: strippedEnv as NodeJS.ProcessEnv,
+						encoding: "utf8",
+					},
+				);
+				expect(docCliFlag.status).toBe(0);
+				expect((JSON.parse(docCliFlag.stdout) as { ok: boolean }).ok).toBe(true);
+
+				// 2c) [#131 P1-4 反例] 删除新拆解底层子模块 storage-io.ts / sqlite-schema.ts / autoexec-baseline.ts 及 engine-helpers.ts 后，doctor 必须报错返回 exitCode=1, ok=false
+				const extDir = join(agentHome, "extensions", "nuwa-omp");
+				rmSync(join(extDir, "storage-io.ts"), { force: true });
+				rmSync(join(extDir, "sqlite-schema.ts"), { force: true });
+				rmSync(join(extDir, "autoexec-baseline.ts"), { force: true });
+				rmSync(join(agentHome, "nuwa-core", "core", "engine-helpers.ts"), { force: true });
+
+				const docBroken = spawnSync("bun", [installedBin, "doctor", "--json", "--omp-bin", ompStub], {
+					cwd: tmpdir(),
+					env: installEnv as NodeJS.ProcessEnv,
+					encoding: "utf8",
+				});
+				expect(docBroken.status).toBe(1);
+				const jsonBroken = JSON.parse(docBroken.stdout) as {
+					ok: boolean;
+					exitCode: number;
+					checks: { extension: { ok: boolean; submodulesMissing: string[]; nuwaCoreMissing: string[]; reason?: string } };
+				};
+				expect(jsonBroken.ok).toBe(false);
+				expect(jsonBroken.exitCode).toBe(1);
+				expect(jsonBroken.checks.extension.ok).toBe(false);
+				expect(jsonBroken.checks.extension.submodulesMissing).toEqual([
+					"storage-io.ts",
+					"sqlite-schema.ts",
+					"autoexec-baseline.ts",
+				]);
+				expect(jsonBroken.checks.extension.nuwaCoreMissing).toEqual(["engine-helpers.ts"]);
+			} finally {
+				rmSync(sbBase, { recursive: true, force: true });
+			}
+		},
+		35_000,
 	);
 
 	test("5. executeChainsCommand(root, 'verify') 在入口锁前预读拦截终态项目，严格零写盘零发包", async () => {

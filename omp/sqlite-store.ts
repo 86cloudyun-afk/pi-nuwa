@@ -70,6 +70,7 @@ import {
 	intentFromRow,
 	migrateSqliteSchemaV1ToV2,
 	normalizeAttemptedSurfaceDomain,
+	normalizeCredentialFingerprint,
 	readSqliteSchemaVersion,
 	safeJsonParse,
 	type AssetCredentialRow,
@@ -493,34 +494,15 @@ function openReadonlyWalIsolatedSnapshot(dbFile: string): Database {
 	}
 }
 
-/** 供外部模块（如 lineage 探针）零原目录写入安全只读打开指定 SQLite 文件。 */
+/** 供外部模块（如 lineage 探针）零原目录写入安全只读打开指定 SQLite 文件（含非空 -wal + -shm 时统一走隔离快照，杜绝触碰原目录 -shm）。 */
 export function openSqliteReadonlyZeroWrite(dbFile: string): Database {
 	if (!existsSync(dbFile)) {
 		throw new Error(`SQLITE_CANTOPEN: unable to open database file (${dbFile})`);
 	}
-	if (!hasNonEmptyWalSidecar(dbFile)) {
-		return openReadonlyMemorySnapshot(dbFile);
-	}
-	if (!existsSync(`${dbFile}-shm`)) {
+	if (hasNonEmptyWalSidecar(dbFile)) {
 		return openReadonlyWalIsolatedSnapshot(dbFile);
 	}
-	let db: Database | null = null;
-	try {
-		db = new Database(dbFile, { readonly: true });
-		db.exec("PRAGMA busy_timeout = 3000;");
-		db.exec("PRAGMA query_only = ON;");
-		return db;
-	} catch (err) {
-		try {
-			db?.close();
-		} catch {
-			/* ignore */
-		}
-		if (isReadonlyCantOpenError(err)) {
-			return openReadonlyWalIsolatedSnapshot(dbFile);
-		}
-		throw err;
-	}
+	return openReadonlyMemorySnapshot(dbFile);
 }
 
 export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
@@ -545,27 +527,25 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 			if (!existsSync(dbFile)) {
 				throw new Error(`SQLITE_CANTOPEN: unable to open database file (${dbFile})`);
 			}
-			// 无活跃非空 -wal 或有 -wal 但缺 -shm 时直接走内存只读快照（隔离重放 WAL），确保 100% 零新建 -wal/-shm、零 mtime 变动
-			if (!hasNonEmptyWalSidecar(dbFile) || !existsSync(`${dbFile}-shm`)) {
-				let memDb: Database | null = null;
+			// 所有只读打开统一走纯内存只读快照（存在非空 -wal 时在隔离临时目录重放 WAL 后载入内存），确保原目录 nuwa.db/-wal/-shm 100% 零字节变动
+			let memDb: Database | null = null;
+			try {
+				memDb = hasNonEmptyWalSidecar(dbFile)
+					? openReadonlyWalIsolatedSnapshot(dbFile)
+					: openReadonlyMemorySnapshot(dbFile);
+				configureAndInitDb(memDb, dbFile, true);
+				return memDb;
+			} catch (memErr) {
 				try {
-					memDb = hasNonEmptyWalSidecar(dbFile)
-						? openReadonlyWalIsolatedSnapshot(dbFile)
-						: openReadonlyMemorySnapshot(dbFile);
-					configureAndInitDb(memDb, dbFile, true);
-					return memDb;
-				} catch (memErr) {
-					try {
-						memDb?.close();
-					} catch {
-						/* ignore */
-					}
-					if (memErr instanceof NuwaSqliteCorruptError) throw memErr;
-					if (isCorruptError(memErr)) {
-						throw new NuwaSqliteCorruptError(dbFile, memErr instanceof Error ? memErr.message : String(memErr));
-					}
-					throw memErr;
+					memDb?.close();
+				} catch {
+					/* ignore */
 				}
+				if (memErr instanceof NuwaSqliteCorruptError) throw memErr;
+				if (isCorruptError(memErr)) {
+					throw new NuwaSqliteCorruptError(dbFile, memErr instanceof Error ? memErr.message : String(memErr));
+				}
+				throw memErr;
 			}
 		}
 
@@ -1260,6 +1240,8 @@ export class NuwaSqliteStore {
 	appendExecLedger(entry: ExecLedgerEntry, opts?: { vault?: SessionVault }): void {
 		const vault = safeLoadVault(this.root, opts?.vault);
 		const safeEntry = redactUnknownForStorage(entry, vault);
+		const preservedSessionId =
+			typeof entry.sessionId === "string" ? redactTextForStorage(entry.sessionId, vault) ?? null : null;
 		const tx = this.db.transaction(() => {
 			this.db
 				.query(
@@ -1272,7 +1254,7 @@ export class NuwaSqliteStore {
 					safeEntry.ts,
 					safeEntry.tool,
 					safeEntry.command ?? null,
-					safeEntry.sessionId ?? null,
+					preservedSessionId,
 					safeEntry.agentName ?? null,
 					safeEntry.sha1,
 					safeEntry.normSha1,
@@ -1549,14 +1531,17 @@ export class NuwaSqliteStore {
 		}));
 	}
 
-	/** 写入跨资产凭据复用验证记录（`asset_credentials` 表，强制仅存指纹与掩码预览）。 */
+	/** 写入跨资产凭据复用验证记录（`asset_credentials` 表，强制仅存幂等指纹与掩码预览）。 */
 	upsertAssetCredential(row: AssetCredentialRow, opts?: { vault?: SessionVault }): void {
 		const vault = safeLoadVault(this.root, opts?.vault);
-		const safePreview = row.maskedPreview
-			? alreadyMasked(row.maskedPreview)
-				? redactTextForStorage(row.maskedPreview, vault)
-				: maskSecretValue(row.maskedPreview)
+		const afterVaultPreview = row.maskedPreview ? redactVaultSecrets(row.maskedPreview, vault) : undefined;
+		const safePreview = afterVaultPreview
+			? alreadyMasked(afterVaultPreview)
+				? afterVaultPreview.trim()
+				: maskSecretValue(afterVaultPreview)
 			: undefined;
+		const safeFingerprint = normalizeCredentialFingerprint(row.credFingerprint);
+		const safeVerifiedEndpoint = redactTextForStorage(row.verifiedEndpoint, vault);
 		const safeExtra = row.extra ? redactUnknownForStorage(row.extra, vault) : undefined;
 		const tx = this.db.transaction(() => {
 			this.db
@@ -1574,11 +1559,11 @@ export class NuwaSqliteStore {
 					row.port ?? null,
 					row.role,
 					row.credKind,
-					sha256Hex(row.credFingerprint).slice(0, 32),
+					safeFingerprint,
 					safePreview ?? null,
 					row.status,
 					row.sourceAssetId ?? null,
-					row.verifiedEndpoint ?? null,
+					safeVerifiedEndpoint ?? null,
 					row.verifiedStatusCode ?? null,
 					row.expiresAt ?? null,
 					row.lastVerifiedAt ?? null,
@@ -1997,6 +1982,10 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 				);
 				for (const { lineIndex, parsed } of execLines) {
 					const safe = redactUnknownForStorage(parsed, vault);
+					const preservedSid =
+						typeof parsed.sessionId === "string"
+							? redactTextForStorage(parsed.sessionId, vault) ?? null
+							: null;
 					const seq =
 						typeof safe.seq === "number" && Number.isFinite(safe.seq) && safe.seq > 0
 							? Math.floor(safe.seq)
@@ -2006,7 +1995,7 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 						typeof safe.ts === "string" ? safe.ts : nowIso(),
 						typeof safe.tool === "string" ? safe.tool : "unknown",
 						typeof safe.command === "string" ? safe.command : null,
-						typeof safe.sessionId === "string" ? safe.sessionId : null,
+						preservedSid,
 						typeof safe.agentName === "string" ? safe.agentName : null,
 						typeof safe.sha1 === "string" ? safe.sha1 : sha256Hex(String(safe.snippet ?? "")).slice(0, 40),
 						typeof safe.normSha1 === "string" ? safe.normSha1 : sha256Hex(String(safe.snippet ?? "")).slice(0, 40),

@@ -95,6 +95,26 @@ export const V7_EXT_MODULES = [
 	"dispatch-bridge.ts",
 ] as const;
 
+/** Wave 0 无环拆解的 8 个 omp/ 底层子模块及其对应的父模块（用于体检防假绿并兼容 v4 旧版模拟环境）。 */
+export const FOUNDATION_EXT_SUBMODULE_PAIRS = [
+	{ parent: "storage.ts", child: "storage-io.ts" },
+	{ parent: "sqlite-store.ts", child: "sqlite-schema.ts" },
+	{ parent: "graph-planner.ts", child: "graph-dedup.ts" },
+	{ parent: "autoexec.ts", child: "autoexec-baseline.ts" },
+	{ parent: "traffic-workbench.ts", child: "traffic-mutator.ts" },
+	{ parent: "sandbox.ts", child: "sandbox-egress.ts" },
+	{ parent: "cdp-bridge.ts", child: "cdp-client.ts" },
+	{ parent: "chain-composer.ts", child: "chain-capabilities.ts" },
+] as const;
+
+export const FOUNDATION_EXT_SUBMODULES = FOUNDATION_EXT_SUBMODULE_PAIRS.map((p) => p.child);
+
+export const NUWA_CORE_REQUIRED_FILES = [
+	"engine.ts",
+	"engine-helpers.ts",
+	"autonomous-doctor.ts",
+] as const;
+
 export const SQUAD_AGENT_FILES = [
 	"fujiang.md",
 	"nuwa-verifier.md",
@@ -495,6 +515,49 @@ export function checkExtensionInstallation(agentHome: string) {
 		else v7ModulesMissing.push(mod);
 	}
 
+	const isV7OrAbove = typeof version === "string" && Number.parseInt(version.split(".")[0] ?? "0", 10) >= 7;
+
+	// 校验 Wave 0 拆解的 8 个 omp 底层子模块（当 v7+ 或对应父模块实际引用了该子模块时列为必需，对 v4 模拟目录零误杀）
+	const submodulesFound: string[] = [];
+	const submodulesMissing: string[] = [];
+	for (const { parent, child } of FOUNDATION_EXT_SUBMODULE_PAIRS) {
+		const childExists = existsSync(join(extDir, child));
+		if (childExists) {
+			submodulesFound.push(child);
+			continue;
+		}
+		let parentRefsChild = false;
+		const parentPath = join(extDir, parent);
+		if (existsSync(parentPath)) {
+			try {
+				const pSrc = readFileSync(parentPath, "utf8");
+				const childStem = child.replace(/\.ts$/, "");
+				parentRefsChild = new RegExp(`from\\s+["']\\./${childStem}(?:\\.ts)?["']`).test(pSrc);
+			} catch {
+				/* ignore */
+			}
+		}
+		if (isV7OrAbove || parentRefsChild) {
+			submodulesMissing.push(child);
+		}
+	}
+
+	// 校验安装态 nuwa-core/core/{engine.ts,engine-helpers.ts,autonomous-doctor.ts}
+	const nuwaCoreRoot = join(agentHome, "nuwa-core");
+	const nuwaCoreDir = join(nuwaCoreRoot, "core");
+	const referencesNuwaCore = /nuwa-core\/core\/engine/.test(indexSrc) || existsSync(nuwaCoreRoot);
+	const nuwaCoreFound: string[] = [];
+	const nuwaCoreMissing: string[] = [];
+	if (isV7OrAbove || referencesNuwaCore) {
+		for (const cf of NUWA_CORE_REQUIRED_FILES) {
+			if (existsSync(join(nuwaCoreDir, cf))) {
+				nuwaCoreFound.push(cf);
+			} else {
+				nuwaCoreMissing.push(cf);
+			}
+		}
+	}
+
 	const conflicts: string[] = [];
 	if (existsSync(extRoot)) {
 		try {
@@ -508,12 +571,13 @@ export function checkExtensionInstallation(agentHome: string) {
 		}
 	}
 
-	const isV7OrAbove = typeof version === "string" && Number.parseInt(version.split(".")[0] ?? "0", 10) >= 7;
 	const ok =
 		indexExists &&
 		toolsMissing.length === 0 &&
 		coreModulesMissing.length === 0 &&
-		(!isV7OrAbove || v7ModulesMissing.length === 0);
+		(!isV7OrAbove || v7ModulesMissing.length === 0) &&
+		submodulesMissing.length === 0 &&
+		nuwaCoreMissing.length === 0;
 	let reason = "";
 	if (!indexExists) {
 		reason = `未检测到已安装扩展入口 ${indexPath}（请运行 ./install.sh）`;
@@ -523,6 +587,10 @@ export function checkExtensionInstallation(agentHome: string) {
 		reason = `扩展缺少核心模块 (${coreModulesMissing.join(", ")})`;
 	} else if (isV7OrAbove && v7ModulesMissing.length > 0) {
 		reason = `扩展缺少 v7 核心模块 (${v7ModulesMissing.join(", ")})`;
+	} else if (submodulesMissing.length > 0) {
+		reason = `扩展缺少底层拆解子模块 (${submodulesMissing.join(", ")})`;
+	} else if (nuwaCoreMissing.length > 0) {
+		reason = `nuwa-core 缺少核心引擎模块 (${nuwaCoreMissing.join(", ")})`;
 	}
 
 	return {
@@ -545,6 +613,10 @@ export function checkExtensionInstallation(agentHome: string) {
 		v6ModulesMissing,
 		v7ModulesFound,
 		v7ModulesMissing,
+		submodulesFound,
+		submodulesMissing,
+		nuwaCoreFound,
+		nuwaCoreMissing,
 		conflicts,
 		...(reason ? { reason } : {}),
 	};
@@ -602,41 +674,12 @@ export function openReadonlyKbDb(filePath: string): Database {
 	} catch {
 		walNonEmpty = false;
 	}
-	if (!walNonEmpty || !existsSync(`${filePath}-shm`)) {
-		try {
-			const memDb = walNonEmpty
-				? openReadonlyWalIsolatedSnapDaemon(filePath)
-				: openReadonlySqliteMemorySnapDaemon(filePath);
-			memDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
-			return memDb;
-		} catch {
-			/* ignore */
-		}
-	}
-
-	let roDb: Database | null = null;
-	try {
-		roDb = new Database(filePath, { readonly: true });
-		try {
-			roDb.exec("PRAGMA busy_timeout = 3000;");
-			roDb.exec("PRAGMA query_only = ON;");
-		} catch {
-			/* ignore */
-		}
-		roDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
-		return roDb;
-	} catch {
-		try {
-			roDb?.close();
-		} catch {
-			/* ignore */
-		}
-	}
-
-	// 严格零磁盘写入降级：绝不对原路径以可写模式打开，转在隔离 tmp 目录重放 WAL 后内存只读打开
-	const isoDb = openReadonlyWalIsolatedSnapDaemon(filePath);
-	isoDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
-	return isoDb;
+	// 无论是否存在 -shm，统一走纯内存只读快照（非空 -wal 在隔离临时目录重放），确保原目录 -shm / -wal 100% 零字节变动
+	const memDb = walNonEmpty
+		? openReadonlyWalIsolatedSnapDaemon(filePath)
+		: openReadonlySqliteMemorySnapDaemon(filePath);
+	memDb.query("SELECT 1 FROM sqlite_master LIMIT 1").get();
+	return memDb;
 }
 
 export function checkKnowledgeBase(agentHome: string, explicitPath?: string, explicitAgentHome = false) {

@@ -67,39 +67,52 @@ function extractCliAgentHome(argv) {
 	return "";
 }
 
+function extractCoreDirFromMcpWrapper(dirPath) {
+	try {
+		const siblingMcp = join(dirPath, "nuwa-mcp");
+		if (existsSync(siblingMcp)) {
+			const mcpSrc = readFileSync(siblingMcp, "utf8");
+			const m = /exec\s+"([^"]+)\/bin\/nuwa-mcp"/.exec(mcpSrc);
+			if (m?.[1]) {
+				return join(resolve(m[1]), "core", "autonomous-doctor.ts");
+			}
+		}
+	} catch {
+		/* ignore */
+	}
+	return "";
+}
+
 function resolveAutonomousDoctorModulePath(argv = process.argv.slice(2)) {
 	const candidates = [];
-	const cliHome = extractCliAgentHome(argv);
-	if (cliHome) {
-		candidates.push(join(resolve(cliHome), "nuwa-core", "core", "autonomous-doctor.ts"));
+	// 1. 最高优先级：与当前脚本同仓的 ../core/autonomous-doctor.ts（含符号链接真实路径），严防仓库态被外部 --agent-home 或 PI_AGENT_HOME 劫持
+	candidates.push(resolve(import.meta.dir, "..", "core", "autonomous-doctor.ts"));
+	let realSelfDir = "";
+	try {
+		realSelfDir = dirname(realpathSync(import.meta.path));
+		candidates.push(resolve(realSelfDir, "..", "core", "autonomous-doctor.ts"));
+	} catch {
+		/* ignore */
 	}
+
+	// 2. 独立安装态回退顺序：NUWA_CORE_DIR -> 同目录及 realSelfDir 同目录 nuwa-mcp 指针 -> PI_AGENT_HOME -> --agent-home -> ~/.omp/agent -> ~/.pi/agent
 	const envCore = (process.env.NUWA_CORE_DIR ?? "").trim();
 	if (envCore) {
 		candidates.push(join(resolve(envCore), "core", "autonomous-doctor.ts"));
+	}
+	const mcpFromSelf = extractCoreDirFromMcpWrapper(import.meta.dir);
+	if (mcpFromSelf) candidates.push(mcpFromSelf);
+	if (realSelfDir && realSelfDir !== import.meta.dir) {
+		const mcpFromReal = extractCoreDirFromMcpWrapper(realSelfDir);
+		if (mcpFromReal) candidates.push(mcpFromReal);
 	}
 	const envAgentHome = (process.env.PI_AGENT_HOME ?? "").trim();
 	if (envAgentHome) {
 		candidates.push(join(resolve(envAgentHome), "nuwa-core", "core", "autonomous-doctor.ts"));
 	}
-	candidates.push(resolve(import.meta.dir, "..", "core", "autonomous-doctor.ts"));
-	try {
-		const realSelfDir = dirname(realpathSync(import.meta.path));
-		candidates.push(resolve(realSelfDir, "..", "core", "autonomous-doctor.ts"));
-	} catch {
-		/* ignore */
-	}
-	// 兼容独立沙盒安装目录（读取同目录 nuwa-mcp 启动包装器内记录的 CORE_DIR）
-	try {
-		const siblingMcp = join(import.meta.dir, "nuwa-mcp");
-		if (existsSync(siblingMcp)) {
-			const mcpSrc = readFileSync(siblingMcp, "utf8");
-			const m = /exec\s+"([^"]+)\/bin\/nuwa-mcp"/.exec(mcpSrc);
-			if (m?.[1]) {
-				candidates.push(join(resolve(m[1]), "core", "autonomous-doctor.ts"));
-			}
-		}
-	} catch {
-		/* ignore */
+	const cliHome = extractCliAgentHome(argv);
+	if (cliHome) {
+		candidates.push(join(resolve(cliHome), "nuwa-core", "core", "autonomous-doctor.ts"));
 	}
 	candidates.push(join(homedir(), ".omp", "agent", "nuwa-core", "core", "autonomous-doctor.ts"));
 	candidates.push(join(homedir(), ".pi", "agent", "nuwa-core", "core", "autonomous-doctor.ts"));
