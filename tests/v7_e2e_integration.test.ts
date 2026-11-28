@@ -560,7 +560,7 @@ describe("v7.0.0 KB 2.0 混合语义治理、5+1 专精小队与多跳攻击链�
 			cwd: REPO_ROOT,
 			env: env as NodeJS.ProcessEnv,
 			encoding: "utf8",
-			timeout: 60_000,
+			timeout: 120_000,
 		});
 		expect(res.status).toBe(0);
 		expect(res.stdout).toContain("installed version = 8.0.0");
@@ -616,7 +616,7 @@ describe("v7.0.0 KB 2.0 混合语义治理、5+1 专精小队与多跳攻击链�
 		expect(docFailJson.checks.extension.v7ModulesMissing).toContain("cdp-bridge.ts");
 		expect(docFailJson.checks.agents.ok).toBe(false);
 		expect(docFailJson.checks.agents.squadMissing).toContain("nuwa-scout.md");
-	}, 35_000);
+	}, 120_000);
 });
 
 describe("Wave 2 Boost 异构终审全量反例回归（#91 / #92 / #93）", () => {

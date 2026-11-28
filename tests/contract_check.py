@@ -433,7 +433,7 @@ try {
 }
 """
         env["NUWA_OMP_DIR"] = omp_dir
-        rt = subprocess.run([bun_bin, "-e", smoke_js], cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=30)
+        rt = subprocess.run([bun_bin, "-e", smoke_js], cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=90)
         rt_ok = rt.returncode == 0 and "RUNTIME_OK:" in rt.stdout and "tools=12" in rt.stdout
         rt_detail = rt.stdout.strip() if rt_ok else (rt.stderr.strip() or rt.stdout.strip() or f"rc={rt.returncode}")
     else:

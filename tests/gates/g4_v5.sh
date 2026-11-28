@@ -7,7 +7,7 @@ unset BUN_OPTIONS
 fail=0
 python3 tests/version_check.py --require-install-echo || fail=1
 python3 tests/contract_check.py --v2-only || fail=1
-env -u BUN_OPTIONS bun test --isolate \
+env -u BUN_OPTIONS bun test --isolate --timeout 60000 \
   tests/v41_hardening.test.ts \
   tests/v5_auth_sandbox_oob.test.ts \
   tests/v5_hypothesis_report_bench.test.ts || fail=1

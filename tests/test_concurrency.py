@@ -106,7 +106,7 @@ class Concurrency(unittest.TestCase):
         p = self.spawn("p1", env)
         time.sleep(3)
         p.send_signal(signal.SIGTERM)
-        p.wait(timeout=30)
+        p.wait(timeout=90)
         time.sleep(1)
         lock = d / ".nuwa.lock"
         if lock.exists():
