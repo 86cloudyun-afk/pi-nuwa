@@ -594,4 +594,293 @@ describe("v8 跨文件 RGS 代码数据流引擎 (omp/rgs-analyzer.ts)", () => {
 			rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});
+
+	test("对抗回归 P0-1: URL userinfo、扩展敏感 Query 参数、x-www-form-urlencoded 表单凭据与 Vault 全角色密钥 100% 剥离", () => {
+		const tmpRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-pov-p0-"));
+		try {
+			upsertSessionRole(tmpRoot, {
+				role: "auditor",
+				password: "VaultRolePassword_778899",
+				headers: { "X-Internal-Auth": "VaultHeaderSecret_665544" },
+			});
+			const artifact = generateStandalonePovScript({
+				explicit: {
+					factId: "p0-cred-scrub",
+					title: "表单与 URL 多通道敏感参数脱敏验证 VaultHeaderSecret_665544",
+					baseUrl: "http://admin:SuperPlainPass99@127.0.0.1:18080/",
+					path: "/api/data?access_token=my_raw_access_tok_12345&client_secret=cs_raw_998877&page=2",
+					method: "POST",
+					role: "auditor",
+					headers: {
+						"Content-Type": "application/x-www-form-urlencoded",
+						"X-Client-Secret": "HeaderClientSecret_112233",
+					},
+					body: "username=alice&password=FormRawPassword9988&refresh_token=ref_tok_776655&dept=security",
+					expectedStatus: 200,
+				},
+				vaultRootOrVault: tmpRoot,
+			});
+
+			const sc = artifact.scriptContent;
+			expect(artifact.targetUrl).toBe("http://127.0.0.1:18080/api/data?page=2");
+			for (const leaked of [
+				"SuperPlainPass99",
+				"admin:SuperPlainPass99",
+				"my_raw_access_tok_12345",
+				"cs_raw_998877",
+				"FormRawPassword9988",
+				"ref_tok_776655",
+				"HeaderClientSecret_112233",
+				"VaultRolePassword_778899",
+				"VaultHeaderSecret_665544",
+			]) {
+				expect(sc).not.toContain(leaked);
+			}
+			// 非敏感业务参数应正常保留用于重放
+			expect(sc).toContain("username=alice");
+			expect(sc).toContain("dept=security");
+			expect(sc).toContain("page=2");
+		} finally {
+			rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	test("对抗回归 P1-1 & P1-2: 跨 6 语言注释内死代码守卫不复活、注释路由不误报、JS 正则字面量 // 不吞后续路由", () => {
+		const commentedGuardsRepo: Record<string, string> = {
+			"ts/app/api/open/route.ts": [
+				"export async function GET(req: Request) {",
+				"  // await requireAuth(req);",
+				"  /* getServerSession() */",
+				"  return Response.json({ ok: true });",
+				"}",
+			].join("\n"),
+			"ts/regex-and-comment.ts": [
+				'import express from "express";',
+				"const app = express();",
+				"const protoRe = /^https?:\\/\\//i;",
+				'app.get("/after-regex", /* requireAuth, */ (req, res) => res.json({ ok: protoRe.test("http://x") }));',
+				'// app.get("/commented-ghost-ts", (req, res) => res.end());',
+			].join("\n"),
+			"py/main.py": [
+				"from fastapi import FastAPI",
+				"from routers import panel",
+				"app = FastAPI()",
+				"# app.include_router(panel.router, prefix='/py', dependencies=[Depends(verify_token)])",
+				"app.include_router(panel.router, prefix='/py')",
+			].join("\n"),
+			"py/routers/panel.py": [
+				"from fastapi import APIRouter",
+				"router = APIRouter()",
+				"# @require_auth",
+				"@router.get('/status')",
+				"def get_status():",
+				"    return {'ok': True}",
+			].join("\n"),
+			"go/main.go": [
+				"package main",
+				"func setup(r *gin.Engine) {",
+				'    api := r.Group("/go-api")',
+				"    // api.Use(JwtAuthMiddleware())",
+				'    // api.GET("/ghost", ghostHandler)',
+				'    api.GET("/open", openHandler)',
+				"}",
+				"func openHandler(c *gin.Context) {}",
+			].join("\n"),
+			"rust/main.rs": [
+				"use axum::{Router, routing::get};",
+				"pub fn app() -> Router {",
+				"    Router::new()",
+				'        .route("/rs/open", get(open_h))',
+				"        // .layer(axum::middleware::from_fn(jwt_auth_guard))",
+				"}",
+				"async fn open_h() -> &'static str { \"ok\" }",
+				"pub fn actix_cfg(cfg: &mut web::ServiceConfig) {",
+				'    web::scope("/actix-open") /* .wrap(JwtAuthMiddleware) */ .route("/ping", web::get().to(open_h));',
+				"}",
+			].join("\n"),
+			"php/routes.php": [
+				"<?php",
+				"Route::get('/lv/open', [OpenController::class, 'index']) /* ->middleware('auth:sanctum') */;",
+			].join("\n"),
+			"php/raw_open.php": [
+				"<?php",
+				"// if (!isset($_SESSION['user'])) { die('401'); }",
+				"echo $_GET['id'];",
+			].join("\n"),
+			"java/OpenController.java": [
+				"import org.springframework.web.bind.annotation.*;",
+				"@RestController",
+				"public class OpenController {",
+				'    // @PreAuthorize("hasRole(\'ADMIN\')")',
+				'    @GetMapping("/java/open")',
+				"    public String openEndpoint() { return \"ok\"; }",
+				"}",
+			].join("\n"),
+		};
+
+		const rgs = analyzeCrossFileRgs(commentedGuardsRepo);
+
+		// 幽灵注释路由绝不产出
+		expect(rgs.routes.find((r) => r.path.includes("ghost"))).toBeUndefined();
+
+		// 正则字面量 `/^https?:\/\//i` 之后的 `/after-regex` 路由必须被正常解析且注释内的 `requireAuth` 不生效
+		const afterRegex = rgs.routes.find((r) => r.path === "/after-regex");
+		expect(afterRegex).toBeDefined();
+		expect(afterRegex!.hasEffectiveGuard).toBe(false);
+
+		// 全部 6 种语言中被注释掉的守卫均不得复活
+		for (const expectedOpenPath of [
+			"/api/open",
+			"/py/status",
+			"/go-api/open",
+			"/rs/open",
+			"/actix-open/ping",
+			"/lv/open",
+			"/php/raw_open.php",
+			"/java/open",
+		]) {
+			const hit = rgs.routes.find((r) => r.path === expectedOpenPath);
+			expect(hit).toBeDefined();
+			expect(hit!.hasEffectiveGuard).toBe(false);
+		}
+	});
+
+	test("对抗回归 P1-3(a~e): 静态文件常量零伪污点、Spring HttpMethod 过滤链、同文件局部 Router、Laravel 非鉴权 withoutMiddleware 与 Axum 多方法链", () => {
+		const edgeCasesRepo: Record<string, string> = {
+			"ts/same-file-router.ts": [
+				'import express from "express";',
+				'import { readFileSync } from "node:fs";',
+				'const STATIC_VERSION_FILE = "/etc/app-release";',
+				"const app = express();",
+				"const adminRouter = express.Router();",
+				'adminRouter.get("/users", listUsers);',
+				'app.use("/api/admin", requireAuth, adminRouter);',
+				'app.get("/public/version", readStaticVersion);',
+				"function listUsers(req: any, res: any) { return res.json([]); }",
+				"function readStaticVersion(req: any, res: any) {",
+				"  const ver = readFileSync(STATIC_VERSION_FILE, 'utf8');",
+				"  return res.send(ver);",
+				"}",
+			].join("\n"),
+			"java/SecurityConfig.java": [
+				"import org.springframework.security.web.SecurityFilterChain;",
+				"public class SecurityConfig {",
+				"  public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {",
+				"    http.authorizeHttpRequests(auth -> auth",
+				'      .requestMatchers(HttpMethod.GET, "/api/items/**").permitAll()',
+				"      .anyRequest().authenticated()",
+				"    );",
+				"    return http.build();",
+				"  }",
+				"}",
+			].join("\n"),
+			"java/ItemController.java": [
+				"import org.springframework.web.bind.annotation.*;",
+				"@RestController",
+				'@RequestMapping("/api/items")',
+				"public class ItemController {",
+				'  @GetMapping("/list")',
+				"  public String listItems() { return \"[]\"; }",
+				'  @PostMapping("/create")',
+				"  public String createItem(@RequestBody String body) { return body; }",
+				"}",
+			].join("\n"),
+			"php/api.php": [
+				"<?php",
+				"Route::middleware(['auth:sanctum'])->prefix('v2')->group(function () {",
+				"    Route::post('/import', [ImportController::class, 'run'])->withoutMiddleware([ThrottleRequests::class]);",
+				"});",
+			].join("\n"),
+			"rust/multi.rs": [
+				"use axum::{Router, routing::get};",
+				"pub fn router() -> Router {",
+				'    Router::new().route("/multi", get(h_get).post(h_post).delete(h_del))',
+				"}",
+				"async fn h_get() {}",
+				"async fn h_post() {}",
+				"async fn h_del() {}",
+			].join("\n"),
+		};
+
+		const rgs = analyzeCrossFileRgs(edgeCasesRepo);
+
+		// (a) 静态常量路径读取不得产生伪路由污点链
+		const pubVer = rgs.routes.find((r) => r.path === "/public/version")!;
+		expect(pubVer).toBeDefined();
+		expect(pubVer.reachableSinks.length).toBe(0);
+		expect(pubVer.dataflowChains.length).toBe(0);
+
+		// (b) Spring HttpMethod.GET permitAll 仅豁免 GET，不误豁免 POST
+		const springGet = rgs.routes.find((r) => r.path === "/api/items/list" && r.method === "GET")!;
+		const springPost = rgs.routes.find((r) => r.path === "/api/items/create" && r.method === "POST")!;
+		expect(springGet.hasEffectiveGuard).toBe(false);
+		expect(springPost.hasEffectiveGuard).toBe(true);
+
+		// (c) Express 同文件局部 adminRouter 正确继承 /api/admin 与 requireAuth，且不污染 /public/version
+		const adminUsers = rgs.routes.find((r) => r.path === "/api/admin/users")!;
+		expect(adminUsers).toBeDefined();
+		expect(adminUsers.hasEffectiveGuard).toBe(true);
+		expect(pubVer.hasEffectiveGuard).toBe(false);
+
+		// (d) Laravel withoutMiddleware([ThrottleRequests::class]) 仅移除限流，不清空外层 auth:sanctum
+		const lvImport = rgs.routes.find((r) => r.path === "/v2/import")!;
+		expect(lvImport).toBeDefined();
+		expect(lvImport.hasEffectiveGuard).toBe(true);
+
+		// (e) Rust Axum 链式 `.route("/multi", get(h1).post(h2).delete(h3))` 完整提取 3 个 HTTP 方法
+		const multiMethods = rgs.routes
+			.filter((r) => r.path === "/multi")
+			.map((r) => r.method)
+			.sort();
+		expect(multiMethods).toEqual(["DELETE", "GET", "POST"]);
+	});
+
+	test("对抗回归 P1-4: 独立 PoV 脚本面对带随机 reqId 的全局 Fake-200 靶场必须断言失败返回退出码 1", async () => {
+		const tmpRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-pov-fake200-"));
+		let seq = 0;
+		const fake200Srv = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(): Response {
+				seq++;
+				return new Response(
+					JSON.stringify({
+						ok: true,
+						reqId: `rand-req-${seq}-${Date.now()}`,
+						confidentialTier: "internal-only",
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			},
+		});
+
+		try {
+			const written = writeStandalonePovScript(tmpRoot, {
+				explicit: {
+					factId: "fake200-guard",
+					title: "验证全局 Fake-200 负向对照阻断",
+					baseUrl: `http://127.0.0.1:${fake200Srv.port}`,
+					path: "/api/v1/legacy/audit-dump",
+					method: "GET",
+					expectedStatus: 200,
+					expectedBodyIncludes: ["internal-only"],
+				},
+			});
+
+			const proc = Bun.spawn(["bun", written.filePath], {
+				env: { PATH: process.env.PATH, HOME: process.env.HOME },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const exitCode = await proc.exited;
+			const stdoutText = await new Response(proc.stdout).text();
+			expect(exitCode).toBe(1);
+			const report = JSON.parse(stdoutText.trim()) as { ok: boolean; failures: string[] };
+			expect(report.ok).toBe(false);
+			expect(report.failures.some((f) => f.includes("负向对照路径状态码异常"))).toBe(true);
+		} finally {
+			fake200Srv.stop(true);
+			rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
 });

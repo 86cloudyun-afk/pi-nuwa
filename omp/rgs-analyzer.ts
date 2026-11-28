@@ -24,7 +24,7 @@ import {
 } from "./hybrid-audit";
 import { inferFindingRuleMeta } from "./reporting";
 import { isHostInScope } from "./scope";
-import { redactVaultSecrets, type SessionVault } from "./session-vault";
+import { loadSessionVault, redactVaultSecrets, type SessionVault } from "./session-vault";
 
 const DEFAULT_IGNORED_DIRS = new Set([
 	"node_modules", ".git", ".hg", ".svn", ".next", ".nuxt", ".svelte-kit",
@@ -56,7 +56,7 @@ export type RgsGuardKind =
 	| "global_filter" | "prefix_interceptor" | "router_mount_guard"
 	| "route_middleware" | "method_annotation" | "public_exempt";
 
-export interface RgsGuardRule { pattern: string; effect: "authenticated" | "permit_all"; guardName: string; order: number; }
+export interface RgsGuardRule { pattern: string; httpMethod?: string; effect: "authenticated" | "permit_all"; guardName: string; order: number; }
 export interface RgsGuardNode {
 	id: string; name: string; kind: RgsGuardKind; language: RgsLanguage; framework: RgsFramework;
 	file: string; line: number; anchor: string; pathPatterns: string[]; exemptPatterns: string[]; orderedRules?: RgsGuardRule[];
@@ -138,13 +138,16 @@ const AUTH_GUARD_TOKEN_RE =
 const EXPLICIT_PERMIT_ALL_RE = /\b(?:permitAll\s*\(\s*\)|anonymous\s*\(\s*\)|AllowAny|allow_anonymous|AllowAnonymous|PermitAll|publicRoute|skipAuth|withoutMiddleware)\b/;
 const LIFECYCLE_PUBLIC_ROUTE_RE = /^\/(?:health|healthz|readyz|livez|ping|metrics|login|signin|signup|register|logout|auth\/login|auth\/token|auth\/callback|oauth\/callback|favicon\.ico)(?:\/|$)/i;
 const SENSITIVE_HEADER_KEY_RE = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-session-id|x-csrf-token|x-xsrf-token|api-key|token|secret)$/i;
+const SENSITIVE_PARAM_KEY_RE = /(?:^(?:token|auth|jwt|key|secret|password|passwd|pwd|pass|session|sid|cookie|credential|credentials)$|(?:access|refresh|id|auth|csrf|xsrf|session|api|private|secret|client)[_-]?(?:token|key|secret|id)|apikey)/i;
 const INLINE_CREDENTIAL_PATTERNS: readonly RegExp[] = [
+	/https?:\/\/[^/\s'"]+:[^/\s'"]+@/gi,
 	/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b/g,
 	/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi,
 	/\b(?:sk|rk|pk|tok|sec|key|pat|ghp|gho|glpat)-[A-Za-z0-9_-]{8,}/g,
 	/(?:--cookie|-b)\s+['"]?[^'"\s]+['"]?/gi,
 	/(?:--user|-u)\s+['"]?[^'"\s]+:[^'"\s]+['"]?/gi,
 	/\b(?:Cookie|Authorization|X-Api-Key|X-Auth-Token|X-Access-Token)\s*:\s*[^\r\n'"]+/gi,
+	/\b(?:access_token|refresh_token|id_token|client_secret|api_key|apikey|auth_token|password|passwd|pwd|session_id)=[^\s&'"]+/gi,
 ];
 
 function sha256Short(input: string, len = 12): string { return createHash("sha256").update(input).digest("hex").slice(0, len); }
@@ -216,7 +219,22 @@ function detectRgsLanguage(filePath: string, content: string, includeBundles: bo
 	return null;
 }
 
-/** 保持字符偏移与换行符 100% 不变剥离注释（保护 PHP 8 `#[...]` 注解与 Rust 生命周期 `'a`）。 */
+const JS_REGEX_PRECEDING_KW = new Set(["return", "case", "throw", "typeof", "void", "delete", "in", "of", "instanceof", "await", "yield"]);
+function canStartJsRegexAt(chars: string[], slashIdx: number): boolean {
+	let p = slashIdx - 1;
+	while (p >= 0 && (chars[p] === " " || chars[p] === "\t" || chars[p] === "\r" || chars[p] === "\n")) p--;
+	if (p < 0) return true;
+	const prev = chars[p]!;
+	if ("=(,[!:;&|?{}~+-*%^<>".includes(prev)) return true;
+	if (/[A-Za-z_$]/.test(prev)) {
+		const end = p;
+		while (p >= 0 && /[A-Za-z0-9_$]/.test(chars[p]!)) p--;
+		return JS_REGEX_PRECEDING_KW.has(chars.slice(p + 1, end + 1).join(""));
+	}
+	return false;
+}
+
+/** 保持字符偏移与换行符 100% 不变剥离注释（保护 JS/TS 正则字面量、PHP 8 `#[...]` 注解与 Rust 生命周期 `'a`）。 */
 function stripCommentsPreservingOffsets(src: string, lang: RgsLanguage): string {
 	const chars = Array.from(src);
 	const len = chars.length;
@@ -254,6 +272,18 @@ function stripCommentsPreservingOffsets(src: string, lang: RgsLanguage): string 
 				i++;
 			}
 			continue;
+		}
+		if ((lang === "typescript" || lang === "javascript" || lang === "bundle") && ch === "/" && canStartJsRegexAt(chars, i)) {
+			let j = i + 1, inClass = false, closed = false;
+			while (j < len && chars[j] !== "\n" && chars[j] !== "\r") {
+				const rc = chars[j]!;
+				if (rc === "\\") { j += 2; continue; }
+				if (rc === "[") inClass = true;
+				else if (rc === "]" && inClass) inClass = false;
+				else if (rc === "/" && !inClass) { closed = true; j++; while (j < len && /[a-z]/i.test(chars[j]!)) j++; break; }
+				j++;
+			}
+			if (closed) { i = j; continue; }
 		}
 		if (lang === "php" && ch === "#" && next !== "[") { while (i < len && chars[i] !== "\n" && chars[i] !== "\r") { chars[i] = " "; i++; } continue; }
 		if (lang === "java" && ch === '"' && next === '"' && chars[i + 2] === '"') {
@@ -317,18 +347,10 @@ function isRustLifetimeAt(src: string, idx: number): boolean {
 	return src[p] !== "'";
 }
 
-function extractBalanced(
-	src: string,
-	openIdx: number,
-	openChar: "(" | "{" | "[",
-	closeChar: ")" | "}" | "]",
-	maxScan = 16000,
-	rustMode = false,
-): { inner: string; endIdx: number } | null {
+function extractBalanced(src: string, openIdx: number, openChar: "(" | "{" | "[", closeChar: ")" | "}" | "]", maxScan = 16000, rustMode = false): { inner: string; endIdx: number } | null {
 	if (src[openIdx] !== openChar) return null;
 	const limit = Math.min(src.length, openIdx + maxScan);
-	let depth = 1;
-	let quote: string | null = null;
+	let depth = 1, quote: string | null = null;
 	for (let i = openIdx + 1; i < limit; i++) {
 		const ch = src[i]!;
 		if (quote) {
@@ -339,23 +361,17 @@ function extractBalanced(
 		}
 		if (ch === '"' || ch === "'" || ch === "`") {
 			if (rustMode && ch === "'" && isRustLifetimeAt(src, i)) continue;
-			quote = ch;
-			continue;
+			quote = ch; continue;
 		}
 		if (ch === openChar) depth++;
-		else if (ch === closeChar) {
-			depth--;
-			if (depth === 0) return { inner: src.slice(openIdx + 1, i), endIdx: i };
-		}
+		else if (ch === closeChar && --depth === 0) return { inner: src.slice(openIdx + 1, i), endIdx: i };
 	}
 	return null;
 }
 
 function splitTopLevelCommas(inner: string, rustMode = false): string[] {
 	const parts: string[] = [];
-	let start = 0;
-	let depth = 0;
-	let quote: string | null = null;
+	let start = 0, depth = 0, quote: string | null = null;
 	for (let i = 0; i < inner.length; i++) {
 		const ch = inner[i]!;
 		if (quote) {
@@ -366,8 +382,7 @@ function splitTopLevelCommas(inner: string, rustMode = false): string[] {
 		}
 		if (ch === '"' || ch === "'" || ch === "`") {
 			if (rustMode && ch === "'" && isRustLifetimeAt(inner, i)) continue;
-			quote = ch;
-			continue;
+			quote = ch; continue;
 		}
 		if (ch === "(" || ch === "{" || ch === "[" || ch === "<") depth++;
 		else if (ch === ")" || ch === "}" || ch === "]" || ch === ">") depth = Math.max(0, depth - 1);
@@ -490,14 +505,7 @@ function collectRgsFiles(input: CodeSurfaceInput, opts?: AnalyzeRgsOptions): Loa
 					if (!subContent) continue;
 					const subPath = normalizeRelPath(typeof sources[idx] === "string" ? (sources[idx] as string) : `map-src-${idx}.js`);
 					const subLang = detectRgsLanguage(subPath, subContent, includeBundles);
-					if (!subLang) continue;
-					loaded.push({
-						file: subPath,
-						raw: subContent,
-						clean: stripCommentsPreservingOffsets(subContent, subLang),
-						lang: subLang,
-						lineStarts: buildLineStarts(subContent),
-					});
+					if (subLang) loaded.push({ file: subPath, raw: subContent, clean: stripCommentsPreservingOffsets(subContent, subLang), lang: subLang, lineStarts: buildLineStarts(subContent) });
 				}
 			} catch { /* ignore invalid map */ }
 			continue;
@@ -505,14 +513,7 @@ function collectRgsFiles(input: CodeSurfaceInput, opts?: AnalyzeRgsOptions): Loa
 		const lang = detectRgsLanguage(vf.path, vf.content, includeBundles);
 		if (!lang) continue;
 		const isXmlMapper = ext === ".xml";
-		loaded.push({
-			file: vf.path,
-			raw: vf.content,
-			clean: isXmlMapper ? vf.content : stripCommentsPreservingOffsets(vf.content, lang),
-			lang,
-			lineStarts: buildLineStarts(vf.content),
-			...(isXmlMapper ? { isXmlMapper: true } : {}),
-		});
+		loaded.push({ file: vf.path, raw: vf.content, clean: isXmlMapper ? vf.content : stripCommentsPreservingOffsets(vf.content, lang), lang, lineStarts: buildLineStarts(vf.content), ...(isXmlMapper ? { isXmlMapper: true } : {}) });
 	}
 	return loaded.sort((a, b) => a.file.localeCompare(b.file));
 }
@@ -522,31 +523,15 @@ function collectRgsFiles(input: CodeSurfaceInput, opts?: AnalyzeRgsOptions): Loa
 function containsIdentifier(expr: string, ident: string): boolean {
 	if (!expr || !ident) return false;
 	const escaped = ident.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	return ident.startsWith("$")
-		? new RegExp(`${escaped}(?![A-Za-z0-9_])`).test(expr)
-		: new RegExp(`\\b${escaped}\\b`).test(expr);
+	return ident.startsWith("$") ? new RegExp(`${escaped}(?![A-Za-z0-9_])`).test(expr) : new RegExp(`\\b${escaped}\\b`).test(expr);
 }
 
 function scanBodyForSinksAndCalls(opts: {
-	rawFileContent: string;
-	bodyClean: string;
-	bodyRaw: string;
-	bodyStartOffset: number;
-	lineStarts: number[];
-	file: string;
-	lang: RgsLanguage;
-	framework?: RgsFramework;
-	enclosingSymbol?: string;
-	enclosingMethod?: string;
-	knownParams: string[];
+	rawFileContent: string; bodyClean: string; bodyRaw: string; bodyStartOffset: number; lineStarts: number[];
+	file: string; lang: RgsLanguage; framework?: RgsFramework; enclosingSymbol?: string; enclosingMethod?: string; knownParams: string[];
 }): { sinks: RgsSinkNode[]; calls: RgsCallSite[]; paramAliases: Record<string, string[]> } {
-	const {
-		rawFileContent, bodyClean, bodyRaw, bodyStartOffset, lineStarts,
-		file, lang, framework, enclosingSymbol, enclosingMethod, knownParams,
-	} = opts;
-	const sinks: RgsSinkNode[] = [];
-	const calls: RgsCallSite[] = [];
-	const paramAliases: Record<string, string[]> = {};
+	const { rawFileContent, bodyClean, bodyRaw, bodyStartOffset, lineStarts, file, lang, framework, enclosingSymbol, enclosingMethod, knownParams } = opts;
+	const sinks: RgsSinkNode[] = [], calls: RgsCallSite[] = [], paramAliases: Record<string, string[]> = {};
 	for (const p of knownParams) paramAliases[p] = [p];
 
 	const assignPatterns: RegExp[] = [
@@ -683,47 +668,32 @@ function extractStringLiterals(src: string): string[] {
 
 // ==================== 1. Java / Spring Boot + MyBatis 解析器 ====================
 
-function parseJavaAndSpringFile(
-	lf: LoadedRgsFile,
-	routesOut: RawRouteDraft[],
-	guardsOut: RgsGuardNode[],
-	servicesOut: RgsServiceNode[],
-	sinksOut: RgsSinkNode[],
-): void {
+function parseJavaAndSpringFile(lf: LoadedRgsFile, routesOut: RawRouteDraft[], guardsOut: RgsGuardNode[], servicesOut: RgsServiceNode[], sinksOut: RgsSinkNode[]): void {
 	const { file, raw, clean, lineStarts } = lf;
-
 	if (lf.isXmlMapper) {
 		const nsMatch = /<mapper\b[^>]*\bnamespace\s*=\s*["']([^"']+)["']/i.exec(raw);
 		if (!nsMatch?.[1]) return;
 		const shortClass = nsMatch[1].trim().split(".").pop()!;
-		const stmtRe = /<(select|insert|update|delete)\b[^>]*\bid\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/\1>/gi;
-		for (const m of raw.matchAll(stmtRe)) {
-			const methodId = m[2]!.trim();
-			const sqlBody = m[3] ?? "";
-			const bodyOffsetInMatch = Math.max(0, m[0].indexOf(sqlBody));
-			const stmtLine = offsetToLine(lineStarts, m.index ?? 0);
-			const localSinks: RgsSinkNode[] = [];
-			const params: string[] = [];
+		for (const m of raw.matchAll(/<(select|insert|update|delete)\b[^>]*\bid\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/\1>/gi)) {
+			const methodId = m[2]!.trim(), sqlBody = m[3] ?? "", bodyOffsetInMatch = Math.max(0, m[0].indexOf(sqlBody));
+			const stmtLine = offsetToLine(lineStarts, m.index ?? 0), localSinks: RgsSinkNode[] = [], params: string[] = [];
 			for (const interp of sqlBody.matchAll(/\$\{\s*([A-Za-z0-9_.]+)\s*\}/g)) {
 				const paramName = interp[1]!.split(".")[0]!;
 				if (!params.includes(paramName)) params.push(paramName);
 				const sinkLine = offsetToLine(lineStarts, (m.index ?? 0) + bodyOffsetInMatch + (interp.index ?? 0));
 				const sinkNode: RgsSinkNode = {
-					id: `sink-${sha256Short(`${file}:${sinkLine}:${methodId}`)}`,
-					kind: "unparameterized_sql", severity: "high", language: "java", framework: "spring-boot",
-					file, line: sinkLine, anchor: `${file}:${sinkLine}`, snippet: lineSnippet(raw, lineStarts, sinkLine),
-					enclosingSymbol: shortClass, enclosingMethod: methodId, taintedExprs: [paramName],
-					message: `MyBatis XML Mapper (${shortClass}.${methodId}) 使用非参数化 \${${interp[1]}} 拼接 SQL`,
+					id: `sink-${sha256Short(`${file}:${sinkLine}:${methodId}`)}`, kind: "unparameterized_sql", severity: "high",
+					language: "java", framework: "spring-boot", file, line: sinkLine, anchor: `${file}:${sinkLine}`,
+					snippet: lineSnippet(raw, lineStarts, sinkLine), enclosingSymbol: shortClass, enclosingMethod: methodId,
+					taintedExprs: [paramName], message: `MyBatis XML Mapper (${shortClass}.${methodId}) 使用非参数化 \${${interp[1]}} 拼接 SQL`,
 				};
-				localSinks.push(sinkNode);
-				sinksOut.push(sinkNode);
+				localSinks.push(sinkNode); sinksOut.push(sinkNode);
 			}
 			const effParams = params.length > 0 ? params : ["arg0"];
 			servicesOut.push({
-				id: `svc-${sha256Short(`${file}:${shortClass}.${methodId}`)}`,
-				language: "java", className: shortClass, methodName: methodId, qualifiedName: `${shortClass}.${methodId}`,
-				role: "repository", file, line: stmtLine, anchor: `${file}:${stmtLine}`,
-				params: effParams, fieldTypes: {}, imports: {}, calls: [], localSinks,
+				id: `svc-${sha256Short(`${file}:${shortClass}.${methodId}`)}`, language: "java", className: shortClass,
+				methodName: methodId, qualifiedName: `${shortClass}.${methodId}`, role: "repository", file, line: stmtLine,
+				anchor: `${file}:${stmtLine}`, params: effParams, fieldTypes: {}, imports: {}, calls: [], localSinks,
 				paramToLocalAliases: Object.fromEntries(effParams.map((p) => [p, [p]])),
 			});
 		}
@@ -743,9 +713,26 @@ function parseJavaAndSpringFile(
 		}
 		const matcherRuleRe = /\.(?:requestMatchers|antMatchers|mvcMatchers)\s*\(([^)]+)\)\s*\.\s*(permitAll|anonymous|authenticated|hasRole|hasAnyRole|hasAuthority|hasAnyAuthority|access)\s*\(([^)]*)\)/g;
 		for (const mr of clean.matchAll(matcherRuleRe)) {
-			const pats = extractStringLiterals(mr[1] ?? ""), action = mr[2]!, actionArg = (mr[3] ?? "").trim();
+			const rawParts = splitTopLevelCommas(mr[1] ?? "");
+			let httpMethod: string | undefined;
+			let pathParts = rawParts;
+			if (rawParts.length >= 1) {
+				const mEnum = /\bHttpMethod\.(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\b/.exec(rawParts[0]!);
+				const mStr = rawParts.length >= 2 ? /^['"](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)['"]$/i.exec(rawParts[0]!.trim()) : null;
+				if (mEnum) { httpMethod = mEnum[1]!.toUpperCase(); pathParts = rawParts.slice(1); }
+				else if (mStr) { httpMethod = mStr[1]!.toUpperCase(); pathParts = rawParts.slice(1); }
+			}
+			const pats = pathParts.length > 0 ? extractStringLiterals(pathParts.join(",")) : ["/**"];
+			const action = mr[2]!, actionArg = (mr[3] ?? "").trim();
 			const isPermit = action === "permitAll" || action === "anonymous" || (action === "access" && /permitAll/i.test(actionArg));
-			for (const pat of pats) orderedRules.push({ pattern: pat, effect: isPermit ? "permit_all" : "authenticated", guardName: isPermit ? `SecurityFilterChain:${action}` : `SecurityFilterChain:${action}(${actionArg})`, order: orderSeq++ });
+			for (const pat of pats) {
+				orderedRules.push({
+					pattern: pat, ...(httpMethod ? { httpMethod } : {}),
+					effect: isPermit ? "permit_all" : "authenticated",
+					guardName: isPermit ? `SecurityFilterChain:${action}` : `SecurityFilterChain:${action}(${actionArg})`,
+					order: orderSeq++,
+				});
+			}
 		}
 		for (const ar of clean.matchAll(/\.anyRequest\s*\(\s*\)\s*\.\s*(authenticated|permitAll|hasRole|hasAuthority)\s*\(([^)]*)\)/g)) {
 			const isPermit = ar[1] === "permitAll";
@@ -783,7 +770,7 @@ function parseJavaAndSpringFile(
 
 	const classRe = /((?:@[A-Za-z0-9_.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*)*)\b(?:public\s+|protected\s+|private\s+|abstract\s+|final\s+)*(class|interface)\s+([A-Za-z0-9_]+)[^{]*\{/g;
 	for (const cm of clean.matchAll(classRe)) {
-		const classAnnsRaw = raw.slice(cm.index ?? 0, (cm.index ?? 0) + (cm[1]?.length ?? 0));
+		const classAnnsClean = clean.slice(cm.index ?? 0, (cm.index ?? 0) + (cm[1]?.length ?? 0));
 		const kindWord = cm[2]!;
 		const className = cm[3]!;
 		const openBraceIdx = (cm.index ?? 0) + cm[0].length - 1;
@@ -792,26 +779,23 @@ function parseJavaAndSpringFile(
 		const classBodyRaw = raw.slice(openBraceIdx + 1, classBodyBal.endIdx);
 		const classBodyClean = classBodyBal.inner;
 		const classBodyOffset = openBraceIdx + 1;
-		const isController = /@(?:RestController|Controller)\b/.test(classAnnsRaw);
-		const classBasePaths = extractSpringMappingPaths(classAnnsRaw, "RequestMapping");
-		const classGuardInfo = extractJavaAuthAnnotations(classAnnsRaw);
+		const isController = /@(?:RestController|Controller)\b/.test(classAnnsClean);
+		const classBasePaths = extractSpringMappingPaths(classAnnsClean, "RequestMapping");
+		const classGuardInfo = extractJavaAuthAnnotations(classAnnsClean);
 		const fieldTypes: Record<string, string> = {};
 		for (const fm of classBodyClean.matchAll(/\b(?:private|protected|public)\s+(?:final\s+)?([A-Za-z0-9_]+)(?:<[^>]+>)?\s+([A-Za-z0-9_]+)\s*;/g)) fieldTypes[fm[2]!] = fm[1]!;
-		const role: RgsServiceNode["role"] = isController ? "controller" : /@(?:Repository|Mapper)\b|(?:Repository|Mapper|Dao)$/.test(classAnnsRaw + className) ? "repository" : "service";
+		const role: RgsServiceNode["role"] = isController ? "controller" : /@(?:Repository|Mapper)\b|(?:Repository|Mapper|Dao)$/.test(classAnnsClean + className) ? "repository" : "service";
 
 		const methodRe = /((?:@[A-Za-z0-9_.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*)+|(?:public|protected|private)[ \t]+)(?:(?:public|protected|private|static|final|synchronized|default)[ \t]+)*[A-Za-z0-9_<>,?[\] \t]+[ \t]+([A-Za-z0-9_]+)\s*\(((?:[^()]|\([^()]*\))*)\)\s*(?:throws\s+[A-Za-z0-9_.,\s]+)?(\{|;)/g;
 		for (const mm of classBodyClean.matchAll(methodRe)) {
 			const methodName = mm[2]!;
 			if (methodName === className || methodName === "if" || methodName === "for") continue;
 			const methodStartInFile = classBodyOffset + (mm.index ?? 0);
-			const methodAnnsRaw = raw.slice(methodStartInFile, methodStartInFile + (mm[1]?.length ?? 0));
-			const paramsRaw = raw.slice(
-				classBodyOffset + (mm.index ?? 0) + mm[0].indexOf("(") + 1,
-				classBodyOffset + (mm.index ?? 0) + mm[0].lastIndexOf(")"),
-			);
+			const methodAnnsClean = clean.slice(methodStartInFile, methodStartInFile + (mm[1]?.length ?? 0));
+			const paramsClean = mm[3] ?? "";
 			const terminator = mm[4]!;
 			const methodLine = offsetToLine(lineStarts, methodStartInFile);
-			const parsedParams = parseJavaMethodParams(paramsRaw);
+			const parsedParams = parseJavaMethodParams(paramsClean);
 
 			let methodBodyClean = "";
 			let methodBodyRaw = "";
@@ -820,7 +804,6 @@ function parseJavaAndSpringFile(
 				const braceInClass = (mm.index ?? 0) + mm[0].length - 1;
 				const mBal = extractBalanced(classBodyClean, braceInClass, "{", "}", 24000);
 				if (mBal) {
-					// 严格保持 methodBodyClean 与 methodBodyRaw 字符偏移 1:1 对齐
 					methodBodyClean = mBal.inner;
 					methodBodyRaw = classBodyRaw.slice(braceInClass + 1, mBal.endIdx);
 					bodyAbsOffset = classBodyOffset + braceInClass + 1;
@@ -833,8 +816,7 @@ function parseJavaAndSpringFile(
 				enclosingSymbol: className, enclosingMethod: methodName, knownParams: parsedParams.allNames,
 			});
 
-			// 单独检查方法上的 MyBatis `@Select("... ${param} ...")` 注解汇点
-			for (const annSql of methodAnnsRaw.matchAll(/@(?:Select|Update|Delete|Insert)\s*\(\s*["'][^"']*\$\{([^}]+)\}[^"']*["']\s*\)/g)) {
+			for (const annSql of methodAnnsClean.matchAll(/@(?:Select|Update|Delete|Insert)\s*\(\s*["'][^"']*\$\{([^}]+)\}[^"']*["']\s*\)/g)) {
 				const tParam = annSql[1]!.split(".")[0]!;
 				const annLine = offsetToLine(lineStarts, methodStartInFile + (annSql.index ?? 0));
 				scanned.sinks.push({
@@ -856,9 +838,9 @@ function parseJavaAndSpringFile(
 			});
 
 			if (isController && kindWord === "class") {
-				const mappings = extractSpringMethodMappings(methodAnnsRaw);
+				const mappings = extractSpringMethodMappings(methodAnnsClean);
 				if (mappings.length > 0) {
-					const methodGuardInfo = extractJavaAuthAnnotations(methodAnnsRaw);
+					const methodGuardInfo = extractJavaAuthAnnotations(methodAnnsClean);
 					const directGuards = [...classGuardInfo.guards, ...methodGuardInfo.guards];
 					const isExplicitlyPublic = methodGuardInfo.explicitPublic || (classGuardInfo.explicitPublic && methodGuardInfo.guards.length === 0);
 					const baseList = classBasePaths.length > 0 ? classBasePaths : ["/"];
@@ -920,8 +902,7 @@ function extractJavaAuthAnnotations(annsText: string): { guards: string[]; expli
 }
 
 function parseJavaMethodParams(paramsRaw: string): { allNames: string[]; webInputNames: string[] } {
-	const allNames: string[] = [];
-	const webInputNames: string[] = [];
+	const allNames: string[] = [], webInputNames: string[] = [];
 	for (const seg of splitTopLevelCommas(paramsRaw)) {
 		const stripped = seg.replace(/@[A-Za-z0-9_.]+(?:\s*\([^)]*\))?\s*/g, " ").trim();
 		const tokens = stripped.split(/\s+/).filter(Boolean);
@@ -929,40 +910,27 @@ function parseJavaMethodParams(paramsRaw: string): { allNames: string[]; webInpu
 		if (!paramName || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(paramName)) continue;
 		if (/\b(?:Model|HttpServletResponse|BindingResult|Principal|Authentication)\b/.test(stripped)) continue;
 		allNames.push(paramName);
-		if (/@(?:RequestParam|PathVariable|RequestBody|RequestHeader|ModelAttribute)\b/.test(seg) || /\bHttpServletRequest\b/.test(stripped)) {
-			webInputNames.push(paramName);
-		}
+		if (/@(?:RequestParam|PathVariable|RequestBody|RequestHeader|ModelAttribute)\b/.test(seg) || /\bHttpServletRequest\b/.test(stripped)) webInputNames.push(paramName);
 	}
 	return { allNames, webInputNames };
 }
 
 // ==================== 2. PHP（Laravel / Symfony / 原生）解析器 ====================
 
-function parsePhpFile(
-	lf: LoadedRgsFile,
-	routesOut: RawRouteDraft[],
-	mountsOut: RawCrossMountEdge[],
-	servicesOut: RgsServiceNode[],
-	sinksOut: RgsSinkNode[],
-): void {
+function parsePhpFile(lf: LoadedRgsFile, routesOut: RawRouteDraft[], mountsOut: RawCrossMountEdge[], servicesOut: RgsServiceNode[], sinksOut: RgsSinkNode[]): void {
 	const { file, raw, clean, lineStarts } = lf;
 	const imports: Record<string, string> = {};
-	for (const um of clean.matchAll(/\buse\s+([A-Za-z0-9_\\]+)(?:\s+as\s+([A-Za-z0-9_]+))?\s*;/g)) {
-		imports[um[2] ?? um[1]!.split("\\").pop()!] = um[1]!;
-	}
+	for (const um of clean.matchAll(/\buse\s+([A-Za-z0-9_\\]+)(?:\s+as\s+([A-Za-z0-9_]+))?\s*;/g)) imports[um[2] ?? um[1]!.split("\\").pop()!] = um[1]!;
 	const isLaravel = /\bRoute::/.test(clean) || /\bIlluminate\\/.test(clean);
 	const isSymfony = /#\[Route\s*\(/.test(clean) || /\bSymfony\\Component\\Routing/.test(clean);
 	const framework: RgsFramework = isLaravel ? "laravel" : isSymfony ? "symfony" : "php-native";
-
-	if (/\bRoute::/.test(clean)) {
-		parseLaravelRoutesBlock(clean, raw, 0, "", [], file, lineStarts, routesOut, mountsOut);
-	}
+	if (/\bRoute::/.test(clean)) parseLaravelRoutesBlock(clean, 0, "", [], file, lineStarts, routesOut, mountsOut);
 
 	const classRe = /((?:#\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)*)\bclass\s+([A-Za-z0-9_]+)[^{]*\{/g;
 	let hasClass = false;
 	for (const cm of clean.matchAll(classRe)) {
 		hasClass = true;
-		const classAttrs = raw.slice(cm.index ?? 0, (cm.index ?? 0) + (cm[1]?.length ?? 0));
+		const classAttrs = clean.slice(cm.index ?? 0, (cm.index ?? 0) + (cm[1]?.length ?? 0));
 		const className = cm[2]!;
 		const openBrace = (cm.index ?? 0) + cm[0].length - 1;
 		const cBal = extractBalanced(clean, openBrace, "{", "}", 80000);
@@ -980,21 +948,21 @@ function parsePhpFile(
 
 		const fnRe = /((?:#\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)*)\b(?:public|protected|private)?\s*function\s+([A-Za-z0-9_]+)\s*\(([^)]*)\)[^{]*\{/g;
 		for (const fm of cBodyClean.matchAll(fnRe)) {
-			const fnAttrs = cBodyRaw.slice(fm.index ?? 0, (fm.index ?? 0) + (fm[1]?.length ?? 0));
+			const fnAttrs = cBodyClean.slice(fm.index ?? 0, (fm.index ?? 0) + (fm[1]?.length ?? 0));
 			const fnName = fm[2]!;
-			const fnParamsRaw = fm[3] ?? "";
+			const fnParamsClean = fm[3] ?? "";
 			const fnBrace = (fm.index ?? 0) + fm[0].length - 1;
 			const fnBal = extractBalanced(cBodyClean, fnBrace, "{", "}", 24000);
 			if (!fnBal) continue;
 			const fnLine = offsetToLine(lineStarts, cOffset + (fm.index ?? 0));
 
 			if (fnName === "__construct") {
-				for (const cp of splitTopLevelCommas(fnParamsRaw)) {
+				for (const cp of splitTopLevelCommas(fnParamsClean)) {
 					const m = /([A-Za-z0-9_\\]+)\s+\$([A-Za-z0-9_]+)/.exec(cp);
 					if (m) fieldTypes[m[2]!] = m[1]!.split("\\").pop()!;
 				}
 			}
-			const paramNames = splitTopLevelCommas(fnParamsRaw)
+			const paramNames = splitTopLevelCommas(fnParamsClean)
 				.map((cp) => /\$([A-Za-z0-9_]+)/.exec(cp)?.[1])
 				.filter((s): s is string => Boolean(s))
 				.map((s) => `$${s}`);
@@ -1029,7 +997,7 @@ function parsePhpFile(
 		}
 	}
 
-	if (!hasClass && !isLaravel && /\$_(?:GET|POST|REQUEST|COOKIE)\b/.test(raw)) {
+	if (!hasClass && !isLaravel && /\$_(?:GET|POST|REQUEST|COOKIE)\b/.test(clean)) {
 		const scriptSym = basename(file, extname(file));
 		const scanned = scanBodyForSinksAndCalls({
 			rawFileContent: raw, bodyClean: clean, bodyRaw: raw, bodyStartOffset: 0,
@@ -1037,7 +1005,7 @@ function parsePhpFile(
 			enclosingSymbol: scriptSym, enclosingMethod: "main", knownParams: [],
 		});
 		for (const sk of scanned.sinks) sinksOut.push(sk);
-		const hasSessionGuard = /\b(?:isset\s*\(\s*\$_SESSION\s*\[\s*['"](?:user|uid|admin|auth|role)|check_auth|require_login)\b/i.test(raw);
+		const hasSessionGuard = /\b(?:isset\s*\(\s*\$_SESSION\s*\[\s*['"](?:user|uid|admin|auth|role)|check_auth|require_login)\b/i.test(clean);
 		servicesOut.push({
 			id: `svc-${sha256Short(`${file}:main`)}`,
 			language: "php", className: scriptSym, methodName: "main", qualifiedName: `${scriptSym}.main`,
@@ -1046,7 +1014,7 @@ function parsePhpFile(
 			calls: scanned.calls, localSinks: scanned.sinks, paramToLocalAliases: scanned.paramAliases,
 		});
 		routesOut.push({
-			method: /\$_POST\b/.test(raw) && !/\$_GET\b/.test(raw) ? "POST" : "GET",
+			method: /\$_POST\b/.test(clean) && !/\$_GET\b/.test(clean) ? "POST" : "GET",
 			localPath: `/${file.replace(/^public\//, "")}`,
 			controllerClass: scriptSym, handlerName: `${scriptSym}.main`,
 			language: "php", framework: "php-native", file, line: 1,
@@ -1058,7 +1026,6 @@ function parsePhpFile(
 
 function parseLaravelRoutesBlock(
 	blockClean: string,
-	blockRaw: string,
 	baseOffset: number,
 	inheritedPrefix: string,
 	inheritedGuards: string[],
@@ -1074,8 +1041,8 @@ function parseLaravelRoutesBlock(
 		const windowSlice = blockClean.slice(startIdx, Math.min(blockClean.length, startIdx + 500));
 		const grpCallMatch = /(?:::|->)\s*group\s*\(/.exec(windowSlice);
 		if (!grpCallMatch) continue;
-		const headerRaw = blockRaw.slice(startIdx, startIdx + grpCallMatch.index);
-		if (headerRaw.includes(";")) continue;
+		const headerClean = blockClean.slice(startIdx, startIdx + grpCallMatch.index);
+		if (headerClean.includes(";")) continue;
 
 		const openParen = startIdx + grpCallMatch.index + grpCallMatch[0].length - 1;
 		const gBal = extractBalanced(blockClean, openParen, "(", ")", 50000);
@@ -1083,8 +1050,8 @@ function parseLaravelRoutesBlock(
 		groupRanges.push([startIdx, gBal.endIdx + 1]);
 
 		const braceIdx = gBal.inner.indexOf("{");
-		const groupArgsHead = braceIdx >= 0 ? blockRaw.slice(openParen, openParen + 1 + braceIdx) : blockRaw.slice(openParen, gBal.endIdx + 1);
-		const fullGroupHeader = `${headerRaw}${groupArgsHead}`;
+		const groupArgsHead = braceIdx >= 0 ? blockClean.slice(openParen, openParen + 1 + braceIdx) : blockClean.slice(openParen, gBal.endIdx + 1);
+		const fullGroupHeader = `${headerClean}${groupArgsHead}`;
 		let nextPrefix = inheritedPrefix;
 		const nextGuards = [...inheritedGuards];
 
@@ -1111,7 +1078,6 @@ function parseLaravelRoutesBlock(
 			if (innerBraceBal) {
 				parseLaravelRoutesBlock(
 					innerBraceBal.inner,
-					blockRaw.slice(openParen + 1 + braceIdx + 1, openParen + 1 + innerBraceBal.endIdx),
 					baseOffset + openParen + 1 + braceIdx + 1,
 					nextPrefix, nextGuards, file, lineStarts, routesOut, mountsOut,
 				);
@@ -1124,9 +1090,9 @@ function parseLaravelRoutesBlock(
 		if (groupRanges.some(([s, e]) => rIdx >= s && rIdx < e)) continue;
 		const method = rm[1]!.toUpperCase() === "ANY" ? "GET" : rm[1]!.toUpperCase();
 		const openParen = rIdx + rm[0].length - 1;
-		const rBal = extractBalanced(blockRaw, openParen, "(", ")", 4000);
+		const rBal = extractBalanced(blockClean, openParen, "(", ")", 4000);
 		if (!rBal) continue;
-		const afterTail = blockRaw.slice(rBal.endIdx + 1, Math.min(blockRaw.length, rBal.endIdx + 240)).split(";")[0] ?? "";
+		const afterTail = blockClean.slice(rBal.endIdx + 1, Math.min(blockClean.length, rBal.endIdx + 240)).split(";")[0] ?? "";
 		const args = splitTopLevelCommas(rBal.inner);
 		const pathLit = extractStringLiterals(args[0] ?? "")[0];
 		if (!pathLit) continue;
@@ -1138,12 +1104,21 @@ function parseLaravelRoutesBlock(
 				if (AUTH_GUARD_TOKEN_RE.test(tok) || /^auth(?::|$)/i.test(tok)) guards.push(`laravel:${tok}`);
 			}
 		}
-		if (/->withoutMiddleware\s*\(/.test(afterTail)) {
-			const removed = extractStringLiterals(/->withoutMiddleware\s*\(([^)]*)\)/.exec(afterTail)?.[1] ?? "");
-			if (removed.length === 0) { guards = []; explicitPublic = true; }
-			else {
-				guards = guards.filter((g) => !removed.some((rem) => g.includes(rem)));
-				if (guards.length === 0) explicitPublic = true;
+		const wmMatch = /->withoutMiddleware\s*\(([^)]*)\)/.exec(afterTail);
+		if (wmMatch) {
+			const wmInner = (wmMatch[1] ?? "").trim();
+			if (!wmInner) {
+				guards = []; explicitPublic = true;
+			} else {
+				const removedTokens = [
+					...extractStringLiterals(wmInner),
+					...[...wmInner.matchAll(/([A-Za-z0-9_]+)::class/g)].map((m) => m[1]!),
+				];
+				const removedAuth = removedTokens.filter((t) => AUTH_GUARD_TOKEN_RE.test(t) || /^auth(?::|$)/i.test(t) || /^Authenticate$/i.test(t));
+				if (removedAuth.length > 0) {
+					guards = guards.filter((g) => !removedAuth.some((rem) => g.toLowerCase().includes(rem.toLowerCase()) || (/^Authenticate$/i.test(rem) && g.startsWith("laravel:auth"))));
+					if (guards.length === 0) explicitPublic = true;
+				}
 			}
 		}
 		let controllerClass: string | undefined;
@@ -1185,33 +1160,22 @@ function extractSymfonyGuards(attrs: string): string[] {
 
 // ==================== 3. Rust（Actix-web / Axum）解析器 ====================
 
-function parseRustFile(
-	lf: LoadedRgsFile,
-	routesOut: RawRouteDraft[],
-	mountsOut: RawCrossMountEdge[],
-	servicesOut: RgsServiceNode[],
-	sinksOut: RgsSinkNode[],
-): void {
+function parseRustFile(lf: LoadedRgsFile, routesOut: RawRouteDraft[], mountsOut: RawCrossMountEdge[], servicesOut: RgsServiceNode[], sinksOut: RgsSinkNode[]): void {
 	const { file, raw, clean, lineStarts } = lf;
 	const framework: RgsFramework = /\baxum\b|\bRouter::new\s*\(/.test(clean) ? "axum" : "actix-web";
 	const imports: Record<string, string> = {};
-	for (const um of clean.matchAll(/\buse\s+(?:crate::)?([A-Za-z0-9_:]+)\s*;/g)) {
-		imports[um[1]!.split("::").pop()!] = um[1]!;
-	}
+	for (const um of clean.matchAll(/\buse\s+(?:crate::)?([A-Za-z0-9_:]+)\s*;/g)) imports[um[1]!.split("::").pop()!] = um[1]!;
 
 	const fnRe = /((?:#\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)*)\b(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*(?:<[^>]*>)?\s*\(((?:[^()]|\([^()]*\))*)\)(?:\s*->\s*[^{]+)?\{/g;
 	for (const fm of clean.matchAll(fnRe)) {
-		const attrsRaw = raw.slice(fm.index ?? 0, (fm.index ?? 0) + (fm[1]?.length ?? 0));
-		const fnName = fm[2]!;
-		const openParen = (fm.index ?? 0) + fm[0].indexOf("(");
-		const pBal = extractBalanced(raw, openParen, "(", ")", 2000, true);
-		const paramsRaw = pBal ? pBal.inner : fm[3] ?? "";
+		const attrsClean = clean.slice(fm.index ?? 0, (fm.index ?? 0) + (fm[1]?.length ?? 0));
+		const fnName = fm[2]!, paramsClean = fm[3] ?? "";
 		const openBrace = (fm.index ?? 0) + fm[0].length - 1;
 		const fBal = extractBalanced(clean, openBrace, "{", "}", 40000, true);
 		if (!fBal) continue;
 		const fnLine = offsetToLine(lineStarts, fm.index ?? 0);
 
-		const paramInfo = parseRustFnParams(paramsRaw);
+		const paramInfo = parseRustFnParams(paramsClean);
 		const scanned = scanBodyForSinksAndCalls({
 			rawFileContent: raw, bodyClean: fBal.inner, bodyRaw: raw.slice(openBrace + 1, fBal.endIdx),
 			bodyStartOffset: openBrace + 1, lineStarts, file, lang: "rust", framework,
@@ -1227,7 +1191,7 @@ function parseRustFile(
 			calls: scanned.calls, localSinks: scanned.sinks, paramToLocalAliases: scanned.paramAliases,
 		});
 
-		const actixMacro = /#\[(get|post|put|patch|delete)\s*\(([^)]+)\)\]/i.exec(attrsRaw);
+		const actixMacro = /#\[(get|post|put|patch|delete)\s*\(([^)]+)\)\]/i.exec(attrsClean);
 		if (actixMacro) {
 			const routePath = extractStringLiterals(actixMacro[2]!)[0];
 			if (routePath) {
@@ -1245,7 +1209,7 @@ function parseRustFile(
 
 	for (const sm of clean.matchAll(/\bweb::scope\s*\(\s*"([^"]+)"\s*\)/g)) {
 		const scopePrefix = sm[1]!;
-		const tailSlice = raw.slice(sm.index ?? 0, Math.min(raw.length, (sm.index ?? 0) + 1200));
+		const tailSlice = clean.slice(sm.index ?? 0, Math.min(clean.length, (sm.index ?? 0) + 1200));
 		const scopeGuards = [...tailSlice.matchAll(/\.wrap\s*\(\s*([^)]+)\s*\)/g)]
 			.filter((wm) => AUTH_GUARD_TOKEN_RE.test(wm[1]!))
 			.map((wm) => `actix:wrap(${wm[1]!.trim()})`);
@@ -1266,10 +1230,9 @@ function parseRustFile(
 		}
 	}
 
-	// Axum 顺序敏感 `.layer()` 解析：仅保护其调用前已挂载的 `.route()` 与 `.nest()`
 	for (const axm of clean.matchAll(/\bRouter::new\s*\(\s*\)/g)) {
 		const startIdx = axm.index ?? 0;
-		const stmtSlice = extractRustStatementChain(raw, startIdx);
+		const stmtSlice = extractRustStatementChain(clean, startIdx);
 		const pendingRoutes: RawRouteDraft[] = [];
 		const pendingMounts: RawCrossMountEdge[] = [];
 
@@ -1281,15 +1244,16 @@ function parseRustFile(
 			const args = splitTopLevelCommas(bal.inner, true);
 			if (kind === "route") {
 				const pathStr = extractStringLiterals(args[0] ?? "")[0];
-				const mc = /\b(get|post|put|patch|delete)\s*\(\s*([A-Za-z0-9_:]+)\s*\)/.exec(args[1] ?? "");
-				if (pathStr && mc) {
-					const draft: RawRouteDraft = {
-						method: mc[1]!.toUpperCase(), localPath: pathStr, handlerName: mc[2]!.split("::").pop()!,
-						language: "rust", framework: "axum", file, line: opLine,
-						sourceParams: ["input"], directGuards: [], isExplicitlyPublic: false,
-					};
-					pendingRoutes.push(draft);
-					routesOut.push(draft);
+				if (pathStr) {
+					for (const mc of (args[1] ?? "").matchAll(/\b(get|post|put|patch|delete)\s*\(\s*([A-Za-z0-9_:]+)\s*\)/g)) {
+						const draft: RawRouteDraft = {
+							method: mc[1]!.toUpperCase(), localPath: pathStr, handlerName: mc[2]!.split("::").pop()!,
+							language: "rust", framework: "axum", file, line: opLine,
+							sourceParams: ["input"], directGuards: [], isExplicitlyPublic: false,
+						};
+						pendingRoutes.push(draft);
+						routesOut.push(draft);
+					}
 				}
 			} else if (kind === "nest") {
 				const nestPrefix = extractStringLiterals(args[0] ?? "")[0];
@@ -1381,10 +1345,11 @@ function parseJsTsPyGoFile(
 				const openB = (em.index ?? 0) + em[0].length - 1;
 				const bal = extractBalanced(clean, openB, "{", "}", 20000);
 				const line = offsetToLine(lineStarts, em.index ?? 0);
+				const bodyClean = bal?.inner ?? "";
 				const bodyRaw = bal ? raw.slice(openB + 1, bal.endIdx) : "";
 				const pName = em[2]?.trim().split(/[,\s:]/)[0] || "req";
 				const scanned = scanBodyForSinksAndCalls({
-					rawFileContent: raw, bodyClean: bal?.inner ?? "", bodyRaw, bodyStartOffset: openB + 1,
+					rawFileContent: raw, bodyClean, bodyRaw, bodyStartOffset: openB + 1,
 					lineStarts, file, lang, framework: "nextjs", enclosingMethod: mth, knownParams: [pName],
 				});
 				for (const sk of scanned.sinks) sinksOut.push(sk);
@@ -1397,21 +1362,25 @@ function parseJsTsPyGoFile(
 				routesOut.push({
 					method: mth, localPath: nextPath, handlerName: mth, language: lang, framework: "nextjs",
 					file, line, sourceParams: [pName],
-					directGuards: AUTH_GUARD_TOKEN_RE.test(bodyRaw) ? ["nextjs-inline-auth"] : [],
-					isExplicitlyPublic: EXPLICIT_PERMIT_ALL_RE.test(bodyRaw),
+					directGuards: AUTH_GUARD_TOKEN_RE.test(bodyClean) ? ["nextjs-inline-auth"] : [],
+					isExplicitlyPublic: EXPLICIT_PERMIT_ALL_RE.test(bodyClean),
 				});
 			}
 		}
 
 		const localRouterGuards = new Map<string, string[]>();
 		const localRouterPrefixes = new Map<string, string>();
+		const localDeclaredRouters = new Set<string>();
+		for (const dr of clean.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:(?:express\.)?Router\s*\(|new\s+(?:[A-Za-z_$][A-Za-z0-9_$.]*)?Router\s*\()/g)) {
+			localDeclaredRouters.add(dr[1]!);
+		}
 		for (const km of clean.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*new\s+Router\s*\(\s*\{\s*prefix\s*:\s*['"`]([^'"`]+)['"`]/g)) {
 			localRouterPrefixes.set(km[1]!, km[2]!);
 		}
 
 		for (const um of clean.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\.(use|register)\s*\(/g)) {
 			const obj = um[1]!;
-			const bal = extractBalanced(raw, (um.index ?? 0) + um[0].length - 1, "(", ")", 3000);
+			const bal = extractBalanced(clean, (um.index ?? 0) + um[0].length - 1, "(", ")", 3000);
 			if (!bal) continue;
 			const args = splitTopLevelCommas(bal.inner);
 			if (args.length === 0) continue;
@@ -1423,20 +1392,23 @@ function parseJsTsPyGoFile(
 			const lastArg = rest[rest.length - 1]!.trim();
 			const middleGuards = rest.slice(0, -1).filter((a) => AUTH_GUARD_TOKEN_RE.test(a)).map((a) => a.trim());
 			const inheritedOnObj = localRouterGuards.get(obj) ?? [];
+			const isKnownSubRouter = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(lastArg) && lastArg !== obj && Boolean(imports[lastArg] || localDeclaredRouters.has(lastArg));
 
-			if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(lastArg) && imports[lastArg]) {
+			if (isKnownSubRouter) {
 				const fastifyPrefix = um[2] === "register" && rest.length >= 2
 					? /\bprefix\s*:\s*['"`]([^'"`]+)['"`]/.exec(rest[rest.length - 1]!)?.[1] : undefined;
 				mountsOut.push({
-					parentFile: file, parentRouterVar: obj, targetModuleRel: imports[lastArg], targetSymbol: lastArg,
+					parentFile: file, parentRouterVar: obj,
+					targetModuleRel: imports[lastArg] ?? file, targetSymbol: lastArg,
 					prefix: joinRoutePaths(localRouterPrefixes.get(obj) ?? "", firstLit ?? fastifyPrefix ?? "/"),
 					guards: [...inheritedOnObj, ...middleGuards], exempts: [], framework: defaultFw, language: lang, line,
 				});
-			} else if (um[2] === "register" && imports[args[0]!.trim()]) {
+			} else if (um[2] === "register" && (imports[args[0]!.trim()] || localDeclaredRouters.has(args[0]!.trim()))) {
 				const regTarget = args[0]!.trim();
 				const optPrefix = /\bprefix\s*:\s*['"`]([^'"`]+)['"`]/.exec(args[1] ?? "")?.[1] ?? "/";
 				mountsOut.push({
-					parentFile: file, parentRouterVar: obj, targetModuleRel: imports[regTarget], targetSymbol: regTarget,
+					parentFile: file, parentRouterVar: obj,
+					targetModuleRel: imports[regTarget] ?? file, targetSymbol: regTarget,
 					prefix: optPrefix, guards: [...inheritedOnObj], exempts: [], framework: "fastify", language: lang, line,
 				});
 			} else if (!firstLit && AUTH_GUARD_TOKEN_RE.test(bal.inner)) {
@@ -1457,8 +1429,9 @@ function parseJsTsPyGoFile(
 			if (/^(?:axios|http|https|Math|Map|Set|Reflect|FormData|URLSearchParams|headers|cookies|cache|redis|store)$/i.test(obj)) continue;
 			const mth = rm[2]!.toUpperCase();
 			const openP = (rm.index ?? 0) + rm[0].length - 1;
-			const bal = extractBalanced(raw, openP, "(", ")", 12000);
+			const bal = extractBalanced(clean, openP, "(", ")", 12000);
 			if (!bal) continue;
+			const rawBal = extractBalanced(raw, openP, "(", ")", 12000);
 			const args = splitTopLevelCommas(bal.inner);
 			const pathLit = /^['"`](\/[^'"`]*)['"`]$/.exec(args[0] ?? "")?.[1];
 			if (!pathLit) continue;
@@ -1473,8 +1446,9 @@ function parseJsTsPyGoFile(
 				const hBrace = bal.inner.lastIndexOf(lastHandler) + lastHandler.indexOf("{");
 				const hBal = extractBalanced(bal.inner, hBrace, "{", "}", 10000);
 				if (hBal) {
+					const rawInnerSlice = rawBal ? rawBal.inner.slice(hBrace + 1, hBal.endIdx) : hBal.inner;
 					const scanned = scanBodyForSinksAndCalls({
-						rawFileContent: raw, bodyClean: stripCommentsPreservingOffsets(hBal.inner, lang), bodyRaw: hBal.inner,
+						rawFileContent: raw, bodyClean: hBal.inner, bodyRaw: rawInnerSlice,
 						bodyStartOffset: openP + 1 + hBrace + 1, lineStarts, file, lang, framework: defaultFw,
 						enclosingMethod: handlerIdent, knownParams: ["req"],
 					});
@@ -1537,19 +1511,19 @@ function parseJsTsPyGoFile(
 		}
 
 		const routerMeta = new Map<string, { prefix: string; guards: string[] }>();
-		for (const rm of raw.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:APIRouter|Blueprint)\s*\(([^)]*)\)/g)) {
+		for (const rm of clean.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:APIRouter|Blueprint)\s*\(([^)]*)\)/g)) {
 			const pref = /\b(?:prefix|url_prefix)\s*=\s*['"]([^'"]+)['"]/.exec(rm[2] ?? "")?.[1] ?? "";
 			const gs = AUTH_GUARD_TOKEN_RE.test(rm[2] ?? "") ? [`router_dep(${rm[1]!})`] : [];
 			routerMeta.set(rm[1]!, { prefix: pref, guards: gs });
 		}
-		for (const bm of raw.matchAll(/@([A-Za-z_][A-Za-z0-9_]*)\.before_request\b[\s\S]{0,260}?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*:([\s\S]{0,400})/g)) {
+		for (const bm of clean.matchAll(/@([A-Za-z_][A-Za-z0-9_]*)\.before_request\b[\s\S]{0,260}?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*:([\s\S]{0,400})/g)) {
 			if (AUTH_GUARD_TOKEN_RE.test(bm[2] ?? "")) {
 				const meta = routerMeta.get(bm[1]!) ?? { prefix: "", guards: [] };
 				meta.guards.push(`flask:before_request(${bm[1]!})`);
 				routerMeta.set(bm[1]!, meta);
 			}
 		}
-		for (const im of raw.matchAll(/\b[A-Za-z_][A-Za-z0-9_]*\.(include_router|register_blueprint)\s*\(([^)]+)\)/g)) {
+		for (const im of clean.matchAll(/\b[A-Za-z_][A-Za-z0-9_]*\.(include_router|register_blueprint)\s*\(([^)]+)\)/g)) {
 			const args = splitTopLevelCommas(im[2] ?? "");
 			const targetExpr = (args[0] ?? "").trim();
 			const rootSym = targetExpr.split(".")[0]!;
@@ -1565,17 +1539,16 @@ function parseJsTsPyGoFile(
 			}
 		}
 
-		const pyDefRe = /((?:@[A-Za-z0-9_.]+(?:\([^)]*\))?\s*\n\s*)*)(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)(?:\s*->\s*[^:]+)?\s*:/g;
+		const pyDefRe = /((?:@[A-Za-z0-9_.]+(?:\([^)]*\))?\s*\n\s*)*)(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(((?:[^()]|\([^()]*\))*)\)(?:\s*->\s*[^:]+)?\s*:/g;
 		const defMatches = [...clean.matchAll(pyDefRe)];
 		for (let idx = 0; idx < defMatches.length; idx++) {
 			const dm = defMatches[idx]!;
 			const nextStart = idx + 1 < defMatches.length ? (defMatches[idx + 1]!.index ?? clean.length) : clean.length;
-			const decRaw = raw.slice(dm.index ?? 0, (dm.index ?? 0) + (dm[1]?.length ?? 0));
-			const fnName = dm[2]!;
-			const paramsRaw = raw.slice((dm.index ?? 0) + dm[0].indexOf("(") + 1, (dm.index ?? 0) + dm[0].lastIndexOf(")"));
+			const decClean = clean.slice(dm.index ?? 0, (dm.index ?? 0) + (dm[1]?.length ?? 0));
+			const fnName = dm[2]!, paramsClean = dm[3] ?? "";
 			const bodyStart = (dm.index ?? 0) + dm[0].length;
 			const fnLine = offsetToLine(lineStarts, dm.index ?? 0);
-			const params = splitTopLevelCommas(paramsRaw).map((p) => p.split(":")[0]!.split("=")[0]!.trim()).filter((p) => p && p !== "self" && p !== "cls");
+			const params = splitTopLevelCommas(paramsClean).map((p) => p.split(":")[0]!.split("=")[0]!.trim()).filter((p) => p && p !== "self" && p !== "cls");
 
 			const scanned = scanBodyForSinksAndCalls({
 				rawFileContent: raw, bodyClean: clean.slice(bodyStart, nextStart), bodyRaw: raw.slice(bodyStart, nextStart),
@@ -1589,26 +1562,22 @@ function parseJsTsPyGoFile(
 				calls: scanned.calls, localSinks: scanned.sinks, paramToLocalAliases: scanned.paramAliases,
 			});
 
-			const routeDec = /@([A-Za-z_][A-Za-z0-9_]*)\.(route|get|post|put|patch|delete)\s*\(([^)]*)\)/.exec(decRaw);
+			const routeDec = /@([A-Za-z_][A-Za-z0-9_]*)\.(route|get|post|put|patch|delete)\s*\(([^)]*)\)/.exec(decClean);
 			if (routeDec) {
-				const rObj = routeDec[1]!;
-				const rKind = routeDec[2]!.toLowerCase();
-				const rInner = routeDec[3] ?? "";
+				const rObj = routeDec[1]!, rKind = routeDec[2]!.toLowerCase(), rInner = routeDec[3] ?? "";
 				const pathStr = extractStringLiterals(rInner)[0] ?? "/";
 				const methodsMatch = /\bmethods\s*=\s*\[([^\]]+)\]/.exec(rInner);
-				const methods = rKind === "route"
-					? (methodsMatch ? extractStringLiterals(methodsMatch[1]!).map((s) => s.toUpperCase()) : ["GET"])
-					: [rKind.toUpperCase()];
+				const methods = rKind === "route" ? (methodsMatch ? extractStringLiterals(methodsMatch[1]!).map((s) => s.toUpperCase()) : ["GET"]) : [rKind.toUpperCase()];
 				const rMeta = routerMeta.get(rObj);
 				const guards = [...(rMeta?.guards ?? [])];
-				if (AUTH_GUARD_TOKEN_RE.test(decRaw) || AUTH_GUARD_TOKEN_RE.test(paramsRaw)) guards.push("python:auth_dependency");
+				if (AUTH_GUARD_TOKEN_RE.test(decClean) || AUTH_GUARD_TOKEN_RE.test(paramsClean)) guards.push("python:auth_dependency");
 				for (const mth of methods) {
 					routesOut.push({
 						method: mth, localPath: joinRoutePaths(rMeta?.prefix ?? "", pathStr),
 						routerVar: rObj, handlerName: fnName, language: "python",
 						framework: rKind === "route" ? "flask" : "fastapi",
 						file, line: fnLine, sourceParams: params, directGuards: guards,
-						isExplicitlyPublic: EXPLICIT_PERMIT_ALL_RE.test(decRaw),
+						isExplicitlyPublic: EXPLICIT_PERMIT_ALL_RE.test(decClean),
 					});
 				}
 			}
@@ -1620,14 +1589,14 @@ function parseJsTsPyGoFile(
 		const fw: RgsFramework = /\becho\.New\b|\*echo\.Group/.test(clean)
 			? "echo" : /\bgin\.(?:Default|New|RouterGroup)\b/.test(clean) ? "gin" : "net/http";
 		const groupMeta = new Map<string, { prefix: string; guards: string[] }>();
-		for (const gm of raw.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([A-Za-z_][A-Za-z0-9_]*)\.Group\s*\(([^)]+)\)/g)) {
+		for (const gm of clean.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*([A-Za-z_][A-Za-z0-9_]*)\.Group\s*\(([^)]+)\)/g)) {
 			const args = splitTopLevelCommas(gm[3]!);
 			const pref = extractStringLiterals(args[0] ?? "")[0] ?? "/";
 			const parentMeta = groupMeta.get(gm[2]!);
 			const gs = [...(parentMeta?.guards ?? []), ...args.slice(1).filter((a) => AUTH_GUARD_TOKEN_RE.test(a)).map((a) => a.trim())];
 			groupMeta.set(gm[1]!, { prefix: joinRoutePaths(parentMeta?.prefix ?? "", pref), guards: gs });
 		}
-		for (const um of raw.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\.Use\s*\(([^)]+)\)/g)) {
+		for (const um of clean.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\.Use\s*\(([^)]+)\)/g)) {
 			if (AUTH_GUARD_TOKEN_RE.test(um[2]!)) {
 				const prev = groupMeta.get(um[1]!) ?? { prefix: "", guards: [] };
 				prev.guards.push(`go:Use(${um[2]!.trim()})`);
@@ -1645,9 +1614,7 @@ function parseJsTsPyGoFile(
 			}
 		}
 		for (const fm of clean.matchAll(/\bfunc\s+(?:\(\s*[A-Za-z0-9_]+\s+\*?([A-Za-z0-9_]+)\s*\)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)[^{]*\{/g)) {
-			const recvType = fm[1];
-			const fnName = fm[2]!;
-			const openB = (fm.index ?? 0) + fm[0].length - 1;
+			const recvType = fm[1], fnName = fm[2]!, openB = (fm.index ?? 0) + fm[0].length - 1;
 			const bal = extractBalanced(clean, openB, "{", "}", 28000);
 			if (!bal) continue;
 			const fnLine = offsetToLine(lineStarts, fm.index ?? 0);
@@ -1666,7 +1633,7 @@ function parseJsTsPyGoFile(
 				calls: scanned.calls, localSinks: scanned.sinks, paramToLocalAliases: scanned.paramAliases,
 			});
 
-			for (const rm of bodyRaw.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\.(GET|POST|PUT|PATCH|DELETE|HandleFunc)\s*\(([^)]+)\)/g)) {
+			for (const rm of bal.inner.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\.(GET|POST|PUT|PATCH|DELETE|HandleFunc)\s*\(([^)]+)\)/g)) {
 				const args = splitTopLevelCommas(rm[3]!);
 				const pathStr = extractStringLiterals(args[0] ?? "")[0];
 				if (!pathStr) continue;
@@ -1795,8 +1762,12 @@ export function analyzeCrossFileRgs(input: CodeSurfaceInput, opts?: AnalyzeRgsOp
 		for (let depth = 0; depth < 5; depth++) {
 			const fileNoExt = stripExt(curFile);
 			const matchedEdge = mounts.find((edge) => {
-				const edgeKey = `${edge.parentFile}:${edge.line}:${edge.prefix}`;
+				const edgeKey = `${edge.parentFile}:${edge.line}:${edge.prefix}:${edge.targetSymbol ?? ""}`;
 				if (visited.has(edgeKey) || edge.language !== draft.language) return false;
+				// 同文件局部子路由器挂载（如 Express `app.use("/api/admin", requireAuth, adminRouter)`）必须精确匹配子路由器变量或符号名
+				if (edge.parentFile === curFile && edge.targetModuleRel === curFile) {
+					return Boolean(edge.targetSymbol && (curRouterVar === edge.targetSymbol || curSymbol === edge.targetSymbol));
+				}
 				if (edge.targetModuleRel) {
 					const targetNoExt = stripExt(edge.targetModuleRel);
 					if (fileNoExt === targetNoExt || fileNoExt.endsWith(`/${targetNoExt}`)) return true;
@@ -1808,7 +1779,7 @@ export function analyzeCrossFileRgs(input: CodeSurfaceInput, opts?: AnalyzeRgsOp
 				return false;
 			});
 			if (!matchedEdge) break;
-			visited.add(`${matchedEdge.parentFile}:${matchedEdge.line}:${matchedEdge.prefix}`);
+			visited.add(`${matchedEdge.parentFile}:${matchedEdge.line}:${matchedEdge.prefix}:${matchedEdge.targetSymbol ?? ""}`);
 			curPath = joinRoutePaths(matchedEdge.prefix, curPath);
 			for (const g of matchedEdge.guards) if (!inherited.includes(g)) inherited.push(g);
 			curFile = matchedEdge.parentFile; curRouterVar = matchedEdge.parentRouterVar; curSymbol = undefined;
@@ -1836,7 +1807,7 @@ export function analyzeCrossFileRgs(input: CodeSurfaceInput, opts?: AnalyzeRgsOp
 		for (const gNode of guards) {
 			if (gNode.language !== draft.language) continue;
 			if (gNode.orderedRules && gNode.orderedRules.length > 0) {
-				const firstHit = gNode.orderedRules.find((r) => matchGuardPathPattern(r.pattern, fullPath));
+				const firstHit = gNode.orderedRules.find((r) => (!r.httpMethod || r.httpMethod === draft.method) && matchGuardPathPattern(r.pattern, fullPath));
 				if (firstHit) {
 					if (firstHit.effect === "permit_all") {
 						isExplicitlyPublic = true;
@@ -1900,24 +1871,18 @@ export function analyzeCrossFileRgs(input: CodeSurfaceInput, opts?: AnalyzeRgsOp
 	}
 
 	const unauthenticatedRoutes = routes.filter((r) => r.riskFlags.includes("missing_auth_guard"));
-	const byLanguage: Record<string, number> = {};
-	const byFramework: Record<string, number> = {};
+	const byLanguage: Record<string, number> = {}, byFramework: Record<string, number> = {};
 	for (const r of routes) {
 		byLanguage[r.language] = (byLanguage[r.language] ?? 0) + 1;
 		byFramework[r.framework] = (byFramework[r.framework] ?? 0) + 1;
 	}
-
 	return {
-		scannedFiles: loadedFiles.length,
-		routes, guards, services, sinks, chains: allChains, bundles,
+		scannedFiles: loadedFiles.length, routes, guards, services, sinks, chains: allChains, bundles,
 		unauthenticatedRoutes, suppressedByGlobalGuardCount,
 		summary: {
-			totalRoutes: routes.length,
-			guardedRoutes: routes.filter((r) => r.hasEffectiveGuard).length,
-			unauthenticatedRoutes: unauthenticatedRoutes.length,
-			suppressedFalsePositives: suppressedByGlobalGuardCount,
-			totalSinks: sinks.length,
-			crossFileChains: allChains.filter((c) => c.crossFile).length,
+			totalRoutes: routes.length, guardedRoutes: routes.filter((r) => r.hasEffectiveGuard).length,
+			unauthenticatedRoutes: unauthenticatedRoutes.length, suppressedFalsePositives: suppressedByGlobalGuardCount,
+			totalSinks: sinks.length, crossFileChains: allChains.filter((c) => c.crossFile).length,
 			bundleEndpoints: bundles.reduce((acc, b) => acc + b.endpoints.length, 0),
 			graphqlOperations: bundles.reduce((acc, b) => acc + b.graphqlOperations.length, 0),
 			byLanguage, byFramework,
@@ -1925,16 +1890,11 @@ export function analyzeCrossFileRgs(input: CodeSurfaceInput, opts?: AnalyzeRgsOp
 	};
 }
 
-function findEntryServiceForRoute(
-	draft: RawRouteDraft,
-	byQualified: Map<string, RgsServiceNode[]>,
-	byMethod: Map<string, RgsServiceNode[]>,
-): RgsServiceNode | undefined {
+function findEntryServiceForRoute(draft: RawRouteDraft, byQualified: Map<string, RgsServiceNode[]>, byMethod: Map<string, RgsServiceNode[]>): RgsServiceNode | undefined {
 	if (!draft.handlerName) return undefined;
 	const exactList = byQualified.get(draft.handlerName);
 	if (exactList && exactList.length > 0) {
-		return exactList.find((s) => s.file === draft.file && s.line === draft.line)
-			?? exactList.find((s) => s.file === draft.file) ?? exactList[0];
+		return exactList.find((s) => s.file === draft.file && s.line === draft.line) ?? exactList.find((s) => s.file === draft.file) ?? exactList[0];
 	}
 	const mList = byMethod.get(draft.handlerName.split(".").pop()!);
 	if (!mList || mList.length === 0) return undefined;
@@ -1966,8 +1926,8 @@ function traceCrossFileDataflow(opts: {
 		}];
 
 		for (const sk of svc.localSinks) {
-			const isTaintedHit = sk.taintedExprs.length === 0 || sk.taintedExprs.includes("request_input")
-				|| sk.taintedExprs.includes("req_input") || sk.taintedExprs.some((te) => activeTaintedParams.has(te));
+			const isTaintedHit = sk.taintedExprs.length > 0 && (sk.taintedExprs.includes("request_input")
+				|| sk.taintedExprs.includes("req_input") || sk.taintedExprs.some((te) => activeTaintedParams.has(te)));
 			if (!isTaintedHit) continue;
 
 			reachableSinksMap.set(sk.id, sk);
@@ -2109,39 +2069,41 @@ function sanitizeRoleEnvSuffix(role: string): string {
 	return String(role || "MEMBER").trim().toUpperCase().replace(/[^A-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "MEMBER";
 }
 
-function scrubCredentialStrings(
-	rawText: string,
-	vaultRootOrVault?: string | SessionVault,
-	extraSecrets?: readonly string[],
-): { cleaned: string; hits: number } {
-	let text = String(rawText ?? "");
-	let hits = 0;
+function scrubCredentialStrings(rawText: string, vaultRootOrVault?: string | SessionVault, extraSecrets?: readonly string[]): { cleaned: string; hits: number } {
+	let text = String(rawText ?? ""), hits = 0;
 	if (vaultRootOrVault) {
 		const before = text;
 		text = redactVaultSecrets(text, vaultRootOrVault);
 		if (text !== before) hits++;
 	}
 	for (const sec of extraSecrets ?? []) {
-		if (sec && sec.length >= 6 && text.includes(sec)) {
-			text = text.split(sec).join("<REDACTED_BY_POV_GENERATOR>");
-			hits++;
-		}
+		if (sec && sec.length >= 6 && text.includes(sec)) { text = text.split(sec).join("<REDACTED_BY_POV_GENERATOR>"); hits++; }
 	}
-	for (const re of INLINE_CREDENTIAL_PATTERNS) {
-		text = text.replace(re, () => { hits++; return "<REDACTED_CREDENTIAL>"; });
-	}
+	for (const re of INLINE_CREDENTIAL_PATTERNS) text = text.replace(re, () => { hits++; return "<REDACTED_CREDENTIAL>"; });
 	return { cleaned: text, hits };
 }
 
-function assertZeroPlaintextSecretsInScript(script: string, extraSecrets?: readonly string[]): void {
-	for (const sec of extraSecrets ?? []) {
-		if (sec && sec.length >= 6 && script.includes(sec)) {
-			throw new Error("安全门禁阻断：生成的 PoV 脚本检测到残留敏感凭据字面量");
+function collectVaultRawSecrets(vaultRootOrVault?: string | SessionVault): string[] {
+	if (!vaultRootOrVault) return [];
+	try {
+		const v = typeof vaultRootOrVault === "string" ? loadSessionVault(vaultRootOrVault) : vaultRootOrVault;
+		const out = new Set<string>();
+		for (const r of Object.values(v.roles ?? {})) {
+			for (const cand of [r.bearer, r.cookie, r.password, ...Object.values(r.headers ?? {})]) {
+				if (typeof cand === "string" && cand.trim().length >= 6) out.add(cand.trim());
+			}
 		}
+		return [...out];
+	} catch { return []; }
+}
+
+function assertZeroPlaintextSecretsInScript(script: string, vaultRootOrVault?: string | SessionVault, extraSecrets?: readonly string[]): void {
+	for (const sec of [...collectVaultRawSecrets(vaultRootOrVault), ...(extraSecrets ?? [])]) {
+		if (sec && sec.length >= 6 && script.includes(sec)) throw new Error("安全门禁阻断：生成的 PoV 脚本检测到残留敏感凭据字面量");
 	}
 	for (const re of INLINE_CREDENTIAL_PATTERNS) {
 		re.lastIndex = 0;
-		if (re.test(script)) throw new Error("安全门禁阻断：生成的 PoV 脚本检测到疑似明文 Token / Bearer / JWT 字面量");
+		if (re.test(script)) throw new Error("安全门禁阻断：生成的 PoV 脚本检测到疑似明文凭据 / URL userinfo / 敏感参数残留");
 	}
 }
 
@@ -2164,6 +2126,12 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		return r.cleaned;
 	};
 
+	const sanitizeBaseOrigin = (rawOrigin: string): string => {
+		const u = new URL(rawOrigin);
+		if (u.username || u.password) { u.username = ""; u.password = ""; redactedCount++; }
+		return `${u.protocol}//${u.host}`;
+	};
+
 	let resolvedBaseUrl = (explicit?.baseUrl ?? input.baseUrl ?? "").trim().replace(/\/+$/, "");
 	let resolvedPath = (explicit?.path ?? "").trim();
 	let resolvedMethod = (explicit?.method ?? "").trim().toUpperCase();
@@ -2173,6 +2141,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		if (urlMatch?.[0]) {
 			try {
 				const u = new URL(urlMatch[0].replace(/[),.;]+$/, ""));
+				if (u.username || u.password) { u.username = ""; u.password = ""; redactedCount++; }
 				if (!resolvedBaseUrl) resolvedBaseUrl = `${u.protocol}//${u.host}`;
 				if (!resolvedPath) resolvedPath = `${u.pathname}${u.search}`;
 			} catch { /* ignore */ }
@@ -2185,6 +2154,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 	}
 
 	if (!resolvedBaseUrl) resolvedBaseUrl = "http://127.0.0.1:8080";
+	else resolvedBaseUrl = sanitizeBaseOrigin(resolvedBaseUrl);
 	if (!resolvedPath) resolvedPath = "/";
 	if (!resolvedPath.startsWith("/")) resolvedPath = `/${resolvedPath}`;
 	if (!resolvedMethod) resolvedMethod = "GET";
@@ -2199,7 +2169,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		for (const [qk, qv] of Object.entries(explicit.queryParams)) parsedTargetUrl.searchParams.set(qk, scrub(qv));
 	}
 	for (const [qk, qv] of [...parsedTargetUrl.searchParams.entries()]) {
-		if (/^(?:token|auth|jwt|key|secret|password|session|sid|api_key)$/i.test(qk)) {
+		if (SENSITIVE_PARAM_KEY_RE.test(qk)) {
 			parsedTargetUrl.searchParams.delete(qk);
 			redactedCount++;
 		} else {
@@ -2215,7 +2185,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 	for (const [hk, hv] of Object.entries(explicit?.headers ?? {})) {
 		const trimmedKey = hk.trim();
 		if (!trimmedKey) continue;
-		if (SENSITIVE_HEADER_KEY_RE.test(trimmedKey) || /auth|token|secret|cookie|key|jwt|session/i.test(trimmedKey)) {
+		if (SENSITIVE_HEADER_KEY_RE.test(trimmedKey) || SENSITIVE_PARAM_KEY_RE.test(trimmedKey)) {
 			redactedCount++;
 			continue;
 		}
@@ -2228,10 +2198,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		if (val && typeof val === "object") {
 			const out: Record<string, unknown> = {};
 			for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-				if (/(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|cookie|session[_-]?id|authorization|credential)/i.test(k)) {
-					redactedCount++;
-					continue;
-				}
+				if (SENSITIVE_PARAM_KEY_RE.test(k)) { redactedCount++; continue; }
 				out[k] = scrubJsonFields(v);
 			}
 			return out;
@@ -2239,11 +2206,28 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		return val;
 	};
 
+	const scrubFormEncodedOrTextBody = (rawBody: string): string => {
+		if (/^[^=\s&]+=[^]*$/.test(rawBody) && !rawBody.trim().startsWith("{")) {
+			const kept: string[] = [];
+			for (const pair of rawBody.split("&")) {
+				const eqIdx = pair.indexOf("=");
+				if (eqIdx <= 0) { kept.push(scrub(pair)); continue; }
+				const rawKey = pair.slice(0, eqIdx);
+				let decodedKey = rawKey;
+				try { decodedKey = decodeURIComponent(rawKey); } catch { /* ignore */ }
+				if (SENSITIVE_PARAM_KEY_RE.test(decodedKey.trim())) { redactedCount++; continue; }
+				kept.push(`${rawKey}=${scrub(pair.slice(eqIdx + 1))}`);
+			}
+			return kept.join("&");
+		}
+		return scrub(rawBody);
+	};
+
 	let serializedBody: string | null = null;
 	if (explicit?.body !== undefined) {
 		if (typeof explicit.body === "string") {
 			try { serializedBody = JSON.stringify(scrubJsonFields(JSON.parse(explicit.body))); }
-			catch { serializedBody = scrub(explicit.body); }
+			catch { serializedBody = scrubFormEncodedOrTextBody(explicit.body); }
 		} else {
 			serializedBody = JSON.stringify(scrubJsonFields(explicit.body));
 			if (!safeStaticHeaders["Content-Type"] && !safeStaticHeaders["content-type"]) safeStaticHeaders["Content-Type"] = "application/json";
@@ -2298,12 +2282,13 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		"async function runPov(): Promise<void> {",
 		'\tconst baseUrl = (process.env.NUWA_POV_BASE_URL ?? CONFIG.defaultBaseUrl).trim().replace(/\\/+$/, "");',
 		"\tconst runtimeHeaders = loadRuntimeAuthHeaders();",
-		'\tconst negRes = await fetch(`${baseUrl}${CONFIG.negativeControlPath}`, { method: "GET", redirect: "manual" });',
+		'\tconst negRes = await fetch(`${baseUrl}${CONFIG.negativeControlPath}`, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(8000) });',
 		"\tconst negBody = await negRes.text();",
-		'\tconst posRes = await fetch(`${baseUrl}${CONFIG.targetPath}`, { method: CONFIG.method, headers: runtimeHeaders, ...(CONFIG.body !== null ? { body: CONFIG.body } : {}), redirect: "manual" });',
+		'\tconst posRes = await fetch(`${baseUrl}${CONFIG.targetPath}`, { method: CONFIG.method, headers: runtimeHeaders, ...(CONFIG.body !== null ? { body: CONFIG.body } : {}), redirect: "manual", signal: AbortSignal.timeout(8000) });',
 		"\tconst posBody = await posRes.text();",
 		"\tconst failures: string[] = [];",
 		"\tif (posRes.status !== CONFIG.expectedStatus) failures.push(`正向状态码不匹配: 期望 ${CONFIG.expectedStatus}, 实际 ${posRes.status}`);",
+		"\tif (!(CONFIG.negativeExpectedStatuses as readonly number[]).includes(negRes.status)) failures.push(`负向对照路径状态码异常: 期望 [${CONFIG.negativeExpectedStatuses.join(\",\")}], 实际 ${negRes.status}`);",
 		'\tif (negRes.status === 200 && negBody.trim() === posBody.trim()) failures.push("负向随机路径返回同构 200 响应体");',
 		"\tfor (const m of CONFIG.expectedBodyIncludes) if (!posBody.includes(m)) failures.push(`缺失预期特征串: ${m}`);",
 		"\tfor (const b of CONFIG.forbiddenBodyIncludes) if (posBody.includes(b)) failures.push(`命中禁止特征串: ${b}`);",
@@ -2312,7 +2297,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		"\t}",
 		"\tlet protectedStatus: number | null = null;",
 		"\tif (CONFIG.protectedControlPath) {",
-		'\t\tconst protRes = await fetch(`${baseUrl}${CONFIG.protectedControlPath}`, { method: "GET", headers: runtimeHeaders, redirect: "manual" });',
+		'\t\tconst protRes = await fetch(`${baseUrl}${CONFIG.protectedControlPath}`, { method: "GET", headers: runtimeHeaders, redirect: "manual", signal: AbortSignal.timeout(8000) });',
 		"\t\tawait protRes.text(); protectedStatus = protRes.status;",
 		"\t\tif (!(CONFIG.protectedExpectedStatuses as readonly number[]).includes(protRes.status)) failures.push(`受保护对照端点状态码异常: ${protRes.status}`);",
 		"\t}",
@@ -2324,7 +2309,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		"",
 	].join("\n");
 
-	assertZeroPlaintextSecretsInScript(scriptContent, knownSecretsToScrub);
+	assertZeroPlaintextSecretsInScript(scriptContent, vaultRootOrVault, knownSecretsToScrub);
 
 	return {
 		factId: safeFactId, fileName, ruleId: ruleMeta.ruleId, ...(ruleMeta.cwe ? { cwe: ruleMeta.cwe } : {}),

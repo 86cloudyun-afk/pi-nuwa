@@ -162,11 +162,36 @@ export function computeInPageRequestSignature(
 	return computeRfc2104Hmac("sha256", signingKey, canonical).toString("hex");
 }
 
-/** 编码 gRPC-Web 5 字节帧 + Protobuf 消息（field 1: string orgId, field 2: varint includeAudit）。 */
+function encodeProtobufVarint(value: number): Buffer {
+	const bytes: number[] = [];
+	let v = value >>> 0;
+	while (v >= 0x80) {
+		bytes.push((v & 0x7f) | 0x80);
+		v >>>= 7;
+	}
+	bytes.push(v & 0x7f);
+	return Buffer.from(bytes);
+}
+
+function decodeProtobufVarint(buf: Uint8Array, startOffset: number): { value: number; nextOffset: number } | null {
+	let value = 0;
+	let shift = 0;
+	let i = startOffset;
+	while (i < buf.length && shift < 35) {
+		const b = buf[i++]!;
+		value += (b & 0x7f) * (2 ** shift);
+		if ((b & 0x80) === 0) return { value, nextOffset: i };
+		shift += 7;
+	}
+	return null;
+}
+
+/** 编码 gRPC-Web 5 字节帧 + Protobuf 消息（field 1: string orgId, field 2: varint includeAudit，支持任意 Varint 长度）。 */
 export function encodeGrpcWebOrgRequest(orgId: string, includeAudit: boolean): Uint8Array {
 	const strBytes = Buffer.from(orgId, "utf8");
 	const protoPayload = Buffer.concat([
-		Buffer.from([0x0a, strBytes.length]),
+		Buffer.from([0x0a]),
+		encodeProtobufVarint(strBytes.length),
 		strBytes,
 		Buffer.from([0x10, includeAudit ? 1 : 0]),
 	]);
@@ -179,7 +204,7 @@ export function encodeGrpcWebOrgRequest(orgId: string, includeAudit: boolean): U
 	return Buffer.concat([header, protoPayload]);
 }
 
-/** 解码 gRPC-Web 请求帧中的 Protobuf 字段（真实校验 5 字节帧头与长度边界）。 */
+/** 解码 gRPC-Web 请求帧中的 Protobuf 字段（真实校验 5 字节帧头与 Base-128 Varint 长度边界）。 */
 export function decodeGrpcWebOrgRequest(rawBuf: Uint8Array): { ok: boolean; orgId: string; includeAudit: boolean } {
 	if (rawBuf.length < 5 || rawBuf[0] !== 0x00) return { ok: false, orgId: "", includeAudit: false };
 	const frameLen = ((rawBuf[1]! << 24) >>> 0) + (rawBuf[2]! << 16) + (rawBuf[3]! << 8) + rawBuf[4]!;
@@ -189,23 +214,23 @@ export function decodeGrpcWebOrgRequest(rawBuf: Uint8Array): { ok: boolean; orgI
 	let orgId = "";
 	let includeAudit = false;
 	while (i < msg.length) {
-		const tag = msg[i++]!;
-		const fieldNo = tag >>> 3;
-		const wireType = tag & 0x07;
+		const tagVar = decodeProtobufVarint(msg, i);
+		if (!tagVar) break;
+		i = tagVar.nextOffset;
+		const fieldNo = tagVar.value >>> 3;
+		const wireType = tagVar.value & 0x07;
 		if (wireType === 2) {
-			const len = msg[i++] ?? 0;
-			const val = Buffer.from(msg.slice(i, i + len)).toString("utf8");
-			i += len;
+			const lenVar = decodeProtobufVarint(msg, i);
+			if (!lenVar || lenVar.nextOffset + lenVar.value > msg.length) return { ok: false, orgId: "", includeAudit: false };
+			i = lenVar.nextOffset;
+			const val = Buffer.from(msg.slice(i, i + lenVar.value)).toString("utf8");
+			i += lenVar.value;
 			if (fieldNo === 1) orgId = val;
 		} else if (wireType === 0) {
-			let v = 0, shift = 0;
-			while (i < msg.length) {
-				const b = msg[i++]!;
-				v |= (b & 0x7f) << shift;
-				if ((b & 0x80) === 0) break;
-				shift += 7;
-			}
-			if (fieldNo === 2) includeAudit = v !== 0;
+			const vVar = decodeProtobufVarint(msg, i);
+			if (!vVar) break;
+			i = vVar.nextOffset;
+			if (fieldNo === 2) includeAudit = vVar.value !== 0;
 		} else {
 			break;
 		}
@@ -213,10 +238,10 @@ export function decodeGrpcWebOrgRequest(rawBuf: Uint8Array): { ok: boolean; orgI
 	return { ok: Boolean(orgId), orgId, includeAudit };
 }
 
-/** 构造真实 gRPC-Web Data Frame (0x00) + Trailer Frame (0x80 `grpc-status: 0`) 二进制响应。 */
+/** 构造真实 gRPC-Web Data Frame (0x00) + Trailer Frame (0x80 `grpc-status: 0`) 二进制响应（标准 Varint 长度前缀）。 */
 export function encodeGrpcWebJsonFrameResponse(jsonPayload: Record<string, unknown>, grpcStatus = 0): Uint8Array {
 	const jsonBytes = Buffer.from(JSON.stringify(jsonPayload), "utf8");
-	const dataFrame = Buffer.concat([Buffer.from([0x0a, jsonBytes.length]), jsonBytes]);
+	const dataFrame = Buffer.concat([Buffer.from([0x0a]), encodeProtobufVarint(jsonBytes.length), jsonBytes]);
 	const dataHdr = Buffer.from([
 		0x00,
 		(dataFrame.length >>> 24) & 0xff,
@@ -235,7 +260,7 @@ export function encodeGrpcWebJsonFrameResponse(jsonPayload: Record<string, unkno
 	return Buffer.concat([dataHdr, dataFrame, trailerHdr, trailerBytes]);
 }
 
-/** 解码 gRPC-Web 响应中的 Data Frame 与 Trailer Frame 状态码。 */
+/** 解码 gRPC-Web 响应中的 Data Frame（标准 Protobuf Base-128 Varint）与 Trailer Frame 状态码。 */
 export function decodeGrpcWebFrameResponse(raw: Uint8Array): { grpcStatus: number; payloadText: string } {
 	let offset = 0;
 	let payloadText = "";
@@ -248,8 +273,15 @@ export function decodeGrpcWebFrameResponse(raw: Uint8Array): { grpcStatus: numbe
 		const chunk = raw.slice(offset, offset + len);
 		offset += len;
 		if (flag === 0x00) {
-			const inner = chunk[0] === 0x0a && chunk.length >= 2 ? chunk.slice(2) : chunk;
-			payloadText = Buffer.from(inner).toString("utf8");
+			if (chunk[0] === 0x0a && chunk.length >= 2) {
+				const lenVar = decodeProtobufVarint(chunk, 1);
+				const inner = lenVar && lenVar.nextOffset + lenVar.value <= chunk.length
+					? chunk.slice(lenVar.nextOffset, lenVar.nextOffset + lenVar.value)
+					: chunk.slice(2);
+				payloadText = Buffer.from(inner).toString("utf8");
+			} else {
+				payloadText = Buffer.from(chunk).toString("utf8");
+			}
 		} else if (flag === 0x80) {
 			const tr = Buffer.from(chunk).toString("utf8");
 			const m = /grpc-status:\s*(\d+)/i.exec(tr);

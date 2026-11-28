@@ -1125,9 +1125,18 @@ const L4_EVALUATORS: Record<L4ScenarioId, L4Evaluator> = {
 		const intentId = await planSingleVulnIntent(engine, "验证 POST /api/v1/jobs/webhook-verify 异步延迟 OOB 服务端请求", "/api/v1/jobs/webhook-verify");
 		const triggerAndAwaitDelayedOob = async (tag: string): Promise<string> => {
 			const canaryToken = `cnry_${tag}_${randomBytes(4).toString("hex")}`;
-			const ctxCanonical = `${canaryToken}|${intentId}|/api/v1/jobs/webhook-verify|webhookUrl`;
-			const ctxSig = computeRfc2104Hmac("sha256", "nuwa-l4-oob-ledger-key", ctxCanonical).toString("hex").slice(0, 24);
+			const computeExpectedCtxSig = (tok: string) =>
+				computeRfc2104Hmac("sha256", "nuwa-l4-oob-ledger-key", `${tok}|${intentId}|/api/v1/jobs/webhook-verify|webhookUrl`).toString("hex").slice(0, 24);
+			const ctxSig = computeExpectedCtxSig(canaryToken);
 			const cbUrl = `${srv.oobCollectorUrl}/cb/${canaryToken}?sig=${ctxSig}`;
+
+			// 先注入一条携带相同 canaryToken 但伪造无效签名的干扰 OOB 回调，验证归因校验器绝不误采纳伪造回调
+			const forgedRes = await fetch(`${srv.oobCollectorUrl}/cb/${canaryToken}?sig=forged_invalid_sig_0000`);
+			await forgedRes.text();
+			const prematureVerifiedHit = srv.getDelayedOobHits().find(
+				(h) => h.canaryToken === canaryToken && h.contextSig === computeExpectedCtxSig(h.canaryToken),
+			);
+			assertOk(!prematureVerifiedHit, "OOB 因果归因校验器必须严格拒绝携带伪造签名的干扰回调");
 
 			const trigRes = await fetch(`${srv.baseUrl}/api/v1/jobs/webhook-verify`, {
 				method: "POST",
@@ -1136,10 +1145,12 @@ const L4_EVALUATORS: Record<L4ScenarioId, L4Evaluator> = {
 			});
 			assertOk(trigRes.status === 202, "异步任务提交应立即返回盲 202");
 
-			// 等待异步延迟回调（45ms 后台触发）到达本机监听器并完成签名归因校验
+			// 等待异步延迟回调（45ms 后台触发）到达本机监听器并完成 HMAC 上下文签名归因校验
 			const deadline = Date.now() + 2500;
 			while (Date.now() < deadline) {
-				const matched = srv.getDelayedOobHits().find((h) => h.canaryToken === canaryToken && h.contextSig === ctxSig);
+				const matched = srv.getDelayedOobHits().find(
+					(h) => h.canaryToken === canaryToken && h.contextSig === computeExpectedCtxSig(h.canaryToken),
+				);
 				if (matched) {
 					return JSON.stringify({
 						correlatedEndpoint: "/api/v1/jobs/webhook-verify",

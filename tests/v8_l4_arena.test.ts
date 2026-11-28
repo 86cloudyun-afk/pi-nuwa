@@ -58,6 +58,17 @@ describe("v8 L4 真实有状态 12 场景综合演武场 (benchmarks/l4-arena)",
 		const decodedResp = decodeGrpcWebFrameResponse(respBytes);
 		expect(decodedResp.grpcStatus).toBe(0);
 		expect(JSON.parse(decodedResp.payloadText)).toEqual({ orgId: "org-alpha", marker: "ok" });
+
+		// 多字节 Base-128 Varint（> 300 字节）请求与响应帧无截断往返验证
+		const longOrgId = `org-${"x".repeat(320)}`;
+		const longReqBytes = encodeGrpcWebOrgRequest(longOrgId, true);
+		expect(decodeGrpcWebOrgRequest(longReqBytes)).toEqual({ ok: true, orgId: longOrgId, includeAudit: true });
+
+		const largePayload = { orgId: longOrgId, auditNotes: "A".repeat(420), count: 2048 };
+		const largeRespBytes = encodeGrpcWebJsonFrameResponse(largePayload, 0);
+		const decodedLargeResp = decodeGrpcWebFrameResponse(largeRespBytes);
+		expect(decodedLargeResp.grpcStatus).toBe(0);
+		expect(JSON.parse(decodedLargeResp.payloadText)).toEqual(largePayload);
 	});
 
 	test("多端口场景服务绑定 127.0.0.1:0 且 stop() 后零孤儿端口残留", async () => {
