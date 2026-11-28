@@ -640,6 +640,49 @@ describe("v8 跨文件 RGS 代码数据流引擎 (omp/rgs-analyzer.ts)", () => {
 			expect(sc).toContain("username=alice");
 			expect(sc).toContain("dept=security");
 			expect(sc).toContain("page=2");
+
+			// 二轮对抗回归 P0-R1：复合敏感键（adminToken / user_password / userPassword / adminSecret / X-Admin-Token / X-Custom-Secret）100% 剥离，且不误伤 keyboard / sortBy / bypass / X-Tenant-Id
+			const compoundArtifact = generateStandalonePovScript({
+				explicit: {
+					factId: "p0-r1-compound-keys",
+					title: "复合敏感键名与自定义鉴权头零残留验证",
+					baseUrl: "http://127.0.0.1:18080",
+					path: "/api/v2/profile?adminToken=tok_admin_999888&user_password=Pass_Regression_123&sortBy=createdAt",
+					method: "POST",
+					role: "auditor",
+					headers: {
+						"X-Admin-Token": "plain_hdr_admin_tok_111",
+						"X-Custom-Secret": "plain_hdr_secret_222",
+						"X-Tenant-Id": "org-alpha",
+					},
+					body: {
+						userPassword: "JsonUserPass_456",
+						adminSecret: "JsonAdminSecret_789",
+						keyboard: "mech-87",
+						sortBy: "createdAt",
+						bypass: "none",
+					},
+					expectedStatus: 200,
+				},
+				vaultRootOrVault: tmpRoot,
+			});
+
+			const csc = compoundArtifact.scriptContent;
+			expect(compoundArtifact.targetUrl).toBe("http://127.0.0.1:18080/api/v2/profile?sortBy=createdAt");
+			for (const leaked of [
+				"tok_admin_999888",
+				"Pass_Regression_123",
+				"JsonUserPass_456",
+				"JsonAdminSecret_789",
+				"plain_hdr_admin_tok_111",
+				"plain_hdr_secret_222",
+			]) {
+				expect(csc).not.toContain(leaked);
+			}
+			expect(csc).toContain("mech-87");
+			expect(csc).toContain("createdAt");
+			expect(csc).toContain('\\"bypass\\":\\"none\\"');
+			expect(csc).toContain('"X-Tenant-Id":"org-alpha"');
 		} finally {
 			rmSync(tmpRoot, { recursive: true, force: true });
 		}

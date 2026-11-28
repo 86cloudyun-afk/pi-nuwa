@@ -138,7 +138,8 @@ const AUTH_GUARD_TOKEN_RE =
 const EXPLICIT_PERMIT_ALL_RE = /\b(?:permitAll\s*\(\s*\)|anonymous\s*\(\s*\)|AllowAny|allow_anonymous|AllowAnonymous|PermitAll|publicRoute|skipAuth|withoutMiddleware)\b/;
 const LIFECYCLE_PUBLIC_ROUTE_RE = /^\/(?:health|healthz|readyz|livez|ping|metrics|login|signin|signup|register|logout|auth\/login|auth\/token|auth\/callback|oauth\/callback|favicon\.ico)(?:\/|$)/i;
 const SENSITIVE_HEADER_KEY_RE = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-session-id|x-csrf-token|x-xsrf-token|api-key|token|secret)$/i;
-const SENSITIVE_PARAM_KEY_RE = /(?:^(?:token|auth|jwt|key|secret|password|passwd|pwd|pass|session|sid|cookie|credential|credentials)$|(?:access|refresh|id|auth|csrf|xsrf|session|api|private|secret|client)[_-]?(?:token|key|secret|id)|apikey)/i;
+const SENSITIVE_PARAM_KEY_RE = /(?:password|passwd|secret|token|cookie|credential|authorization|jwt|apikey|(?:api|private|access|client|auth|session|csrf|xsrf|master|signing)[_-]?key|session[_-]?id|^(?:auth|key|pwd|pass|session|sid)$|(?:^|[_-])(?:pwd|pass|auth|sid)(?:$|[_-]))/i;
+const isSensitiveParamKey = (k: string): boolean => SENSITIVE_PARAM_KEY_RE.test(k) || /[a-z0-9](?:Pwd|Pass|Auth|Sid)$/.test(k);
 const INLINE_CREDENTIAL_PATTERNS: readonly RegExp[] = [
 	/https?:\/\/[^/\s'"]+:[^/\s'"]+@/gi,
 	/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\b/g,
@@ -147,7 +148,7 @@ const INLINE_CREDENTIAL_PATTERNS: readonly RegExp[] = [
 	/(?:--cookie|-b)\s+['"]?[^'"\s]+['"]?/gi,
 	/(?:--user|-u)\s+['"]?[^'"\s]+:[^'"\s]+['"]?/gi,
 	/\b(?:Cookie|Authorization|X-Api-Key|X-Auth-Token|X-Access-Token)\s*:\s*[^\r\n'"]+/gi,
-	/\b(?:access_token|refresh_token|id_token|client_secret|api_key|apikey|auth_token|password|passwd|pwd|session_id)=[^\s&'"]+/gi,
+	/\b(?:[A-Za-z0-9_.-]*(?:password|passwd|secret|token|apikey|api_key|session_id)|pwd)=(?!<REDACTED)[^\s&'"]+/gi,
 ];
 
 function sha256Short(input: string, len = 12): string { return createHash("sha256").update(input).digest("hex").slice(0, len); }
@@ -2169,7 +2170,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		for (const [qk, qv] of Object.entries(explicit.queryParams)) parsedTargetUrl.searchParams.set(qk, scrub(qv));
 	}
 	for (const [qk, qv] of [...parsedTargetUrl.searchParams.entries()]) {
-		if (SENSITIVE_PARAM_KEY_RE.test(qk)) {
+		if (isSensitiveParamKey(qk)) {
 			parsedTargetUrl.searchParams.delete(qk);
 			redactedCount++;
 		} else {
@@ -2185,7 +2186,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 	for (const [hk, hv] of Object.entries(explicit?.headers ?? {})) {
 		const trimmedKey = hk.trim();
 		if (!trimmedKey) continue;
-		if (SENSITIVE_HEADER_KEY_RE.test(trimmedKey) || SENSITIVE_PARAM_KEY_RE.test(trimmedKey)) {
+		if (SENSITIVE_HEADER_KEY_RE.test(trimmedKey) || isSensitiveParamKey(trimmedKey) || /auth|token|secret|cookie|key|jwt|session/i.test(trimmedKey)) {
 			redactedCount++;
 			continue;
 		}
@@ -2198,7 +2199,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		if (val && typeof val === "object") {
 			const out: Record<string, unknown> = {};
 			for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
-				if (SENSITIVE_PARAM_KEY_RE.test(k)) { redactedCount++; continue; }
+				if (isSensitiveParamKey(k)) { redactedCount++; continue; }
 				out[k] = scrubJsonFields(v);
 			}
 			return out;
@@ -2215,7 +2216,7 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 				const rawKey = pair.slice(0, eqIdx);
 				let decodedKey = rawKey;
 				try { decodedKey = decodeURIComponent(rawKey); } catch { /* ignore */ }
-				if (SENSITIVE_PARAM_KEY_RE.test(decodedKey.trim())) { redactedCount++; continue; }
+				if (isSensitiveParamKey(decodedKey.trim())) { redactedCount++; continue; }
 				kept.push(`${rawKey}=${scrub(pair.slice(eqIdx + 1))}`);
 			}
 			return kept.join("&");
