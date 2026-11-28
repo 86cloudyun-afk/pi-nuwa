@@ -28,17 +28,22 @@ EXT_DIR="$AGENT_HOME/extensions/nuwa-omp"
 # 扩展子模块清单（主入口 omp/nuwa.ts 复制为 index.ts，其余保持原名）
 EXT_MODULES=(
   "omp/types.ts"
+  "omp/storage-io.ts"
   "omp/storage.ts"
+  "omp/sqlite-schema.ts"
   "omp/sqlite-store.ts"
+  "omp/graph-dedup.ts"
   "omp/graph.ts"
   "omp/graph-planner.ts"
   "omp/graph-commands.ts"
   "omp/ui.ts"
   "omp/ui-native.ts"
+  "omp/autoexec-baseline.ts"
   "omp/autoexec.ts"
   "omp/auto-loops.ts"
   "omp/belief-search.ts"
   "omp/calibration.ts"
+  "omp/traffic-mutator.ts"
   "omp/traffic-workbench.ts"
   "omp/hybrid-audit.ts"
   "omp/browser-recon.ts"
@@ -51,11 +56,14 @@ EXT_MODULES=(
   "omp/session-vault.ts"
   "omp/auth-diff.ts"
   "omp/verifier-gate.ts"
+  "omp/sandbox-egress.ts"
   "omp/sandbox.ts"
   "omp/oob.ts"
   "omp/hypothesis.ts"
   "omp/reporting.ts"
+  "omp/cdp-client.ts"
   "omp/cdp-bridge.ts"
+  "omp/chain-capabilities.ts"
   "omp/chain-composer.ts"
   "omp/specialist-squad.ts"
   "omp/kb-v2.ts"
@@ -150,7 +158,9 @@ done
 [[ -f "$REPO_DIR/skills/nuwa-pentest/SKILL.md" ]] || die "仓库缺少 skills/nuwa-pentest/SKILL.md" 1
 [[ -f "$REPO_DIR/bin/nuwa-autonomous" ]] || die "仓库缺少 bin/nuwa-autonomous" 1
 [[ -f "$REPO_DIR/core/protocol.ts" ]] || die "仓库缺少 core/protocol.ts" 1
+[[ -f "$REPO_DIR/core/engine-helpers.ts" ]] || die "仓库缺少 core/engine-helpers.ts" 1
 [[ -f "$REPO_DIR/core/engine.ts" ]] || die "仓库缺少 core/engine.ts" 1
+[[ -f "$REPO_DIR/core/autonomous-doctor.ts" ]] || die "仓库缺少 core/autonomous-doctor.ts" 1
 [[ -f "$REPO_DIR/core/mcp-server.ts" ]] || die "仓库缺少 core/mcp-server.ts" 1
 [[ -f "$REPO_DIR/bin/nuwa-mcp" ]] || die "仓库缺少 bin/nuwa-mcp" 1
 
@@ -201,7 +211,9 @@ CORE_DIR="$AGENT_HOME/nuwa-core"
 rm -rf "$CORE_DIR"
 mkdir -p "$CORE_DIR/core" "$CORE_DIR/bin" "$CORE_DIR/kb"
 cp "$REPO_DIR/core/protocol.ts" "$CORE_DIR/core/protocol.ts" || die "core/protocol.ts 复制失败" 1
+cp "$REPO_DIR/core/engine-helpers.ts" "$CORE_DIR/core/engine-helpers.ts" || die "core/engine-helpers.ts 复制失败" 1
 cp "$REPO_DIR/core/engine.ts" "$CORE_DIR/core/engine.ts" || die "core/engine.ts 复制失败" 1
+cp "$REPO_DIR/core/autonomous-doctor.ts" "$CORE_DIR/core/autonomous-doctor.ts" || die "core/autonomous-doctor.ts 复制失败" 1
 cp "$REPO_DIR/core/mcp-server.ts" "$CORE_DIR/core/mcp-server.ts" || die "core/mcp-server.ts 复制失败" 1
 for kbf in "${KB_FILES[@]}"; do
   cp "$REPO_DIR/$kbf" "$CORE_DIR/kb/$(basename "$kbf")" || die "$kbf 复制失败" 1

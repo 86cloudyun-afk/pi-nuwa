@@ -32,18 +32,61 @@ import {
 	SCHEMA,
 	atomicWrite,
 	journalPath,
-	loadStateJsonOnly,
-	normalizeState,
 	nowIso,
 	stateDir,
 	statePath,
-} from "./storage";
+} from "./storage-io";
+import { loadStateJsonOnly, normalizeState } from "./storage";
 import {
 	loadSessionVault,
 	maskSecretValue,
 	redactVaultSecrets,
 	type SessionVault,
 } from "./session-vault";
+import {
+	ALL_SQLITE_TABLES,
+	CORE_DDL,
+	KNOWN_ASSET_KEYS,
+	KNOWN_ATTEMPTED_KEYS,
+	KNOWN_FACT_KEYS,
+	KNOWN_HYPOTHESIS_KEYS,
+	KNOWN_INTENT_KEYS,
+	SQLITE_SCHEMA_VERSION,
+	V1_CORE_DDL,
+	V1_CORE_TABLES,
+	V2_EXTENSION_DDL,
+	V2_EXTENSION_TABLES,
+	alreadyMasked,
+	assetFromRow,
+	redactHeadersRecord,
+	redactTextForStorage,
+	redactUnknownForStorage,
+	attemptedFromRow,
+	extractExtraFields,
+	factFromRow,
+	formatFactMetaSearchText,
+	hasSqliteTable,
+	hypothesisFromRow,
+	intentFromRow,
+	migrateSqliteSchemaV1ToV2,
+	normalizeAttemptedSurfaceDomain,
+	normalizeCredentialFingerprint,
+	readSqliteSchemaVersion,
+	safeJsonParse,
+	type AssetCredentialRow,
+	type AssetCredentialStatus,
+	type OobCorrelationRow,
+	type OobCorrelationStatus,
+	type ProtocolFrameDirection,
+	type ProtocolFrameKind,
+	type ProtocolFrameRow,
+	type SqliteSchemaMigrationResult,
+	type SqliteTableName,
+	type V1CoreTableName,
+	type V2ExtensionTableName,
+	type WorkflowActionLevel,
+	type WorkflowRunRow,
+} from "./sqlite-schema";
 import type { ExecLedgerEntry } from "./evidence";
 import type {
 	AssetNode,
@@ -60,7 +103,7 @@ import type {
 } from "./types";
 import type { JournalEntry } from "./ui";
 
-export const SQLITE_SCHEMA_VERSION = 1;
+export * from "./sqlite-schema";
 export type StorageBackend = "json" | "sqlite" | "dual";
 
 export interface OpenNuwaDbOptions {
@@ -223,18 +266,6 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
 	return Math.max(min, Math.min(max, Math.floor(value)));
 }
 
-function formatFactMetaSearchText(meta: Fact["meta"] | undefined): string {
-	if (!meta || typeof meta !== "object") return "";
-	const parts: string[] = [];
-	if (meta.server) parts.push(meta.server);
-	if (meta.waf) parts.push(meta.waf);
-	if (Array.isArray(meta.tech) && meta.tech.length) parts.push(meta.tech.join(" "));
-	if (Array.isArray(meta.paths) && meta.paths.length) parts.push(meta.paths.join(" "));
-	if (Array.isArray(meta.routes) && meta.routes.length) parts.push(meta.routes.join(" "));
-	if (Array.isArray(meta.san) && meta.san.length) parts.push(meta.san.join(" "));
-	return parts.join(" ");
-}
-
 function isBusyError(err: unknown): boolean {
 	const msg = String(err instanceof Error ? err.message : err ?? "").toLowerCase();
 	return (
@@ -282,495 +313,12 @@ function safeChmod600(filePath: string): void {
 	}
 }
 
-// ============================================================================
-// 全表零明文凭据脱敏层（Vault 凭据 + 通用敏感头/口令/JWT 幂等掩码）
-// ============================================================================
-
-const SENSITIVE_FIELD_KEY_RE =
-	/^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-session-token|api[-_]?key|auth[-_]?token|access[-_]?token|refresh[-_]?token|bearer|password|passwd|pwd|secret|client[-_]?secret|private[-_]?key|session[-_]?secret)$/i;
-
-/** 仅用于 HTTP 请求/响应头字典：排除标准非敏感头后再宽泛匹配敏感头名（与 session-vault.ts 对齐）。 */
-const STANDARD_NON_SENSITIVE_HTTP_HEADER_RE =
-	/^(?:accept(?:-[a-z0-9-]+)?|content-(?:type|length|encoding|language|disposition|range|security-policy|md5)|cache-control|pragma|expires|etag|last-modified|if-(?:match|none-match|modified-since|unmodified-since|range)|connection|keep-alive|transfer-encoding|upgrade(?:-insecure-requests)?|host|origin|referer|user-agent|date|server|vary|via|age|location|allow|range|te|trailer|dnt|priority|sec-[a-z0-9-]+|x-forwarded-(?:for|host|proto|port)|x-real-ip|x-request-id|x-correlation-id|x-trace-id|x-ratelimit-[a-z0-9-]+|x-frame-options|x-content-type-options|strict-transport-security|referrer-policy|permissions-policy|access-control-[a-z0-9-]+)$/i;
-const SENSITIVE_HTTP_HEADER_NAME_RE =
-	/(?:auth|token|key|secret|cookie|session|jwt|csrf|xsrf|pass|cred|sign|bearer|ticket|access)/i;
-
-const GENERIC_AUTH_HEADER_RE =
-	/\b(Authorization|Proxy-Authorization)\s*:\s*(Bearer|Basic|Token|JWT)\s+([A-Za-z0-9._~+/=-]{6,})/gi;
-const GENERIC_API_KEY_HEADER_RE =
-	/\b(X-API-Key|X-Auth-Token|X-Access-Token|X-Session-Token|Api-Key|Private-Token|X-Vault-Token|X-CSRF-Token|X-XSRF-Token|X-Gitlab-Token)\s*:\s*([^\s\r\n'",;]{4,})/gi;
-const GENERIC_COOKIE_HEADER_RE =
-	/\b(Cookie|Set-Cookie)\s*:\s*([^\r\n]+)/gi;
-const GENERIC_PASSWORD_KV_RE =
-	/\b(password|passwd|pwd|api_key|apikey|secret_key|client_secret|access_token|refresh_token)\s*([:=])\s*(["']?)([^\s\r\n"',;}{[\]&#)>]{4,})\3/gi;
-const URL_USERINFO_RE =
-	/(\b(?:https?|ftp|sftp|ftps|ws|wss|redis|rediss|mysql|postgres(?:ql)?|mongodb(?:\+srv)?|amqp|amqps|socks(?:4a?|5h?)?):\/\/)([^\/\s:@?#]+)?:([^\/\s@?#]+)@/gi;
-const RAW_JWT_RE = /\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,})\b/g;
-const KNOWN_TOKEN_PREFIX_RE = /\b((?:sk-proj-|sk-live-|sk-|ghp_|gho_|ghu_|github_pat_|xoxb-|xoxp-|AKIA)[A-Za-z0-9_-]{10,})\b/g;
-
-const COOKIE_ATTRS = new Set([
-	"path",
-	"domain",
-	"expires",
-	"max-age",
-	"samesite",
-	"secure",
-	"httponly",
-	"priority",
-	"partitioned",
-	"version",
-]);
-
-function alreadyMasked(val: string): boolean {
-	return val.includes("***") || /^\*{4,}$/.test(val.trim());
-}
-
-function maskCookieHeaderLine(cookieVal: string): string {
-	return cookieVal
-		.split(";")
-		.map((part) => {
-			const seg = part.trim();
-			if (!seg) return "";
-			const eq = seg.indexOf("=");
-			if (eq <= 0) return seg;
-			const k = seg.slice(0, eq).trim();
-			const v = seg.slice(eq + 1).trim();
-			if (!k || !v || COOKIE_ATTRS.has(k.toLowerCase()) || alreadyMasked(v)) return seg;
-			if (v.length < 4) return seg;
-			return `${k}=${maskSecretValue(v)}`;
-		})
-		.filter(Boolean)
-		.join("; ");
-}
-
-function redactGenericSecrets(text: string): string {
-	if (!text) return text;
-	let out = text;
-
-	out = out.replace(GENERIC_AUTH_HEADER_RE, (_m, hdr: string, scheme: string, tok: string) => {
-		if (alreadyMasked(tok)) return `${hdr}: ${scheme} ${tok}`;
-		return `${hdr}: ${scheme} ${maskSecretValue(tok)}`;
-	});
-
-	out = out.replace(GENERIC_API_KEY_HEADER_RE, (_m, hdr: string, tok: string) => {
-		if (alreadyMasked(tok)) return `${hdr}: ${tok}`;
-		return `${hdr}: ${maskSecretValue(tok)}`;
-	});
-
-	out = out.replace(GENERIC_COOKIE_HEADER_RE, (_m, hdr: string, val: string) => {
-		return `${hdr}: ${maskCookieHeaderLine(val)}`;
-	});
-
-	out = out.replace(
-		GENERIC_PASSWORD_KV_RE,
-		(_m, key: string, sep: string, quote: string, val: string) => {
-			if (alreadyMasked(val)) return `${key}${sep}${quote}${val}${quote}`;
-			return `${key}${sep}${quote}${maskSecretValue(val)}${quote}`;
-		},
-	);
-
-	out = out.replace(URL_USERINFO_RE, (_m, scheme: string, user: string | undefined, pass: string) => {
-		const userPart = user ?? "";
-		if (alreadyMasked(pass)) return `${scheme}${userPart}:${pass}@`;
-		return `${scheme}${userPart}:${maskSecretValue(pass)}@`;
-	});
-
-	out = out.replace(RAW_JWT_RE, (jwt) => (alreadyMasked(jwt) ? jwt : maskSecretValue(jwt)));
-	out = out.replace(KNOWN_TOKEN_PREFIX_RE, (tok) => (alreadyMasked(tok) ? tok : maskSecretValue(tok)));
-
-	return out;
-}
-
-function redactTextForStorage(text: string | undefined, vault: SessionVault): string | undefined {
-	if (text === undefined) return undefined;
-	if (!text) return text;
-	const afterVault = redactVaultSecrets(text, vault);
-	return redactGenericSecrets(afterVault);
-}
-
-function isSensitiveHttpHeaderName(name: string): boolean {
-	const norm = name.trim();
-	if (!norm) return false;
-	if (STANDARD_NON_SENSITIVE_HTTP_HEADER_RE.test(norm)) return false;
-	return SENSITIVE_FIELD_KEY_RE.test(norm) || SENSITIVE_HTTP_HEADER_NAME_RE.test(norm);
-}
-
-function redactHeadersRecord(
-	headers: Record<string, string> | undefined,
-	vault: SessionVault,
-): Record<string, string> | undefined {
-	if (!headers) return undefined;
-	const out: Record<string, string> = {};
-	for (const [k, v] of Object.entries(headers)) {
-		const cleanV = String(v ?? "");
-		if (isSensitiveHttpHeaderName(k)) {
-			if (k.trim().toLowerCase() === "cookie" || k.trim().toLowerCase() === "set-cookie") {
-				out[k] = maskCookieHeaderLine(redactVaultSecrets(cleanV, vault));
-			} else {
-				const authScheme = /^(Bearer|Basic|Token|JWT)\s+(.+)$/i.exec(cleanV.trim());
-				if (authScheme?.[1] && authScheme[2]) {
-					const tok = authScheme[2].trim();
-					out[k] = alreadyMasked(tok)
-						? `${authScheme[1]} ${tok}`
-						: `${authScheme[1]} ${maskSecretValue(tok)}`;
-				} else {
-					out[k] = alreadyMasked(cleanV) ? cleanV : maskSecretValue(cleanV);
-				}
-			}
-		} else {
-			out[k] = redactTextForStorage(cleanV, vault) ?? cleanV;
-		}
-	}
-	return out;
-}
-
-function redactUnknownForStorage<T>(value: T, vault: SessionVault, depth = 0): T {
-	if (depth > 12 || value === null || value === undefined) return value;
-	if (typeof value === "string") {
-		return (redactTextForStorage(value, vault) ?? value) as unknown as T;
-	}
-	if (Array.isArray(value)) {
-		return value.map((item) => redactUnknownForStorage(item, vault, depth + 1)) as unknown as T;
-	}
-	if (typeof value === "object") {
-		const obj = value as Record<string, unknown>;
-		const out: Record<string, unknown> = {};
-		for (const [k, v] of Object.entries(obj)) {
-			if (typeof v === "string" && SENSITIVE_FIELD_KEY_RE.test(k.trim())) {
-				if (k.trim().toLowerCase() === "cookie" || k.trim().toLowerCase() === "set-cookie") {
-					out[k] = maskCookieHeaderLine(redactVaultSecrets(v, vault));
-				} else {
-					out[k] = alreadyMasked(v) ? v : maskSecretValue(v);
-				}
-			} else {
-				out[k] = redactUnknownForStorage(v, vault, depth + 1);
-			}
-		}
-		return out as T;
-	}
-	return value;
-}
-
 function safeLoadVault(root: string, explicit?: SessionVault): SessionVault {
 	if (explicit) return explicit;
 	try {
 		return loadSessionVault(root);
 	} catch {
 		return { schema: 1, updatedAt: "", roles: {} };
-	}
-}
-
-// ============================================================================
-// DDL 定义（10 张核心表 + FTS5 全文检索索引）
-// ============================================================================
-
-const CORE_DDL = `
-CREATE TABLE IF NOT EXISTS meta (
-	key TEXT PRIMARY KEY NOT NULL,
-	value TEXT NOT NULL,
-	updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS facts (
-	id TEXT PRIMARY KEY NOT NULL,
-	kind TEXT NOT NULL,
-	title TEXT NOT NULL,
-	detail TEXT NOT NULL,
-	command TEXT,
-	output TEXT,
-	intent TEXT,
-	fact_key TEXT,
-	created_at TEXT NOT NULL,
-	verified INTEGER,
-	verify_stage TEXT,
-	verify_note TEXT,
-	verified_at TEXT,
-	verified_by TEXT,
-	evidence_seq INTEGER,
-	asset_id TEXT,
-	target_key TEXT,
-	surface_domain TEXT,
-	evidence_ref TEXT,
-	meta_json TEXT,
-	agent_result_json TEXT,
-	extra_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_facts_kind ON facts(kind);
-CREATE INDEX IF NOT EXISTS idx_facts_created_at ON facts(created_at);
-CREATE INDEX IF NOT EXISTS idx_facts_fact_key ON facts(fact_key);
-CREATE INDEX IF NOT EXISTS idx_facts_target_key ON facts(target_key);
-CREATE INDEX IF NOT EXISTS idx_facts_verify_stage ON facts(verify_stage);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
-	fact_id UNINDEXED,
-	kind,
-	title,
-	detail,
-	command,
-	output,
-	fact_key,
-	target_key,
-	tokenize = 'unicode61'
-);
-
-CREATE TABLE IF NOT EXISTS intents (
-	id TEXT PRIMARY KEY NOT NULL,
-	phase TEXT NOT NULL,
-	intent_key TEXT NOT NULL,
-	title TEXT NOT NULL,
-	detail TEXT NOT NULL,
-	from_json TEXT NOT NULL,
-	to_fact_id TEXT,
-	status TEXT NOT NULL,
-	worker TEXT,
-	priority INTEGER NOT NULL,
-	attempts INTEGER NOT NULL DEFAULT 0,
-	created_at TEXT NOT NULL,
-	claimed_at TEXT,
-	done_at TEXT,
-	note TEXT,
-	next_run_at INTEGER,
-	hypothesis_id TEXT,
-	asset_id TEXT,
-	auth_role TEXT,
-	invalidated_reason TEXT,
-	expected_kind TEXT,
-	surface_domain TEXT,
-	target_key TEXT,
-	dedup_key TEXT,
-	hint_hash TEXT,
-	extra_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_intents_status ON intents(status);
-CREATE INDEX IF NOT EXISTS idx_intents_phase_status ON intents(phase, status);
-CREATE INDEX IF NOT EXISTS idx_intents_key ON intents(intent_key);
-CREATE INDEX IF NOT EXISTS idx_intents_dedup_key ON intents(dedup_key);
-CREATE INDEX IF NOT EXISTS idx_intents_priority ON intents(priority DESC);
-
-CREATE TABLE IF NOT EXISTS attempted (
-	attempted_key TEXT PRIMARY KEY NOT NULL,
-	entry_key TEXT NOT NULL,
-	expected_kind TEXT NOT NULL,
-	target_key TEXT NOT NULL,
-	surface_domain TEXT NOT NULL,
-	status TEXT NOT NULL,
-	at TEXT NOT NULL,
-	from_json TEXT NOT NULL,
-	extra_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_attempted_target ON attempted(target_key);
-CREATE INDEX IF NOT EXISTS idx_attempted_status ON attempted(status);
-
-CREATE TABLE IF NOT EXISTS assets (
-	id TEXT PRIMARY KEY NOT NULL,
-	kind TEXT NOT NULL,
-	target TEXT NOT NULL,
-	host TEXT,
-	port INTEGER,
-	scheme TEXT,
-	reachable_via_json TEXT,
-	tags_json TEXT,
-	source_fact_id TEXT,
-	created_at TEXT NOT NULL,
-	extra_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_assets_kind ON assets(kind);
-CREATE INDEX IF NOT EXISTS idx_assets_host ON assets(host);
-
-CREATE TABLE IF NOT EXISTS hypotheses (
-	id TEXT PRIMARY KEY NOT NULL,
-	title TEXT NOT NULL,
-	statement TEXT NOT NULL,
-	required_facts_json TEXT NOT NULL,
-	falsification_test TEXT NOT NULL,
-	expected_gain REAL NOT NULL,
-	estimated_cost REAL NOT NULL,
-	status TEXT NOT NULL,
-	linked_intents_json TEXT NOT NULL,
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL,
-	note TEXT,
-	extra_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
-
-CREATE TABLE IF NOT EXISTS journal (
-	seq INTEGER PRIMARY KEY AUTOINCREMENT,
-	ts TEXT NOT NULL,
-	type TEXT NOT NULL,
-	dedup_hash TEXT UNIQUE,
-	payload_json TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_journal_ts ON journal(ts);
-CREATE INDEX IF NOT EXISTS idx_journal_type ON journal(type);
-
-CREATE TABLE IF NOT EXISTS exec_ledger (
-	seq INTEGER PRIMARY KEY,
-	ts TEXT NOT NULL,
-	tool TEXT NOT NULL,
-	command TEXT,
-	session_id TEXT,
-	agent_name TEXT,
-	sha1 TEXT NOT NULL,
-	norm_sha1 TEXT NOT NULL,
-	bytes INTEGER NOT NULL DEFAULT 0,
-	snippet TEXT NOT NULL,
-	extra_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_exec_ledger_ts ON exec_ledger(ts);
-CREATE INDEX IF NOT EXISTS idx_exec_ledger_tool ON exec_ledger(tool);
-
-CREATE TABLE IF NOT EXISTS calibration_records (
-	prediction_id TEXT PRIMARY KEY NOT NULL,
-	intent_id TEXT,
-	task_category TEXT NOT NULL,
-	model_id TEXT NOT NULL,
-	predicted_confidence REAL NOT NULL,
-	estimated_tokens INTEGER,
-	outcome INTEGER,
-	is_false_positive INTEGER,
-	actual_tokens INTEGER,
-	duration_ms INTEGER,
-	source TEXT,
-	settled INTEGER NOT NULL DEFAULT 0,
-	created_at TEXT NOT NULL,
-	settled_at TEXT,
-	payload_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_calib_model_cat ON calibration_records(model_id, task_category);
-CREATE INDEX IF NOT EXISTS idx_calib_settled ON calibration_records(settled);
-CREATE INDEX IF NOT EXISTS idx_calib_created_at ON calibration_records(created_at);
-
-CREATE TABLE IF NOT EXISTS traffic_entries (
-	id TEXT PRIMARY KEY NOT NULL,
-	ts TEXT NOT NULL,
-	method TEXT NOT NULL,
-	url TEXT NOT NULL,
-	host TEXT NOT NULL,
-	path TEXT NOT NULL,
-	status INTEGER NOT NULL,
-	duration_ms INTEGER,
-	request_headers_json TEXT,
-	request_body_preview TEXT,
-	response_headers_json TEXT,
-	response_body_preview TEXT,
-	tags_json TEXT,
-	redacted INTEGER NOT NULL DEFAULT 1,
-	payload_json TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_traffic_host_path ON traffic_entries(host, path);
-CREATE INDEX IF NOT EXISTS idx_traffic_status ON traffic_entries(status);
-CREATE INDEX IF NOT EXISTS idx_traffic_ts ON traffic_entries(ts);
-`;
-
-const KNOWN_FACT_KEYS = new Set([
-	"id",
-	"kind",
-	"title",
-	"detail",
-	"command",
-	"output",
-	"intent",
-	"key",
-	"createdAt",
-	"meta",
-	"verified",
-	"verifyStage",
-	"verifyNote",
-	"verifiedAt",
-	"verifiedBy",
-	"evidenceSeq",
-	"assetId",
-	"targetKey",
-	"surfaceDomain",
-	"evidenceRef",
-	"agentResult",
-]);
-
-const KNOWN_INTENT_KEYS = new Set([
-	"id",
-	"phase",
-	"key",
-	"title",
-	"detail",
-	"from",
-	"to",
-	"status",
-	"worker",
-	"priority",
-	"attempts",
-	"createdAt",
-	"claimedAt",
-	"doneAt",
-	"note",
-	"nextRunAt",
-	"hypothesisId",
-	"assetId",
-	"authRole",
-	"invalidatedReason",
-	"expectedKind",
-	"surfaceDomain",
-	"targetKey",
-	"dedupKey",
-	"hintHash",
-]);
-
-const KNOWN_ATTEMPTED_KEYS = new Set([
-	"key",
-	"expectedKind",
-	"targetKey",
-	"surfaceDomain",
-	"status",
-	"at",
-	"from",
-]);
-
-const KNOWN_ASSET_KEYS = new Set([
-	"id",
-	"kind",
-	"target",
-	"host",
-	"port",
-	"scheme",
-	"reachableVia",
-	"tags",
-	"sourceFactId",
-	"createdAt",
-]);
-
-const KNOWN_HYPOTHESIS_KEYS = new Set([
-	"id",
-	"title",
-	"statement",
-	"requiredFacts",
-	"falsificationTest",
-	"expectedGain",
-	"estimatedCost",
-	"status",
-	"linkedIntents",
-	"createdAt",
-	"updatedAt",
-	"note",
-]);
-
-function extractExtraFields(obj: Record<string, unknown>, known: Set<string>): Record<string, unknown> | null {
-	const extra: Record<string, unknown> = {};
-	let count = 0;
-	for (const [k, v] of Object.entries(obj)) {
-		if (!known.has(k) && v !== undefined) {
-			extra[k] = v;
-			count += 1;
-		}
-	}
-	return count > 0 ? extra : null;
-}
-
-function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
-	if (!raw) return fallback;
-	try {
-		return JSON.parse(raw) as T;
-	} catch {
-		return fallback;
 	}
 }
 
@@ -828,16 +376,7 @@ function quarantineCorruptDbFiles(dbFile: string): string {
 	return backupPath;
 }
 
-function hasTable(db: Database, name: string): boolean {
-	try {
-		const row = db
-			.query("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?")
-			.get(name) as { name?: string } | null;
-		return Boolean(row?.name);
-	} catch {
-		return false;
-	}
-}
+const hasTable = hasSqliteTable;
 
 function isReadonlyCantOpenError(err: unknown): boolean {
 	const msg = String(err instanceof Error ? err.message : err ?? "").toLowerCase();
@@ -874,15 +413,8 @@ function configureAndInitDb(db: Database, dbFile: string, readonly: boolean): vo
 
 	if (!readonly) {
 		runWithBusyRetry(() => {
-			db.exec(CORE_DDL);
-			const initTx = db.transaction(() => {
-				db.query("INSERT OR IGNORE INTO meta (key, value, updated_at) VALUES (?, ?, ?)").run(
-					"schema_version",
-					String(SQLITE_SCHEMA_VERSION),
-					nowIso(),
-				);
-			});
-			initTx.immediate();
+			db.exec(V1_CORE_DDL);
+			migrateSqliteSchemaV1ToV2(db);
 		});
 		safeChmod600(dbFile);
 	}
@@ -962,34 +494,15 @@ function openReadonlyWalIsolatedSnapshot(dbFile: string): Database {
 	}
 }
 
-/** 供外部模块（如 lineage 探针）零原目录写入安全只读打开指定 SQLite 文件。 */
+/** 供外部模块（如 lineage 探针）零原目录写入安全只读打开指定 SQLite 文件（含非空 -wal + -shm 时统一走隔离快照，杜绝触碰原目录 -shm）。 */
 export function openSqliteReadonlyZeroWrite(dbFile: string): Database {
 	if (!existsSync(dbFile)) {
 		throw new Error(`SQLITE_CANTOPEN: unable to open database file (${dbFile})`);
 	}
-	if (!hasNonEmptyWalSidecar(dbFile)) {
-		return openReadonlyMemorySnapshot(dbFile);
-	}
-	if (!existsSync(`${dbFile}-shm`)) {
+	if (hasNonEmptyWalSidecar(dbFile)) {
 		return openReadonlyWalIsolatedSnapshot(dbFile);
 	}
-	let db: Database | null = null;
-	try {
-		db = new Database(dbFile, { readonly: true });
-		db.exec("PRAGMA busy_timeout = 3000;");
-		db.exec("PRAGMA query_only = ON;");
-		return db;
-	} catch (err) {
-		try {
-			db?.close();
-		} catch {
-			/* ignore */
-		}
-		if (isReadonlyCantOpenError(err)) {
-			return openReadonlyWalIsolatedSnapshot(dbFile);
-		}
-		throw err;
-	}
+	return openReadonlyMemorySnapshot(dbFile);
 }
 
 export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
@@ -1014,27 +527,25 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 			if (!existsSync(dbFile)) {
 				throw new Error(`SQLITE_CANTOPEN: unable to open database file (${dbFile})`);
 			}
-			// 无活跃非空 -wal 或有 -wal 但缺 -shm 时直接走内存只读快照（隔离重放 WAL），确保 100% 零新建 -wal/-shm、零 mtime 变动
-			if (!hasNonEmptyWalSidecar(dbFile) || !existsSync(`${dbFile}-shm`)) {
-				let memDb: Database | null = null;
+			// 所有只读打开统一走纯内存只读快照（存在非空 -wal 时在隔离临时目录重放 WAL 后载入内存），确保原目录 nuwa.db/-wal/-shm 100% 零字节变动
+			let memDb: Database | null = null;
+			try {
+				memDb = hasNonEmptyWalSidecar(dbFile)
+					? openReadonlyWalIsolatedSnapshot(dbFile)
+					: openReadonlyMemorySnapshot(dbFile);
+				configureAndInitDb(memDb, dbFile, true);
+				return memDb;
+			} catch (memErr) {
 				try {
-					memDb = hasNonEmptyWalSidecar(dbFile)
-						? openReadonlyWalIsolatedSnapshot(dbFile)
-						: openReadonlyMemorySnapshot(dbFile);
-					configureAndInitDb(memDb, dbFile, true);
-					return memDb;
-				} catch (memErr) {
-					try {
-						memDb?.close();
-					} catch {
-						/* ignore */
-					}
-					if (memErr instanceof NuwaSqliteCorruptError) throw memErr;
-					if (isCorruptError(memErr)) {
-						throw new NuwaSqliteCorruptError(dbFile, memErr instanceof Error ? memErr.message : String(memErr));
-					}
-					throw memErr;
+					memDb?.close();
+				} catch {
+					/* ignore */
 				}
+				if (memErr instanceof NuwaSqliteCorruptError) throw memErr;
+				if (isCorruptError(memErr)) {
+					throw new NuwaSqliteCorruptError(dbFile, memErr instanceof Error ? memErr.message : String(memErr));
+				}
+				throw memErr;
 			}
 		}
 
@@ -1090,177 +601,6 @@ export function openNuwaDb(root: string, opts?: OpenNuwaDbOptions): Database {
 		}
 		throw err;
 	}
-}
-
-// ============================================================================
-// 行结构 <-> 领域对象双向转换（保证 100% 无损往返）
-// ============================================================================
-
-function factFromRow(row: Record<string, any>): Fact {
-	const extra = safeJsonParse<Record<string, unknown>>(row.extra_json, {});
-	const fact: Fact = {
-		...extra,
-		id: String(row.id),
-		kind: String(row.kind) as FactKind,
-		title: String(row.title),
-		detail: String(row.detail),
-		createdAt: String(row.created_at),
-	};
-	if (row.command !== null && row.command !== undefined) fact.command = String(row.command);
-	if (row.output !== null && row.output !== undefined) fact.output = String(row.output);
-	if (row.intent !== null && row.intent !== undefined) fact.intent = String(row.intent);
-	if (row.fact_key !== null && row.fact_key !== undefined) fact.key = String(row.fact_key);
-	if (row.verified !== null && row.verified !== undefined) fact.verified = Number(row.verified) !== 0;
-	if (row.verify_stage !== null && row.verify_stage !== undefined) {
-		fact.verifyStage = String(row.verify_stage) as VerifyStage;
-	}
-	if (row.verify_note !== null && row.verify_note !== undefined) fact.verifyNote = String(row.verify_note);
-	if (row.verified_at !== null && row.verified_at !== undefined) fact.verifiedAt = String(row.verified_at);
-	if (row.verified_by !== null && row.verified_by !== undefined) fact.verifiedBy = String(row.verified_by);
-	if (row.evidence_seq !== null && row.evidence_seq !== undefined) fact.evidenceSeq = Number(row.evidence_seq);
-	if (row.asset_id !== null && row.asset_id !== undefined) fact.assetId = String(row.asset_id);
-	if (row.target_key !== null && row.target_key !== undefined) fact.targetKey = String(row.target_key);
-	if (row.surface_domain !== null && row.surface_domain !== undefined) {
-		fact.surfaceDomain = String(row.surface_domain) as SurfaceDomain;
-	}
-	if (row.evidence_ref !== null && row.evidence_ref !== undefined) fact.evidenceRef = String(row.evidence_ref);
-	if (row.meta_json) {
-		const meta = safeJsonParse<Fact["meta"]>(row.meta_json, undefined);
-		if (meta !== undefined) fact.meta = meta;
-	}
-	if (row.agent_result_json) {
-		const ar = safeJsonParse<Record<string, unknown> | undefined>(row.agent_result_json, undefined);
-		if (ar !== undefined) fact.agentResult = ar;
-	}
-	return fact;
-}
-
-function intentFromRow(row: Record<string, any>): Intent {
-	const extra = safeJsonParse<Record<string, unknown>>(row.extra_json, {});
-	const intent: Intent = {
-		...extra,
-		id: String(row.id),
-		phase: String(row.phase) as Intent["phase"],
-		key: String(row.intent_key),
-		title: String(row.title),
-		detail: String(row.detail),
-		from: safeJsonParse<string[]>(row.from_json, []),
-		status: String(row.status) as Intent["status"],
-		priority: Number(row.priority),
-		attempts: Number(row.attempts),
-		createdAt: String(row.created_at),
-	};
-	if (row.to_fact_id !== null && row.to_fact_id !== undefined) intent.to = String(row.to_fact_id);
-	if (row.worker !== null && row.worker !== undefined) intent.worker = String(row.worker);
-	if (row.claimed_at !== null && row.claimed_at !== undefined) intent.claimedAt = String(row.claimed_at);
-	if (row.done_at !== null && row.done_at !== undefined) intent.doneAt = String(row.done_at);
-	if (row.note !== null && row.note !== undefined) intent.note = String(row.note);
-	if (row.next_run_at !== null && row.next_run_at !== undefined) intent.nextRunAt = Number(row.next_run_at);
-	if (row.hypothesis_id !== null && row.hypothesis_id !== undefined) intent.hypothesisId = String(row.hypothesis_id);
-	if (row.asset_id !== null && row.asset_id !== undefined) intent.assetId = String(row.asset_id);
-	if (row.auth_role !== null && row.auth_role !== undefined) intent.authRole = String(row.auth_role);
-	if (row.invalidated_reason !== null && row.invalidated_reason !== undefined) {
-		intent.invalidatedReason = String(row.invalidated_reason);
-	}
-	if (row.expected_kind !== null && row.expected_kind !== undefined) {
-		intent.expectedKind = String(row.expected_kind) as FactKind;
-	}
-	if (row.surface_domain !== null && row.surface_domain !== undefined) {
-		intent.surfaceDomain = String(row.surface_domain) as SurfaceDomain;
-	}
-	if (row.target_key !== null && row.target_key !== undefined) intent.targetKey = String(row.target_key);
-	if (row.dedup_key !== null && row.dedup_key !== undefined) intent.dedupKey = String(row.dedup_key);
-	if (row.hint_hash !== null && row.hint_hash !== undefined) intent.hintHash = String(row.hint_hash);
-	return intent;
-}
-
-function normalizeAttemptedSurfaceDomain(rawDomain: unknown, targetKey: unknown): SurfaceDomain {
-	if (rawDomain === "port" || rawDomain === "path" || rawDomain === "host") {
-		return rawDomain;
-	}
-	const key = String(targetKey ?? "").trim();
-	if (/^port:/i.test(key) || /^(?:[a-z0-9.-]+:)?\d{1,5}(?:\/(?:tcp|udp))?$/i.test(key)) {
-		return "port";
-	}
-	if (/^path:/i.test(key) || key.startsWith("/")) {
-		return "path";
-	}
-	if (/^https?:\/\//i.test(key)) {
-		try {
-			const u = new URL(key);
-			if (u.pathname && u.pathname !== "/") return "path";
-			if (u.search) return "path";
-		} catch {
-			/* ignore */
-		}
-	}
-	const slashIdx = key.indexOf("/");
-	if (slashIdx > 0 && !/^\d+\/(?:tcp|udp)$/i.test(key)) {
-		return "path";
-	}
-	return "host";
-}
-
-function attemptedFromRow(row: Record<string, any>): [string, AttemptedEntry] {
-	const extra = safeJsonParse<Record<string, unknown>>(row.extra_json, {});
-	const targetKey = String(row.target_key);
-	const entry: AttemptedEntry = {
-		...extra,
-		key: String(row.entry_key),
-		expectedKind: String(row.expected_kind) as FactKind,
-		targetKey,
-		surfaceDomain: normalizeAttemptedSurfaceDomain(row.surface_domain, targetKey),
-		status: String(row.status) as "done" | "blocked",
-		at: String(row.at),
-		from: safeJsonParse<string[]>(row.from_json, []),
-	};
-	return [String(row.attempted_key), entry];
-}
-
-function assetFromRow(row: Record<string, any>): AssetNode {
-	const extra = safeJsonParse<Record<string, unknown>>(row.extra_json, {});
-	const node: AssetNode = {
-		...extra,
-		id: String(row.id),
-		kind: String(row.kind) as AssetNode["kind"],
-		target: String(row.target),
-		createdAt: String(row.created_at),
-	};
-	if (row.host !== null && row.host !== undefined) node.host = String(row.host);
-	if (row.port !== null && row.port !== undefined) node.port = Number(row.port);
-	if (row.scheme !== null && row.scheme !== undefined) node.scheme = String(row.scheme);
-	if (row.reachable_via_json) {
-		const rv = safeJsonParse<string[] | undefined>(row.reachable_via_json, undefined);
-		if (rv !== undefined) node.reachableVia = rv;
-	}
-	if (row.tags_json) {
-		const tags = safeJsonParse<string[] | undefined>(row.tags_json, undefined);
-		if (tags !== undefined) node.tags = tags;
-	}
-	if (row.source_fact_id !== null && row.source_fact_id !== undefined) {
-		node.sourceFactId = String(row.source_fact_id);
-	}
-	return node;
-}
-
-function hypothesisFromRow(row: Record<string, any>): HypothesisNode {
-	const extra = safeJsonParse<Record<string, unknown>>(row.extra_json, {});
-	const node: HypothesisNode = {
-		...extra,
-		id: String(row.id),
-		title: String(row.title),
-		statement: String(row.statement),
-		requiredFacts: safeJsonParse<string[]>(row.required_facts_json, []),
-		falsificationTest: String(row.falsification_test),
-		expectedGain: Number(row.expected_gain),
-		estimatedCost: Number(row.estimated_cost),
-		status: String(row.status) as HypothesisNode["status"],
-		linkedIntents: safeJsonParse<string[]>(row.linked_intents_json, []),
-		createdAt: String(row.created_at),
-		updatedAt: String(row.updated_at),
-	};
-	if (row.note !== null && row.note !== undefined) node.note = String(row.note);
-	return node;
 }
 
 // ============================================================================
@@ -1900,6 +1240,8 @@ export class NuwaSqliteStore {
 	appendExecLedger(entry: ExecLedgerEntry, opts?: { vault?: SessionVault }): void {
 		const vault = safeLoadVault(this.root, opts?.vault);
 		const safeEntry = redactUnknownForStorage(entry, vault);
+		const preservedSessionId =
+			typeof entry.sessionId === "string" ? redactTextForStorage(entry.sessionId, vault) ?? null : null;
 		const tx = this.db.transaction(() => {
 			this.db
 				.query(
@@ -1912,7 +1254,7 @@ export class NuwaSqliteStore {
 					safeEntry.ts,
 					safeEntry.tool,
 					safeEntry.command ?? null,
-					safeEntry.sessionId ?? null,
+					preservedSessionId,
 					safeEntry.agentName ?? null,
 					safeEntry.sha1,
 					safeEntry.normSha1,
@@ -2111,6 +1453,319 @@ export class NuwaSqliteStore {
 			...(r.tags_json ? { tags: safeJsonParse<string[]>(r.tags_json, []) } : {}),
 			redacted: Number(r.redacted) !== 0,
 			...(r.payload_json ? { payload: safeJsonParse<Record<string, unknown>>(r.payload_json, {}) } : {}),
+		}));
+	}
+
+	/** 写入脱敏后的现代协议帧记录（`protocol_frames` 表）。 */
+	upsertProtocolFrame(frame: ProtocolFrameRow, opts?: { vault?: SessionVault }): void {
+		const vault = safeLoadVault(this.root, opts?.vault);
+		const safeHeaders = redactHeadersRecord(frame.headers, vault);
+		const safePreview = redactTextForStorage(frame.payloadPreview, vault);
+		const safeUrl = redactTextForStorage(frame.url, vault) ?? frame.url;
+		const safeSchema = frame.schemaSummary ? redactUnknownForStorage(frame.schemaSummary, vault) : undefined;
+		const safeExtra = frame.extra ? redactUnknownForStorage(frame.extra, vault) : undefined;
+		const tx = this.db.transaction(() => {
+			this.db
+				.query(
+					`INSERT OR REPLACE INTO protocol_frames (
+						id, ts, protocol, direction, url, host, operation_name, role, status,
+						frame_seq, headers_json, payload_preview, schema_summary_json, anomaly_tag, redacted, extra_json
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+				)
+				.run(
+					frame.id,
+					frame.ts || nowIso(),
+					frame.protocol,
+					frame.direction || "bidirectional",
+					safeUrl,
+					frame.host.toLowerCase(),
+					frame.operationName ?? null,
+					frame.role ?? null,
+					frame.status ?? null,
+					frame.frameSeq ?? null,
+					safeHeaders ? JSON.stringify(safeHeaders) : null,
+					safePreview ?? null,
+					safeSchema ? JSON.stringify(safeSchema) : null,
+					frame.anomalyTag ?? null,
+					safeExtra ? JSON.stringify(safeExtra) : null,
+				);
+		});
+		runWithBusyRetry(() => tx.immediate());
+	}
+
+	/** 查询现代协议帧记录（若只读连接打开的是旧版 v1 库则安全返回空数组，零写盘不报错）。 */
+	listProtocolFrames(filter?: { protocol?: string; host?: string; limit?: number }): ProtocolFrameRow[] {
+		if (!hasTable(this.db, "protocol_frames")) return [];
+		const clauses: string[] = [];
+		const params: Array<string | number> = [];
+		if (filter?.protocol) {
+			clauses.push("protocol = ?");
+			params.push(filter.protocol);
+		}
+		if (filter?.host) {
+			clauses.push("host = ?");
+			params.push(filter.host.toLowerCase());
+		}
+		const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+		const limit = clampInt(filter?.limit, 200, 1, 2000);
+		const rows = this.db
+			.query(`SELECT * FROM protocol_frames ${where} ORDER BY ts DESC LIMIT ?`)
+			.all(...params, limit) as Array<Record<string, any>>;
+		return rows.map((r) => ({
+			id: String(r.id),
+			ts: String(r.ts),
+			protocol: String(r.protocol),
+			direction: String(r.direction) as ProtocolFrameDirection,
+			url: String(r.url),
+			host: String(r.host),
+			...(r.operation_name !== null && r.operation_name !== undefined ? { operationName: String(r.operation_name) } : {}),
+			...(r.role !== null && r.role !== undefined ? { role: String(r.role) } : {}),
+			...(r.status !== null && r.status !== undefined ? { status: Number(r.status) } : {}),
+			...(r.frame_seq !== null && r.frame_seq !== undefined ? { frameSeq: Number(r.frame_seq) } : {}),
+			...(r.headers_json ? { headers: safeJsonParse<Record<string, string>>(r.headers_json, {}) } : {}),
+			...(r.payload_preview !== null && r.payload_preview !== undefined ? { payloadPreview: String(r.payload_preview) } : {}),
+			...(r.schema_summary_json ? { schemaSummary: safeJsonParse<Record<string, unknown>>(r.schema_summary_json, {}) } : {}),
+			...(r.anomaly_tag !== null && r.anomaly_tag !== undefined ? { anomalyTag: String(r.anomaly_tag) } : {}),
+			redacted: Number(r.redacted) !== 0,
+			...(r.extra_json ? { extra: safeJsonParse<Record<string, unknown>>(r.extra_json, {}) } : {}),
+		}));
+	}
+
+	/** 写入跨资产凭据复用验证记录（`asset_credentials` 表，强制仅存幂等指纹与掩码预览）。 */
+	upsertAssetCredential(row: AssetCredentialRow, opts?: { vault?: SessionVault }): void {
+		const vault = safeLoadVault(this.root, opts?.vault);
+		const afterVaultPreview = row.maskedPreview ? redactVaultSecrets(row.maskedPreview, vault) : undefined;
+		const safePreview = afterVaultPreview
+			? alreadyMasked(afterVaultPreview)
+				? afterVaultPreview.trim()
+				: maskSecretValue(afterVaultPreview)
+			: undefined;
+		const safeFingerprint = normalizeCredentialFingerprint(row.credFingerprint);
+		const safeVerifiedEndpoint = redactTextForStorage(row.verifiedEndpoint, vault);
+		const safeExtra = row.extra ? redactUnknownForStorage(row.extra, vault) : undefined;
+		const tx = this.db.transaction(() => {
+			this.db
+				.query(
+					`INSERT OR REPLACE INTO asset_credentials (
+						id, asset_id, host, port, role, cred_kind, cred_fingerprint, masked_preview,
+						status, source_asset_id, verified_endpoint, verified_status_code,
+						expires_at, last_verified_at, created_at, updated_at, extra_json
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.run(
+					row.id,
+					row.assetId,
+					row.host.toLowerCase(),
+					row.port ?? null,
+					row.role,
+					row.credKind,
+					safeFingerprint,
+					safePreview ?? null,
+					row.status,
+					row.sourceAssetId ?? null,
+					safeVerifiedEndpoint ?? null,
+					row.verifiedStatusCode ?? null,
+					row.expiresAt ?? null,
+					row.lastVerifiedAt ?? null,
+					row.createdAt || nowIso(),
+					row.updatedAt || nowIso(),
+					safeExtra ? JSON.stringify(safeExtra) : null,
+				);
+		});
+		runWithBusyRetry(() => tx.immediate());
+	}
+
+	/** 查询跨资产凭据验证记录（旧版 v1 只读库安全返回空数组）。 */
+	listAssetCredentials(filter?: { assetId?: string; role?: string; status?: AssetCredentialStatus; limit?: number }): AssetCredentialRow[] {
+		if (!hasTable(this.db, "asset_credentials")) return [];
+		const clauses: string[] = [];
+		const params: Array<string | number> = [];
+		if (filter?.assetId) {
+			clauses.push("asset_id = ?");
+			params.push(filter.assetId);
+		}
+		if (filter?.role) {
+			clauses.push("role = ?");
+			params.push(filter.role);
+		}
+		if (filter?.status) {
+			clauses.push("status = ?");
+			params.push(filter.status);
+		}
+		const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+		const limit = clampInt(filter?.limit, 200, 1, 2000);
+		const rows = this.db
+			.query(`SELECT * FROM asset_credentials ${where} ORDER BY updated_at DESC LIMIT ?`)
+			.all(...params, limit) as Array<Record<string, any>>;
+		return rows.map((r) => ({
+			id: String(r.id),
+			assetId: String(r.asset_id),
+			host: String(r.host),
+			...(r.port !== null && r.port !== undefined ? { port: Number(r.port) } : {}),
+			role: String(r.role),
+			credKind: String(r.cred_kind),
+			credFingerprint: String(r.cred_fingerprint),
+			...(r.masked_preview !== null && r.masked_preview !== undefined ? { maskedPreview: String(r.masked_preview) } : {}),
+			status: String(r.status) as AssetCredentialStatus,
+			...(r.source_asset_id !== null && r.source_asset_id !== undefined ? { sourceAssetId: String(r.source_asset_id) } : {}),
+			...(r.verified_endpoint !== null && r.verified_endpoint !== undefined ? { verifiedEndpoint: String(r.verified_endpoint) } : {}),
+			...(r.verified_status_code !== null && r.verified_status_code !== undefined ? { verifiedStatusCode: Number(r.verified_status_code) } : {}),
+			...(r.expires_at !== null && r.expires_at !== undefined ? { expiresAt: String(r.expires_at) } : {}),
+			...(r.last_verified_at !== null && r.last_verified_at !== undefined ? { lastVerifiedAt: String(r.last_verified_at) } : {}),
+			createdAt: String(r.created_at),
+			updatedAt: String(r.updated_at),
+			...(r.extra_json ? { extra: safeJsonParse<Record<string, unknown>>(r.extra_json, {}) } : {}),
+		}));
+	}
+
+	/** 写入或更新延迟 OOB 因果归因台账记录（`oob_correlations` 表）。 */
+	upsertOobCorrelation(row: OobCorrelationRow, opts?: { vault?: SessionVault }): void {
+		const vault = safeLoadVault(this.root, opts?.vault);
+		const safeEndpoint = redactTextForStorage(row.endpoint, vault) ?? row.endpoint;
+		const safeDetail = redactTextForStorage(row.callbackDetail, vault);
+		const safeExtra = row.extra ? redactUnknownForStorage(row.extra, vault) : undefined;
+		const tx = this.db.transaction(() => {
+			this.db
+				.query(
+					`INSERT OR REPLACE INTO oob_correlations (
+						canary_id, project_id, intent_id, fact_id, endpoint, param_name, template_hash,
+						auth_role, channel, token_sig, status, callback_ts, callback_source_ip,
+						callback_detail, created_at, extra_json
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.run(
+					row.canaryId,
+					row.projectId,
+					row.intentId ?? null,
+					row.factId ?? null,
+					safeEndpoint,
+					row.paramName ?? null,
+					row.templateHash ?? null,
+					row.authRole ?? null,
+					row.channel || "http",
+					row.tokenSig ?? null,
+					row.status || "pending",
+					row.callbackTs ?? null,
+					row.callbackSourceIp ?? null,
+					safeDetail ?? null,
+					row.createdAt || nowIso(),
+					safeExtra ? JSON.stringify(safeExtra) : null,
+				);
+		});
+		runWithBusyRetry(() => tx.immediate());
+	}
+
+	/** 查询延迟 OOB 因果归因台账记录（旧版 v1 只读库安全返回空数组）。 */
+	listOobCorrelations(filter?: { status?: OobCorrelationStatus; intentId?: string; limit?: number }): OobCorrelationRow[] {
+		if (!hasTable(this.db, "oob_correlations")) return [];
+		const clauses: string[] = [];
+		const params: Array<string | number> = [];
+		if (filter?.status) {
+			clauses.push("status = ?");
+			params.push(filter.status);
+		}
+		if (filter?.intentId) {
+			clauses.push("intent_id = ?");
+			params.push(filter.intentId);
+		}
+		const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+		const limit = clampInt(filter?.limit, 200, 1, 2000);
+		const rows = this.db
+			.query(`SELECT * FROM oob_correlations ${where} ORDER BY created_at DESC LIMIT ?`)
+			.all(...params, limit) as Array<Record<string, any>>;
+		return rows.map((r) => ({
+			canaryId: String(r.canary_id),
+			projectId: String(r.project_id),
+			...(r.intent_id !== null && r.intent_id !== undefined ? { intentId: String(r.intent_id) } : {}),
+			...(r.fact_id !== null && r.fact_id !== undefined ? { factId: String(r.fact_id) } : {}),
+			endpoint: String(r.endpoint),
+			...(r.param_name !== null && r.param_name !== undefined ? { paramName: String(r.param_name) } : {}),
+			...(r.template_hash !== null && r.template_hash !== undefined ? { templateHash: String(r.template_hash) } : {}),
+			...(r.auth_role !== null && r.auth_role !== undefined ? { authRole: String(r.auth_role) } : {}),
+			channel: String(r.channel),
+			...(r.token_sig !== null && r.token_sig !== undefined ? { tokenSig: String(r.token_sig) } : {}),
+			status: String(r.status) as OobCorrelationStatus,
+			...(r.callback_ts !== null && r.callback_ts !== undefined ? { callbackTs: String(r.callback_ts) } : {}),
+			...(r.callback_source_ip !== null && r.callback_source_ip !== undefined ? { callbackSourceIp: String(r.callback_source_ip) } : {}),
+			...(r.callback_detail !== null && r.callback_detail !== undefined ? { callbackDetail: String(r.callback_detail) } : {}),
+			createdAt: String(r.created_at),
+			...(r.extra_json ? { extra: safeJsonParse<Record<string, unknown>>(r.extra_json, {}) } : {}),
+		}));
+	}
+
+	/** 写入或更新有状态工作流链执行记录（`workflow_runs` 表）。 */
+	upsertWorkflowRun(row: WorkflowRunRow, opts?: { vault?: SessionVault }): void {
+		const vault = safeLoadVault(this.root, opts?.vault);
+		const safeUrl = redactTextForStorage(row.targetUrl, vault) ?? row.targetUrl;
+		const safeSummary = redactTextForStorage(row.summary, vault);
+		const safeSteps = row.steps ? redactUnknownForStorage(row.steps, vault) : undefined;
+		const safeExtra = row.extra ? redactUnknownForStorage(row.extra, vault) : undefined;
+		const tx = this.db.transaction(() => {
+			this.db
+				.query(
+					`INSERT OR REPLACE INTO workflow_runs (
+						run_id, workflow_kind, action_level, intent_id, target_url, role, status,
+						step_count, broken_at_step, cleanup_executed, candidate_fact_id,
+						started_at, finished_at, summary, steps_json, extra_json
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.run(
+					row.runId,
+					row.workflowKind,
+					row.actionLevel,
+					row.intentId ?? null,
+					safeUrl,
+					row.role ?? null,
+					row.status,
+					row.stepCount,
+					row.brokenAtStep ?? null,
+					row.cleanupExecuted ? 1 : 0,
+					row.candidateFactId ?? null,
+					row.startedAt || nowIso(),
+					row.finishedAt ?? null,
+					safeSummary ?? null,
+					safeSteps ? JSON.stringify(safeSteps) : null,
+					safeExtra ? JSON.stringify(safeExtra) : null,
+				);
+		});
+		runWithBusyRetry(() => tx.immediate());
+	}
+
+	/** 查询有状态工作流链执行记录（旧版 v1 只读库安全返回空数组）。 */
+	listWorkflowRuns(filter?: { workflowKind?: string; status?: string; limit?: number }): WorkflowRunRow[] {
+		if (!hasTable(this.db, "workflow_runs")) return [];
+		const clauses: string[] = [];
+		const params: Array<string | number> = [];
+		if (filter?.workflowKind) {
+			clauses.push("workflow_kind = ?");
+			params.push(filter.workflowKind);
+		}
+		if (filter?.status) {
+			clauses.push("status = ?");
+			params.push(filter.status);
+		}
+		const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+		const limit = clampInt(filter?.limit, 200, 1, 2000);
+		const rows = this.db
+			.query(`SELECT * FROM workflow_runs ${where} ORDER BY started_at DESC LIMIT ?`)
+			.all(...params, limit) as Array<Record<string, any>>;
+		return rows.map((r) => ({
+			runId: String(r.run_id),
+			workflowKind: String(r.workflow_kind),
+			actionLevel: String(r.action_level),
+			...(r.intent_id !== null && r.intent_id !== undefined ? { intentId: String(r.intent_id) } : {}),
+			targetUrl: String(r.target_url),
+			...(r.role !== null && r.role !== undefined ? { role: String(r.role) } : {}),
+			status: String(r.status),
+			stepCount: Number(r.step_count),
+			...(r.broken_at_step !== null && r.broken_at_step !== undefined ? { brokenAtStep: Number(r.broken_at_step) } : {}),
+			cleanupExecuted: Number(r.cleanup_executed) !== 0,
+			...(r.candidate_fact_id !== null && r.candidate_fact_id !== undefined ? { candidateFactId: String(r.candidate_fact_id) } : {}),
+			startedAt: String(r.started_at),
+			...(r.finished_at !== null && r.finished_at !== undefined ? { finishedAt: String(r.finished_at) } : {}),
+			...(r.summary !== null && r.summary !== undefined ? { summary: String(r.summary) } : {}),
+			...(r.steps_json ? { steps: safeJsonParse<Array<Record<string, unknown>>>(r.steps_json, []) } : {}),
+			...(r.extra_json ? { extra: safeJsonParse<Record<string, unknown>>(r.extra_json, {}) } : {}),
 		}));
 	}
 }
@@ -2327,6 +1982,10 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 				);
 				for (const { lineIndex, parsed } of execLines) {
 					const safe = redactUnknownForStorage(parsed, vault);
+					const preservedSid =
+						typeof parsed.sessionId === "string"
+							? redactTextForStorage(parsed.sessionId, vault) ?? null
+							: null;
 					const seq =
 						typeof safe.seq === "number" && Number.isFinite(safe.seq) && safe.seq > 0
 							? Math.floor(safe.seq)
@@ -2336,7 +1995,7 @@ export function migrateJsonToSqlite(root: string, opts?: MigrateJsonOptions): Mi
 						typeof safe.ts === "string" ? safe.ts : nowIso(),
 						typeof safe.tool === "string" ? safe.tool : "unknown",
 						typeof safe.command === "string" ? safe.command : null,
-						typeof safe.sessionId === "string" ? safe.sessionId : null,
+						preservedSid,
 						typeof safe.agentName === "string" ? safe.agentName : null,
 						typeof safe.sha1 === "string" ? safe.sha1 : sha256Hex(String(safe.snippet ?? "")).slice(0, 40),
 						typeof safe.normSha1 === "string" ? safe.normSha1 : sha256Hex(String(safe.snippet ?? "")).slice(0, 40),

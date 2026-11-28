@@ -181,13 +181,17 @@ export {
 	type ExportEpisodeTimelineOptions, type WriteEpisodeArchiveResult,
 } from "./reporting";
 export {
-	NuwaSqliteCorruptError, NuwaSqliteStore, SQLITE_SCHEMA_VERSION, appendJournalSqlite,
-	exportStateJsonCompat, loadStateFromSqlite, migrateJsonToSqlite, openNuwaDb, queryFactsByText,
-	saveStateToSqlite,
-	type AppendJournalOptions, type CalibrationRecordRow, type ExportCompatOptions, type ExportCompatResult,
-	type FactSearchHit, type LoadSqliteStateOptions, type MigrateJsonOptions, type MigrateJsonResult,
-	type OpenNuwaDbOptions, type QueryFactsOptions, type SaveSqliteStateOptions, type TrafficEntryRow,
-	type TrafficQueryFilter as SqliteTrafficQueryFilter,
+	ALL_SQLITE_TABLES, NuwaSqliteCorruptError, NuwaSqliteStore, SQLITE_SCHEMA_VERSION, V1_CORE_TABLES,
+	V2_EXTENSION_TABLES, appendJournalSqlite, exportStateJsonCompat, loadStateFromSqlite,
+	migrateJsonToSqlite, migrateSqliteSchemaV1ToV2, openNuwaDb, openSqliteReadonlyZeroWrite,
+	queryFactsByText, readSqliteSchemaVersion, saveStateToSqlite,
+	type AppendJournalOptions, type AssetCredentialRow, type AssetCredentialStatus, type CalibrationRecordRow,
+	type ExportCompatOptions, type ExportCompatResult, type FactSearchHit, type LoadSqliteStateOptions,
+	type MigrateJsonOptions, type MigrateJsonResult, type OobCorrelationRow, type OobCorrelationStatus,
+	type OpenNuwaDbOptions, type ProtocolFrameDirection, type ProtocolFrameKind, type ProtocolFrameRow,
+	type QueryFactsOptions, type SaveSqliteStateOptions, type SqliteSchemaMigrationResult,
+	type SqliteTableName, type TrafficEntryRow, type TrafficQueryFilter as SqliteTrafficQueryFilter,
+	type V1CoreTableName, type V2ExtensionTableName, type WorkflowActionLevel, type WorkflowRunRow,
 } from "./sqlite-store";
 export {
 	DEFAULT_AUTHDIFF_COOLDOWN_MS, DEFAULT_MAX_AUTH_PATHS, DEFAULT_MAX_NEW_OOB_CANARIES,
