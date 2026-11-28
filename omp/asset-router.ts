@@ -266,11 +266,35 @@ function collectCredentialSecrets(credentials: readonly CredentialSpec[]): strin
 		out.push(s);
 		const bare = s.replace(/^(?:Bearer|Basic|Token|JWT)\s+/i, "").trim();
 		if (bare.length >= 4 && bare !== s) out.push(bare);
+		if (/^Basic\s+/i.test(s) && bare.length >= 4) {
+			try {
+				const decoded = Buffer.from(bare, "base64").toString("utf8");
+				if (decoded.length >= 4 && !/[\x00-\x08\x0e-\x1f]/.test(decoded)) {
+					out.push(decoded);
+					const colon = decoded.indexOf(":");
+					if (colon > 0 && decoded.slice(colon + 1).length >= 4) out.push(decoded.slice(colon + 1));
+				}
+			} catch {}
+		}
 	};
 	for (const cred of credentials) {
 		push(cred.token);
 		for (const v of Object.values(cred.cookies ?? {})) push(v);
-		for (const v of Object.values(cred.headers ?? {})) push(v);
+		for (const [k, v] of Object.entries(cred.headers ?? {})) {
+			push(v);
+			if (/^cookie2?$/i.test(k.trim())) {
+				for (const part of String(v ?? "").split(";")) {
+					const trimmed = part.trim();
+					if (!trimmed) continue;
+					push(trimmed);
+					const eq = trimmed.indexOf("=");
+					if (eq >= 0) {
+						const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+						push(val);
+					}
+				}
+			}
+		}
 	}
 	return uniq(out).sort((a, b) => b.length - a.length);
 }
@@ -300,14 +324,21 @@ function scrubText(text: string, root?: string, extraSecrets?: readonly string[]
 	return maskExtraSecrets(out, extraSecrets);
 }
 
-function scrubUrl(url: string, root?: string, extraSecrets?: string[]): string {
+function scrubUrl(url: string, root?: string, extraSecrets?: readonly string[]): string {
 	const src = String(url ?? "");
 	if (!src) return src;
 	try {
-		return maskExtraSecrets(redactTrafficUrl(src, { root, extraSecrets }), extraSecrets);
+		return maskExtraSecrets(redactTrafficUrl(src, { root, extraSecrets: extraSecrets ? [...extraSecrets] : undefined }), extraSecrets);
 	} catch {
 		return maskExtraSecrets(src, extraSecrets);
 	}
+}
+
+function scrubRouteUrl(rawUrl: string, root?: string, extraSecrets?: readonly string[]): string {
+	const src = String(rawUrl ?? "").trim();
+	if (!src) return src;
+	const noUserinfo = src.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/i, "$1[REDACTED]@");
+	return scrubUrl(noUserinfo, root, extraSecrets);
 }
 
 function scrubHeaders(
@@ -968,7 +999,7 @@ export async function verifyCredentialPivot(
 				results.push({
 					...baseFinding,
 					status: "invalid",
-					reason: `认证响应被重定向至登录端点（${scrubUrl(redirectLocation, root)}），判定为无效凭据`,
+					reason: `认证响应被重定向至登录端点（${scrubUrl(redirectLocation, root, extraSecrets)}），判定为无效凭据`,
 				});
 				continue;
 			}
@@ -1129,25 +1160,47 @@ interface ChainTrace {
 }
 
 function traceReachability(startId: string, byId: Map<string, AssetNode>): ChainTrace {
+	const state = new Map<string, 1 | 2>();
+	const path: string[] = [];
 	const chain: string[] = [];
-	const seen = new Set<string>();
-	let current: string | undefined = startId;
+	const chainSet = new Set<string>();
 	let cycle = false;
 	let cyclePath: string[] = [];
 
-	while (current) {
-		if (seen.has(current)) {
-			const startAt = chain.indexOf(current);
-			cyclePath = [...chain.slice(startAt >= 0 ? startAt : 0), current];
-			cycle = true;
-			break;
+	const pushNode = (id: string): { id: string; nextIdx: number; edges: string[] } | null => {
+		if (!chainSet.has(id)) {
+			chainSet.add(id);
+			chain.push(id);
 		}
-		const node = byId.get(current);
-		if (!node) break;
-		seen.add(current);
-		chain.push(current);
-		const next = reachableViaOf(node).find((id) => id !== current);
-		current = next;
+		const node = byId.get(id);
+		if (!node) return null;
+		state.set(id, 1);
+		path.push(id);
+		return { id, nextIdx: 0, edges: reachableViaOf(node) };
+	};
+
+	const first = pushNode(startId);
+	if (first) {
+		const stack = [first];
+		while (stack.length > 0) {
+			const top = stack[stack.length - 1]!;
+			if (top.nextIdx >= top.edges.length) {
+				stack.pop();
+				path.pop();
+				state.set(top.id, 2);
+				continue;
+			}
+			const nextId = top.edges[top.nextIdx++]!;
+			if (nextId === top.id || state.get(nextId) === 1) {
+				const startAt = path.indexOf(nextId);
+				cyclePath = [...path.slice(startAt >= 0 ? startAt : 0), nextId];
+				cycle = true;
+				break;
+			}
+			if (state.get(nextId) === 2) continue;
+			const nextFrame = pushNode(nextId);
+			if (nextFrame) stack.push(nextFrame);
+		}
 	}
 
 	return { chain, cycle, cyclePath };
@@ -1340,39 +1393,45 @@ export function resolveAssetRoutePlan(opts: ResolveAssetRoutePlanOptions): Asset
 		]);
 
 		const assetUrl = readString(asset, "url");
+		const safeAssetUrl = assetUrl ? scrubRouteUrl(assetUrl) : undefined;
+		const safeProxyUrl = decision.proxyUrl ? scrubRouteUrl(decision.proxyUrl) : undefined;
+		const safeReason = decision.reason.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/gi, "$1[REDACTED]@");
 		const portCandidate =
 			typeof (asset as unknown as Record<string, unknown>).port === "number"
 				? ((asset as unknown as Record<string, unknown>).port as number)
 				: undefined;
+		const safeReachableVia = uniq([...trace.chain.slice(1), ...reachableViaOf(asset)]).filter(
+			(id) => id && id !== assetId,
+		);
 
 		const entry: AssetRoutePlanEntry = {
 			assetId,
 			host,
 			assetKind: readString(asset, "kind") ?? "unknown",
 			route: decision.route,
-			proxyUrl: decision.proxyUrl,
+			proxyUrl: safeProxyUrl,
 			tunnelId: decision.tunnelId,
 			chain: trace.chain,
 			cycleDetected: trace.cycle,
 			blocked: decision.route === "blocked",
-			reason: decision.reason,
+			reason: safeReason,
 			privateHost: isPrivateHost(host),
 			credentialRoles,
-			endpoint: assetUrl ? scrubUrl(assetUrl) : host ? builtTargetLabel({ host, port: portCandidate }) : undefined,
+			endpoint: safeAssetUrl ?? (host ? builtTargetLabel({ host, port: portCandidate }) : undefined),
 		};
 		entries.push(entry);
 
 		const upsert = {
 			id: assetId,
 			host: host || undefined,
-			url: assetUrl || undefined,
+			url: safeAssetUrl,
 			port: portCandidate,
 			ports: (readStringArray(asset, "ports").map((p) => Number(p)).filter((n) => Number.isFinite(n)) as number[]).slice(0, 8),
 			kind: (readString(asset, "kind") ?? "target") as unknown as UpsertAssetInput["kind"],
 			tags: uniq([...(readStringArray(asset, "tags") ?? []), `route:${decision.route}`]),
-			reachableVia: trace.chain.slice(1),
+			reachableVia: safeReachableVia,
 			sourceFactId: readString(asset, "sourceFactId"),
-			note: oneLine(`route=${decision.route}; ${decision.reason}`, 200),
+			note: oneLine(`route=${decision.route}; ${safeReason}`, 200),
 		} as unknown as UpsertAssetInput;
 		upserts.push(upsert);
 	}
@@ -1402,7 +1461,7 @@ export function resolveAssetRoutePlan(opts: ResolveAssetRoutePlanOptions): Asset
 		cycles,
 		entries,
 		upserts,
-		summary: summaryLines.join("\n"),
+		summary: summaryLines.join("\n").replace(/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/gi, "$1[REDACTED]@"),
 	};
 }
 
@@ -1474,10 +1533,18 @@ export function applySsrfUrlTemplate(template: string, target: string, host?: st
 	if (!injected) return raw;
 
 	if (containsTemplateToken(raw)) {
-		return raw
-			.replace(/\{\{\s*target\s*\}\}/gi, injected)
-			.replace(/\{\{\s*url\s*\}\}/gi, injected)
-			.replace(/\{\{\s*host\s*\}\}/gi, host ? String(host) : injected);
+		const qIdx = raw.indexOf("?");
+		const replaceTokens = (segment: string, encode: boolean): string => {
+			const tVal = encode ? encodeURIComponent(injected) : injected;
+			const hRaw = host ? String(host) : injected;
+			const hVal = encode ? encodeURIComponent(hRaw) : hRaw;
+			return segment
+				.replace(/\{\{\s*target\s*\}\}/gi, tVal)
+				.replace(/\{\{\s*url\s*\}\}/gi, tVal)
+				.replace(/\{\{\s*host\s*\}\}/gi, hVal);
+		};
+		if (qIdx < 0) return replaceTokens(raw, false);
+		return `${replaceTokens(raw.slice(0, qIdx), false)}${replaceTokens(raw.slice(qIdx), true)}`;
 	}
 
 	const encoded = encodeURIComponent(injected);
@@ -1645,6 +1712,12 @@ export async function probeViaConfirmedSsrf(
 		if (res.status === 0 || res.error) {
 			reachable = false;
 			reason = `请求失败: ${oneLine(res.error ?? "无响应", 100)}`;
+		} else if (res.status === 502 || res.status === 503 || res.status === 504) {
+			reachable = false;
+			reason = `上游代理/网关返回失败状态 HTTP ${res.status}，判定目标不可达`;
+		} else if (genericErrorText) {
+			reachable = false;
+			reason = `响应命中网络/连接失败指纹（HTTP ${res.status}, ${res.bodyBytes} bytes），判定不可达`;
 		} else if (baseline.used && sameHash && sameStatus) {
 			reachable = false;
 			reason = "响应与 canary 基线完全一致，疑似出口统一失败应答，判定不可达";
@@ -1652,9 +1725,6 @@ export async function probeViaConfirmedSsrf(
 			const delta = res.bodyBytes - baselineBytes;
 			reachable = true;
 			reason = `响应与 canary 基线差异（status ${baseline.status ?? "?"}→${res.status}, bytes=${res.bodyBytes}${delta ? `, Δ=${delta}` : ""}），判定可达`;
-		} else if (genericErrorText && res.bodyBytes < 32) {
-			reachable = false;
-			reason = "响应匹配静态失败指纹且体积极小，判定不可达";
 		} else {
 			reachable = true;
 			reason = `无 canary 基线，目标返回 HTTP ${res.status}（${res.bodyBytes} bytes），按可达处理`;

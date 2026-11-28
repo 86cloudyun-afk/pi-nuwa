@@ -233,21 +233,27 @@ export function detectGatewaySignature(input: GatewaySignalInput): GatewaySignal
 		markVendor("modsecurity", "ModSecurity 拦截标记", 0.5);
 	}
 
-	// Akamai
-	if (headerValue(headers, "akamai-grn") || htext.includes("x-akamai-")) {
-		markVendor("akamai", "akamai-grn/x-akamai-*", 0.5);
+	// Akamai：常态头仅在出现 403/429/503 或阻断特征页时计入阻断，避免误杀正常 200 CDN 响应
+	if (statusBlock && (headerValue(headers, "akamai-grn") || htext.includes("x-akamai-") || server.includes("akamaighost"))) {
+		markVendor("akamai", "akamai-grn/x-akamai-*/AkamaiGHost", 0.5);
 	}
-	if (server.includes("akamaighost") || (body && body.includes("reference #") && body.includes("access denied"))) {
-		markVendor("akamai", "AkamaiGHost / Reference # 页面", 0.4);
+	if (body && body.includes("reference #") && (body.includes("access denied") || statusBlock)) {
+		markVendor("akamai", "AkamaiGHost / Reference # 拦截页", 0.4);
 	}
 
 	// Imperva / Incapsula
-	if (headerValue(headers, "x-iinfo") || (body && IMPERVA_BODY_MARKERS.some((m) => body.includes(m)))) {
-		markVendor("imperva", "x-iinfo / Incapsula 标记", 0.5);
+	if (statusBlock && headerValue(headers, "x-iinfo")) {
+		markVendor("imperva", "x-iinfo", 0.5);
+	}
+	if (body && IMPERVA_BODY_MARKERS.some((m) => body.includes(m)) && (statusBlock || body.includes("unsuccessful") || body.includes("blocked") || body.includes("access denied"))) {
+		markVendor("imperva", "Incapsula 拦截标记", 0.5);
 	}
 
 	// Sucuri
-	if (headerValue(headers, "x-sucuri-id") || (body && SUCURI_BODY_MARKERS.some((m) => body.includes(m)))) {
+	if (statusBlock && headerValue(headers, "x-sucuri-id")) {
+		markVendor("sucuri", "x-sucuri-id", 0.45);
+	}
+	if (body && SUCURI_BODY_MARKERS.some((m) => body.includes(m))) {
 		markVendor("sucuri", "Sucuri 防火墙标记", 0.45);
 	}
 
@@ -800,7 +806,7 @@ function normalizePathKey(raw: string): string {
 }
 
 function isSuccessishStatus(status: number): boolean {
-	return (status >= 200 && status < 400) || status === 401;
+	return status >= 200 && status < 400;
 }
 
 /**
@@ -1268,11 +1274,19 @@ export class EmbeddedOobListener {
 		};
 	}
 
-	/** 生成 / 复用高熵 token 与 HMAC 签名。 */
+	/** 生成 / 复用高熵 token 与 HMAC 签名；禁止同 `canaryId` 跨项目覆写。 */
 	signToken(canaryId: string, projectId: string, intentId?: string): { token: string; signature: string } {
 		const existing = this.registrations.get(canaryId);
-		if (existing && existing.projectId === projectId && (existing.intentId ?? "") === (intentId ?? "")) {
-			return { token: existing.token, signature: existing.signature };
+		if (existing) {
+			if (existing.projectId !== projectId) {
+				throw new Error(`EmbeddedOobListener: canaryId "${canaryId}" 已绑定至项目 "${existing.projectId}"，禁止跨项目覆写`);
+			}
+			if ((existing.intentId ?? "") === (intentId ?? "")) {
+				return { token: existing.token, signature: existing.signature };
+			}
+			if (existing.intentId && intentId && existing.intentId !== intentId) {
+				throw new Error(`EmbeddedOobListener: canaryId "${canaryId}" 已绑定至意图 "${existing.intentId}"，禁止覆写`);
+			}
 		}
 		const token = randomBytes(18).toString("hex");
 		const signature = this.computeSignature(canaryId, projectId, intentId, token);
@@ -1394,10 +1408,11 @@ export class EmbeddedOobListener {
 			const tokenOk = safeEqual(reg.token, parsed.token);
 			const sigOk = this.verifySignature(parsed.canaryId, reg.projectId, parsed.token, parsed.signature);
 			if (!tokenOk || !sigOk) {
+				const safeForgedPath = url.pathname.split(reg.token).join("[REDACTED]").split(reg.signature).join("[REDACTED]");
 				this.recordForged({
 					canaryId: parsed.canaryId,
 					reason: "HMAC 签名校验失败（伪造或篡改）",
-					path: url.pathname,
+					path: safeForgedPath,
 					...(remote ? { remoteAddress: remote } : {}),
 				});
 				this.respond(res, 403, "forbidden");
@@ -1406,7 +1421,14 @@ export class EmbeddedOobListener {
 
 			const receivedAt = new Date(this.now()).toISOString();
 			const query: Record<string, string> = {};
-			for (const [key, value] of url.searchParams) query[key] = value;
+			for (const [key, value] of url.searchParams) {
+				const sensitiveKey = /^(?:tok|token|sig|signature|secret|hmac|mac|sign|auth)$/i.test(key);
+				const sensitiveVal = safeEqual(value, reg.token) || safeEqual(value, reg.signature);
+				query[key] = sensitiveKey || sensitiveVal ? "[REDACTED]" : value;
+			}
+			const safePath = url.pathname.startsWith(`${this.pathPrefix}/`)
+				? `${this.pathPrefix}/${encodeURIComponent(parsed.canaryId)}/[REDACTED]/[REDACTED]`
+				: url.pathname.split(reg.token).join("[REDACTED]").split(reg.signature).join("[REDACTED]");
 			const userAgent = headerValue(req.headers as HeaderBag, "user-agent");
 			this.hitSeq += 1;
 
@@ -1418,7 +1440,7 @@ export class EmbeddedOobListener {
 				projectId: reg.projectId,
 				tokenHash: sha256Hex(reg.token).slice(0, 16),
 				method: req.method ?? "GET",
-				path: url.pathname,
+				path: safePath,
 				query,
 				timestamp: receivedAt,
 				receivedAt,
@@ -1541,6 +1563,7 @@ export class OobCorrelator {
 	private readonly seenHitIds = new Set<string>();
 	private readonly externalHits: CorrelationHit[] = [];
 	private unmatchedHitCount = 0;
+	private correlatorForgedCount = 0;
 
 	constructor(options: { listener?: EmbeddedOobListener; now?: () => number } = {}) {
 		this.ownsListener = options.listener === undefined;
@@ -1605,7 +1628,7 @@ export class OobCorrelator {
 		return ingested;
 	}
 
-	/** 摄入单条回调（内部收件箱或人工注入）。 */
+	/** 摄入单条回调（内部收件箱或人工注入）；传入 `token` 时强制作恒定时间校验。 */
 	ingestHit(hit: CorrelationHit): boolean {
 		if (!hit || typeof hit.id !== "string" || hit.id.length === 0) return false;
 		if (this.seenHitIds.has(hit.id)) return false;
@@ -1620,6 +1643,11 @@ export class OobCorrelator {
 		const context = this.contexts.get(canaryId);
 		if (!context) {
 			this.unmatchedHitCount += 1;
+			return false;
+		}
+		if (hit.token !== undefined && (typeof hit.token !== "string" || !safeEqual(hit.token, context.token))) {
+			this.unmatchedHitCount += 1;
+			this.correlatorForgedCount += 1;
 			return false;
 		}
 		this.touch(hit, context);
@@ -1666,7 +1694,7 @@ export class OobCorrelator {
 			matches,
 			wakeSignals,
 			unmatchedHitCount: this.unmatchedHitCount,
-			rejectedForgedCount: this.listener.rejectedForgedCount,
+			rejectedForgedCount: this.listener.rejectedForgedCount + this.correlatorForgedCount,
 		};
 	}
 
@@ -1687,6 +1715,7 @@ export class OobCorrelator {
 		this.seenHitIds.clear();
 		this.externalHits.length = 0;
 		this.unmatchedHitCount = 0;
+		this.correlatorForgedCount = 0;
 	}
 
 	/** 关闭内部监听器（若由本关联器创建）。 */
@@ -1704,6 +1733,20 @@ export class OobCorrelator {
 		if (filter.canaryIds && filter.canaryIds.length > 0 && !filter.canaryIds.includes(context.canaryId)) return false;
 		if (typeof filter.minHits === "number" && aggregate.hitCount < filter.minHits) return false;
 		return true;
+	}
+
+	private scrubPath(rawPath: string, context: OobCanaryContext): string {
+		let safe = rawPath;
+		if (context.token && safe.includes(context.token)) safe = safe.split(context.token).join("[REDACTED]");
+		if (context.signature && safe.includes(context.signature)) safe = safe.split(context.signature).join("[REDACTED]");
+		const prefix = this.listener.pathPrefixValue;
+		if (safe.startsWith(`${prefix}/`)) {
+			const rest = safe.slice(prefix.length + 1).split("/");
+			if (rest.length >= 2) {
+				return `${prefix}/${rest[0]}/[REDACTED]${rest.length >= 3 ? "/[REDACTED]" : ""}`;
+			}
+		}
+		return safe.replace(/([?&](?:tok|token|sig|signature|secret|hmac|mac|sign|auth)=)[^&]*/gi, "$1[REDACTED]");
 	}
 
 	private touch(hit: CorrelationHit, context: OobCanaryContext): void {
@@ -1727,7 +1770,7 @@ export class OobCorrelator {
 		if (timestamp > aggregate.lastSeenAt) aggregate.lastSeenAt = timestamp;
 		if (hit.remoteAddress) aggregate.remoteAddresses.add(hit.remoteAddress);
 		if (hit.protocol) aggregate.protocols.add(hit.protocol);
-		if (hit.path) aggregate.paths.add(hit.path);
+		if (hit.path) aggregate.paths.add(this.scrubPath(hit.path, context));
 		aggregate.dirty = true;
 	}
 

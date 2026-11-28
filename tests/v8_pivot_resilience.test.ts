@@ -646,6 +646,44 @@ describe("verifyCredentialPivot —— 跨目标凭据复用复验", () => {
 			await server.close();
 		}
 	});
+
+	test("[P0-1 回归] 30x 登录重定向参数与 Cookie 分号子键值回显均彻底脱敏", async () => {
+		const cookieA = `ck_a_${randomBytes(4).toString("hex")}`;
+		const cookieB = `ck_b_${randomBytes(4).toString("hex")}`;
+		const server = await startLoopback((req: IncomingMessage, res: ServerResponse) => {
+			const path = (req.url ?? "/").split("?")[0] ?? "/";
+			if (path === "/redir") {
+				const rawCookie = String(req.headers.cookie ?? "");
+				if (rawCookie.includes(cookieB)) {
+					res.writeHead(302, {
+						location: `/login?next=/admin&token=${encodeURIComponent(cookieB)}&sid=${cookieA}`,
+					});
+					res.end("redirecting");
+					return;
+				}
+				res.writeHead(401, { "content-type": "text/plain" });
+				res.end("unauth");
+				return;
+			}
+			res.writeHead(200, { "content-type": "text/plain" });
+			res.end(`echo=${cookieA}; other=${cookieB}`);
+		});
+		try {
+			const stub = makeRealFetch();
+			const out = await (assetRouter.verifyCredentialPivot as Any)({
+				scope: buildScope(),
+				fetchFn: stub.fn,
+				credentials: [{ role: "ops", headers: { Cookie: `a=${cookieA}; b=${cookieB}` } }],
+				candidates: [candidate("t-redir", `${server.origin}/redir`)],
+			});
+			const text = jsonText(out);
+			expect(text.includes(cookieA)).toBe(false);
+			expect(text.includes(cookieB)).toBe(false);
+			expect(text.includes("[REDACTED]")).toBe(true);
+		} finally {
+			await server.close();
+		}
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -843,6 +881,64 @@ describe("resolveAssetRoutePlan —— 多资产可达拓扑选路", () => {
 		expect(Date.now() - startedAt).toBeLessThan(3000);
 		expect(routeEntries(plan).length).toBeGreaterThan(0);
 		expect(jsonText(plan)).toContain("l4");
+	});
+
+	test("[P0-1 & P1-2 回归] 自环/多父次分支成环必拦截、外部跳板血缘保留、URL/代理 userinfo 全脱敏", () => {
+		const secretPass = `p4ss_${randomBytes(4).toString("hex")}`;
+		const assets = [
+			assetNode("self-loop", {
+				host: "self.example.com",
+				url: `https://alice:${secretPass}@self.example.com/`,
+				reachableVia: ["self-loop"],
+			}),
+			assetNode("branch-ok", {
+				host: "ok.example.com",
+				url: "https://ok.example.com/",
+			}),
+			assetNode("branch-bad", {
+				host: "bad.example.com",
+				url: "https://bad.example.com/",
+				reachableVia: ["multi-root"],
+			}),
+			assetNode("multi-root", {
+				host: "multi.example.com",
+				url: `https://bob:${secretPass}@multi.example.com/api`,
+				reachableVia: ["branch-ok", "branch-bad"],
+			}),
+			assetNode("ext-pivot", {
+				host: "10.10.0.9",
+				ip: "10.10.0.9",
+				url: "http://10.10.0.9:8080/",
+				reachableVia: ["fact-ext-ssrf-99"],
+			}),
+		];
+		const tunnels = [
+			{
+				id: "tn-secret",
+				proxyUrl: `socks5h://proxyu:${secretPass}@10.10.0.2:1080`,
+				targetCidrs: ["10.0.0.0/8"],
+			},
+		];
+		const plan = resolvePlan({ assets, tunnels });
+		const selfEntry = entryFor(plan, "self-loop");
+		expect(selfEntry?.cycleDetected).toBe(true);
+		expect(selfEntry?.blocked).toBe(true);
+		expect(routeKindOf(selfEntry)).toBe("blocked");
+
+		const multiEntry = entryFor(plan, "multi-root");
+		expect(multiEntry?.cycleDetected).toBe(true);
+		expect(multiEntry?.blocked).toBe(true);
+		expect(routeKindOf(multiEntry)).toBe("blocked");
+
+		const extUpsert = (plan.upserts ?? []).find((u: Any) => u.id === "ext-pivot");
+		expect(extUpsert).toBeDefined();
+		expect(extUpsert.reachableVia).toContain("fact-ext-ssrf-99");
+
+		const serialized = jsonText(plan);
+		expect(serialized.includes(secretPass)).toBe(false);
+		expect(serialized.includes("alice")).toBe(false);
+		expect(serialized.includes("bob")).toBe(false);
+		expect(serialized.includes("proxyu")).toBe(false);
 	});
 });
 
@@ -1042,6 +1138,38 @@ describe("probeViaConfirmedSsrf —— 仅对已确认 SSRF 做内网可达性�
 			await server.close();
 		}
 	});
+
+	test("[P1-1 回归] 上游 502 / 报错文案（>=32B）不误判为可达，查询参数槽位对目标 URL 做编码", async () => {
+		const encoded = assetRouter.applySsrfUrlTemplate(
+			"http://pivot.example/proxy?target={{target}}&mode=strict",
+			"http://127.0.0.1:8080/a?x=1&admin=1",
+			"127.0.0.1",
+		);
+		expect(encoded).toContain("mode=strict");
+		expect(encoded).not.toContain("&admin=1");
+		expect(encoded).toContain(encodeURIComponent("http://127.0.0.1:8080/a?x=1&admin=1"));
+
+		const server = await startLoopback((_req: IncomingMessage, res: ServerResponse) => {
+			res.writeHead(502, { "content-type": "text/plain" });
+			res.end("upstream dial tcp 127.0.0.1:18080: connection refused (detailed gateway diagnostic body > 32 bytes)");
+		});
+		try {
+			const stub = makeRealFetch();
+			const out = await probeSsrf({
+				fact: ssrfFact("confirmed"),
+				targets: [ssrfTarget("t-502", server.origin)],
+				scope: buildScope(),
+				urlTemplate: `${server.origin}/proxy?url={{target}}`,
+				fetchFn: stub.fn,
+			});
+			expect(out.ok).toBe(false);
+			expect((out.discoveredAssets ?? []).length).toBe(0);
+			const finding = (out.findings ?? [])[0];
+			expect(finding?.reachable).toBe(false);
+		} finally {
+			await server.close();
+		}
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1246,22 @@ describe("韧性层：网关签名指纹与出口代理自适应轮换", () => {
 		} as Any);
 		const awsText = jsonText(awsWaf).toLowerCase();
 		expect(awsText).toMatch(/aws|waf|hard|block/);
+
+		// [P1-3 回归] 正常 HTTP 200 响应携带 CDN 常态头不得误判为阻断
+		for (const headers of [
+			{ server: "AkamaiGHost", "akamai-grn": "0.abcd.1234", "content-type": "application/json" },
+			{ "x-iinfo": "10-12345-0 0CNN", "content-type": "text/html" },
+			{ "x-sucuri-id": "12004", "content-type": "text/html" },
+			{ server: "cloudflare", "cf-ray": "8b1f2c3d4e5f-SJC", "content-type": "application/json" },
+		]) {
+			const ok200 = resilience.detectGatewaySignature({
+				status: 200,
+				headers,
+				body: '{"ok":true,"items":[1,2,3]}',
+			} as Any);
+			expect(ok200.blocked).toBe(false);
+			expect(ok200.kind).toBe("none");
+		}
 	});
 
 	test("buildAdaptiveVariants：仅使用合规 HTTP 语义，不含伪造头与协议走私技巧", () => {
@@ -1440,6 +1584,20 @@ describe("IsomorphicTrapDetector —— 同构蜜罐 / tarpit 识别", () => {
 		expect(text).not.toMatch(/"circuitbreak"\s*:\s*true/);
 		expect(text).not.toMatch(/"istrapdetected"\s*:\s*true/);
 		expect(text).not.toMatch(/"confidence"\s*:\s*"(high|medium)"/);
+	});
+
+	test("[P1-4 回归] 统一 401 JSON 鉴权拒绝响应不得误杀为同构陷阱熔断", () => {
+		const detector = makeTrapDetector();
+		for (let i = 0; i < 6; i += 1) {
+			ingestSample(
+				detector,
+				trapSample(`/api/private/resource-${i}`, 401, '{"error":"unauthorized","code":401}', 15),
+			);
+		}
+		const evaluation = readTrapEvaluation(detector, undefined);
+		expect(evaluation?.isTrapDetected).toBe(false);
+		expect(evaluation?.circuitBreak).toBe(false);
+		expect(evaluation?.confidence).toBe("none");
 	});
 });
 
@@ -1775,5 +1933,62 @@ describe("EmbeddedOobListener / OobCorrelator —— 带外回调关联", () => 
 			await stopFn();
 		}
 		expect(await connectionRefused(port)).toBe(true);
+	});
+
+	test("[P0-2 回归] 回调凭证脱敏、跨项目 canaryId 覆写拒绝与 ingestHit token 强校验", async () => {
+		const listener = new (resilience as Any).EmbeddedOobListener({ host: "127.0.0.1", port: 0, pathPrefix: "/oob" });
+		const correlator = new (resilience as Any).OobCorrelator({ listener });
+		try {
+			const ep = await listener.start();
+			const ctx = correlator.register({
+				canaryId: `c-p02-${randomBytes(3).toString("hex")}`,
+				projectId: "proj-alpha",
+				intentId: "intent-alpha",
+				endpoint: "POST /api/webhook",
+			});
+
+			// 1. 跨项目复用同一 canaryId 必须抛错，且不破坏原项目签名
+			expect(() =>
+				listener.registerCanary({ canaryId: ctx.canaryId, projectId: "proj-evil" }),
+			).toThrow();
+			expect(listener.verifySignature(ctx.canaryId, "proj-alpha", ctx.token, ctx.signature)).toBe(true);
+
+			// 2. 真实命中后，listener.getHits().path/query 与 correlator evidence.paths 不得泄露明文 token/signature
+			const res = await fetch(`${ep.baseUrl}/oob/${encodeURIComponent(ctx.canaryId)}/${ctx.token}/${ctx.signature}?token=${ctx.token}&sig=${ctx.signature}&note=ok`);
+			expect(res.status).toBe(200);
+			await res.text();
+
+			const hitsText = jsonText(listener.getHits());
+			expect(hitsText.includes(ctx.token)).toBe(false);
+			expect(hitsText.includes(ctx.signature)).toBe(false);
+			expect(hitsText.includes("[REDACTED]")).toBe(true);
+
+			// 3. ingestHit 传入错误或空 token 必须拒收并计数
+			expect(
+				correlator.ingestHit({
+					id: "fake-hit-1",
+					canaryId: ctx.canaryId,
+					token: "wrong-token-value",
+					path: `/oob/${ctx.canaryId}/${ctx.token}/${ctx.signature}`,
+				}),
+			).toBe(false);
+			expect(
+				correlator.ingestHit({
+					id: "fake-hit-2",
+					canaryId: ctx.canaryId,
+					token: "",
+				}),
+			).toBe(false);
+
+			const corr = correlator.correlateCallbacks();
+			expect(corr.matches.length).toBe(1);
+			expect(corr.unmatchedHitCount).toBeGreaterThanOrEqual(2);
+			expect(corr.rejectedForgedCount).toBeGreaterThanOrEqual(2);
+			const corrText = jsonText(corr);
+			expect(corrText.includes(ctx.token)).toBe(false);
+			expect(corrText.includes(ctx.signature)).toBe(false);
+		} finally {
+			await correlator.close();
+		}
 	});
 });
