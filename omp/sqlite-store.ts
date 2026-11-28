@@ -88,18 +88,19 @@ import {
 	type WorkflowRunRow,
 } from "./sqlite-schema";
 import type { ExecLedgerEntry } from "./evidence";
-import type {
-	AssetNode,
-	AttemptedEntry,
-	Fact,
-	FactKind,
-	HypothesisNode,
-	Intent,
-	NuwaState,
-	Project,
-	Runtime,
-	SurfaceDomain,
-	VerifyStage,
+import {
+	NUWA_VERSION,
+	type AssetNode,
+	type AttemptedEntry,
+	type Fact,
+	type FactKind,
+	type HypothesisNode,
+	type Intent,
+	type NuwaState,
+	type Project,
+	type Runtime,
+	type SurfaceDomain,
+	type VerifyStage,
 } from "./types";
 import type { JournalEntry } from "./ui";
 
@@ -851,7 +852,7 @@ export class NuwaSqliteStore {
 			);
 			setMeta.run("schema_version", String(SQLITE_SCHEMA_VERSION), ts);
 			setMeta.run("nuwa_schema", String(state.schema ?? SCHEMA), ts);
-			setMeta.run("nuwa_version", String(state.version ?? "7.0.0"), ts);
+			setMeta.run("nuwa_version", String(state.version ?? NUWA_VERSION), ts);
 			setMeta.run("project_json", JSON.stringify(projectCopy), ts);
 			setMeta.run("seq_json", JSON.stringify(seqCopy), ts);
 			setMeta.run("runtime_json", JSON.stringify(runtimeCopy), ts);
@@ -1059,7 +1060,7 @@ export class NuwaSqliteStore {
 		if (!project) return null;
 
 		const schema = Number(meta.get("nuwa_schema") ?? SCHEMA) || SCHEMA;
-		const version = meta.get("nuwa_version") ?? "7.0.0";
+		const version = meta.get("nuwa_version") ?? NUWA_VERSION;
 		const seq = safeJsonParse<{ fact: number; intent: number }>(meta.get("seq_json"), { fact: 0, intent: 0 });
 		const runtime = safeJsonParse<Runtime>(meta.get("runtime_json"), {} as Runtime);
 
@@ -1462,6 +1463,8 @@ export class NuwaSqliteStore {
 		const safeHeaders = redactHeadersRecord(frame.headers, vault);
 		const safePreview = redactTextForStorage(frame.payloadPreview, vault);
 		const safeUrl = redactTextForStorage(frame.url, vault) ?? frame.url;
+		const safeOperationName = redactTextForStorage(frame.operationName, vault);
+		const safeAnomalyTag = redactTextForStorage(frame.anomalyTag, vault);
 		const safeSchema = frame.schemaSummary ? redactUnknownForStorage(frame.schemaSummary, vault) : undefined;
 		const safeExtra = frame.extra ? redactUnknownForStorage(frame.extra, vault) : undefined;
 		const tx = this.db.transaction(() => {
@@ -1479,14 +1482,14 @@ export class NuwaSqliteStore {
 					frame.direction || "bidirectional",
 					safeUrl,
 					frame.host.toLowerCase(),
-					frame.operationName ?? null,
+					safeOperationName ?? null,
 					frame.role ?? null,
 					frame.status ?? null,
 					frame.frameSeq ?? null,
 					safeHeaders ? JSON.stringify(safeHeaders) : null,
 					safePreview ?? null,
 					safeSchema ? JSON.stringify(safeSchema) : null,
-					frame.anomalyTag ?? null,
+					safeAnomalyTag ?? null,
 					safeExtra ? JSON.stringify(safeExtra) : null,
 				);
 		});

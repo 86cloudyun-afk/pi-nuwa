@@ -18,6 +18,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync }
 import { join, resolve } from "node:path";
 import type { AssetNode, Fact, HypothesisNode, NuwaState } from "./types";
 import { partitionFactsByVerifyStage } from "./verifier-gate";
+import { writeStandalonePovScript } from "./rgs-analyzer";
 import { computeBodyHash, extractHitEvidenceMetrics, readFactEvidenceLog } from "./evidence";
 import { redactVaultSecrets } from "./session-vault";
 import { NuwaSqliteStore, resolveStorageBackend, sqliteDbPath } from "./sqlite-store";
@@ -773,8 +774,13 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 	const sarifObj = buildSarifReport(st, normRoot);
 	const sarifPath = recordWrite("report.sarif.json", `${JSON.stringify(sarifObj, null, 2)}\n`);
 
-	// 2. evidence-<factId>.json（仅包含已确认漏洞的脱敏审计取证记录）
+	// 2. evidence-<factId>.json 与零明文独立复验脚本 pov-<factId>.ts（仅包含已确认漏洞的脱敏记录）
 	const evidenceNames: string[] = [];
+	const povScriptNames: string[] = [];
+	const fallbackBaseUrl =
+		st.project.scheme === "local"
+			? "http://127.0.0.1:8080"
+			: st.project.url || st.project.target || "http://127.0.0.1:8080";
 	for (const fact of confirmed) {
 		const meta = inferFindingRuleMeta(fact);
 		const safeFactId = fact.id.replace(/[^a-zA-Z0-9._-]/g, "_");
@@ -800,6 +806,29 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 		);
 		recordWrite(fileName, `${JSON.stringify(record, null, 2)}\n`);
 		evidenceNames.push(fileName);
+
+		try {
+			const povWritten = writeStandalonePovScript(dir, {
+				fact,
+				baseUrl: fallbackBaseUrl,
+				vaultRootOrVault: normRoot,
+				scope: st.project.scope,
+			});
+			try {
+				chmodSync(povWritten.filePath, 0o600);
+			} catch {
+				/* ignore chmod error */
+			}
+			manifestEntries.push({
+				name: povWritten.fileName,
+				sha256: povWritten.sha256,
+				bytes: povWritten.bytes,
+			});
+			writtenFiles.push(povWritten.filePath);
+			povScriptNames.push(povWritten.fileName);
+		} catch {
+			/* 非 HTTP 事实跳过脚本生成 */
+		}
 	}
 
 	// 3. README.md
@@ -825,11 +854,12 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 		...(evidenceNames.length > 0
 			? evidenceNames.map((n) => `- \`${n}\`: 脱敏审计验证记录`)
 			: [`- (当前无已确认漏洞证据记录)`]),
+		...povScriptNames.map((n) => `- \`${n}\`: 零明文独立可运行复核脚本（凭据经环境变量按需注入）`),
 		``,
 		`## 复核指引`,
 		`1. 使用 \`sha256sum\` 对照 \`manifest.json\` 核验取证文件完整性。`,
 		`2. 将 \`report.sarif.json\` 导入代码托管或安全治理平台跟踪修复闭环。`,
-		`3. 本取证包仅包含经脱敏处理的只读审计验证记录，不包含任何明文凭据或自动化攻击脚本；复现核验须严格限定在书面授权范围内执行。`,
+		`3. 本取证包仅包含经脱敏处理的只读审计验证记录与零明文复核脚本（\`pov-*.ts\`），不包含任何硬编码凭据；复现核验须严格限定在书面授权范围内执行。`,
 		``,
 	];
 	recordWrite("README.md", readmeLines.join("\n"));

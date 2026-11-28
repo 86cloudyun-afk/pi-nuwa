@@ -10,8 +10,8 @@ echo "[g7] 1/7 版本单一事实来源与 install.sh 动态回显校验 (7.0.0)
 VER_OUT="$(python3 tests/version_check.py --require-install-echo 2>&1)"
 rc=$?
 echo "$VER_OUT"
-if (( rc != 0 )) || [[ "$VER_OUT" != *"version_check: OK (7.0.0)"* ]]; then
-  echo "FAIL: version_check 未通过或版本非 7.0.0" >&2
+if (( rc != 0 )) || [[ "$VER_OUT" != *"version_check: OK ("* ]]; then
+  echo "FAIL: version_check 未通过" >&2
   fail=1
 fi
 

@@ -1,35 +1,30 @@
-# 架构设计：女娲 v7.0.0 单核合一、专精小队与全栈认知安全引擎
+# 架构设计：女娲 v8.0.0 模块化全栈认知安全与有状态协议演武引擎
 
 ## 1. 架构总览
 
-女娲 v7.0.0 完成了从双端并行实现到 **宿主无关单一权威内核（`core/engine.ts`）** 的彻底收敛：`omp` 原生宿主入口（`omp/nuwa.ts`，`< 1,000` 行）与跨宿主标准 MCP 服务端（`core/mcp-server.ts` + `bin/nuwa-mcp`）100% 共享同一套状态机、12 个 `nuwa_*` 工具、28 个 `/nuwa` 斜杠命令与安全门禁；底层默认启用 **SQLite WAL 权威持久化**（同时严格守护遗留 JSON 项目只读零写盘），并在上层贯通 **5+1 专精特种小队**、**KB 2.0 混合语义与经验治理**、**原生 CDP 页面内借壳加签差分** 与 **2～4 跳能力互补攻击链合成引擎**。
+女娲 v8.0.0 在单核合一（`core/engine.ts`）基础上完成了全仓反巨石单向无环（DAG）拆解与 **SQLite Schema v2（14 张表）** 平滑演进：全仓每一个 `core/*.ts`、`omp/*.ts`、`kb/*.ts` 与 `bin/nuwa-autonomous` 均严格 `< 2,500` 行（`omp/nuwa.ts < 1,000` 行），100% 兼容 12 个 `nuwa_*` 工具、31 个 `/nuwa` 子命令与全部历史导出，并全面贯通 **有状态多方法工作流与并发屏障引擎**、**CDP TOTP 交互保活与 GraphQL/WS/RSC/gRPC-Web 多协议审计栈**、**跨资产公私网双轨路由与网关韧性/嵌入式 OOB 关联器**、**7 语言 + SPA Bundle 跨文件 RGS 图分析与零明文 `pov-*.ts` 独立复核脚本生成器** 以及 **12 场景 L4 演武场（含 `--live-openai-compat` 实网推理评测）**。
 
 ```mermaid
 flowchart TD
-    HostOMP["omp 精简宿主入口 (omp/nuwa.ts < 1000行)"] --> UnifiedEngine["单一权威执行核 (core/engine.ts: NuwaUnifiedEngine)"]
-    HostOMP --> DispatchBridge["异步派单与看门狗桥接 (omp/dispatch-bridge.ts)"]
+    HostOMP["omp 精简宿主入口 (omp/nuwa.ts < 1000行)"] --> UnifiedEngine["单一权威执行核 (core/engine.ts + engine-helpers.ts)"]
     HostMCP["跨宿主 MCP 客户端"] --> MCPServer["MCP Stdio 服务端 (core/mcp-server.ts + bin/nuwa-mcp)"]
     MCPServer --> UnifiedEngine
 
-    UnifiedEngine --> GraphFacade["图门面与结案编排层 (omp/graph.ts < 2500行)"]
-    GraphFacade --> GraphCmd["命令工作流与只读视图层 (omp/graph-commands.ts)"]
-    GraphCmd --> GraphPlan["规划去重与信念前沿层 (omp/graph-planner.ts)"]
-    GraphFacade --> GraphPlan
+    UnifiedEngine --> V8Cmd["v8 协议/路由/RGS 编排层 (omp/v8-commands.ts)"]
+    UnifiedEngine --> GraphFacade["图门面与结案编排层 (omp/graph.ts + graph-commands.ts + graph-planner.ts + graph-dedup.ts)"]
 
-    GraphPlan --> Squad["5+1 专精小队联合路由 (omp/specialist-squad.ts + agents/*.md)"]
-    UnifiedEngine --> KBv2["KB 2.0 混合语义与治理 (omp/kb-v2.ts + omp/kb.ts >= 520条)"]
-    GraphFacade --> Chains["多跳攻击链能力合成 (omp/chain-composer.ts)"]
-    GraphCmd --> CDP["原生 CDP 流量与加签差分 (omp/cdp-bridge.ts)"]
-    GraphPlan --> Belief["贝叶斯信念与 VoI 搜索 (omp/belief-search.ts)"]
-    GraphFacade --> Calib["反自证机械校准核 (omp/calibration.ts)"]
-    GraphFacade --> Storage["默认 SQLite WAL 存储底座 (omp/sqlite-store.ts + omp/storage.ts)"]
+    V8Cmd --> Stateful["有状态工作流与并发屏障 (omp/stateful-workflow.ts)"]
+    V8Cmd --> ProtoStack["CDP TOTP/加签与多协议审计 (cdp-auth + cdp-signed-probe + protocol-inspector)"]
+    V8Cmd --> PivotOob["跨资产路由与韧性回调 (asset-router + resilience-oob)"]
+    V8Cmd --> RGS["7语言跨文件 RGS 与独立 PoV (omp/rgs-analyzer.ts + reporting.ts)"]
+    GraphFacade --> SqliteV2["SQLite Schema v2 14表权威底座 (sqlite-store.ts + sqlite-schema.ts)"]
 ```
 
 ### 硬性架构不变量
-1. **单核合一与体积红线**：`omp/nuwa.ts` 严格 `< 1,000` 行、`omp/graph.ts` 严格 `< 2,500` 行；12 个 `nuwa_*` 核心工具名称、Schema 契约与 v4–v7 全部重导出符号 100% 向后兼容。
+1. **反巨石体积红线与导出兼容**：`omp/nuwa.ts` 严格 `< 1,000` 行，全仓所有 `core/*.ts`、`omp/*.ts`、`kb/*.ts`、`bin/nuwa-autonomous` 严格 `< 2,500` 行；12 个 `nuwa_*` 核心工具与 v4–v8 全部重导出符号 100% 向后兼容。
 2. **单向无环模块图（DAG）**：除总装入口 `omp/nuwa.ts` 外，所有 `omp/*.ts` 与 `core/*.ts` 模块严禁运行时反向 `import "./nuwa"`；零第三方 npm 依赖，全仓通过严格 `tsc -p tsconfig.json --noEmit` 与离线 `bun build`。
-3. **默认 SQLite WAL 与只读零写入**：`resolveStorageBackend` 默认返回 `"sqlite"`；写入时同步维护 `.nuwa/state.json` 兼容快照；在仅有 `.nuwa/state.json`（无 `nuwa.db`）的遗留目录执行任何只读查询/视图命令时，严格保证 **0 字节磁盘写入**（绝不自动创建 `nuwa.db`/`-wal`/`-shm`）。
-4. **全链路零明文凭据泄露**：SQLite 10 张表、FTS5 索引、CDP 流量录制、攻击链跨跳一次性票据、校准账本、SARIF 与 PoC 证据包全链路强制脱敏。
+3. **SQLite Schema v2 平滑迁移与严格只读零写入**：`SQLITE_SCHEMA_VERSION = 2`（10 张核心表 + `protocol_frames`、`asset_credentials`、`oob_correlations`、`workflow_runs` 4 张扩展表），旧版 v1 库读写打开时单事务原子无损迁移；对含活跃 `-wal` + `-shm` 的历史 v1 库、未初始化目录及仅有 `.nuwa/state.json` 的遗留目录执行只读查询或 `/nuwa proto|pivot|rgs` 视图命令时，严格保证 **0 字节磁盘写入**。
+4. **全链路零明文凭据与零硬编码密钥**：SQLite 全 14 张表、协议帧、凭据指纹（幂等 `sha256:<32hex>`）、SARIF 与 `pov-<factId>.ts` 独立脚本全程零明文落盘；L4 `--live-openai-compat` 严格从环境变量读取 API 密钥。
 
 ---
 

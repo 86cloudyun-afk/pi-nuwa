@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pi-nuwa v7.0 安装器：一键部署 omp 原生扩展全模块、单核合一引擎与跨宿主 MCP Server (nuwa-mcp)、
+# pi-nuwa v8.0 安装器：一键部署 omp 原生扩展全模块、单核合一引擎与跨宿主 MCP Server (nuwa-mcp)、
 # KB 2.0 混合语义便携知识库 kb.db (>=520条)、5+1 专精小队代理模板（6个）、nuwa-pentest skill 与无头守护器 nuwa-autonomous。
 #
 # 退出码：0 成功 / 1 依赖或自检缺失 / 2 参数错误 / 3 回滚失败
@@ -68,6 +68,14 @@ EXT_MODULES=(
   "omp/specialist-squad.ts"
   "omp/kb-v2.ts"
   "omp/dispatch-bridge.ts"
+  "omp/stateful-workflow.ts"
+  "omp/cdp-auth.ts"
+  "omp/cdp-signed-probe.ts"
+  "omp/protocol-inspector.ts"
+  "omp/asset-router.ts"
+  "omp/resilience-oob.ts"
+  "omp/rgs-analyzer.ts"
+  "omp/v8-commands.ts"
   "omp/env.d.ts"
 )
 

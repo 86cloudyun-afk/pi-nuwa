@@ -110,7 +110,7 @@ function setupExt(
 
 describe("v3.0 版本、工具红线、Profile 模式与开局防抢跑", () => {
 	test("VERSION 为 7.0.0 且严格保持 12 个注册工具", () => {
-		expect(mod.VERSION).toBe("7.0.0");
+		expect(mod.VERSION).toBe("8.0.0");
 		const dir = makeTempDir();
 		const { tools } = setupExt(dir);
 		expect(tools.size).toBe(12);

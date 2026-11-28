@@ -111,8 +111,8 @@ describe("v7.0.0 单核收敛、模块瘦身与向后兼容契约", () => {
 		expect(nuwaLines).toBeLessThan(1000);
 		expect(graphLines).toBeLessThan(2500);
 
-		expect(nuwaMod.VERSION).toBe("7.0.0");
-		expect(nuwaMod.NUWA_VERSION).toBe("7.0.0");
+		expect(nuwaMod.VERSION).toBe("8.0.0");
+		expect(nuwaMod.NUWA_VERSION).toBe("8.0.0");
 
 		// 验证 v7 核心导出符号全部挂载在 omp/nuwa.ts
 		expect(typeof nuwaMod.NuwaUnifiedEngine).toBe("function");
@@ -563,7 +563,7 @@ describe("v7.0.0 KB 2.0 混合语义治理、5+1 专精小队与多跳攻击链�
 			timeout: 60_000,
 		});
 		expect(res.status).toBe(0);
-		expect(res.stdout).toContain("installed version = 7.0.0");
+		expect(res.stdout).toContain("installed version = 8.0.0");
 
 		for (const role of [
 			"fujiang.md",

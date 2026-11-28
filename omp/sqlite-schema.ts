@@ -959,6 +959,11 @@ function redactGenericSecrets(text: string): string {
 		return `${hdr}: ${scheme} ${maskSecretValue(tok)}`;
 	});
 
+	out = out.replace(/\b(Bearer|Basic)\s+([A-Za-z0-9._~+/=-]{8,})/gi, (_m, scheme: string, tok: string) => {
+		if (alreadyMasked(tok)) return `${scheme} ${tok}`;
+		return `${scheme} ${maskSecretValue(tok)}`;
+	});
+
 	out = out.replace(GENERIC_API_KEY_HEADER_RE, (_m, hdr: string, tok: string) => {
 		if (alreadyMasked(tok)) return `${hdr}: ${tok}`;
 		return `${hdr}: ${maskSecretValue(tok)}`;

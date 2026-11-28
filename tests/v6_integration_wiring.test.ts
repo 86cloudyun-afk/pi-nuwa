@@ -127,8 +127,8 @@ describe("v6.0.0 架构不变量与 omp/graph.ts 巨石无环拆解兼容门面"
 		const ws = makeWorkspace();
 		const h = setupHarness(ws);
 
-		expect(nuwaMod.VERSION).toBe("7.0.0");
-		expect(nuwaMod.NUWA_VERSION).toBe("7.0.0");
+		expect(nuwaMod.VERSION).toBe("8.0.0");
+		expect(nuwaMod.NUWA_VERSION).toBe("8.0.0");
 		expect(h.tools.size).toBe(12);
 		expect([...h.tools.keys()].sort()).toEqual([...EXPECTED_12_TOOLS].sort());
 

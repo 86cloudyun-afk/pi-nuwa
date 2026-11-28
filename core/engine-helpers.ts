@@ -130,6 +130,9 @@ export const NUWA_SUBCOMMANDS = [
 	"cdp",
 	"chains",
 	"squad",
+	"proto",
+	"pivot",
+	"rgs",
 ] as const;
 
 export type NuwaSubcommand = (typeof NUWA_SUBCOMMANDS)[number];

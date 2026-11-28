@@ -1,4 +1,13 @@
-# 测试与阶段门禁验收记录（v7.0.0 最终封版报告）
+# 测试与阶段门禁验收记录（v8.0.0 总装预填与历史基线）
+
+> **v8.0.0 总装架构说明（待 Wave 2 全量测试员写入最终实测汇总指标）**：
+> - **版本与契约**：`VERSION = "8.0.0"`，`SQLITE_SCHEMA_VERSION = 2`（14 张表），12 个 `nuwa_*` 核心工具与 31 个 `/nuwa` 子命令，`contract(v2): 12/12` + `contract(v1): 13/13`。
+> - **反巨石行数红线**：`omp/nuwa.ts < 1,000` 行，全仓所有 `core/*.ts`、`omp/*.ts`、`kb/*.ts`、`bin/nuwa-autonomous` 严格 `< 2,500` 行。
+> - **新增门禁与四层靶场**：新增第 9 道门禁 `tests/gates/g8_v8.sh`（覆盖 7 个 `tests/v8_*.test.ts` 套件、0 硬编码密钥扫描、L2 `5/5`、L3 `3/3`、L4 `12/12` `--deterministic` 硬门禁，以及 `benchmarks/l4-arena/run-l4-eval.ts --live-openai-compat` 实网推理评测入口）。
+
+---
+
+## 历史封版基线（v7.0.0 最终封版报告）
 
 日期：2026-11-26  
 封版基线：基于 `main@bc9f9f9`（`bc9f9f9a6cd4a2184485ac3bda0adafb614bdbec`）经双路异构 Boost 终审与全量本地 CI 矩阵独立验收定稿。  

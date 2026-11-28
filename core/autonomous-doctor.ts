@@ -95,6 +95,17 @@ export const V7_EXT_MODULES = [
 	"dispatch-bridge.ts",
 ] as const;
 
+export const V8_EXT_MODULES = [
+	"stateful-workflow.ts",
+	"cdp-auth.ts",
+	"cdp-signed-probe.ts",
+	"protocol-inspector.ts",
+	"asset-router.ts",
+	"resilience-oob.ts",
+	"rgs-analyzer.ts",
+	"v8-commands.ts",
+] as const;
+
 /** Wave 0 无环拆解的 8 个 omp/ 底层子模块及其对应的父模块（用于体检防假绿并兼容 v4 旧版模拟环境）。 */
 export const FOUNDATION_EXT_SUBMODULE_PAIRS = [
 	{ parent: "storage.ts", child: "storage-io.ts" },
@@ -515,7 +526,16 @@ export function checkExtensionInstallation(agentHome: string) {
 		else v7ModulesMissing.push(mod);
 	}
 
-	const isV7OrAbove = typeof version === "string" && Number.parseInt(version.split(".")[0] ?? "0", 10) >= 7;
+	const v8ModulesFound: string[] = [];
+	const v8ModulesMissing: string[] = [];
+	for (const mod of V8_EXT_MODULES) {
+		if (existsSync(join(extDir, mod))) v8ModulesFound.push(mod);
+		else v8ModulesMissing.push(mod);
+	}
+
+	const majorVer = typeof version === "string" ? Number.parseInt(version.split(".")[0] ?? "0", 10) : 0;
+	const isV7OrAbove = majorVer >= 7;
+	const isV8OrAbove = majorVer >= 8;
 
 	// 校验 Wave 0 拆解的 8 个 omp 底层子模块（当 v7+ 或对应父模块实际引用了该子模块时列为必需，对 v4 模拟目录零误杀）
 	const submodulesFound: string[] = [];
@@ -576,6 +596,7 @@ export function checkExtensionInstallation(agentHome: string) {
 		toolsMissing.length === 0 &&
 		coreModulesMissing.length === 0 &&
 		(!isV7OrAbove || v7ModulesMissing.length === 0) &&
+		(!isV8OrAbove || v8ModulesMissing.length === 0) &&
 		submodulesMissing.length === 0 &&
 		nuwaCoreMissing.length === 0;
 	let reason = "";
@@ -587,6 +608,8 @@ export function checkExtensionInstallation(agentHome: string) {
 		reason = `扩展缺少核心模块 (${coreModulesMissing.join(", ")})`;
 	} else if (isV7OrAbove && v7ModulesMissing.length > 0) {
 		reason = `扩展缺少 v7 核心模块 (${v7ModulesMissing.join(", ")})`;
+	} else if (isV8OrAbove && v8ModulesMissing.length > 0) {
+		reason = `扩展缺少 v8 核心模块 (${v8ModulesMissing.join(", ")})`;
 	} else if (submodulesMissing.length > 0) {
 		reason = `扩展缺少底层拆解子模块 (${submodulesMissing.join(", ")})`;
 	} else if (nuwaCoreMissing.length > 0) {
@@ -613,6 +636,8 @@ export function checkExtensionInstallation(agentHome: string) {
 		v6ModulesMissing,
 		v7ModulesFound,
 		v7ModulesMissing,
+		v8ModulesFound,
+		v8ModulesMissing,
 		submodulesFound,
 		submodulesMissing,
 		nuwaCoreFound,

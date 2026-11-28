@@ -347,7 +347,14 @@ declare module "node:crypto" {
 		digest(encoding: "hex" | "base64" | "base64url"): string;
 		digest(): Buffer;
 	}
+	export interface Hmac {
+		update(data: string | Uint8Array, inputEncoding?: string): this;
+		digest(encoding: "hex" | "base64" | "base64url"): string;
+		digest(): Buffer;
+	}
 	export function createHash(algorithm: string): Hash;
+	export function createHmac(algorithm: string, key: string | Uint8Array): Hmac;
+	export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean;
 	export function randomUUID(): string;
 	export function randomBytes(size: number): Buffer;
 }
@@ -383,9 +390,14 @@ declare module "node:net" {
 		off(event: string, listener: (...args: any[]) => void): this;
 	}
 	export interface Server {
+		listening?: boolean;
 		listen(port?: number, host?: string, cb?: () => void): this;
 		close(cb?: (err?: Error) => void): this;
+		closeAllConnections?(): void;
+		closeIdleConnections?(): void;
 		address(): { address: string; family: string; port: number } | string | null;
+		unref?(): this;
+		ref?(): this;
 		on(event: string, listener: (...args: any[]) => void): this;
 		once(event: string, listener: (...args: any[]) => void): this;
 		off(event: string, listener: (...args: any[]) => void): this;
@@ -445,9 +457,14 @@ declare module "node:http" {
 		on(event: string, listener: (...args: any[]) => void): this;
 	}
 	export interface Server {
+		listening?: boolean;
 		listen(port?: number, host?: string, cb?: () => void): this;
 		close(cb?: (err?: Error) => void): this;
+		closeAllConnections?(): void;
+		closeIdleConnections?(): void;
 		address(): { address: string; family: string; port: number } | string | null;
+		unref?(): this;
+		ref?(): this;
 		on(event: string, listener: (...args: any[]) => void): this;
 		once(event: string, listener: (...args: any[]) => void): this;
 		off(event: string, listener: (...args: any[]) => void): this;

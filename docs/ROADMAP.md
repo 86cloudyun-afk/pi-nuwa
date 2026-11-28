@@ -1,6 +1,15 @@
-# 女娲模式演进路线图（v0.3 → v7.0）
+# 女娲模式演进路线图（v0.3 → v8.0）
 
-## 当前里程碑：v7.0.0（2026-11-26 已交付）
+## 当前里程碑：v8.0.0（2026-11-28 已交付）
+
+- **十大模块反巨石拆解与 SQLite Schema v2 升级**：全仓 `core/*.ts`、`omp/*.ts`、`kb/*.ts`、`bin/nuwa-autonomous` 均严格 `< 2,500` 行（`omp/nuwa.ts < 1,000` 行）；新增 `protocol_frames`、`asset_credentials`、`oob_correlations`、`workflow_runs` 四张 v2 扩展表与单事务幂等无损迁移，严守活跃 WAL/SHM 及遗留纯 `state.json` 目录只读零写盘红线。
+- **有状态多方法工作流与并发屏障探针（`omp/stateful-workflow.ts`）**：交付 `L0..L3` 语义分级、多步有状态重放、未声明字段绑定契约检验、写后读二阶状态回归（含 `finally` 自动清理）与同步门闩并发竞态探针。
+- **CDP TOTP 交互保活与现代多协议审计栈（`omp/cdp-auth.ts` + `omp/cdp-signed-probe.ts` + `omp/protocol-inspector.ts` + `/nuwa proto`）**：交付 RFC 6238 TOTP、会话自动续期、页面内全方法加签差分、GraphQL 内省/错误提示还原、WebSocket 双向帧对比、Next.js RSC Flight 与 gRPC-Web Protobuf 审计。
+- **跨资产双轨路由、网关自适应韧性与嵌入式回调关联器（`omp/asset-router.ts` + `omp/resilience-oob.ts` + `/nuwa pivot`）**：交付跨资产凭据复用验证、公私网双轨防环路由表、网关限流冷却轮换、同构兜底页熔断与本机 `127.0.0.1:0` 零泄漏 `EmbeddedOobListener` / `OobCorrelator`。
+- **7 语言 + SPA Bundle 跨文件 RGS 图分析与零明文 `pov-*.ts` 生成（`omp/rgs-analyzer.ts` + `omp/reporting.ts` + `/nuwa rgs`）**：跨文件追踪 `Route -> Guard -> Service -> Sink` 抑制全局守卫假阳性，并为 `confirmed` 事实自动生成零明文独立复核脚本。
+- **12 场景 L4 真实演武场、实网 OpenAI 兼容评测与第 9 道门禁（`benchmarks/l4-arena/*` + `tests/gates/g8_v8.sh`）**：12 场景离线确定性硬门禁全绿，并支持环境变量驱动的 `--live-openai-compat` 实网 LLM 推理评测模式。
+
+## 历史里程碑：v7.0.0（2026-11-26 已交付）
 
 - **单核合一与主入口瘦身（`core/engine.ts` + `omp/dispatch-bridge.ts` + `omp/nuwa.ts`）**：将 12 个 `nuwa_*` 工具与 28 个 `/nuwa` 子命令统一收敛至 `NuwaUnifiedEngine`，`omp/nuwa.ts` 瘦身至 `< 1,000` 行，`core/mcp-server.ts` 全面委托单核消除双写分叉，异步乱序派单与 `eval` 词法展开由 `DispatchBridgeStore` 独立承载。
 - **SQLite WAL 默认存储转正**：`resolveStorageBackend` 默认返回 `"sqlite"`（保留 `sqlite|json|dual` 显式切换），同时严格满足「遗留 JSON 只读零写盘」与「写入自动同步 `.nuwa/state.json` 兼容快照」两大不变量。

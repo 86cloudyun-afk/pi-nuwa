@@ -43,6 +43,13 @@ import {
 	type L4ScenarioServerHandle,
 	type L4ScenarioSpec,
 } from "./servers";
+import {
+	evaluateLiveScenarioVerdict,
+	generateLiveScenarioPlan,
+	mergeLiveTokenUsage,
+	resolveLiveOpenAiConfig,
+	type LiveTokenUsage,
+} from "./live-openai-client";
 
 export interface L4ScenarioEvalResult {
 	id: L4ScenarioId;
@@ -60,6 +67,9 @@ export interface L4ScenarioEvalResult {
 	durationMs: number;
 	detail: string;
 	error?: string;
+	liveHypothesis?: string;
+	liveVerdictRationale?: string;
+	liveUsage?: LiveTokenUsage;
 }
 
 export interface L4HardGates {
@@ -86,6 +96,14 @@ export interface L4ScorecardMetrics {
 	wallTimeMs: number;
 }
 
+export interface L4LiveReportMeta {
+	enabled: true;
+	apiBase: string;
+	model: string;
+	usage: LiveTokenUsage;
+	wallTimeMs: number;
+}
+
 export interface L4BenchmarkSummary {
 	schema: 1;
 	suite: "nuwa-l4-arena";
@@ -100,11 +118,15 @@ export interface L4BenchmarkSummary {
 	metrics: L4ScorecardMetrics;
 	gates: L4HardGates;
 	scenarios: L4ScenarioEvalResult[];
+	liveMode?: L4LiveReportMeta;
 }
 
 export interface RunL4BenchmarkOptions {
 	scenario?: string;
 	deterministic?: boolean;
+	liveOpenAiCompat?: boolean;
+	model?: string;
+	liveFetchFn?: typeof fetch;
 }
 
 const FIXED_L4_EVAL_TS = "2026-11-28T00:00:00.000Z";
@@ -1192,6 +1214,16 @@ function candidatePivotUrlsFrom(list: readonly string[]): string[] {
 
 export async function runL4BenchmarkSuite(opts?: RunL4BenchmarkOptions): Promise<L4BenchmarkSummary> {
 	const deterministic = Boolean(opts?.deterministic);
+	const liveCfg = opts?.liveOpenAiCompat
+		? resolveLiveOpenAiConfig({ modelOverride: opts.model })
+		: null;
+	let totalLiveUsage: LiveTokenUsage = {
+		promptTokens: 0,
+		completionTokens: 0,
+		reasoningTokens: 0,
+		totalTokens: 0,
+		llmCalls: 0,
+	};
 	const selectedSpecs = opts?.scenario
 		? L4_SCENARIO_SPECS.filter((s) => s.id === opts.scenario)
 		: [...L4_SCENARIO_SPECS];
@@ -1238,15 +1270,61 @@ export async function runL4BenchmarkSuite(opts?: RunL4BenchmarkOptions): Promise
 			const t0 = Date.now();
 			const srv = startL4ScenarioServer(spec.id);
 			try {
+				const livePlan = liveCfg
+					? await generateLiveScenarioPlan(liveCfg, spec, srv, opts?.liveFetchFn)
+					: null;
 				const evaluator = L4_EVALUATORS[spec.id];
 				const outcome = await evaluator(spec, srv, env);
+				const liveVerdict =
+					liveCfg && livePlan
+						? await evaluateLiveScenarioVerdict(
+								liveCfg,
+								spec,
+								livePlan,
+								{
+									passed: outcome.passed,
+									truePositives: outcome.truePositives,
+									falsePositives: outcome.falsePositives,
+									detail: outcome.detail,
+								},
+								opts?.liveFetchFn,
+							)
+						: null;
+				const scenarioLiveUsage =
+					livePlan && liveVerdict ? mergeLiveTokenUsage(livePlan.usage, liveVerdict.usage) : undefined;
+				if (scenarioLiveUsage) {
+					totalLiveUsage = mergeLiveTokenUsage(totalLiveUsage, scenarioLiveUsage);
+				}
+				// 在实网模式下融合 LLM 最终复核结论计算召回与误报指标
+				let adjustedOutcome = outcome;
+				if (liveVerdict) {
+					if (spec.expectedFindings > 0 && !liveVerdict.confirmed) {
+						adjustedOutcome = {
+							...outcome,
+							passed: false,
+							truePositives: 0,
+							falseNegatives: spec.expectedFindings,
+							detail: `${outcome.detail} | LLM复核未确认: ${liveVerdict.rationale}`,
+						};
+					} else if (spec.expectedFindings === 0 && liveVerdict.confirmed) {
+						adjustedOutcome = {
+							...outcome,
+							passed: false,
+							falsePositives: outcome.falsePositives + 1,
+							detail: `${outcome.detail} | LLM误报确认: ${liveVerdict.rationale}`,
+						};
+					}
+				}
 				scenarioResults.push({
 					id: spec.id,
 					index: spec.index,
 					name: spec.name,
 					category: spec.category,
 					durationMs: deterministic ? 0 : Date.now() - t0,
-					...outcome,
+					...adjustedOutcome,
+					...(livePlan ? { liveHypothesis: livePlan.hypothesis } : {}),
+					...(liveVerdict ? { liveVerdictRationale: liveVerdict.rationale } : {}),
+					...(scenarioLiveUsage ? { liveUsage: scenarioLiveUsage } : {}),
 				});
 			} catch (err) {
 				scenarioResults.push({
@@ -1342,6 +1420,17 @@ export async function runL4BenchmarkSuite(opts?: RunL4BenchmarkOptions): Promise
 		metrics,
 		gates,
 		scenarios: scenarioResults,
+		...(liveCfg
+			? {
+					liveMode: {
+						enabled: true,
+						apiBase: liveCfg.apiBase,
+						model: liveCfg.model,
+						usage: totalLiveUsage,
+						wallTimeMs: Date.now() - wallStart,
+					},
+				}
+			: {}),
 	};
 }
 
@@ -1372,11 +1461,15 @@ function formatL4ScorecardTable(summary: L4BenchmarkSummary): string {
 export function parseL4CliArgs(argv: readonly string[]): {
 	json: boolean;
 	deterministic: boolean;
+	liveOpenAiCompat?: boolean;
+	model?: string;
 	scenario?: string;
 	help: boolean;
 } {
 	let json = false;
 	let deterministic = false;
+	let liveOpenAiCompat = false;
+	let model: string | undefined;
 	let scenario: string | undefined;
 	let help = false;
 
@@ -1385,7 +1478,16 @@ export function parseL4CliArgs(argv: readonly string[]): {
 		if (arg === "--help" || arg === "-h") help = true;
 		else if (arg === "--json") json = true;
 		else if (arg === "--deterministic") deterministic = true;
-		else if (arg === "--scenario") {
+		else if (arg === "--live-openai-compat") liveOpenAiCompat = true;
+		else if (arg === "--model") {
+			const val = argv[++i];
+			if (!val || val.startsWith("-")) throw new Error("--model 需要传入模型名称");
+			model = val.trim();
+		} else if (arg.startsWith("--model=")) {
+			const val = arg.slice("--model=".length).trim();
+			if (!val) throw new Error("--model= 不能为空");
+			model = val;
+		} else if (arg === "--scenario") {
 			const val = argv[++i];
 			if (!val || val.startsWith("-")) throw new Error("--scenario 需要传入场景 ID");
 			scenario = val.trim();
@@ -1397,7 +1499,14 @@ export function parseL4CliArgs(argv: readonly string[]): {
 			throw new Error(`未知命令行参数: ${arg}`);
 		}
 	}
-	return { json, deterministic, scenario, help };
+	return {
+		json,
+		deterministic,
+		...(liveOpenAiCompat ? { liveOpenAiCompat: true } : {}),
+		...(model ? { model } : {}),
+		scenario,
+		help,
+	};
 }
 
 if (import.meta.main) {
@@ -1406,18 +1515,25 @@ if (import.meta.main) {
 		if (opts.help) {
 			console.log(
 				[
-					"用法: bun benchmarks/l4-arena/run-l4-eval.ts [--json] [--deterministic] [--scenario <id>] [--help]",
+					"用法: bun benchmarks/l4-arena/run-l4-eval.ts [--json] [--deterministic] [--live-openai-compat] [--model <name>] [--scenario <id>] [--help]",
 					"",
 					"选项:",
-					"  --json              输出结构化 JSON 评分卡与硬门禁结论",
-					"  --deterministic     使用固定时间戳与确定性耗时输出 JSON",
-					"  --scenario <id>     仅运行单个指定场景（如 s01-second-order-store-read .. s12-fake200-trap-delayed-oob）",
-					"  -h, --help          显示帮助信息",
+					"  --json                 输出结构化 JSON 评分卡与硬门禁结论",
+					"  --deterministic        使用固定时间戳与确定性耗时输出 JSON（CI/门禁默认离线模式）",
+					"  --live-openai-compat   启用 OpenAI 兼容实网 LLM 推理评测（读取 NUWA_LIVE_API_BASE / NUWA_LIVE_API_KEY / NUWA_LIVE_MODEL）",
+					"  --model <name>         指定实网评测模型名称（覆盖 NUWA_LIVE_MODEL，默认 deepseek-flash）",
+					"  --scenario <id>        仅运行单个指定场景（如 s01-second-order-store-read .. s12-fake200-trap-delayed-oob）",
+					"  -h, --help             显示帮助信息",
 				].join("\n"),
 			);
 			process.exit(0);
 		}
-		const summary = await runL4BenchmarkSuite({ scenario: opts.scenario, deterministic: opts.deterministic });
+		const summary = await runL4BenchmarkSuite({
+			scenario: opts.scenario,
+			deterministic: opts.deterministic,
+			liveOpenAiCompat: opts.liveOpenAiCompat,
+			model: opts.model,
+		});
 		if (opts.json) console.log(JSON.stringify(summary, null, 2));
 		else console.log(formatL4ScorecardTable(summary));
 		process.exit(summary.gates.allPassed ? 0 : 1);

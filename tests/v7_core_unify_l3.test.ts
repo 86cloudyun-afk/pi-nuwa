@@ -93,7 +93,7 @@ describe("NuwaUnifiedEngine 单核合一引擎：12 工具、HostHooks 与 #53/#
 		});
 
 		expect(engine.listTools().length).toBe(12);
-		expect(NUWA_SUBCOMMANDS.length).toBe(28);
+		expect(NUWA_SUBCOMMANDS.length).toBe(31);
 
 		// 1. nuwa_init
 		const initRes = await engine.callTool("nuwa_init", {

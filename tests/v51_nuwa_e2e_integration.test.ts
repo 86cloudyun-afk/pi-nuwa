@@ -167,8 +167,8 @@ describe("v5.1.0 总装契约：12 工具不变量、版本号与斜杠子命令
 		const ws = makeTmpWorkspace();
 		const h = createMockHarness(ws);
 
-		expect(nuwaMod.VERSION).toBe("7.0.0");
-		expect(nuwaMod.NUWA_VERSION).toBe("7.0.0");
+		expect(nuwaMod.VERSION).toBe("8.0.0");
+		expect(nuwaMod.NUWA_VERSION).toBe("8.0.0");
 		expect(h.tools.size).toBe(12);
 		expect([...h.tools.keys()].sort()).toEqual([...EXPECTED_12_TOOLS].sort());
 

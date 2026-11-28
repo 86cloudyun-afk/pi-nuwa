@@ -1,10 +1,10 @@
 /**
- * nuwa-omp v7.0.0 — 女娲模式：全自主安全评估与多领域执行引擎（单核合一精简组装入口）。
+ * nuwa-omp v8.0.0 — 女娲模式：全自主安全评估与多领域执行引擎（单核合一精简组装入口）。
  *
  * 架构职责：
  *   - 全部 12 个 `nuwa_*` 核心工具与 `/nuwa` 斜杠子命令统一委托给权威单核 `NuwaUnifiedEngine` (`../core/engine`)；
  *   - 异步派单缓冲、`taskFile`/占位符展开、`eval` 词法解析与 `SubagentWatchdog` 生命周期统一委托给 `./dispatch-bridge`；
- *   - 本文件仅保留宿主 TUI 胶水、自动侦察批与后台续跑心跳钩子，并 100% 完整重导出 v4–v7 全部公共符号与类型。
+ *   - 本文件仅保留宿主 TUI 胶水、自动侦察批与后台续跑心跳钩子，并 100% 完整重导出 v4–v8 全部公共符号与类型。
  */
 import { resolve } from "node:path";
 import { setInterval as setNodeInterval } from "node:timers";
@@ -72,7 +72,7 @@ import type { NuwaState } from "./types";
 import { buildSnapshot, renderBoardLines, renderStatusLine, renderWidgetLines, themeStyle } from "./ui";
 import { createBoardComponent, createWidgetComponent } from "./ui-native";
 
-export const VERSION = "7.0.0";
+export const VERSION = "8.0.0";
 
 // ============================================================================
 // 100% 向后兼容符号与类型全量重导出（覆盖 v4.0 – v7.0 全部模块）
@@ -193,6 +193,7 @@ export {
 	type SqliteTableName, type TrafficEntryRow, type TrafficQueryFilter as SqliteTrafficQueryFilter,
 	type V1CoreTableName, type V2ExtensionTableName, type WorkflowActionLevel, type WorkflowRunRow,
 } from "./sqlite-store";
+export { normalizeCredentialFingerprint } from "./sqlite-schema";
 export {
 	DEFAULT_AUTHDIFF_COOLDOWN_MS, DEFAULT_MAX_AUTH_PATHS, DEFAULT_MAX_NEW_OOB_CANARIES,
 	DEFAULT_OOB_POLL_INTERVAL_MS, collectTestableAuthPaths, computeAuthDiffSignature,
@@ -250,6 +251,21 @@ export * from "./chain-composer";
 export * from "./specialist-squad";
 export * from "./kb-v2";
 export * from "./dispatch-bridge";
+export * from "./stateful-workflow";
+export * from "./cdp-auth";
+export * from "./protocol-inspector";
+export {
+	ASSET_ROUTER_VERSION, applySsrfUrlTemplate, probeViaConfirmedSsrf, resolveAssetRoutePlan, verifyCredentialPivot,
+	type AssetRouteKind, type AssetRoutePlan, type AssetRoutePlanEntry, type CredentialCandidateTarget,
+	type CredentialProbeStatus, type CredentialReuseFinding, type CredentialSpec, type HeaderBagLike,
+	type ProbeViaConfirmedSsrfOptions, type ProbeViaConfirmedSsrfResult, type ResolveAssetRoutePlanOptions,
+	type RouteTargetInput, type SocksTunnelSpec, type SsrfBlockedTarget, type SsrfProbeFinding,
+	type SsrfTargetCandidate, type TrafficFetchFn as AssetRouterFetchFn, type TrafficFetchResponse,
+	type VerifyCredentialPivotOptions, type VerifyCredentialPivotResult,
+} from "./asset-router";
+export * from "./resilience-oob";
+export * from "./rgs-analyzer";
+export * from "./v8-commands";
 export {
 	NUWA_SUBCOMMANDS, NuwaUnifiedEngine, checkCommitRealismGuard, isTerminalProjectState,
 	loadStateZeroWrite, releaseInflightAutoBatch, statusBoardZeroWrite, syncTerminalReports, terminalStatusOf,

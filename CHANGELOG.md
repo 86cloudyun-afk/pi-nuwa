@@ -1,5 +1,28 @@
 # Changelog
 
+## 8.0.0 — 2026-11-28
+
+反巨石无环模块化重构、SQLite Schema v2 平滑演进、全方法有状态业务工作流与并发屏障引擎、CDP TOTP 交互认证与现代多协议深度审计栈（GraphQL / WebSocket / Next.js RSC / gRPC-Web）、跨资产双轨路由与自适应网关韧性/嵌入式 OOB 关联器、7 语言跨文件 RGS 数据流分析与零明文独立复核脚本生成器（`pov-<factId>.ts`），以及 12 场景 L4 真实有状态综合演武场（含 `--live-openai-compat` 实网推理评测模式）与第 9 道阶段门禁 `g8_v8.sh` 大版本。在严格保持 12 个 `nuwa_*` 核心工具与全部历史导出 100% 向后兼容的前提下，全仓所有核心代码文件均严格压制在 `< 2,500` 行以内（`omp/nuwa.ts < 1,000` 行）。
+
+### 六大核心跃升与工程治理
+
+- **十大超长模块无环拆解与 SQLite Schema v2 升级（Wave 0 Foundation）**：
+  - 将 `autoexec`、`nuwa-autonomous`、`cdp-bridge`、`traffic-workbench`、`core/engine`、`sandbox`、`chain-composer`、`storage`、`graph-planner`、`sqlite-store` 按单向 DAG 拆解出 10 个底层专职模块，全仓 `core/*.ts`、`omp/*.ts`、`kb/*.ts`、`bin/nuwa-autonomous` 严格 `< 2,500` 行，`omp/nuwa.ts` 保持 `< 1,000` 行。
+  - 升级 `SQLITE_SCHEMA_VERSION = 2`，新增 `protocol_frames`、`asset_credentials`、`oob_correlations`、`workflow_runs` 四张扩展表与单事务幂等无损迁移函数 `migrateSqliteSchemaV1ToV2`；严格保证历史 v1 库（含活跃 `-wal` + `-shm`）及遗留纯 `state.json` 目录只读查询 0 字节写盘，并强化 JSON 引号键值、URL Query、TOTP/Token 及伪掩码混合串的全量零明文脱敏。
+- **有状态多方法工作流与同步屏障并发竞态引擎（`omp/stateful-workflow.ts`）**：
+  - 实现 `L0_PHYSICAL_READ`、`L1_SEMANTIC_READ`、`L2_SCOPED_STATEFUL`、`L3_RESTRICTED_DESTRUCTIVE` 四级动作语义分级（`classifyWorkflowAction`）、内置 `CookieJar` 与逐跳重定向 Scope 守卫的多步重放器（`executeStatefulWorkflowChain`）、未声明字段绑定契约校验器（`probeMassAssignment`）、写后读二阶状态回归器（`verifySecondOrderWorkflow`，`finally` 自动执行清理步骤）及并发上界 `<= 32` 的同步门闩屏障竞态探针（`runBarrierRaceProbe`）。
+- **CDP 交互认证保活、全方法签名探针与现代多协议审计栈（`omp/cdp-auth.ts` + `omp/cdp-signed-probe.ts` + `omp/protocol-inspector.ts` + `/nuwa proto`）**：
+  - 支持零外部依赖 Base32 + RFC 6238 TOTP 生成校验、登录剧本执行、JWT `< 120s` 与连续 `401/403` 自动会话刷新（`ensureSessionFresh`），以及页面内全方法动态加签鉴权差分（`runCdpStatefulSignedAuthDiff`）。
+  - 原生实现 GraphQL 内省与禁用内省下的错误提示字段 Schema 重建/别名批处理、WebSocket 双向帧跨角色推送对比、Next.js RSC Flight 流解析与 Server Action 权限比对、gRPC-Web Protobuf wire format 编解码与角色差分，审计帧自动脱敏落库 `protocol_frames`。
+- **跨资产双轨路由、网关自适应韧性与嵌入式回调关联器（`omp/asset-router.ts` + `omp/resilience-oob.ts` + `/nuwa pivot`）**：
+  - 提供跨服务凭据复用校验（`verifyCredentialPivot`）、公私网双轨分流防环路由表（`resolveAssetRoutePlan`）与已确认节点受控探测（`probeViaConfirmedSsrf`）。
+  - 内置网关限流/拦截信号识别与代理冷却轮换器（`GatewayAdaptiveController`）、同构兜底响应/慢速陷阱熔断检测器（`IsomorphicTrapDetector`），以及绑定 `127.0.0.1:0` 零端口泄漏的原生 `EmbeddedOobListener` 与跨轮次因果关联器 `OobCorrelator`。
+- **7 语言 + SPA Bundle 跨文件 RGS 图分析与零明文独立复核脚本（`omp/rgs-analyzer.ts` + `omp/reporting.ts` + `/nuwa rgs`）**：
+  - 支持 TS/JS/Python/Go/Java/PHP/Rust 与 Webpack/Vite Bundle 跨文件 `Route -> Guard -> Service -> Sink` 追踪，识别全局守卫压制假阳性并桥接派生验证意图（`bridgeRgsToVerificationIntents`）。
+  - `writePocBundle` 与 `/nuwa rgs pov` 对已确认问题自动生成零明文独立可运行复核脚本 `pov-<factId>.ts`（凭据统一通过环境变量按需注入，记入 `manifest.json` SHA-256 清单）。
+- **12 场景 L4 真实有状态演武场、实网 OpenAI 兼容评测与第 9 道门禁（`benchmarks/l4-arena/*` + `tests/gates/g8_v8.sh`）**：
+  - 交付覆盖二阶存储、多方法加签、GraphQL 建议还原、WebSocket 跨租户推送、Next.js RSC、gRPC-Web、并发屏障、TOTP 续期、跨资产路由、Spring RGS + 独立复核脚本与延迟回调的 12 个本机真实服务场景；同时支持确定性离线门禁 `--deterministic`（12/12 召回率 1.0、误报率 0、零泄漏）与读取环境变量的 `--live-openai-compat` 实网 LLM 评测模式。
+
 ## 7.0.0 — 2026-11-26
 
 单核合一收敛、SQLite WAL 默认转正、5+1 专精特种小队、KB 2.0 混合语义治理、原生 CDP 页面借壳加签差分、多跳攻击链能力合成与 L3 真实进程树靶场大版本：在严格保持 12 个 `nuwa_*` 工具名称与全部历史导出 100% 向后兼容的前提下，将 `omp/nuwa.ts` 从 3,990 行瘦身至 932 行（`< 1,000` 行红线），消除 `omp` 与 `MCP` 双核分叉，全面打通六大 v7 核心引擎与第 8 道阶段门禁 `g7_v7.sh`。

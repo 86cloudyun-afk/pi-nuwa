@@ -163,6 +163,11 @@ import {
 import { loadStateFromSqlite } from "../omp/sqlite-store";
 import { hasCalibrationRecords, loadCalibrationRecords, safeSettlePrediction } from "../omp/calibration";
 import {
+	executePivotCommand,
+	executeProtoCommand,
+	executeRgsCommand,
+} from "../omp/v8-commands";
+import {
 	NUWA_CORE_TOOLS,
 	isNuwaToolName,
 	type McpToolCallResult,
@@ -1528,6 +1533,37 @@ export class NuwaUnifiedEngine {
 		}
 		if (arg === "squad" || arg.startsWith("squad ")) {
 			const r = executeSquadCommand(found, arg.slice(5));
+			return emit(r.msg, r.level);
+		}
+		if (arg === "proto" || arg.startsWith("proto ")) {
+			const protoSub = arg.slice(5).trim();
+			if (/^graphql(?:\s|$)/i.test(protoSub)) {
+				const blocked = guardTerminalMutation("/nuwa proto graphql");
+				if (blocked) return blocked;
+			}
+			const r = await executeProtoCommand(found, protoSub);
+			return emit(r.msg, r.level);
+		}
+		if (arg === "pivot" || arg.startsWith("pivot ")) {
+			const pivotSub = arg.slice(5).trim();
+			if (/^verify(?:\s|$)/i.test(pivotSub)) {
+				const blocked = guardTerminalMutation("/nuwa pivot verify");
+				if (blocked) return blocked;
+			}
+			const r = await executePivotCommand(found, pivotSub);
+			return emit(r.msg, r.level);
+		}
+		if (arg === "rgs" || arg.startsWith("rgs ")) {
+			const rgsSub = arg.slice(3).trim();
+			if (/^(?:plan|pov)(?:\s|$)/i.test(rgsSub)) {
+				const blocked = guardTerminalMutation(`/nuwa rgs ${rgsSub.split(/\s+/)[0]}`);
+				if (blocked) return blocked;
+			}
+			const r = executeRgsCommand(found, rgsSub);
+			if (/^plan(?:\s|$)/i.test(rgsSub) && found) {
+				const stAfter = loadStateZeroWrite(found);
+				if (stAfter) this.refreshUi(hooks, found, stAfter, true);
+			}
 			return emit(r.msg, r.level);
 		}
 		if (arg === "chains" || arg.startsWith("chains ")) {

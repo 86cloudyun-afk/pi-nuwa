@@ -46,7 +46,7 @@ import type { CdpSession } from "./cdp-bridge";
  * 均经 SessionVault、URL 查询参数、Cookie、Authorization 与额外运行时密钥全量脱敏。
  */
 
-export const MAX_STATEFUL_PROBE_CONCURRENCY = MAX_CDP_PROBE_CONCURRENCY;
+export const MAX_STATEFUL_PROBE_CONCURRENCY = typeof MAX_CDP_PROBE_CONCURRENCY === "number" ? MAX_CDP_PROBE_CONCURRENCY : 4;
 
 export type StatefulHttpMethod = "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT" | "PATCH" | "DELETE";
 
