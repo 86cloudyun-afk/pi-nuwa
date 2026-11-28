@@ -10,8 +10,8 @@
  *
  * 约束：单向无环模块，严禁运行时 `import "./nuwa"` 或 `import "./graph"`。
  */
-import { existsSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	resolveAssetRoutePlan,
 	verifyCredentialPivot,
@@ -35,6 +35,7 @@ import { getRoleHeadersMap, loadSessionVault } from "./session-vault";
 import {
 	NuwaSqliteStore,
 	loadStateFromSqlite,
+	redactTextForStorage,
 	sqliteDbPath,
 	type AssetCredentialRow,
 	type OobCorrelationRow,
@@ -43,15 +44,19 @@ import {
 } from "./sqlite-store";
 import type { StatefulWorkflowResult } from "./stateful-workflow";
 import {
+	SCHEMA,
+	bindLoadedStateRoot,
+	journalPath,
 	loadState,
-	loadStateJsonOnly,
+	normalizeState,
 	nowIso,
+	readJson,
 	resolveStorageBackend,
 	saveState,
 	statePath,
 	withLock,
 } from "./storage";
-import type { NuwaState, ScopePolicy } from "./types";
+import type { AssetNode, NuwaState, ScopePolicy } from "./types";
 
 export interface V8CommandResult {
 	msg: string;
@@ -68,27 +73,88 @@ function isTerminalState(st: NuwaState | null | undefined): boolean {
 	);
 }
 
-/** 纯只读加载项目状态：绝不在遗留 `state.json` 目录或未初始化目录产生任何磁盘写入。 */
+/** 纯只读加载项目状态：绝不调用 `loadStateJsonOnly` 或 `atomicWrite`，即使 `state.json` 损坏且存在 `.nuwa/snap` 快照也严格 0 字节写盘。 */
 export function loadStateZeroWriteV8(root: string | null | undefined): NuwaState | null {
 	if (!root) return null;
 	const normRoot = resolve(root);
+	const backend = resolveStorageBackend(normRoot);
 	const dbFile = sqliteDbPath(normRoot);
-	try {
-		if (existsSync(dbFile) && statSync(dbFile).size > 0) {
-			const sqlSt = loadStateFromSqlite(normRoot);
-			if (sqlSt) return sqlSt;
+
+	if ((backend === "sqlite" || backend === "dual") && existsSync(dbFile)) {
+		try {
+			if (statSync(dbFile).size > 0) {
+				const sqlSt = loadStateFromSqlite(normRoot, { fallbackToJson: false });
+				if (sqlSt) return bindLoadedStateRoot(normalizeState(sqlSt), normRoot);
+			}
+		} catch {
+			/* 回退纯内存只读 JSON */
 		}
-	} catch {
-		/* 回退只读 JSON */
 	}
-	try {
-		if (existsSync(statePath(normRoot))) {
-			return loadStateJsonOnly(normRoot);
+
+	const sp = statePath(normRoot);
+	if (existsSync(sp)) {
+		const direct = readJson<NuwaState>(sp);
+		if (direct && direct.schema === SCHEMA && direct.project) {
+			const cloned = JSON.parse(JSON.stringify(direct)) as NuwaState;
+			return bindLoadedStateRoot(normalizeState(cloned), normRoot);
 		}
-	} catch {
-		/* ignore */
+	}
+
+	if (existsSync(dbFile)) {
+		try {
+			if (statSync(dbFile).size > 0) {
+				const fbSql = loadStateFromSqlite(normRoot, { fallbackToJson: false });
+				if (fbSql) return bindLoadedStateRoot(normalizeState(fbSql), normRoot);
+			}
+		} catch {
+			/* ignore */
+		}
+	}
+
+	const jp = journalPath(normRoot);
+	if (existsSync(jp)) {
+		try {
+			const lines = readFileSync(jp, "utf8").trim().split("\n").reverse();
+			for (const line of lines) {
+				if (!line) continue;
+				const parsed = JSON.parse(line) as { type?: string; state?: NuwaState };
+				if (parsed.type === "snapshot" && parsed.state?.schema === SCHEMA && parsed.state.project) {
+					const cloned = JSON.parse(JSON.stringify(parsed.state)) as NuwaState;
+					return bindLoadedStateRoot(normalizeState(cloned), normRoot);
+				}
+			}
+		} catch {
+			/* ignore */
+		}
 	}
 	return null;
+}
+
+function isNuwaProtectedPath(targetPath: string): boolean {
+	const norm = String(targetPath ?? "").replace(/\\/g, "/");
+	return /(?:^|\/)\.nuwa(?:\/|$)/i.test(norm);
+}
+
+function resolveRgsTargetDir(rawToken: string | undefined, root: string | null | undefined, st: NuwaState | null): string {
+	if (rawToken && rawToken.trim()) {
+		const trimmed = rawToken.trim();
+		if (isAbsolute(trimmed)) return resolve(trimmed);
+		if (root) {
+			const relToRoot = resolve(root, trimmed);
+			if (existsSync(relToRoot) || isNuwaProtectedPath(relToRoot)) return relToRoot;
+		}
+		return resolve(trimmed);
+	}
+	if (st?.project.scheme === "local" && st.project.target) {
+		return resolve(st.project.target);
+	}
+	return root ? resolve(root) : "";
+}
+
+function resolveCandidateScheme(asset: AssetNode, projectScheme?: string): string {
+	const assetScheme = (asset as { scheme?: string }).scheme;
+	if (assetScheme === "http" || assetScheme === "https") return assetScheme;
+	return projectScheme === "https" ? "https" : "http";
 }
 
 function withReadonlySqliteStore<T>(root: string | null | undefined, fn: (store: NuwaSqliteStore) => T, fallback: T): T {
@@ -208,7 +274,7 @@ export function recordPivotCredentialResults(
 			const statusMap: Record<string, AssetCredentialRow["status"]> = {
 				valid: "valid",
 				invalid: "rejected",
-				blocked_by_scope: "rejected",
+				blocked_by_scope: "scope_blocked",
 				soft_404: "rejected",
 				no_difference: "rejected",
 				error: "unverified",
@@ -357,10 +423,13 @@ export async function executeProtoCommand(root: string | null, rawSubArgs: strin
 		}
 		const baseUrl = st.project.url || st.project.target;
 		const endpointUrl = tokens[1] || `${baseUrl.replace(/\/+$/, "")}/graphql`;
+		const vault = loadSessionVault(root);
+		const safeEndpointUrl = redactTextForStorage(endpointUrl, vault) ?? endpointUrl;
 		const scope: ScopePolicy = st.project.scope ?? defaultScopeForTarget(baseUrl, st.project.mode);
 		const inspected = await inspectGraphQLSchema(endpointUrl, scope, { root, mode: st.project.mode });
 		if (inspected.blockedByScope) {
-			return { level: "error", msg: `GraphQL 探测被 Scope 拦截: ${inspected.blockReason ?? endpointUrl}` };
+			const safeBlockReason = redactTextForStorage(inspected.blockReason ?? endpointUrl, vault) ?? safeEndpointUrl;
+			return { level: "error", msg: `GraphQL 探测被 Scope 拦截: ${safeBlockReason}` };
 		}
 		let host = st.project.host || "127.0.0.1";
 		try {
@@ -385,7 +454,7 @@ export async function executeProtoCommand(root: string | null, rawSubArgs: strin
 		});
 		return {
 			level: inspected.ok ? "info" : "error",
-			msg: `GraphQL 探测完成 (${endpointUrl}): introspection=${inspected.introspectionEnabled} queries=${inspected.discoveredQueries.length} mutations=${inspected.discoveredMutations.length}`,
+			msg: `GraphQL 探测完成 (${safeEndpointUrl}): introspection=${inspected.introspectionEnabled} queries=${inspected.discoveredQueries.length} mutations=${inspected.discoveredMutations.length}`,
 		};
 	}
 
@@ -460,7 +529,7 @@ export async function executePivotCommand(root: string | null, rawSubArgs: strin
 			.map((a) => ({
 				host: a.host!,
 				...(a.port ? { port: a.port } : {}),
-				scheme: preSt.project.scheme === "https" ? "https" : "http",
+				scheme: resolveCandidateScheme(a, preSt.project.scheme),
 				path: "/",
 				assetId: a.id,
 			}));
@@ -524,17 +593,19 @@ export function executeRgsCommand(root: string | null, rawSubArgs: string): V8Co
 
 	if (action === "scan") {
 		const st = loadStateZeroWriteV8(root);
-		const targetDir = tokens[1]
-			? resolve(tokens[1])
-			: st?.project.scheme === "local" && st.project.target
-				? resolve(st.project.target)
-				: root
-					? resolve(root)
-					: "";
+		const targetDir = resolveRgsTargetDir(tokens[1], root, st);
+		if (isNuwaProtectedPath(targetDir)) {
+			return { level: "error", msg: `[N-003] 安全护栏阻断：禁止扫描或读取 .nuwa 内部状态与会话凭据目录 (${targetDir})` };
+		}
 		if (!targetDir || !existsSync(targetDir)) {
 			return { level: "error", msg: "用法: /nuwa rgs scan <源码目录路径>" };
 		}
-		const graph = analyzeCrossFileRgs(targetDir);
+		let graph;
+		try {
+			graph = analyzeCrossFileRgs(targetDir);
+		} catch (e) {
+			return { level: "error", msg: `RGS 扫描被拒绝: ${e instanceof Error ? e.message : String(e)}` };
+		}
 		const topUnauth = graph.unauthenticatedRoutes.slice(0, 10).map(
 			(r) => `  - [${r.framework}] ${r.method} ${r.path} (${r.anchor}) flags=[${r.riskFlags.join(",")}]`,
 		);
@@ -555,16 +626,24 @@ export function executeRgsCommand(root: string | null, rawSubArgs: string): V8Co
 		if (isTerminalState(preSt)) {
 			return { level: "error", msg: `该项目已处于终态 (${preSt.project.status})，禁止执行 /nuwa rgs plan` };
 		}
-		const targetDir = tokens[1]
-			? resolve(tokens[1])
-			: preSt.project.scheme === "local" && preSt.project.target
-				? resolve(preSt.project.target)
-				: resolve(root);
-		const graph = analyzeCrossFileRgs(targetDir);
+		const targetDir = resolveRgsTargetDir(tokens[1], root, preSt);
+		if (isNuwaProtectedPath(targetDir)) {
+			return { level: "error", msg: `[N-003] 安全护栏阻断：禁止扫描或读取 .nuwa 内部状态与会话凭据目录 (${targetDir})` };
+		}
+		if (!targetDir || !existsSync(targetDir)) {
+			return { level: "error", msg: "用法: /nuwa rgs plan [源码目录路径]" };
+		}
+		let graph;
+		try {
+			graph = analyzeCrossFileRgs(targetDir);
+		} catch (e) {
+			return { level: "error", msg: `RGS 分析被拒绝: ${e instanceof Error ? e.message : String(e)}` };
+		}
 		const baseUrl = preSt.project.scheme === "local" ? "http://127.0.0.1:8080" : preSt.project.url || preSt.project.target;
+		const resolvedScope = preSt.project.scope ?? defaultScopeForTarget(baseUrl, preSt.project.mode);
 		const bridged = bridgeRgsToVerificationIntents(graph, baseUrl, {
 			phase: preSt.project.phase,
-			scope: preSt.project.scope,
+			scope: resolvedScope,
 		});
 		const added = withLock(root, () => {
 			const s = loadState(root);
@@ -604,6 +683,9 @@ export function executeRgsCommand(root: string | null, rawSubArgs: string): V8Co
 		if (!factId) return { level: "error", msg: "用法: /nuwa rgs pov <factId>" };
 		const st = loadStateZeroWriteV8(root);
 		if (!st) return { level: "error", msg: "state 读取失败" };
+		if (isTerminalState(st)) {
+			return { level: "error", msg: `该项目已处于终态 (${st.project.status})，禁止执行 /nuwa rgs pov 写操作` };
+		}
 		const fact = st.facts[factId];
 		if (!fact) return { level: "error", msg: `未找到事实: ${factId}` };
 		const outDir = join(resolve(root), ".nuwa", "poc-bundle");
@@ -747,7 +829,7 @@ export async function executeSecondOrderChainVerification(
 			{
 				intentId: opts.intentId,
 				cleanupExecuted: res.cleanupExecuted,
-				candidateFactId: res.candidateFact?.key,
+				candidateFactId: res.candidateFact?.id ?? res.candidateFact?.key,
 			},
 		);
 	}
@@ -832,7 +914,7 @@ export async function runAutonomousV8PivotAndOobLoop(
 			.map((a) => ({
 				host: a.host!,
 				...(a.port ? { port: a.port } : {}),
-				scheme: state.project.scheme === "https" ? "https" : "http",
+				scheme: resolveCandidateScheme(a, state.project.scheme),
 				path: "/",
 				assetId: a.id,
 			}));

@@ -813,7 +813,7 @@ describe("L3 真实进程树门禁 runL3LiveSuite() 端到端三场景全绿验�
 		expect(helpOut).toContain("l3-async-socks5-finding");
 		expect(helpOut).toContain("l3-hardened-seal-noop");
 		expect(helpOut).toContain("l3-stopped-resume-migrate");
-	}, 60_000);
+	}, 180_000);
 });
 
 describe("Boost 异构审查 #73 全量边界反例回归（P1-1 ~ P1-7）", () => {

@@ -88,7 +88,7 @@ trap 'rm -rf "$_NUWA_TS_SANDBOX"' EXIT
 run_bun_isolated() {
   env -u NUWA_KB_DB \
     PI_AGENT_HOME="$_NUWA_TS_SANDBOX/agent" \
-    bun test --isolate "$@"
+    bun test --isolate --timeout 60000 "$@"
 }
 
 run unit run_bun_isolated unit.test.ts

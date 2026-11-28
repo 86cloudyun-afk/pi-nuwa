@@ -1,10 +1,11 @@
 /**
- * L4 综合演武场 OpenAI 兼容实网推理客户端（支持 JSON 与 SSE 流式响应、重试与 Token 统计）。
+ * L4 综合演武场 OpenAI 兼容实网推理客户端（支持 JSON 与 SSE 流式响应、转义感知 JSON 解析、零回退门禁与密钥脱敏）。
  *
  * 环境变量约定（仓库内严禁硬编码任何密钥）：
- *   - NUWA_LIVE_API_BASE: 默认 "https://api.deepseek.com"
- *   - NUWA_LIVE_API_KEY:  必填（缺失时立即抛出明确错误）
- *   - NUWA_LIVE_MODEL:    默认 "deepseek-flash"（可被 CLI --model 覆盖）
+ *   - NUWA_LIVE_API_BASE:   默认 "https://api.deepseek.com"
+ *   - NUWA_LIVE_API_KEY:    必填（缺失时立即抛出明确错误）
+ *   - NUWA_LIVE_MODEL:      默认 "deepseek-flash"（可被 CLI --model 覆盖）
+ *   - NUWA_LIVE_MAX_TOKENS: 默认 4096
  */
 import { analyzeCrossFileRgs } from "../../omp/rgs-analyzer";
 import { S11_SPRING_BOOT_FILES, type L4ScenarioServerHandle, type L4ScenarioSpec } from "./servers";
@@ -13,6 +14,7 @@ export interface LiveOpenAiConfig {
 	apiBase: string;
 	apiKey: string;
 	model: string;
+	maxTokens: number;
 	timeoutMs: number;
 	maxRetries: number;
 }
@@ -41,11 +43,32 @@ export interface LiveFinalVerdict {
 	usage: LiveTokenUsage;
 }
 
+const NON_RETRYABLE_HTTP_STATUS = new Set([400, 401, 403, 404, 422]);
+
+export function scrubLiveErrorText(raw: string, apiKey?: string): string {
+	let out = String(raw ?? "");
+	if (!out) return out;
+	if (apiKey && apiKey.trim().length >= 4) {
+		const k = apiKey.trim();
+		out = out.split(k).join("[REDACTED]");
+		try {
+			const enc = encodeURIComponent(k);
+			if (enc !== k) out = out.split(enc).join("[REDACTED]");
+		} catch {
+			/* ignore */
+		}
+	}
+	out = out.replace(/(^|[^A-Za-z0-9])(Bearer|Basic)\s+[^\s"',;}{[\])>]{4,}/gi, "$1$2 [REDACTED]");
+	out = out.replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]");
+	return out;
+}
+
 export function resolveLiveOpenAiConfig(opts?: {
 	modelOverride?: string;
 	env?: Record<string, string | undefined>;
 	timeoutMs?: number;
 	maxRetries?: number;
+	maxTokens?: number;
 }): LiveOpenAiConfig {
 	const env = opts?.env ?? process.env;
 	const apiKey = String(env.NUWA_LIVE_API_KEY ?? "").trim();
@@ -57,9 +80,13 @@ export function resolveLiveOpenAiConfig(opts?: {
 	const rawBase = String(env.NUWA_LIVE_API_BASE ?? "").trim() || "https://api.deepseek.com";
 	const apiBase = rawBase.replace(/\/+$/, "");
 	const model = String(opts?.modelOverride ?? env.NUWA_LIVE_MODEL ?? "").trim() || "deepseek-flash";
+	const envMaxTokens = Number(env.NUWA_LIVE_MAX_TOKENS ?? "");
+	const maxTokens =
+		opts?.maxTokens ??
+		(Number.isFinite(envMaxTokens) && envMaxTokens >= 256 ? Math.floor(envMaxTokens) : 4096);
 	const timeoutMs = opts?.timeoutMs ?? 90_000;
 	const maxRetries = opts?.maxRetries ?? 3;
-	return { apiBase, apiKey, model, timeoutMs, maxRetries };
+	return { apiBase, apiKey, model, maxTokens, timeoutMs, maxRetries };
 }
 
 export function buildChatCompletionsUrl(apiBase: string): string {
@@ -69,12 +96,17 @@ export function buildChatCompletionsUrl(apiBase: string): string {
 	return `${clean}/v1/chat/completions`;
 }
 
-function parseSseChatCompletion(rawText: string): { content: string; usage: Omit<LiveTokenUsage, "llmCalls"> } {
+export function parseSseChatCompletion(rawText: string): { content: string; usage: Omit<LiveTokenUsage, "llmCalls"> } {
 	let content = "";
 	let promptTokens = 0;
 	let completionTokens = 0;
 	let reasoningTokens = 0;
 	let totalTokens = 0;
+
+	const takePositiveMax = (prev: number, rawVal: unknown): number => {
+		const n = Number(rawVal);
+		return Number.isFinite(n) && n > 0 ? Math.max(prev, Math.floor(n)) : prev;
+	};
 
 	for (const line of rawText.split(/\r?\n/)) {
 		const trimmed = line.trim();
@@ -86,22 +118,79 @@ function parseSseChatCompletion(rawText: string): { content: string; usage: Omit
 			const delta = evt.choices?.[0]?.delta?.content ?? evt.choices?.[0]?.message?.content;
 			if (typeof delta === "string") content += delta;
 			if (evt.usage && typeof evt.usage === "object") {
-				promptTokens = Number(evt.usage.prompt_tokens ?? promptTokens) || 0;
-				completionTokens = Number(evt.usage.completion_tokens ?? completionTokens) || 0;
-				reasoningTokens =
-					Number(
-						evt.usage.completion_tokens_details?.reasoning_tokens ??
-							evt.usage.reasoning_tokens ??
-							reasoningTokens,
-					) || 0;
-				totalTokens = Number(evt.usage.total_tokens ?? promptTokens + completionTokens) || 0;
+				promptTokens = takePositiveMax(promptTokens, evt.usage.prompt_tokens);
+				completionTokens = takePositiveMax(completionTokens, evt.usage.completion_tokens);
+				reasoningTokens = takePositiveMax(
+					reasoningTokens,
+					evt.usage.completion_tokens_details?.reasoning_tokens ?? evt.usage.reasoning_tokens,
+				);
+				totalTokens = takePositiveMax(totalTokens, evt.usage.total_tokens);
 			}
 		} catch {
 			/* 忽略非 JSON SSE 心跳行 */
 		}
 	}
-	if (!totalTokens) totalTokens = promptTokens + completionTokens;
+	if (totalTokens < promptTokens + completionTokens) {
+		totalTokens = promptTokens + completionTokens;
+	}
 	return { content, usage: { promptTokens, completionTokens, reasoningTokens, totalTokens } };
+}
+
+/**
+ * 字符串转义感知的配对花括号扫描：提取文本中首个语法合法的顶层 JSON 对象，
+ * 避免模型在 JSON 后附带 `/users/{id}` 等花括号说明导致解析失败。
+ */
+export function extractFirstJsonObject(raw: string): Record<string, any> | null {
+	const cleaned = String(raw ?? "").replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+	if (!cleaned) return null;
+
+	const len = cleaned.length;
+	for (let start = 0; start < len; start++) {
+		if (cleaned[start] !== "{") continue;
+		let depth = 0;
+		let inString = false;
+		let escaped = false;
+		for (let i = start; i < len; i++) {
+			const ch = cleaned[i]!;
+			if (inString) {
+				if (escaped) {
+					escaped = false;
+				} else if (ch === "\\") {
+					escaped = true;
+				} else if (ch === '"') {
+					inString = false;
+				}
+				continue;
+			}
+			if (ch === '"') {
+				inString = true;
+			} else if (ch === "{") {
+				depth += 1;
+			} else if (ch === "}") {
+				depth -= 1;
+				if (depth === 0) {
+					const candidate = cleaned.slice(start, i + 1);
+					try {
+						const parsed = JSON.parse(candidate);
+						if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+							return parsed as Record<string, any>;
+						}
+					} catch {
+						/* 继续尝试下一个左花括号起点 */
+					}
+					break;
+				}
+			}
+		}
+	}
+	return null;
+}
+
+class NonRetryableLiveHttpError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "NonRetryableLiveHttpError";
+	}
 }
 
 export async function callOpenAiChatCompletion(
@@ -125,7 +214,7 @@ export async function callOpenAiChatCompletion(
 				body: JSON.stringify({
 					model: cfg.model,
 					temperature: 0.1,
-					max_tokens: 900,
+					max_tokens: cfg.maxTokens,
 					messages,
 				}),
 				signal: controller.signal,
@@ -134,7 +223,12 @@ export async function callOpenAiChatCompletion(
 			const contentType = (resp.headers.get("content-type") ?? "").toLowerCase();
 			const rawBody = await resp.text();
 			if (!resp.ok) {
-				throw new Error(`HTTP ${resp.status}: ${rawBody.slice(0, 240)}`);
+				const safePreview = scrubLiveErrorText(rawBody.slice(0, 240), cfg.apiKey);
+				const msg = `HTTP ${resp.status}: ${safePreview}`;
+				if (NON_RETRYABLE_HTTP_STATUS.has(resp.status)) {
+					throw new NonRetryableLiveHttpError(msg);
+				}
+				throw new Error(msg);
 			}
 
 			if (contentType.includes("text/event-stream") || rawBody.trimStart().startsWith("data:")) {
@@ -167,6 +261,9 @@ export async function callOpenAiChatCompletion(
 			};
 		} catch (err) {
 			lastErr = err;
+			if (err instanceof NonRetryableLiveHttpError) {
+				break;
+			}
 			if (attempt < cfg.maxRetries) {
 				await Bun.sleep(250 * attempt);
 			}
@@ -175,21 +272,10 @@ export async function callOpenAiChatCompletion(
 		}
 	}
 
+	const rawReason = lastErr instanceof Error ? lastErr.message : String(lastErr);
 	throw new Error(
-		`实网模型调用失败 (${cfg.apiBase} model=${cfg.model}): ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+		`实网模型调用失败 (${scrubLiveErrorText(cfg.apiBase, cfg.apiKey)} model=${cfg.model}): ${scrubLiveErrorText(rawReason, cfg.apiKey)}`,
 	);
-}
-
-function extractFirstJsonObject(raw: string): Record<string, any> | null {
-	const cleaned = raw.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) return null;
-	try {
-		return JSON.parse(cleaned.slice(start, end + 1)) as Record<string, any>;
-	} catch {
-		return null;
-	}
 }
 
 async function probeScenarioSurfaceHint(spec: L4ScenarioSpec, srv: L4ScenarioServerHandle): Promise<string> {
@@ -199,12 +285,16 @@ async function probeScenarioSurfaceHint(spec: L4ScenarioSpec, srv: L4ScenarioSer
 		const unauth = rgs.unauthenticatedRoutes.map((r) => `${r.method} ${r.path}`).join(", ");
 		parts.push(`rgsRoutes=${rgs.summary.totalRoutes}`, `unauthRoutes=[${unauth}]`);
 	}
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 3_000);
 	try {
-		const r = await fetch(srv.baseUrl, { method: "GET" });
+		const r = await fetch(srv.baseUrl, { method: "GET", signal: controller.signal });
 		const txt = (await r.text()).slice(0, 180).replace(/\s+/g, " ");
 		parts.push(`rootStatus=${r.status}`, `rootPreview=${txt}`);
 	} catch {
-		/* 非纯 HTTP 根路径忽略 */
+		/* 非纯 HTTP 根路径或超时忽略 */
+	} finally {
+		clearTimeout(timer);
 	}
 	return parts.join(" | ");
 }
@@ -231,18 +321,26 @@ export async function generateLiveScenarioPlan(
 		],
 		fetchFn,
 	);
+	if (!res.content) {
+		throw new Error(`实网规划阶段返回空内容 (scenario=${spec.id})，拒绝回退离线默认方案`);
+	}
 	const parsed = extractFirstJsonObject(res.content);
+	if (!parsed || typeof parsed.hypothesis !== "string" || !parsed.hypothesis.trim()) {
+		throw new Error(
+			`实网规划阶段未返回合法 JSON hypothesis (scenario=${spec.id}): ${scrubLiveErrorText(res.content.slice(0, 160), cfg.apiKey)}`,
+		);
+	}
 	return {
-		hypothesis: String(parsed?.hypothesis ?? `${spec.name} 接口契约与权限边界验证`).slice(0, 200),
-		recommendedActions: Array.isArray(parsed?.actions)
+		hypothesis: parsed.hypothesis.trim().slice(0, 200),
+		recommendedActions: Array.isArray(parsed.actions)
 			? parsed.actions.map((x: unknown) => String(x)).slice(0, 6)
-			: ["baseline_request", "boundary_verification"],
+			: [],
 		targetParameters:
-			parsed?.params && typeof parsed.params === "object" && !Array.isArray(parsed.params)
+			parsed.params && typeof parsed.params === "object" && !Array.isArray(parsed.params)
 				? Object.fromEntries(Object.entries(parsed.params).map(([k, v]) => [k, String(v)]))
 				: {},
-		confidence: Math.min(0.99, Math.max(0.05, Number(parsed?.confidence ?? 0.8) || 0.8)),
-		rawSummary: res.content.slice(0, 240),
+		confidence: Math.min(0.99, Math.max(0.05, Number(parsed.confidence ?? 0.8) || 0.8)),
+		rawSummary: scrubLiveErrorText(res.content.slice(0, 240), cfg.apiKey),
 		usage: res.usage,
 	};
 }
@@ -269,12 +367,22 @@ export async function evaluateLiveScenarioVerdict(
 		],
 		fetchFn,
 	);
+	if (!res.content) {
+		throw new Error(`实网复核阶段返回空内容 (scenario=${spec.id})，拒绝静默回退离线答案`);
+	}
 	const parsed = extractFirstJsonObject(res.content);
-	const defaultConfirmed = execDetail.truePositives > 0;
+	if (!parsed || typeof parsed.confirmed !== "boolean") {
+		throw new Error(
+			`实网复核阶段未返回合法布尔字段 confirmed (scenario=${spec.id}): ${scrubLiveErrorText(res.content.slice(0, 160), cfg.apiKey)}`,
+		);
+	}
 	return {
-		confirmed: typeof parsed?.confirmed === "boolean" ? parsed.confirmed : defaultConfirmed,
-		rationale: String(parsed?.rationale ?? execDetail.detail).slice(0, 240),
-		confidence: Math.min(0.99, Math.max(0.05, Number(parsed?.confidence ?? 0.85) || 0.85)),
+		confirmed: parsed.confirmed,
+		rationale: scrubLiveErrorText(String(parsed.rationale ?? "").trim() || "LLM completed verdict", cfg.apiKey).slice(
+			0,
+			240,
+		),
+		confidence: Math.min(0.99, Math.max(0.05, Number(parsed.confidence ?? 0.85) || 0.85)),
 		usage: res.usage,
 	};
 }

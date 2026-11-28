@@ -93,6 +93,8 @@ export interface SessionVault {
 	schema: 1;
 	updatedAt: string;
 	roles: Record<string, SessionRoleEntry>;
+	/** 已轮换退役的历史凭据集合（仅用于全链路脱敏防泄露，绝不作为活跃认证凭据返回）。 */
+	retiredSecrets?: string[];
 }
 
 export type SessionRoleInput = Omit<SessionRoleEntry, "updatedAt"> & {
@@ -360,10 +362,17 @@ export function loadSessionVault(root: string): SessionVault {
 				if (norm) roles[norm.role] = norm;
 			}
 		}
+		const rawRetired = Array.isArray(parsed.retiredSecrets)
+			? parsed.retiredSecrets
+					.filter((x): x is string => typeof x === "string" && x.trim().length >= 3)
+					.map((x) => stripCrlf(x))
+					.filter(Boolean)
+			: undefined;
 		return {
 			schema: VAULT_SCHEMA,
 			updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
 			roles,
+			...(rawRetired && rawRetired.length > 0 ? { retiredSecrets: [...new Set(rawRetired)].slice(-128) } : {}),
 		};
 	} catch {
 		return emptyVault();
@@ -376,6 +385,9 @@ function saveSessionVault(root: string, vault: SessionVault): void {
 		schema: VAULT_SCHEMA,
 		updatedAt: vault.updatedAt || nowIso(),
 		roles: vault.roles,
+		...(vault.retiredSecrets && vault.retiredSecrets.length > 0
+			? { retiredSecrets: [...new Set(vault.retiredSecrets)].slice(-128) }
+			: {}),
 	};
 	atomicWriteSecureFile(file, `${JSON.stringify(payload, null, 2)}\n`);
 }
@@ -446,6 +458,38 @@ export function upsertSessionRole(root: string, input: SessionRoleInput): Sessio
 		}
 	}
 	if (expiresAt) entry.expiresAt = expiresAt;
+
+	// 记录同角色轮换覆盖前的旧敏感凭据至 retiredSecrets（仅用于 redactVaultSecrets 脱敏，防止 JSON/报告泄露历史令牌）
+	if (prev) {
+		const retired = new Set<string>(vault.retiredSecrets ?? []);
+		const pushRetired = (oldVal: string | undefined, newVal: string | undefined) => {
+			const cleanOld = String(oldVal ?? "").trim();
+			const cleanNew = String(newVal ?? "").trim();
+			if (cleanOld.length >= 4 && cleanOld !== cleanNew) {
+				retired.add(cleanOld);
+				const bare = cleanOld.replace(/^(?:Bearer|Token|Basic|JWT)\s+/i, "").trim();
+				if (bare.length >= 4) retired.add(bare);
+			}
+		};
+		pushRetired(prev.bearer, entry.bearer);
+		pushRetired(prev.cookie, entry.cookie);
+		pushRetired(prev.password, entry.password);
+		if (prev.password && prev.username && (prev.password !== entry.password || prev.username !== entry.username)) {
+			const oldBasic = Buffer.from(`${prev.username}:${prev.password}`, "utf8").toString("base64");
+			if (oldBasic.length >= 4) retired.add(oldBasic);
+		}
+		if (prev.headers) {
+			for (const [hk, hv] of Object.entries(prev.headers)) {
+				const nextHv = entry.headers?.[hk];
+				if (SENSITIVE_HEADER_NAME_RE.test(hk) || String(hv ?? "").trim().length >= 8) {
+					pushRetired(hv, nextHv);
+				}
+			}
+		}
+		if (retired.size > 0) {
+			vault.retiredSecrets = [...retired].slice(-128);
+		}
+	}
 
 	vault.roles[role] = entry;
 	vault.updatedAt = ts;
@@ -606,6 +650,18 @@ function collectVaultSecrets(vault: SessionVault): Array<{ raw: string; masked: 
 					}
 				}
 			}
+		}
+	}
+
+	for (const retiredSec of vault.retiredSecrets ?? []) {
+		const s = String(retiredSec ?? "").trim();
+		if (!s || s.length < 4) continue;
+		if (s.includes("=") && s.includes(";")) {
+			addCookieSecrets(s);
+		} else {
+			addReplacement(s, maskAuthSchemeValue(s), 4);
+			const bare = s.replace(/^(?:Bearer|Token|Basic|JWT)\s+/i, "").trim();
+			if (bare && bare !== s) addSecret(bare, 4);
 		}
 	}
 

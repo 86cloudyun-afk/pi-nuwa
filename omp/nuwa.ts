@@ -722,7 +722,7 @@ export default function nuwaOmp(pi: ExtensionAPI) {
 
 	// ---------------------------------------------------------------- 斜杠命令（全面委托 NuwaUnifiedEngine）
 	pi.registerCommand?.("nuwa", {
-		description: "女娲模式：/nuwa <目标任务> | status | board | belief | calibrate | traffic | hybrid | mcp | cdp | chains | squad | scope | session | authdiff | oob | assets | spa | report | export | seal | inspect | query | pause | stop | resume | doctor",
+		description: "女娲模式：/nuwa <目标任务> | status | board | proto | pivot | rgs | belief | calibrate | traffic | hybrid | mcp | cdp | chains | squad | scope | session | authdiff | oob | assets | spa | report | export | seal | inspect | query | pause | stop | resume | doctor",
 		getArgumentCompletions: (prefix) =>
 			NUWA_SUBCOMMANDS.filter((s) => s.startsWith(prefix)).map((s) => ({ value: s, label: s })),
 		handler: async (args, ctx) => {

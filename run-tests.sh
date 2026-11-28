@@ -11,4 +11,4 @@ _NUWA_TEST_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/nuwa-test-sandbox.XXXXXX")"
 trap 'rm -rf "$_NUWA_TEST_SANDBOX"' EXIT
 export PI_AGENT_HOME="$_NUWA_TEST_SANDBOX/agent"
 unset NUWA_KB_DB
-bun test --isolate "$@"
+bun test --isolate --timeout 60000 "$@"

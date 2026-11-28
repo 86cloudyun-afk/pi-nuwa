@@ -20,7 +20,8 @@ import type { AssetNode, Fact, HypothesisNode, NuwaState } from "./types";
 import { partitionFactsByVerifyStage } from "./verifier-gate";
 import { writeStandalonePovScript } from "./rgs-analyzer";
 import { computeBodyHash, extractHitEvidenceMetrics, readFactEvidenceLog } from "./evidence";
-import { redactVaultSecrets } from "./session-vault";
+import { loadSessionVault, redactVaultSecrets, type SessionVault } from "./session-vault";
+import { redactTextForStorage, redactUnknownForStorage } from "./sqlite-schema";
 import { NuwaSqliteStore, resolveStorageBackend, sqliteDbPath } from "./sqlite-store";
 import { atomicWrite, cell, journalPath, loadState } from "./storage";
 
@@ -156,29 +157,27 @@ export function inferFindingRuleMeta(fact: Pick<Fact, "kind" | "title" | "detail
 	};
 }
 
+const EMPTY_REPORT_VAULT: SessionVault = { schema: 1, updatedAt: "", roles: {} };
+
+function resolveReportVault(root?: string): SessionVault {
+	if (!root || !root.trim()) return EMPTY_REPORT_VAULT;
+	try {
+		return loadSessionVault(root);
+	} catch {
+		return EMPTY_REPORT_VAULT;
+	}
+}
+
 function maybeRedact(text: string | undefined, root?: string): string {
 	const raw = String(text ?? "");
-	if (!raw || !root || !root.trim()) return raw;
-	return redactVaultSecrets(raw, root);
+	if (!raw) return raw;
+	const vault = resolveReportVault(root);
+	return redactTextForStorage(raw, vault) ?? raw;
 }
 
 function redactDeep<T>(value: T, root?: string): T {
-	if (!root || !root.trim()) return value;
-	if (typeof value === "string") {
-		return redactVaultSecrets(value, root) as unknown as T;
-	}
-	if (Array.isArray(value)) {
-		return value.map((item) => redactDeep(item, root)) as unknown as T;
-	}
-	if (value && typeof value === "object") {
-		const out: Record<string, unknown> = {};
-		for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-			if (v === undefined) continue;
-			out[k] = redactDeep(v, root);
-		}
-		return out as T;
-	}
-	return value;
+	const vault = resolveReportVault(root);
+	return redactUnknownForStorage(value, vault);
 }
 
 function sha256Hex(content: string | Buffer): string {
@@ -756,8 +755,9 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 	const manifestEntries: Array<{ name: string; sha256: string; bytes: number }> = [];
 	const writtenFiles: string[] = [];
 
+	const bundleVault = resolveReportVault(normRoot);
 	const recordWrite = (name: string, content: string): string => {
-		const safeContent = redactVaultSecrets(content, normRoot);
+		const safeContent = redactTextForStorage(content, bundleVault) ?? redactVaultSecrets(content, normRoot);
 		const fullPath = join(dir, name);
 		writeSecureFile(fullPath, safeContent);
 		const bytes = Buffer.byteLength(safeContent, "utf8");
@@ -810,6 +810,7 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 		try {
 			const povWritten = writeStandalonePovScript(dir, {
 				fact,
+				ruleMeta: meta,
 				baseUrl: fallbackBaseUrl,
 				vaultRootOrVault: normRoot,
 				scope: st.project.scope,
@@ -885,7 +886,9 @@ export function writePocBundle(root: string, st: NuwaState): PocBundleResult {
 		},
 		normRoot,
 	);
-	const manifestContent = redactVaultSecrets(`${JSON.stringify(manifestObj, null, 2)}\n`, normRoot);
+	const manifestContent =
+		redactTextForStorage(`${JSON.stringify(manifestObj, null, 2)}\n`, bundleVault) ??
+		redactVaultSecrets(`${JSON.stringify(manifestObj, null, 2)}\n`, normRoot);
 	const manifestPath = join(dir, "manifest.json");
 	writeSecureFile(manifestPath, manifestContent);
 	writtenFiles.push(manifestPath);

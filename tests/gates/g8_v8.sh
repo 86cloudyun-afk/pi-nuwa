@@ -60,7 +60,7 @@ from pathlib import Path
 import re, sys
 
 secret_re = re.compile(r"\bsk-[0-9a-zA-Z]{20,}\b")
-scan_dirs = ["core", "omp", "kb", "bin", "benchmarks", "tests", "scripts"]
+scan_dirs = ["core", "omp", "kb", "bin", "benchmarks", "tests", "scripts", "docs", "agents", "skills", "config"]
 leaks = []
 for d in scan_dirs:
     base = Path(d)
@@ -83,6 +83,13 @@ if leaks:
     sys.exit(1)
 print("PASS: 全仓源码扫描 0 处 sk-[0-9a-zA-Z]{20,} 硬编码密钥泄漏")
 PY
+
+if env -u BUN_OPTIONS -u NUWA_LIVE_API_KEY bun benchmarks/l4-arena/run-l4-eval.ts --live-openai-compat --scenario s01-second-order-store-read >/dev/null 2>&1; then
+  echo "FAIL: --live-openai-compat 在缺失 NUWA_LIVE_API_KEY 时未拒绝退出" >&2
+  fail=1
+else
+  echo "PASS: --live-openai-compat 缺失 NUWA_LIVE_API_KEY 时显式拒绝退出 (非 0)"
+fi
 
 _G8_SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/nuwa-g8-sandbox.XXXXXX")"
 trap 'rm -rf "$_G8_SANDBOX" .nuwa-l3-tmp-persist' EXIT

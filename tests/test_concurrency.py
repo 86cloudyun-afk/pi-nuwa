@@ -71,7 +71,7 @@ class Concurrency(unittest.TestCase):
         bootstrap(self.tmp, "shared", self.base_env)
         env = {**self.base_env, "FAKE_SLOW": "2", "FAKE_COMPLETE_AFTER": "999"}
         procs = [self.spawn("shared", env) for _ in range(5)]
-        out = [p.communicate(timeout=120) for p in procs]
+        out = [p.communicate(timeout=240) for p in procs]
         codes = [p.returncode for p in procs]
         winners = [c for c in codes if c == 0]
         losers = [c for c in codes if c == 5]

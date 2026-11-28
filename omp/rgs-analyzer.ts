@@ -22,7 +22,6 @@ import {
 	type HybridVerificationIntentSpec,
 	type VirtualSourceFile,
 } from "./hybrid-audit";
-import { inferFindingRuleMeta } from "./reporting";
 import { isHostInScope } from "./scope";
 import { loadSessionVault, redactVaultSecrets, type SessionVault } from "./session-vault";
 
@@ -121,6 +120,7 @@ export interface ExplicitPovTargetSpec {
 export interface GenerateStandalonePovInput {
 	fact?: Pick<Fact, "id" | "kind" | "title" | "detail" | "command" | "output" | "verifyStage" | "verified" | "targetKey" | "sourceAnchor">;
 	explicit?: ExplicitPovTargetSpec; baseUrl?: string; role?: string;
+	ruleMeta?: { ruleId: string; cwe?: string; level?: string; category?: string };
 	vaultRootOrVault?: string | SessionVault; knownSecretsToScrub?: readonly string[]; scope?: ScopePolicy;
 }
 export interface StandalonePovArtifact {
@@ -455,7 +455,15 @@ function collectRgsFiles(input: CodeSurfaceInput, opts?: AnalyzeRgsOptions): Loa
 	const includeBundles = opts?.includeBundles !== false;
 	const virtuals: VirtualSourceFile[] = [];
 
+	const assertNotNuwaInternalPath = (rawPath: string): void => {
+		const norm = String(rawPath ?? "").replace(/\\/g, "/");
+		if (/(?:^|\/)\.nuwa(?:\/|$)/i.test(norm)) {
+			throw new Error(`[N-003] 安全护栏阻断：禁止扫描或读取 .nuwa 内部状态与会话凭据目录 (${rawPath})`);
+		}
+	};
+
 	const addDiskPath = (targetPath: string, rootBase: string): void => {
+		assertNotNuwaInternalPath(targetPath);
 		if (!existsSync(targetPath)) return;
 		let st;
 		try { st = lstatSync(targetPath); } catch { return; }
@@ -2235,11 +2243,38 @@ export function generateStandalonePovScript(input: GenerateStandalonePovInput): 
 		}
 	}
 
+	const inferLocalRuleMeta = (f: { kind?: string; title?: string; detail?: string }): { ruleId: string; cwe?: string } => {
+		if (f.kind === "flag") return { ruleId: "NUWA-FLAG" };
+		const txt = `${f.title ?? ""}\n${f.detail ?? ""}`;
+		if (/\b(?:idor|bola|broken\s+object\s+level|insecure\s+direct\s+object)\b|对象级越权|水平越权|越权修改他人|越权访问他人|跨租户/i.test(txt)) {
+			return { ruleId: "NUWA-BOLA", cwe: "CWE-639" };
+		}
+		if (/\b(?:bfla|broken\s+function\s+level|auth[\s_-]?bypass|authentication\s+bypass|authorization\s+bypass|unauth(?:orized)?\s+admin|jwt\s+(?:none|bypass|forgery)|privilege\s+escalation)\b|功能级越权|垂直越权|认证绕过|鉴权绕过|未授权管理|权限绕过|权限提升/i.test(txt)) {
+			return { ruleId: "NUWA-AUTH", cwe: "CWE-287" };
+		}
+		if (/\b(?:sqli|sql\s+injection)\b|sql\s*注入/i.test(txt)) return { ruleId: "NUWA-SQLI", cwe: "CWE-89" };
+		if (/\b(?:ssrf|server[\s_-]?side\s+request\s+forgery)\b|服务端请求伪造/i.test(txt)) return { ruleId: "NUWA-SSRF", cwe: "CWE-918" };
+		if (/\b(?:lfi|path\s+traversal|directory\s+traversal|arbitrary\s+file\s+read|local\s+file\s+inclusion)\b|路径穿越|目录穿越|任意文件读取|本地文件包含/i.test(txt)) {
+			return { ruleId: "NUWA-LFI", cwe: "CWE-22" };
+		}
+		if (/\b(?:rce|cmdi|command\s+injection|os\s+command|remote\s+code\s+execution|code\s+execution|ssti|deserializ(?:ation|e))\b|命令注入|远程代码执行|模板注入|反序列化/i.test(txt)) {
+			return { ruleId: "NUWA-RCE", cwe: "CWE-78" };
+		}
+		if (/\b(?:xss|cross[\s_-]?site\s+scripting)\b|跨站脚本/i.test(txt)) return { ruleId: "NUWA-XSS", cwe: "CWE-79" };
+		if (/\b(?:exposure|information\s+disclosure|info\s+disclosure|sensitive\s+file|misconfig(?:uration)?|actuator|\.git\/head|\.env|swagger|openapi|debug\s+endpoint|directory\s+listing|cors\s+misconfig)\b|信息泄露|配置泄露|敏感文件|端点暴露|配置暴露|未授权暴露/i.test(txt)) {
+			return { ruleId: "NUWA-EXPOSURE", cwe: "CWE-200" };
+		}
+		if (/越权读取|越权/i.test(txt)) return { ruleId: "NUWA-BOLA", cwe: "CWE-639" };
+		return { ruleId: "NUWA-VULN" };
+	};
+
 	const roleSuffix = sanitizeRoleEnvSuffix(explicit?.role ?? input.role ?? "MEMBER");
 	const roleTokenEnv = `NUWA_POV_TOKEN_${roleSuffix}`;
 	const roleCookieEnv = `NUWA_POV_COOKIE_${roleSuffix}`;
 	const headersFileEnv = "NUWA_POV_HEADERS_FILE" as const;
-	const ruleMeta = inferFindingRuleMeta({ kind: fact?.kind ?? "vuln", title: explicit?.title ?? fact?.title ?? "", detail: fact?.detail ?? "" });
+	const ruleMeta =
+		input.ruleMeta ??
+		inferLocalRuleMeta({ kind: fact?.kind ?? "vuln", title: explicit?.title ?? fact?.title ?? "", detail: fact?.detail ?? "" });
 	const safeTitle = scrub(explicit?.title ?? fact?.title ?? `Finding ${safeFactId}`).replace(/\r?\n/g, " ");
 	const safeAnchor = scrub(explicit?.sourceAnchor ?? fact?.sourceAnchor ?? "").replace(/\r?\n/g, " ");
 

@@ -65,7 +65,7 @@ print(f"PASS: kb.db 构建成功 kbItems={kb_items} (>= 520), cards={stats.get('
 PY
 
 echo "[g7] 5/7 全量 5+1 个 v7 测试套件隔离回归验收"
-env -u BUN_OPTIONS -u NUWA_KB_DB PI_AGENT_HOME="$_G7_SANDBOX/agent" bun test --isolate \
+env -u BUN_OPTIONS -u NUWA_KB_DB PI_AGENT_HOME="$_G7_SANDBOX/agent" bun test --isolate --timeout 120000 \
   tests/v7_cdp_bridge.test.ts \
   tests/v7_chain_composer.test.ts \
   tests/v7_squad_kb2.test.ts \

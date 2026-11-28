@@ -851,7 +851,7 @@ const URL_SENSITIVE_QUERY_RE =
 const URL_USERINFO_RE =
 	/(\b(?:https?|ftp|sftp|ftps|ws|wss|redis|rediss|mysql|postgres(?:ql)?|mongodb(?:\+srv)?|amqp|amqps|socks(?:4a?|5h?)?):\/\/)([^\/\s:@?#]+)?:([^\/\s@?#]+)@/gi;
 const RAW_JWT_RE = /\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,})\b/g;
-const KNOWN_TOKEN_PREFIX_RE = /\b((?:sk-proj-|sk-live-|sk-|ghp_|gho_|ghu_|github_pat_|xoxb-|xoxp-|AKIA)[A-Za-z0-9_-]{10,})\b/g;
+const KNOWN_TOKEN_PREFIX_RE = /\b((?:sk-proj-|sk-live-|sk-[A-Za-z0-9_-]{6,}|ghp_|gho_|ghu_|github_pat_|xoxb-|xoxp-|AKIA)[A-Za-z0-9_-]{10,})\b/g;
 
 const COOKIE_ATTRS = new Set([
 	"path",
@@ -959,10 +959,13 @@ function redactGenericSecrets(text: string): string {
 		return `${hdr}: ${scheme} ${maskSecretValue(tok)}`;
 	});
 
-	out = out.replace(/\b(Bearer|Basic)\s+([A-Za-z0-9._~+/=-]{8,})/gi, (_m, scheme: string, tok: string) => {
-		if (alreadyMasked(tok)) return `${scheme} ${tok}`;
-		return `${scheme} ${maskSecretValue(tok)}`;
-	});
+	out = out.replace(
+		/(^|[^A-Za-z0-9])(Bearer|Basic)\s+([A-Za-z0-9._~+/=-]{8,})/gi,
+		(_m, prefix: string, scheme: string, tok: string) => {
+			if (alreadyMasked(tok)) return `${prefix}${scheme} ${tok}`;
+			return `${prefix}${scheme} ${maskSecretValue(tok)}`;
+		},
+	);
 
 	out = out.replace(GENERIC_API_KEY_HEADER_RE, (_m, hdr: string, tok: string) => {
 		if (alreadyMasked(tok)) return `${hdr}: ${tok}`;

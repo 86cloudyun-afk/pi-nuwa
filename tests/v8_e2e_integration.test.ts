@@ -167,21 +167,29 @@ describe("v8.0.0 全栈总装、模块行数红线与导出兼容性", () => {
 			};
 			nuwaMod.saveState(ws, st);
 
-			// 验证 #138 P2：protocol_frames 的 operationName 与 anomalyTag 强制脱敏
-			nuwaMod.recordProtocolAuditFrame(ws, {
-				id: "pf-p2-check",
-				ts: "2026-11-28T00:00:01.000Z",
-				protocol: "graphql",
-				direction: "request",
-				url: "http://127.0.0.1:19882/graphql",
-				host: "127.0.0.1",
-				operationName: opLeak,
-				anomalyTag: tagLeak,
-				status: 200,
-			});
+			// 验证 #138 P2：protocol_frames 的 operationName 与 anomalyTag 强制脱敏（显式在 sqlite 后端下验证落库）
+			const prevBe3 = process.env.NUWA_STORAGE_BACKEND;
+			process.env.NUWA_STORAGE_BACKEND = "sqlite";
+			try {
+				nuwaMod.recordProtocolAuditFrame(ws, {
+					id: "pf-p2-check",
+					ts: "2026-11-28T00:00:01.000Z",
+					protocol: "graphql",
+					direction: "request",
+					url: "http://127.0.0.1:19882/graphql",
+					host: "127.0.0.1",
+					operationName: opLeak,
+					anomalyTag: tagLeak,
+					status: 200,
+				});
+			} finally {
+				if (prevBe3 === undefined) delete process.env.NUWA_STORAGE_BACKEND;
+				else process.env.NUWA_STORAGE_BACKEND = prevBe3;
+			}
 
 			const store = new nuwaMod.NuwaSqliteStore(ws);
 			try {
+				expect(store.listProtocolFrames().length).toBe(1);
 				store.rawDb.exec("PRAGMA wal_checkpoint(TRUNCATE);");
 			} finally {
 				store.close();
@@ -355,5 +363,298 @@ describe("v8.0.0 全栈总装、模块行数红线与导出兼容性", () => {
 			}
 		},
 		40_000,
+	);
+
+	test(
+		"5. Wave 2 终审全反例回归：损坏 state.json 零写盘、无环 DAG、五文件内联脱敏、retiredSecrets 轮换保护与 Live 严拒离线回退",
+		async () => {
+			// A1. [#171 P1-1] 13B 损坏 state.json + .nuwa/snap 快照下执行只读 /nuwa proto|pivot|rgs 严格 0 字节改动
+			const corruptRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-corrupt-ro-"));
+			// A3 & C1/C2 工作目录
+			const rgsRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-rgs-guard-"));
+			const bundleRoot = mkdtempSync(join(tmpdir(), "nuwa-v8-bundle-inline-"));
+			try {
+				const stInit = nuwaMod.newState("http://127.0.0.1:19890", "corrupt state ro test", "pentest", nuwaMod.readCfg());
+				nuwaMod.saveStateJsonOnly(corruptRoot, stInit, { forceSnapshot: true });
+				rmSync(join(corruptRoot, ".nuwa", "journal.jsonl"), { force: true });
+				writeFileSync(nuwaMod.statePath(corruptRoot), "{ broken json", "utf8"); // 13 bytes
+				expect(statSync(nuwaMod.statePath(corruptRoot)).size).toBe(13);
+
+				const corruptNuwaDir = join(corruptRoot, ".nuwa");
+				const snapBeforeCorrupt = snapshotDir(corruptNuwaDir);
+				const engCorrupt = new nuwaMod.NuwaUnifiedEngine({ projectRoot: corruptRoot, cwd: corruptRoot });
+				for (const roCmd of ["proto", "pivot", "rgs"]) {
+					await engCorrupt.executeSlashCommand(roCmd);
+				}
+				expect(snapshotDir(corruptNuwaDir)).toEqual(snapBeforeCorrupt);
+				expect(statSync(nuwaMod.statePath(corruptRoot)).size).toBe(13);
+
+				// A2. [#171 P1-2 / #172 P1-2 / #174 P1-3] rgs-analyzer.ts 零运行时反向引用 ./reporting
+				const rgsSrc = readFileSync(join(REPO_ROOT, "omp/rgs-analyzer.ts"), "utf8");
+				expect(/from\s+["']\.\/reporting(?:\.ts)?["']/.test(rgsSrc)).toBe(false);
+
+				// A3. [#171 P1-3 + #172 P1-3] 终态 pov 拦截、跨目录相对路径解析、.nuwa/sessions N-003 阻断、scope_blocked 映射、proto 脱敏
+				mkdirSync(join(rgsRoot, "src"), { recursive: true });
+				writeFileSync(
+					join(rgsRoot, "src", "app.ts"),
+					'import express from "express"; const app = express(); app.post("/api/orders", (req, res) => res.json({ ok: true }));\n',
+					"utf8",
+				);
+				const stRgs = nuwaMod.newState("http://127.0.0.1:19891", "rgs guard test", "pentest", nuwaMod.readCfg());
+				stRgs.facts.f001 = {
+					id: "f001",
+					kind: "vuln",
+					title: "订单接口越权访问",
+					detail: "GET http://127.0.0.1:19891/api/orders/2 返回跨租户数据",
+					command: "curl -sS http://127.0.0.1:19891/api/orders/2",
+					output: '{"id":2}',
+					verified: true,
+					verifyStage: "confirmed",
+					createdAt: "2026-11-28T00:00:00.000Z",
+				};
+				nuwaMod.saveState(rgsRoot, stRgs);
+				nuwaMod.upsertSessionRole(rgsRoot, { role: "user", bearer: "tok_n003_guard_test_1122" });
+
+				// 跨目录（当前进程 cwd 非 rgsRoot）传入相对路径 "src" 正常扫描项目内 src/app.ts
+				const relScan = nuwaMod.executeRgsCommand(rgsRoot, "scan src");
+				expect(relScan.level).toBe("info");
+				expect(relScan.msg).toContain("routes=1");
+
+				// 扫描 .nuwa/sessions 必须触发 N-003 硬阻断（斜杠命令层 + 核心 API 层双阻断）
+				const nuwaScan = nuwaMod.executeRgsCommand(rgsRoot, "scan .nuwa/sessions");
+				expect(nuwaScan.level).toBe("error");
+				expect(nuwaScan.msg).toContain("N-003");
+				expect(() => nuwaMod.analyzeCrossFileRgs(join(rgsRoot, ".nuwa", "sessions"))).toThrow(/N-003/);
+
+				// proto graphql 越界/报错回显 URL 凭据脱敏
+				const protoLeakRes = await nuwaMod.executeProtoCommand(
+					rgsRoot,
+					"graphql http://user:ProtoUrlPass9911@evil.example.test/graphql?api_key=ProtoQueryKey8822",
+				);
+				expect(protoLeakRes.level).toBe("error");
+				expect(protoLeakRes.msg.includes("ProtoUrlPass9911")).toBe(false);
+				expect(protoLeakRes.msg.includes("ProtoQueryKey8822")).toBe(false);
+
+				// scope_blocked 映射落库校验 + Op_Basic 下划线前缀脱敏校验（显式在 sqlite 后端下验证落库）
+				const prevBe5 = process.env.NUWA_STORAGE_BACKEND;
+				process.env.NUWA_STORAGE_BACKEND = "sqlite";
+				try {
+					nuwaMod.recordPivotCredentialResults(rgsRoot, {
+						ok: true,
+						generatedAt: "2026-11-28T00:00:00.000Z",
+						mode: "pentest",
+						roles: ["user"],
+						results: [
+							{
+								target: "http://blocked.internal.test:8080/",
+								host: "blocked.internal.test",
+								role: "user",
+								status: "blocked_by_scope",
+								reason: "N-007 out of scope",
+								diffScore: 0,
+							},
+						],
+						validReuses: [],
+						blockedTargets: [{ target: "http://blocked.internal.test:8080/", host: "blocked.internal.test", reason: "N-007" }],
+						soft404Targets: [],
+						summary: "blocked=1",
+					});
+					nuwaMod.recordProtocolAuditFrame(rgsRoot, {
+						id: "pf-underscore-basic",
+						ts: "2026-11-28T00:00:02.000Z",
+						protocol: "http",
+						direction: "request",
+						url: "http://127.0.0.1:19891/api",
+						host: "127.0.0.1",
+						anomalyTag: "Op_Basic dXNlcjpVbmRlcnNjb3JlQmFzaWNTZWNyZXQ5OQ==",
+					});
+				} finally {
+					if (prevBe5 === undefined) delete process.env.NUWA_STORAGE_BACKEND;
+					else process.env.NUWA_STORAGE_BACKEND = prevBe5;
+				}
+				const checkStore = new nuwaMod.NuwaSqliteStore(rgsRoot);
+				try {
+					const scopeBlockedRows = checkStore.listAssetCredentials({ status: "scope_blocked" });
+					expect(scopeBlockedRows.length).toBe(1);
+					expect(scopeBlockedRows[0]?.host).toBe("blocked.internal.test");
+					checkStore.rawDb.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+				} finally {
+					checkStore.close();
+				}
+				expect(
+					readFileSync(nuwaMod.sqliteDbPath(rgsRoot))
+						.toString("latin1")
+						.includes("dXNlcjpVbmRlcnNjb3JlQmFzaWNTZWNyZXQ5OQ=="),
+				).toBe(false);
+
+				// 置为 sealed_negative 终态后直接调 executeRgsCommand(rgsRoot, "pov f001") 必须拦截且不写 pov-f001.ts
+				stRgs.project.status = "sealed_negative";
+				stRgs.runtime.status = "sealed_negative";
+				nuwaMod.saveState(rgsRoot, stRgs);
+				const povBlocked = nuwaMod.executeRgsCommand(rgsRoot, "pov f001");
+				expect(povBlocked.level).toBe("error");
+				expect(existsSync(join(rgsRoot, ".nuwa", "poc-bundle", "pov-f001.ts"))).toBe(false);
+
+				// C1 & #182. SessionVault 角色凭据轮换覆盖后旧凭据保留脱敏 + writePocBundle 五文件非入罐内联凭据零明文
+				const rotatedOldToken = "RotatedLegacyOpaqueToken_5566778899";
+				const freshActiveToken = "FreshReplacementToken_1122334455";
+				nuwaMod.upsertSessionRole(bundleRoot, { role: "member", bearer: rotatedOldToken });
+				nuwaMod.upsertSessionRole(bundleRoot, { role: "member", bearer: freshActiveToken });
+
+				const inlineUrlPass = "UrlPassSecret554433";
+				const inlineQueryKey = "QueryApiKeySecret667788";
+				const inlineTotp = "JBSWY3DPEHPK3PXP_INLINE";
+				const inlineApiToken = ["s" + "k", "LiveInlineTestToken998877665544"].join("-");
+
+				const stBundle = nuwaMod.newState(
+					`http://admin:${inlineUrlPass}@127.0.0.1:19892`,
+					"inline secret scrubbing test",
+					"pentest",
+					nuwaMod.readCfg(),
+				);
+				stBundle.facts.f001 = {
+					id: "f001",
+					kind: "vuln",
+					title: "账单详情接口水平访问控制缺失",
+					detail: `请求 http://admin:${inlineUrlPass}@127.0.0.1:19892/api/bills/9?api_key=${inlineQueryKey} 附带旧令牌 ${rotatedOldToken}`,
+					command: `curl -sS "http://127.0.0.1:19892/api/bills/9?api_key=${inlineQueryKey}"`,
+					output: JSON.stringify({
+						totpSecret: inlineTotp,
+						providerKey: inlineApiToken,
+						oldTokenEcho: rotatedOldToken,
+					}),
+					verified: true,
+					verifyStage: "confirmed",
+					targetKey: "/api/bills/9",
+					createdAt: "2026-11-28T00:00:00.000Z",
+				};
+				const outBundle = nuwaMod.writePocBundle(bundleRoot, stBundle);
+				expect(outBundle.files.length).toBe(5);
+				for (const fPath of outBundle.files) {
+					const rawTxt = readFileSync(fPath, "utf8");
+					for (const forbidden of [
+						rotatedOldToken,
+						freshActiveToken,
+						inlineUrlPass,
+						inlineQueryKey,
+						inlineTotp,
+						inlineApiToken,
+					]) {
+						expect(rawTxt.includes(forbidden)).toBe(false);
+					}
+				}
+
+				// B1 & B2. [#174 P1-1 & P1-2] Live 评测拒绝空内容回退、配对花括号解析保留否决、SSE 0 帧不覆盖、401 回显密钥脱敏
+				const prevKey = process.env.NUWA_LIVE_API_KEY;
+				const prevBase = process.env.NUWA_LIVE_API_BASE;
+				let modeSelector: "empty" | "tail_brace_false" | "sse_zero_tail" | "http_401_leak" = "empty";
+				const leakTestKey = "ephemeral_live_secret_key_for_401_echo_check";
+				let auth401Hits = 0;
+
+				const advSrv = http.createServer((_req, res) => {
+					if (modeSelector === "empty") {
+						res.writeHead(200, { "Content-Type": "application/json" });
+						res.end(
+							JSON.stringify({
+								choices: [{ message: { content: "", reasoning_content: "thinking exhausted" } }],
+								usage: { prompt_tokens: 50, completion_tokens: 900, total_tokens: 950 },
+							}),
+						);
+						return;
+					}
+					if (modeSelector === "tail_brace_false") {
+						res.writeHead(200, { "Content-Type": "application/json" });
+						// 第 1 次调返回合法 plan，第 2 次返回 confirmed:false 且带尾花括号 /users/{id}
+						auth401Hits += 1;
+						if (auth401Hits % 2 === 1) {
+							res.end(
+								JSON.stringify({
+									choices: [{ message: { content: '{"hypothesis":"测试尾花括号","actions":["read"],"confidence":0.9} 参见 /items/{id}' } }],
+									usage: { prompt_tokens: 40, completion_tokens: 20, total_tokens: 60 },
+								}),
+							);
+						} else {
+							res.end(
+								JSON.stringify({
+									choices: [{ message: { content: '{"confirmed":false,"rationale":"模型明确否决","confidence":0.92} 参考路由 /users/{id}' } }],
+									usage: { prompt_tokens: 45, completion_tokens: 25, total_tokens: 70 },
+								}),
+							);
+						}
+						return;
+					}
+					if (modeSelector === "sse_zero_tail") {
+						res.writeHead(200, { "Content-Type": "text/event-stream" });
+						auth401Hits += 1;
+						const payloadJson =
+							auth401Hits % 2 === 1
+								? '{"hypothesis":"SSE零帧测试","actions":["check"],"confidence":0.88}'
+								: '{"confirmed":true,"rationale":"SSE实测确认","confidence":0.95}';
+						res.write(
+							`data: {"choices":[{"delta":{"content":${JSON.stringify(payloadJson)}}}],"usage":{"prompt_tokens":120,"completion_tokens":30,"reasoning_tokens":10,"total_tokens":150}}\n\n`,
+						);
+						res.write(
+							'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":0,"completion_tokens":0,"reasoning_tokens":0,"total_tokens":0}}\n\n',
+						);
+						res.end("data: [DONE]\n\n");
+						return;
+					}
+					// http_401_leak
+					auth401Hits += 1;
+					res.writeHead(401, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ error: `Invalid header Authorization: Bearer ${leakTestKey}` }));
+				});
+
+				await new Promise<void>((r) => advSrv.listen(0, "127.0.0.1", () => r()));
+				const advPort = (advSrv.address() as { port: number }).port;
+				try {
+					process.env.NUWA_LIVE_API_BASE = `http://127.0.0.1:${advPort}`;
+					process.env.NUWA_LIVE_API_KEY = leakTestKey;
+
+					// 1) 空内容严禁回退离线答案 -> allPassed=false, passed=false
+					modeSelector = "empty";
+					const emptySum = await runL4BenchmarkSuite({ scenario: "s01-second-order-store-read", liveOpenAiCompat: true });
+					expect(emptySum.allPassed).toBe(false);
+					expect(emptySum.scenarios[0]?.passed).toBe(false);
+
+					// 2) JSON 后跟 /users/{id} 保留 confirmed:false 否决 -> allPassed=false, passed=false
+					modeSelector = "tail_brace_false";
+					auth401Hits = 0;
+					const vetoSum = await runL4BenchmarkSuite({ scenario: "s01-second-order-store-read", liveOpenAiCompat: true });
+					expect(vetoSum.allPassed).toBe(false);
+					expect(vetoSum.scenarios[0]?.passed).toBe(false);
+					expect(vetoSum.scenarios[0]?.detail).toContain("模型明确否决");
+
+					// 3) SSE 结束帧为 0 不清零首帧 usage -> 2 次调用合计 totalTokens=300
+					modeSelector = "sse_zero_tail";
+					auth401Hits = 0;
+					const sseSum = await runL4BenchmarkSuite({ scenario: "s01-second-order-store-read", liveOpenAiCompat: true });
+					expect(sseSum.allPassed).toBe(true);
+					expect(sseSum.liveMode?.usage.promptTokens).toBe(240);
+					expect(sseSum.liveMode?.usage.completionTokens).toBe(60);
+					expect(sseSum.liveMode?.usage.reasoningTokens).toBe(20);
+					expect(sseSum.liveMode?.usage.totalTokens).toBe(300);
+
+					// 4) HTTP 401 快速失败不重试（仅请求 1 次）且错误文本 0 明文泄露 apiKey
+					modeSelector = "http_401_leak";
+					auth401Hits = 0;
+					const errSum = await runL4BenchmarkSuite({ scenario: "s01-second-order-store-read", liveOpenAiCompat: true });
+					expect(errSum.allPassed).toBe(false);
+					expect(auth401Hits).toBe(1);
+					expect(JSON.stringify(errSum).includes(leakTestKey)).toBe(false);
+				} finally {
+					advSrv.close();
+					if (prevKey === undefined) delete process.env.NUWA_LIVE_API_KEY;
+					else process.env.NUWA_LIVE_API_KEY = prevKey;
+					if (prevBase === undefined) delete process.env.NUWA_LIVE_API_BASE;
+					else process.env.NUWA_LIVE_API_BASE = prevBase;
+				}
+			} finally {
+				rmSync(corruptRoot, { recursive: true, force: true });
+				rmSync(rgsRoot, { recursive: true, force: true });
+				rmSync(bundleRoot, { recursive: true, force: true });
+			}
+		},
+		45_000,
 	);
 });
