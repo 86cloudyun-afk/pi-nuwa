@@ -116,8 +116,8 @@ import {
 
 const VERSION = NUWA_VERSION;
 
-function isTerminalCommandState(st: NuwaState | null | undefined): boolean {
-	if (!st) return true;
+function isTerminalProjectState(st: NuwaState | null | undefined): boolean {
+	if (!st) return false;
 	const ps = String(st.project.status ?? "");
 	return (
 		ps === "completed" ||
@@ -126,6 +126,11 @@ function isTerminalCommandState(st: NuwaState | null | undefined): boolean {
 		st.runtime.status === "completed" ||
 		st.runtime.status === "sealed_negative"
 	);
+}
+
+function isTerminalCommandState(st: NuwaState | null | undefined): boolean {
+	if (!st) return true;
+	return isTerminalProjectState(st);
 }
 
 /** 纯只读加载项目状态（严格零磁盘写入、绝不调用 loadStateJsonOnly 回写恢复，专用于只读诊断视图）。 */
@@ -1238,6 +1243,16 @@ export async function executeChainsCommand(
 	if (action === "verify") {
 		const pre = loadStateStrictlyReadOnly(normRoot);
 		if (!pre) return { msg: "state 读取失败", level: "error" };
+		if (isTerminalProjectState(pre)) {
+			const termStatus =
+				pre.project.status === "sealed_negative" || pre.runtime.status === "sealed_negative"
+					? "sealed_negative"
+					: "completed";
+			return {
+				msg: `该项目已处于终态 (${termStatus}): ${pre.project.id}，禁止执行 /nuwa chains verify 改写已封盘图谱`,
+				level: "error",
+			};
+		}
 		if (pre.project.scheme === "local") {
 			return { msg: "本地模式项目不支持 HTTP 多跳攻击链网络重放验证", level: "error" };
 		}

@@ -4,7 +4,7 @@
  * 约束：仅使用 import type 引用 ./nuwa，保持运行时零循环依赖。
  */
 import { posix as posixPath } from "node:path";
-import type { Mode } from "./nuwa";
+import type { Mode } from "./types";
 
 export interface ScopePolicy {
 	allowHosts: string[];
