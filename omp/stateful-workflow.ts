@@ -14,7 +14,7 @@ import { computeBodyHash, computeTemplateFingerprint, detectSoft404, sampleSoft4
 import { propagateBeliefUpdate, resolveBeliefNodeId, type BeliefGraph, type BeliefObservation, type BeliefPropagationResult } from "./belief-search";
 import { evaluatePositiveEvidenceGate, recordToolExecution, type ResponseSnapshot } from "./evidence";
 import type { Fact, Mode, NuwaState, ScopePolicy } from "./types";
-import { checkScopeAndRisk, defaultScopeForTarget, formatScopeBlockReason, isHostInScope } from "./scope";
+import { checkNuwaDirTamper, checkScopeAndRisk, defaultScopeForTarget, formatScopeBlockReason, isHostInScope } from "./scope";
 import { REDACTED_MARKER, redactTrafficBody, redactTrafficHeaders, redactTrafficUrl, type TrafficExtractorSpec, type TrafficFetchFn, type TrafficFetchResponseLike, type TrafficRecorder } from "./traffic-workbench";
 import { getRoleHeadersMap, loadSessionVault, redactVaultSecrets, type SessionVault } from "./session-vault";
 
@@ -24,17 +24,12 @@ interface RedactOptions {
 	root?: string; vault?: SessionVault; extraSecrets?: string[]; }
 const SENSITIVE_SHORT_NAMES = new Set(["sid", "sig", "cred", "auth", "pwd", "jwt", "otp", "pin", "key"]);
 const SENSITIVE_COMPACT_PARTS = ["token", "secret", "password", "passwd", "cookie", "authorization", "jwt",
-	"bearer", "apikey", "csrf", "xsrf", "session", "ticket", "signature", "credential",
-	"privatekey", "accesskey", "refreshtoken", "clientsecret", "authtoken"];
+	"bearer", "apikey", "csrf", "xsrf", "session", "ticket", "signature", "credential", "privatekey", "accesskey", "refreshtoken", "clientsecret", "authtoken"];
 /** 判断字段名是否属于敏感字段。 */
 export function isSensitiveKeyName(name: string): boolean {
-	const raw = String(name ?? "").toLowerCase();
-	if (!raw) return false;
-	const compact = raw.replace(/[^a-z0-9]/g, "");
-	if (!compact) return false;
+	const raw = String(name ?? "").toLowerCase(); if (!raw) return false; const compact = raw.replace(/[^a-z0-9]/g, ""); if (!compact) return false;
 	if (SENSITIVE_COMPACT_PARTS.some((part) => compact.includes(part))) return true;
-	return raw.split(/[^a-z0-9]+/g).filter(Boolean).some((part) => SENSITIVE_SHORT_NAMES.has(part));
-}
+	return raw.split(/[^a-z0-9]+/g).filter(Boolean).some((part) => SENSITIVE_SHORT_NAMES.has(part)); }
 /** 安全调用 vault 加载，失败时静默忽略。 */
 function tryLoadVault(root?: string): SessionVault | undefined {
 	if (!root) return undefined;
@@ -46,6 +41,7 @@ function tryLoadVault(root?: string): SessionVault | undefined {
 	}
 	return undefined;
 }
+const VAULT_COOKIE_ATTRS = new Set(["path", "domain", "expires", "max-age", "samesite", "secure", "httponly", "priority"]);
 /** 收集需要强制擦除的敏感值集合。 */
 export function collectSecretSet(opts?: { root?: string;
 	vault?: SessionVault; extraSecrets?: string[]; headers?: Record<string, string>; roleHeaders?: Record<string, Record<string, string>>;
@@ -57,23 +53,52 @@ export function collectSecretSet(opts?: { root?: string;
 		const trimmed = value.trim();
 		if (trimmed.length >= 3) set.add(trimmed);
 	};
+	const addAuth = (val: string): void => {
+		add(val); const bare = val.replace(/^(?:Bearer|Basic|Token|JWT|Digest)\s+/i, "").trim();
+		if (bare && bare !== val) add(bare);
+	};
+	const addCookies = (raw: string): void => {
+		for (const seg of raw.split(";")) {
+			const eq = seg.indexOf("=");
+			if (eq <= 0) continue;
+			const ck = seg.slice(0, eq).trim().toLowerCase();
+			if (!ck || VAULT_COOKIE_ATTRS.has(ck)) continue;
+			add(seg.slice(eq + 1));
+		}
+	};
 	for (const secret of opts?.extraSecrets ?? []) add(secret);
-	for (const [key, value] of Object.entries(opts?.headers ?? {})) if (isSensitiveKeyName(key)) add(value);
-	for (const roleMap of Object.values(opts?.roleHeaders ?? {})) { for (const [key, value] of Object.entries(roleMap)) if (isSensitiveKeyName(key)) add(value); }
-	for (const [key, value] of Object.entries(opts?.vars ?? {})) { if (isSensitiveKeyName(key) || String(value ?? "").length >= 12) add(value); }
+	for (const [key, value] of Object.entries(opts?.headers ?? {})) {
+		const lk = key.toLowerCase();
+		if (lk === "cookie" || lk === "set-cookie") addCookies(String(value ?? ""));
+		else if (isSensitiveKeyName(key)) addAuth(String(value ?? ""));
+	}
+	for (const roleMap of Object.values(opts?.roleHeaders ?? {})) {
+		for (const [key, value] of Object.entries(roleMap)) {
+			const lk = key.toLowerCase();
+			if (lk === "cookie" || lk === "set-cookie") addCookies(String(value ?? ""));
+			else if (isSensitiveKeyName(key)) addAuth(String(value ?? ""));
+		}
+	}
+	for (const [key, value] of Object.entries(opts?.vars ?? {})) { if (isSensitiveKeyName(key)) add(value); }
 	for (const value of Object.values(opts?.cookies ?? {})) add(value);
 	const vault = opts?.vault ?? tryLoadVault(opts?.root);
-	if (vault) {
-		try {
-			const anyVault = vault as unknown as Record<string, unknown>;
-			for (const fnName of ["listSecrets", "getSecrets", "allSecrets", "toJSON", "getAll"]) {
-				const fn = anyVault[fnName];
-				if (typeof fn !== "function") continue;
-				const value = (fn as () => unknown).call(vault);
-				if (value && typeof value === "object") { for (const item of Object.values(value as Record<string, unknown>)) add(item); }
+	if (vault && typeof vault === "object" && vault.roles && typeof vault.roles === "object") {
+		for (const entry of Object.values(vault.roles)) {
+			if (!entry) continue;
+			if (entry.password) {
+				add(entry.password);
+				if (entry.username) add(Buffer.from(`${entry.username}:${entry.password}`, "utf8").toString("base64"));
 			}
-		} catch {
-			// 忽略 vault 内部结构差异。
+			if (entry.bearer) addAuth(entry.bearer);
+			if (entry.cookie) addCookies(entry.cookie);
+			if (entry.headers) {
+				for (const [hk, hv] of Object.entries(entry.headers)) {
+					if (!hv) continue;
+					const lk = hk.trim().toLowerCase();
+					if (lk === "cookie" || lk === "set-cookie") addCookies(hv);
+					else addAuth(hv);
+				}
+			}
 		}
 	}
 	return set;
@@ -211,8 +236,7 @@ function bodyToText(body: string | Record<string, unknown> | undefined): string 
 		return JSON.stringify(body);
 	} catch { return String(body); }
 }
-function interpolateBodyValue(body: string | Record<string, unknown> | undefined,
-	vars: Record<string, string>,): { value?: string; unresolved: string[] } {
+function interpolateBodyValue(body: string | Record<string, unknown> | undefined, vars: Record<string, string>,): { value?: string; unresolved: string[] } {
 	if (body === undefined) return { value: undefined, unresolved: [] };
 	if (typeof body === "string") {
 		const result = interpolateTemplate(body, vars);
@@ -269,8 +293,7 @@ function safeRedactBody(body: string | undefined, opts: RedactOptions & { maxCha
 // ==================== CookieJar ====================
 
 export interface CookieRecord {
-	name: string; value: string; domain: string; path: string; expires?: string; secure?: boolean; httpOnly?: boolean; sameSite?: string;
-}
+	name: string; value: string; domain: string; path: string; expires?: string; secure?: boolean; httpOnly?: boolean; sameSite?: string; }
 /** 轻量 CookieJar：支持 Set-Cookie 收集、域名/路径匹配与脱敏导出。 */
 export class CookieJar {
 	private readonly cookies = new Map<string, CookieRecord>();
@@ -297,8 +320,7 @@ export class CookieJar {
 			for (const piece of pieces) {
 				const item = piece.trim();
 				if (!item) continue;
-				const sep = item.indexOf("="); const key = (sep >= 0 ? item.slice(0, sep) : item).trim().toLowerCase();
-				const val = sep >= 0 ? item.slice(sep + 1).trim() : "";
+				const sep = item.indexOf("="); const key = (sep >= 0 ? item.slice(0, sep) : item).trim().toLowerCase(); const val = sep >= 0 ? item.slice(sep + 1).trim() : "";
 				if (key === "domain") domain = val.replace(/^\./, "").toLowerCase();
 				else if (key === "path") path = val || "/"; else if (key === "expires") expires = val;
 				else if (key === "max-age") maxAge = Number(val); else if (key === "secure") secure = true;
@@ -383,10 +405,9 @@ function scopeRiskBlocked(result: unknown): { blocked: boolean; reason: string }
 	if (!result || typeof result !== "object") return { blocked: false, reason: "" };
 	const record = result as Record<string, unknown>; const reason = String(record.reason ?? record.message ?? "");
 	if (record.risk === "destructive" || record.tier === "L3_RESTRICTED_DESTRUCTIVE" || record.destructive === true) {
-		return { blocked: true, reason: reason || "破坏性动作" };
-	}
+		return { blocked: true, reason: reason || "破坏性动作" }; }
 	if (record.block === true || record.blocked === true || record.allowed === false) {
-		if (!reason.includes("N-007") && (reason.includes("N-008") || /拦截高危破坏性操作|destructive|高危|不可逆/i.test(reason))) {
+		if (!reason.includes("N-007") && (reason.includes("N-008") || reason.includes("N-003") || /拦截高危破坏性操作|destructive|高危|不可逆|\.nuwa/i.test(reason))) {
 			return { blocked: true, reason: reason || "Scope 风险守卫拦截" };
 		}
 	}
@@ -405,8 +426,7 @@ export function classifyWorkflowAction(input: ClassifyWorkflowActionInput,): Wor
 	}
 	const lowerPath = path.toLowerCase(); const lowerUrl = url.toLowerCase();
 	const lowerBody = bodyText.toLowerCase(); const combined = `${lowerUrl} ${lowerPath} ${lowerBody}`;
-	const matchedSignals: string[] = []; const readOnlyMethod = method === "GET" || method === "HEAD" || method === "OPTIONS";
-	const destructiveSignals: string[] = [];
+	const matchedSignals: string[] = []; const readOnlyMethod = method === "GET" || method === "HEAD" || method === "OPTIONS"; const destructiveSignals: string[] = [];
 	if (readOnlyMethod && (combined.includes("rm -rf") || /\b(?:drop\s+(?:table|database|schema)|truncate\s+table)\b/i.test(combined))) {
 		destructiveSignals.push("destructive-payload-in-read");
 	}
@@ -425,14 +445,16 @@ export function classifyWorkflowAction(input: ClassifyWorkflowActionInput,): Wor
 		}
 		if (lowerBody.includes("mutation") && DESTRUCTIVE_WORD_RE.test(lowerBody)) { destructiveSignals.push("graphql-destructive-mutation"); }
 	}
-	let riskBlocked = false; let riskReason = "";
+	let riskBlocked = false; let riskReason = ""; const bodySample = bodyText.slice(0, 65_536); const riskText = `${method} ${url} ${bodySample}`;
 	try {
-		const verdict = checkScopeAndRisk(`${method} ${url} ${bodyText.slice(0, 500)}`, { ...scope, allowDestructive: false }, mode,);
-		const checked = scopeRiskBlocked(verdict);
-		if (checked.blocked) { riskBlocked = true; riskReason = checked.reason; }
-	} catch {
-		// 分级守卫失败时不影响后续显式 Scope 检查。
-	}
+		const tamper = checkNuwaDirTamper(riskText);
+		if (tamper?.block) { riskBlocked = true; riskReason = tamper.reason; matchedSignals.push("nuwa-dir-tamper"); }
+		if (!riskBlocked) {
+			const verdict = checkScopeAndRisk(riskText, { ...scope, allowDestructive: false }, mode);
+			const checked = scopeRiskBlocked(verdict);
+			if (checked.blocked) { riskBlocked = true; riskReason = checked.reason; }
+		}
+	} catch { /* 分级守卫失败时不影响后续显式 Scope 检查。 */ }
 	if (destructiveSignals.length > 0 || riskBlocked) {
 		matchedSignals.push(...destructiveSignals);
 		if (riskBlocked) matchedSignals.push("scope-risk-destructive");
@@ -445,13 +467,11 @@ export function classifyWorkflowAction(input: ClassifyWorkflowActionInput,): Wor
 			tier: "L0_PHYSICAL_READ", method, allowedByDefault: true, isReadOnly: true,
 			isStateChanging: false, isDestructive: false, reason: "物理只读请求", matchedSignals: ["safe-method"], };
 	}
-	const trimmedBody = bodyText.trim();
-	const bodyParsed = trimmedBody.startsWith("{") ? tryParseJson(trimmedBody) : undefined;
+	const trimmedBody = bodyText.trim(); const bodyParsed = trimmedBody.startsWith("{") ? tryParseJson(trimmedBody) : undefined;
 	const gqlQueryField = bodyParsed && typeof bodyParsed === "object" && !Array.isArray(bodyParsed) && typeof (bodyParsed as Record<string, unknown>).query === "string"
 		? String((bodyParsed as Record<string, unknown>).query).toLowerCase()
 		: "";
-	const bodyIsGraphqlQuery =
-		/^query(?:\s+[A-Za-z_]\w*|\s*\(|\s*\{)/i.test(trimmedBody) ||
+	const bodyIsGraphqlQuery = /^query(?:\s+[A-Za-z_]\w*|\s*\(|\s*\{)/i.test(trimmedBody) ||
 		(gqlQueryField.length > 0 && !/\b(?:mutation|subscription)\b/.test(gqlQueryField)) ||
 		(lowerPath.includes("/graphql") && (trimmedBody.startsWith("{") ? gqlQueryField.length > 0 && !/\b(?:mutation|subscription)\b/.test(gqlQueryField) : !lowerBody.includes("mutation") && !lowerBody.includes("subscription")));
 	const graphqlRead = (lowerPath.includes("/graphql") || bodyIsGraphqlQuery) && !lowerBody.includes("mutation") && !lowerBody.includes("subscription") && (lowerPath.includes("/graphql") || bodyIsGraphqlQuery);
@@ -510,17 +530,19 @@ export function validateUrlAndActionScope(urlStr: string, method: string, bodyTe
 			ok: false, parsed, blockedByTier: false, tierClassification: classification,
 			reason: formatScopeBlockReason("shell-guard", `目标主机 ${parsed.hostname} 不在授权 Scope 内`), };
 	}
+	const bodySample = (bodyText ?? "").slice(0, 65_536); const fullCmd = `${String(method ?? "GET").toUpperCase()} ${parsed.toString()} ${bodySample}`;
 	try {
-		const verdict = checkScopeAndRisk(`${String(method ?? "GET").toUpperCase()} ${parsed.toString()}`, { ...scope, allowDestructive }, mode,);
+		const tamper = checkNuwaDirTamper(fullCmd);
+		if (tamper?.block) {
+			return { ok: false, parsed, blockedByTier: false, tierClassification: classification, reason: formatScopeBlockReason("shell-guard", tamper.reason, "N-003") };
+		}
+		const verdict = checkScopeAndRisk(fullCmd, { ...scope, allowDestructive }, mode);
 		const checked = scopeRiskBlocked(verdict);
 		if (checked.blocked) {
-			return {
-				ok: false, parsed, blockedByTier: classification.tier === "L3_RESTRICTED_DESTRUCTIVE",
-				tierClassification: classification, reason: formatScopeBlockReason("shell-guard", checked.reason), };
+			return { ok: false, parsed, blockedByTier: classification.tier === "L3_RESTRICTED_DESTRUCTIVE",
+				tierClassification: classification, reason: formatScopeBlockReason("shell-guard", checked.reason) };
 		}
-	} catch {
-		// 风险守卫异常不构成放行依据，继续由后续执行层隔离。
-	}
+	} catch { /* 风险守卫异常不构成放行依据 */ }
 	return { ok: true, parsed, tierClassification: classification };
 }
 
@@ -537,8 +559,7 @@ export interface ExecuteStatefulWorkflowOptions {
 	allowDestructive?: boolean; vars?: Record<string, string>; initialVars?: Record<string, string>;
 	role?: string; roleHeaders?: Record<string, Record<string, string>>; extraHeaders?: Record<string, string>;
 	vault?: SessionVault; fetchFn?: TrafficFetchFn; recorder?: TrafficRecorder;
-	initialCookies?: Record<string, string>; extraSecrets?: string[]; recordTraffic?: boolean;
-	signal?: AbortSignal; timeoutMs?: number; defaultTimeoutMs?: number;
+	initialCookies?: Record<string, string>; extraSecrets?: string[]; recordTraffic?: boolean; signal?: AbortSignal; timeoutMs?: number; defaultTimeoutMs?: number;
 	followRedirects?: boolean; maxRedirects?: number; continueOnError?: boolean; }
 
 export interface StatefulStepTrace {
@@ -555,15 +576,13 @@ export interface StatefulWorkflowResult {
 
 export interface InternalWorkflowExecResult extends StatefulWorkflowResult {
 	rawVariables: Record<string, string>; rawCookies: Record<string, string>; rawLastResponseBody?: string; rawLastResponseJson?: unknown;
-	rawLastResponseHeaders?: Record<string, string>; rawStepBodies: Array<string | undefined>; }
+	rawLastResponseHeaders?: Record<string, string>; rawStepBodies: Array<string | undefined>; rawSecrets: string[]; }
 function normalizeExtractor(spec: string | TrafficExtractorSpec): TrafficExtractorSpec {
-	if (typeof spec !== "string") return spec;
-	const trimmed = spec.trim();
+	if (typeof spec !== "string") return spec; const trimmed = spec.trim();
 	if (trimmed.startsWith("header:")) return { header: trimmed.slice(7).trim() };
 	if (trimmed.startsWith("cookie:")) return { cookie: trimmed.slice(7).trim() };
 	if (trimmed.startsWith("regex:")) return { regex: trimmed.slice(6) };
-	return { jsonPath: trimmed };
-}
+	return { jsonPath: trimmed }; }
 function extractBySpec(spec: string | TrafficExtractorSpec, headers: HeaderRecord, body: string, jar: CookieJar): string | undefined {
 	const normalized = normalizeExtractor(spec);
 	if (normalized.header) return headers[normalized.header.toLowerCase()];
@@ -601,8 +620,7 @@ function makeBlockedTrace(args: { stepIndex: number; step: StatefulWorkflowStep;
 	return {
 		stepIndex: args.stepIndex, id: args.id, name: args.step.name, method: args.method,
 		requestedUrl: args.requestedUrl, resolvedUrl: args.resolvedUrl, finalUrl: args.resolvedUrl,
-		status: 0, ok: false, blocked: true, abortedByScope: args.abortedByScope ?? true,
-		blockReason: args.reason, durationMs: 0, redirectChain: args.redirectChain ?? [],
+		status: 0, ok: false, blocked: true, abortedByScope: args.abortedByScope ?? true, blockReason: args.reason, durationMs: 0, redirectChain: args.redirectChain ?? [],
 		requestHeaders: args.requestHeaders ?? {}, requestBody: args.requestBody, responseHeaders: {}, extracted: {}, tier: args.tier, cookiesSet: [], };
 }
 /** 内部执行器：返回真实未脱敏变量与最后响应体，供同文件后续能力复用。 */
@@ -621,7 +639,7 @@ export async function executeStatefulWorkflowChainInternal(opts: ExecuteStateful
 	if (!fetchFn) {
 		return { ok: false, blocked: false, abortedByScope: false, error: "缺少 fetch 实现，无法执行工作流",
 			steps: [], variables: {}, cookies: {}, totalRequests: 0, durationMs: Date.now() - startedAt,
-			redacted: true, rawVariables: {}, rawCookies: {}, rawStepBodies: [] };
+			redacted: true, rawVariables: {}, rawCookies: {}, rawStepBodies: [], rawSecrets: [...secrets] };
 	}
 	for (let index = 0; index < opts.steps.length; index++) {
 		const step = opts.steps[index]; const stepStartedAt = Date.now();
@@ -662,11 +680,9 @@ export async function executeStatefulWorkflowChainInternal(opts: ExecuteStateful
 			rawTraces.push(trace); rawStepBodies.push(undefined); overallBlocked = true;
 			overallAbortedByScope = overallAbortedByScope || trace.abortedByScope; overallError = trace.blockReason; break;
 		}
-		const followRedirects = step.followRedirects ?? opts.followRedirects ?? true;
-		const maxRedirects = Math.max(0, step.maxRedirects ?? opts.maxRedirects ?? 5);
+		const followRedirects = step.followRedirects ?? opts.followRedirects ?? true; const maxRedirects = Math.max(0, step.maxRedirects ?? opts.maxRedirects ?? 5);
 		const timeoutMs = Math.max(1, step.timeoutMs ?? opts.timeoutMs ?? opts.defaultTimeoutMs ?? 30_000);
-		const redirectChain: string[] = []; const cookiesSet: string[] = []; let currentUrl = resolvedUrl; let currentMethod = method;
-		let currentBody = requestBody;
+		const redirectChain: string[] = []; const cookiesSet: string[] = []; let currentUrl = resolvedUrl; let currentMethod = method; let currentBody = requestBody;
 		let currentHeaders: HeaderRecord = { ...requestHeaders };
 		let redirects = 0; let stepBlocked = false; let stepAbortedByScope = false; let stepRedirectBlocked = false;
 		let stepTimedOut = false; let stepFatalError = false; let stepError: string | undefined; let stepStatus = 0; let stepFinalUrl = resolvedUrl;
@@ -678,8 +694,7 @@ export async function executeStatefulWorkflowChainInternal(opts: ExecuteStateful
 			const sendHeaders: HeaderRecord = { ...currentHeaders };
 			const jarCookie = jar.getCookieHeader(currentUrl);
 			if (jarCookie) sendHeaders.cookie = sendHeaders.cookie ? `${sendHeaders.cookie}; ${jarCookie}` : jarCookie;
-			const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
-			let externalAbortListener: (() => void) | undefined;
+			const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs); let externalAbortListener: (() => void) | undefined;
 			if (opts.signal) {
 				if (opts.signal.aborted) controller.abort();
 				else { externalAbortListener = () => controller.abort(); opts.signal.addEventListener("abort", externalAbortListener); }
@@ -699,11 +714,17 @@ export async function executeStatefulWorkflowChainInternal(opts: ExecuteStateful
 				clearTimeout(timer);
 				if (externalAbortListener && opts.signal) opts.signal.removeEventListener("abort", externalAbortListener);
 			}
-			const durationMs = Date.now() - requestStartedAt; stepStatus = response.status;
-			stepFinalUrl = currentUrl; responseHeaders = headersToRecord(response.headers);
+			const durationMs = Date.now() - requestStartedAt; stepStatus = response.status; stepFinalUrl = currentUrl; responseHeaders = headersToRecord(response.headers);
 			responseBodySnippet = responseText.slice(0, 8192); const setCookieValues = getSetCookieList(response.headers);
 			if (setCookieValues.length > 0) {
-				for (const name of jar.setFromSetCookie(setCookieValues, currentUrl)) { if (!cookiesSet.includes(name)) cookiesSet.push(name); }
+				for (const name of jar.setFromSetCookie(setCookieValues, currentUrl)) {
+					if (!cookiesSet.includes(name)) cookiesSet.push(name);
+					const cVal = jar.getCookieValue(name);
+					if (cVal && cVal.trim().length >= 3) {
+						secrets.add(cVal.trim());
+						try { opts.recorder?.registerTransientSecret(cVal.trim()); } catch { /* 忽略 */ }
+					}
+				}
 			}
 			if (opts.recorder && opts.recordTraffic !== false) {
 				try {
@@ -776,8 +797,7 @@ export async function executeStatefulWorkflowChainInternal(opts: ExecuteStateful
 		return { ...trace, requestedUrl: safeRedactUrl(trace.requestedUrl, redactOpts),
 			resolvedUrl: safeRedactUrl(trace.resolvedUrl, redactOpts), finalUrl: safeRedactUrl(trace.finalUrl, redactOpts),
 			redirectChain: trace.redirectChain.map((url) => safeRedactUrl(url, redactOpts)), requestHeaders: safeRedactHeaders(trace.requestHeaders, redactOpts),
-			requestBody: safeRedactBody(trace.requestBody, { ...redactOpts, maxChars: 4096 }),
-			responseHeaders: safeRedactHeaders(trace.responseHeaders, redactOpts),
+			requestBody: safeRedactBody(trace.requestBody, { ...redactOpts, maxChars: 4096 }), responseHeaders: safeRedactHeaders(trace.responseHeaders, redactOpts),
 			responseBodySnippet: safeRedactBody(trace.responseBodySnippet, { ...redactOpts, maxChars: 4096 }), extracted,
 			blockReason: trace.blockReason ? scrubSecretsInText(trace.blockReason, secrets, rootOrVault) : undefined,
 			error: trace.error ? scrubSecretsInText(trace.error, secrets, rootOrVault) : undefined, cookiesSet: [...trace.cookiesSet] };
@@ -792,7 +812,7 @@ export async function executeStatefulWorkflowChainInternal(opts: ExecuteStateful
 		steps: redactedSteps, variables: redactedVariables, cookies: jar.toRedactedJSON(),
 		finalStatus, finalUrl: finalUrl ? safeRedactUrl(finalUrl, redactOpts) : undefined, totalRequests, durationMs: Date.now() - startedAt, redacted: true,
 		rawVariables: { ...variables }, rawCookies: jar.toJSON(), rawLastResponseBody: lastRawBody,
-		rawLastResponseJson: lastRawJson, rawLastResponseHeaders: lastRawHeaders, rawStepBodies: [...rawStepBodies] };
+		rawLastResponseJson: lastRawJson, rawLastResponseHeaders: lastRawHeaders, rawStepBodies: [...rawStepBodies], rawSecrets: [...secrets] };
 }
 /**
  * 对外多步状态链重放入口：仅返回 100% 脱敏结果。
@@ -801,10 +821,9 @@ export async function executeStatefulWorkflowChainInternal(opts: ExecuteStateful
 export async function executeStatefulWorkflowChain(opts: ExecuteStatefulWorkflowOptions): Promise<StatefulWorkflowResult> {
 	const internal = await executeStatefulWorkflowChainInternal(opts);
 	const { rawVariables: _rawVariables, rawCookies: _rawCookies, rawLastResponseBody: _rawLastResponseBody,
-		rawLastResponseJson: _rawLastResponseJson, rawLastResponseHeaders: _rawLastResponseHeaders, rawStepBodies: _rawStepBodies, ...safe } = internal;
+		rawLastResponseJson: _rawLastResponseJson, rawLastResponseHeaders: _rawLastResponseHeaders, rawStepBodies: _rawStepBodies, rawSecrets: _rawSecrets, ...safe } = internal;
 	return safe;
 }
-
 /* ------------------------------------------------------------------ *
  * 第三部分：Mass Assignment 探测 + 二阶有状态工作流验证
  * 接续第一、二部分，不含任何 import 语句，复用前两块已导出的工具与顶部注入依赖。
@@ -826,12 +845,9 @@ interface Sw3FetchLike {
 	(url: string, init?: Record<string, unknown>): Promise<{
 		ok: boolean; status: number; text: () => Promise<string>; headers: Headers;
 	}>; }
-
 /* ---------------------------- 内部工具补齐 ---------------------------- */
 function sw3Err(e: unknown): string {
-	if (e instanceof Error) return e.message;
-	return typeof e === "string" ? e : "未知错误";
-}
+	if (e instanceof Error) return e.message; return typeof e === "string" ? e : "未知错误"; }
 function sw3Obj(v: unknown): v is Record<string, unknown> { return typeof v === "object" && v !== null && !Array.isArray(v); }
 function sw3Unit(n: unknown, fallback: number): number {
 	const x = typeof n === "number" && Number.isFinite(n) ? n : fallback;
@@ -865,16 +881,21 @@ function sw3Subst(text: string, vars: Record<string, string>): string {
 	} catch { return fill(raw); }
 }
 function sw3Verdict(res: { ok: boolean; reason?: string }): Sw3Verdict { return { allowed: res.ok, reason: res.reason }; }
-function sw3Secrets(extra?: string[]): Set<string> { return collectSecretSet({ extraSecrets: extra }); }
+function sw3Secrets(opts?: { root?: string; vault?: SessionVault; roleHeaders?: Record<string, Record<string, string>>;
+	extraHeaders?: Record<string, string>; initialVars?: Record<string, string>; initialCookies?: Record<string, string>; extraSecrets?: string[];
+}): Set<string> {
+	return collectSecretSet({ root: opts?.root, vault: opts?.vault, roleHeaders: opts?.roleHeaders,
+		headers: opts?.extraHeaders, vars: opts?.initialVars, cookies: opts?.initialCookies, extraSecrets: opts?.extraSecrets });
+}
 function sw3BodyText(body: unknown, vars: Record<string, string>): string | undefined {
 	if (body === undefined || body === null) return undefined;
-	if (typeof body === "string") return sw3Subst(body, vars).slice(0, 8_000);
+	if (typeof body === "string") return sw3Subst(body, vars).slice(0, 65_536);
 	if (sw3Obj(body) || Array.isArray(body)) {
 		try {
-			return JSON.stringify(body).slice(0, 8_000);
+			return JSON.stringify(body).slice(0, 65_536);
 		} catch { return undefined; }
 	}
-	return String(body).slice(0, 8_000);
+	return String(body).slice(0, 65_536);
 }
 function sw3Path(url: string | undefined, vars: Record<string, string>): string {
 	try {
@@ -891,22 +912,30 @@ function sw3Origin(url: string | undefined, vars: Record<string, string>): { ori
 	} catch { return null; }
 }
 function sw3Json(text?: string): unknown { return tryParseJson(text); }
+const SW3_ECHO_CONTAINER_KEYS = new Set(["echo", "requestecho", "request", "input", "params", "args", "payload", "query", "errors", "validationerrors", "invalidfields", "rejectedfields"]);
 function sw3FindDeep(obj: unknown, key: string, depth = 0): unknown {
 	if (depth > 8 || obj === null || obj === undefined) return undefined;
 	if (Array.isArray(obj)) {
-		for (const item of obj) {
-			const hit = sw3FindDeep(item, key, depth + 1);
-			if (hit !== undefined) return hit;
-		}
+		for (const item of obj) { const hit = sw3FindDeep(item, key, depth + 1); if (hit !== undefined) return hit; }
 		return undefined;
 	}
 	if (!sw3Obj(obj)) return undefined;
 	if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
-	for (const v of Object.values(obj)) {
-		const hit = sw3FindDeep(v, key, depth + 1);
-		if (hit !== undefined) return hit;
-	}
+	for (const v of Object.values(obj)) { const hit = sw3FindDeep(v, key, depth + 1); if (hit !== undefined) return hit; }
 	return undefined;
+}
+function sw3CollectBusinessPaths(obj: unknown, key: string, prefix = "", depth = 0): Array<{ path: string; value: unknown }> {
+	if (depth > 8 || obj === null || obj === undefined) return [];
+	if (Array.isArray(obj)) return obj.flatMap((it, idx) => sw3CollectBusinessPaths(it, key, `${prefix}[${idx}]`, depth + 1));
+	if (!sw3Obj(obj)) return [];
+	const hits: Array<{ path: string; value: unknown }> = [];
+	for (const [k, v] of Object.entries(obj)) {
+		if (SW3_ECHO_CONTAINER_KEYS.has(k.toLowerCase().replace(/[_-]/g, ""))) continue;
+		const nextPath = prefix ? `${prefix}.${k}` : k;
+		if (k === key) hits.push({ path: nextPath, value: v });
+		hits.push(...sw3CollectBusinessPaths(v, key, nextPath, depth + 1));
+	}
+	return hits;
 }
 function sw3DeepEq(a: unknown, b: unknown, depth = 0): boolean {
 	if (depth > 6) return false;
@@ -978,41 +1007,61 @@ export function computeTemplateSimilarity(textA: string, textB: string, pathHint
 	if (fpA && fpA === fpB) return Math.max(dice, 0.99);
 	return dice;
 }
-function sw3RedactValue(field: string, value: unknown, secrets: Set<string>): unknown { return isSensitiveKeyName(field) ? REDACTED_MARKER : redactRecordDeep(value, secrets); }
-function sw3RedactVars(vars: Record<string, string>, secrets: Set<string>): Record<string, string> { return redactRecordDeep(vars ?? {}, secrets) as Record<string, string>; }
-function sw3RedactTrace(trace: StatefulStepTrace | undefined, secrets: Set<string>): StatefulStepTrace | undefined {
+function sw3RedactValue(field: string, value: unknown, secrets: Set<string>, rootOrVault?: string | SessionVault): unknown {
+	return isSensitiveKeyName(field) ? REDACTED_MARKER : redactRecordDeep(value, secrets, rootOrVault);
+}
+function sw3RedactVars(vars: Record<string, string>, secrets: Set<string>, rootOrVault?: string | SessionVault): Record<string, string> {
+	return redactRecordDeep(vars ?? {}, secrets, rootOrVault) as Record<string, string>;
+}
+function sw3RedactTrace(trace: StatefulStepTrace | undefined, secrets: Set<string>, rootOrVault?: string | SessionVault): StatefulStepTrace | undefined {
 	if (!trace) return undefined;
 	const scrubHeaders = (h: Record<string, string> | undefined): Record<string, string> => {
 		const out: Record<string, string> = {};
-		for (const [k, v] of Object.entries(h ?? {})) { out[k] = isSensitiveKeyName(k) ? REDACTED_MARKER : scrubSecretsInText(String(v), secrets); }
+		for (const [k, v] of Object.entries(h ?? {})) { out[k] = isSensitiveKeyName(k) ? REDACTED_MARKER : scrubSecretsInText(String(v), secrets, rootOrVault); }
 		return out;
 	};
-	const scrubText = (t?: string): string | undefined => typeof t === "string" ? scrubSecretsInText(t, secrets).slice(0, 2_000) : t;
+	const scrubText = (t?: string): string | undefined => typeof t === "string" ? scrubSecretsInText(t, secrets, rootOrVault).slice(0, 2_000) : t;
 	return {
-		...trace, requestedUrl: scrubSecretsInText(String(trace.requestedUrl ?? ""), secrets),
-		resolvedUrl: scrubSecretsInText(String(trace.resolvedUrl ?? ""), secrets), finalUrl: scrubSecretsInText(String(trace.finalUrl ?? ""), secrets),
-		redirectChain: (trace.redirectChain ?? []).map((u) => scrubSecretsInText(String(u), secrets)),
+		...trace, requestedUrl: scrubSecretsInText(String(trace.requestedUrl ?? ""), secrets, rootOrVault),
+		resolvedUrl: scrubSecretsInText(String(trace.resolvedUrl ?? ""), secrets, rootOrVault), finalUrl: scrubSecretsInText(String(trace.finalUrl ?? ""), secrets, rootOrVault),
+		redirectChain: (trace.redirectChain ?? []).map((u) => scrubSecretsInText(String(u), secrets, rootOrVault)),
 		requestHeaders: scrubHeaders(trace.requestHeaders), responseHeaders: scrubHeaders(trace.responseHeaders),
 		requestBody: scrubText(trace.requestBody), responseBodySnippet: scrubText(trace.responseBodySnippet),
 		blockReason: scrubText(trace.blockReason), error: scrubText(trace.error),
-		extracted: redactRecordDeep(trace.extracted ?? {}, secrets) as Record<string, string>, };
+		extracted: redactRecordDeep(trace.extracted ?? {}, secrets, rootOrVault) as Record<string, string> };
 }
 function sw3Preflight(url: string, method: string, bodyText: string | undefined, scope: ScopePolicy, mode: Mode | string, allowDestructive: boolean): Sw3Verdict { try { return sw3Verdict(validateUrlAndActionScope(url, method, bodyText, scope, mode, allowDestructive)); } catch (e) { return { allowed: false, reason: `Scope 校验异常：${sw3Err(e)}` }; } }
 function sw3PreflightStep(step: StatefulWorkflowStep | undefined, scope: ScopePolicy, mode: Mode | string,
-	allowDestructive: boolean, vars: Record<string, string>,): { ok: boolean; reason?: string; tierBlocked: boolean } {
+	allowDestructive: boolean, vars: Record<string, string>): { ok: boolean; reason?: string; tierBlocked: boolean } {
 	if (!step) return { ok: true, tierBlocked: false };
-	const method = String(step.method ?? "GET").toUpperCase(); const url = sw3Subst(String(step.url ?? ""), vars);
-	if (!url) return { ok: false, reason: "步骤缺少 URL", tierBlocked: false };
-	const bodyText = sw3BodyText(step.body, vars); const verdict = sw3Preflight(url, method, bodyText, scope, mode, allowDestructive);
+	const method = String(step.method ?? "GET").toUpperCase(); const rawTpl = String(step.url ?? "");
+	if (!rawTpl.trim()) return { ok: false, reason: "步骤缺少 URL", tierBlocked: false };
+	const interp = interpolateTemplate(rawTpl, vars); const bodyText = sw3BodyText(step.body, vars);
+	// 若 URL 在已知变量替换后仍依赖运行期动态模板导致无静态协议/主机，延迟 Host 校验至运行期发包前，仅静态检验动作分级与 N-003/N-008
+	let staticHostResolvable = false; const subUrl = sw3Subst(rawTpl, vars);
+	if (interp.unresolved.length === 0) {
+		staticHostResolvable = true;
+	} else {
+		const authPart = interp.value.match(/^https?:\/\/([^/?#]+)/i)?.[1] ?? "";
+		if (authPart && !authPart.includes("{{")) staticHostResolvable = true;
+	}
+	if (!staticHostResolvable) {
+		const tamper = checkNuwaDirTamper(`${method} ${interp.value} ${bodyText ?? ""}`);
+		if (tamper?.block) return { ok: false, reason: tamper.reason, tierBlocked: false };
+		const cls = classifyWorkflowAction({ method, url: interp.value, body: bodyText, scope, mode, allowDestructive });
+		if (cls.tier === "L3_RESTRICTED_DESTRUCTIVE" && !allowDestructive) {
+			return { ok: false, reason: `动作被分级守卫拦截：${cls.reason}`, tierBlocked: true };
+		}
+		return { ok: true, tierBlocked: false };
+	}
+	const verdict = sw3Preflight(subUrl, method, bodyText, scope, mode, allowDestructive);
 	if (verdict.allowed) return { ok: true, tierBlocked: false };
 	let tierBlocked = false;
 	try {
-		const cls = classifyWorkflowAction({ method, url, body: bodyText, scope, mode, allowDestructive });
+		const cls = classifyWorkflowAction({ method, url: subUrl, body: bodyText, scope, mode, allowDestructive });
 		tierBlocked = cls.isDestructive === true && allowDestructive !== true;
-	} catch {
-		/* 分级判定失败时按 Scope 阻断处理 */
-	}
-	return { ok: false, reason: verdict.reason ?? `${method} ${url} 被 Scope/分级策略阻断`, tierBlocked };
+	} catch { /* 分级判定失败时按 Scope 阻断处理 */ }
+	return { ok: false, reason: verdict.reason ?? `${method} ${subUrl} 被 Scope/分级策略阻断`, tierBlocked };
 }
 function sw3ScopedFetch(base: Sw3FetchLike | undefined, scope: ScopePolicy, mode: Mode | string,
 	allowDestructive: boolean, headers: Record<string, string> | undefined, secrets: Set<string>,): Sw3FetchLike {
@@ -1048,6 +1097,9 @@ async function sw3RunStep(step: StatefulWorkflowStep, session: Sw3Session, ctx: 
 	const trace = res.steps.length > 0 ? res.steps[res.steps.length - 1] : undefined;
 	session.vars = { ...session.vars, ...(res.rawVariables ?? res.variables ?? {}) };
 	session.cookies = { ...session.cookies, ...(res.rawCookies ?? res.cookies ?? {}) };
+	for (const sVal of res.rawSecrets ?? []) { if (sVal && sVal.length >= 3) secrets.add(sVal); }
+	for (const cVal of Object.values(session.cookies)) { if (typeof cVal === "string" && cVal.trim().length >= 3) secrets.add(cVal.trim()); }
+	for (const [vk, vv] of Object.entries(session.vars)) { if (isSensitiveKeyName(vk) && typeof vv === "string" && vv.trim().length >= 3) secrets.add(vv.trim()); }
 	const headers: Record<string, string> = {};
 	for (const [k, v] of Object.entries(res.rawLastResponseHeaders ?? {})) headers[k] = String(v);
 	const lastStepBody = res.rawStepBodies.length > 0 ? res.rawStepBodies[res.rawStepBodies.length - 1] : undefined;
@@ -1057,7 +1109,6 @@ async function sw3RunStep(step: StatefulWorkflowStep, session: Sw3Session, ctx: 
 		aborted: res.abortedByScope === true || trace?.abortedByScope === true,
 		body: res.rawLastResponseBody ?? lastStepBody ?? trace?.responseBodySnippet, json: res.rawLastResponseJson, headers, error: res.error ?? trace?.error, };
 }
-
 /* ---------------------- 三、Mass Assignment 探测 ---------------------- */
 
 export interface MassAssignmentFieldSpec {
@@ -1088,141 +1139,122 @@ const SW3_DEFAULT_MASS_FIELDS: readonly MassAssignmentFieldSpec[] = [{ field: "r
  */
 export async function probeMassAssignment(opts: MassAssignmentProbeOptions): Promise<MassAssignmentProbeResult> {
 	const root = opts.root ?? process.cwd(); const mode: Mode | string = opts.mode ?? "standard";
-	const allowDestructive = opts.allowDestructive === true; const secrets = sw3Secrets(opts.extraSecrets);
-	const session: Sw3Session = { vars: { ...(opts.initialVars ?? {}) }, cookies: { ...(opts.initialCookies ?? {}) }, };
+	const allowDestructive = opts.allowDestructive === true; const rootOrVault = opts.vault ?? root;
+	const secrets = sw3Secrets({ root, vault: opts.vault, roleHeaders: opts.roleHeaders, extraHeaders: opts.extraHeaders,
+		initialVars: opts.initialVars, initialCookies: opts.initialCookies, extraSecrets: opts.extraSecrets });
+	const session: Sw3Session = { vars: { ...(opts.initialVars ?? {}) }, cookies: { ...(opts.initialCookies ?? {}) } };
 	const threshold = sw3Unit(opts.templateSimilarityThreshold, 0.9); const timeoutMs = sw3Timeout(opts.timeoutMs);
 	const cases: MassAssignmentCaseResult[] = []; const vulnerableFields: string[] = [];
-	for (const [label, step] of [["写入步", opts.writeStep], ["读取步", opts.readStep], ["回滚步", opts.rollbackStep],
-	] as Array<[string, StatefulWorkflowStep | undefined]>) {
-		if (!step) continue;
-		const verdict = sw3PreflightStep(step, opts.scope, mode, allowDestructive, session.vars);
-		if (verdict.ok) continue;
-		return {
-			detected: false, abortedByScope: true, blockReason: `${label}预检被阻断：${verdict.reason ?? "超出授权范围"}`,
-			baselineStatus: 0, baselineSoft404: false, vulnerableFields: [], cases: [],
-			rollbackExecuted: false, rollbackOk: false, beliefObservation: { type: "waf_block", weight: 1,
-				note: `${label}在 Scope/分级预检阶段被阻断，未发送任何请求`, }, summary: "Scope/分级预检未通过，本次探测未发送任何请求。", };
-	}
+	for (const [label, step] of [["写入步", opts.writeStep], ["读取步", opts.readStep], ["回滚步", opts.rollbackStep]] as Array<[string, StatefulWorkflowStep | undefined]>) {
+		if (!step) continue; const verdict = sw3PreflightStep(step, opts.scope, mode, allowDestructive, session.vars); if (verdict.ok) continue;
+		return { detected: false, abortedByScope: true, blockReason: scrubSecretsInText(`${label}预检被阻断：${verdict.reason ?? "超出授权范围"}`, secrets, rootOrVault),
+			baselineStatus: 0, baselineSoft404: false, vulnerableFields: [], cases: [], rollbackExecuted: false, rollbackOk: false,
+			beliefObservation: { type: "waf_block", weight: 1, note: `${label}在 Scope/分级预检阶段被阻断，未发送任何请求` }, summary: "Scope/分级预检未通过，本次探测未发送任何请求。" }; }
 	let soft404Baseline: Soft404BaselineInput | Soft404Baseline | null = opts.soft404Baseline ?? null;
 	if (opts.soft404Baseline === undefined && opts.autoSampleSoft404 !== false) {
 		const origin = sw3Origin(opts.writeStep.url, session.vars);
 		if (origin && hostAllowed(origin.host, opts.scope)) {
 			try {
-				const fetcher = sw3ScopedFetch(opts.fetchFn as unknown as Sw3FetchLike | undefined, opts.scope, mode, allowDestructive, opts.extraHeaders, secrets,);
+				const fetcher = sw3ScopedFetch(opts.fetchFn as unknown as Sw3FetchLike | undefined, opts.scope, mode, allowDestructive, opts.extraHeaders, secrets);
 				soft404Baseline = await sampleSoft404Baseline(origin.origin, fetcher as unknown as Parameters<typeof sampleSoft404Baseline>[1],
-					{ headers: opts.extraHeaders, timeoutMs: Math.min(timeoutMs, 6_000) },);
+					{ headers: opts.extraHeaders, timeoutMs: Math.min(timeoutMs, 6_000) });
 			} catch { soft404Baseline = null; }
 		}
 	}
 	const ctx: Sw3RunCtx = { root, scope: opts.scope, mode, allowDestructive, vault: opts.vault, role: opts.role, roleHeaders: opts.roleHeaders,
-		extraHeaders: opts.extraHeaders, fetchFn: opts.fetchFn, recorder: opts.recorder, extraSecrets: opts.extraSecrets, timeoutMs, };
+		extraHeaders: opts.extraHeaders, fetchFn: opts.fetchFn, recorder: opts.recorder, extraSecrets: opts.extraSecrets, timeoutMs };
 	const writeBodyBase: unknown = opts.baselineBody !== undefined ? opts.baselineBody : opts.writeStep.body;
 	const baselineObj: Record<string, unknown> = sw3Obj(writeBodyBase) ? { ...writeBodyBase } : {};
-	const withBody = (body: Record<string, unknown>): StatefulWorkflowStep => ({ ...opts.writeStep, body: JSON.stringify(body), });
+	const withBody = (body: Record<string, unknown>): StatefulWorkflowStep => ({ ...opts.writeStep, body: JSON.stringify(body) });
 	const readPathHint = (): string => sw3Path(opts.readStep?.url ?? opts.writeStep.url, session.vars);
 	const baselineWrite = await sw3RunStep(withBody(baselineObj), session, ctx, secrets);
 	if (baselineWrite.aborted || baselineWrite.blocked) {
-		return {
-			detected: false, abortedByScope: baselineWrite.aborted, blockReason: baselineWrite.trace?.blockReason ?? baselineWrite.error ?? "基线写入步被策略阻断",
+		return { detected: false, abortedByScope: baselineWrite.aborted,
+			blockReason: scrubSecretsInText(baselineWrite.trace?.blockReason ?? baselineWrite.error ?? "基线写入步被策略阻断", secrets, rootOrVault),
 			baselineStatus: baselineWrite.status, baselineSoft404: false, vulnerableFields: [], cases: [], rollbackExecuted: false, rollbackOk: false,
-			beliefObservation: { type: "waf_block", weight: 1, note: "基线写入请求被 Scope/分级策略阻断" }, summary: "基线写入请求被拦截，未能建立差分对比基线。", };
+			beliefObservation: { type: "waf_block", weight: 1, note: "基线写入请求被 Scope/分级策略阻断" }, summary: "基线写入请求被拦截，未能建立差分对比基线。" };
 	}
 	const baselineRead = opts.readStep ? await sw3RunStep(opts.readStep, session, ctx, secrets) : baselineWrite;
 	if (baselineRead.aborted || baselineRead.blocked) {
-		return {
-			detected: false, abortedByScope: baselineRead.aborted,
-			blockReason: baselineRead.trace?.blockReason ?? baselineRead.error ?? "基线读取步被策略阻断", baselineStatus: baselineRead.status,
-			baselineSoft404: false, vulnerableFields: [], cases: [], rollbackExecuted: false,
-			rollbackOk: false, beliefObservation: { type: "waf_block", weight: 1, note: "基线读取请求被 Scope/分级策略阻断" }, summary: "基线读取请求被拦截，未能建立差分对比基线。", };
+		return { detected: false, abortedByScope: baselineRead.aborted,
+			blockReason: scrubSecretsInText(baselineRead.trace?.blockReason ?? baselineRead.error ?? "基线读取步被策略阻断", secrets, rootOrVault),
+			baselineStatus: baselineRead.status, baselineSoft404: false, vulnerableFields: [], cases: [], rollbackExecuted: false, rollbackOk: false,
+			beliefObservation: { type: "waf_block", weight: 1, note: "基线读取请求被 Scope/分级策略阻断" }, summary: "基线读取请求被拦截，未能建立差分对比基线。" };
 	}
 	const baselineStatus = baselineRead.status; const baselineText = baselineRead.body ?? ""; const baselineJson = baselineRead.json ?? sw3Json(baselineText);
-	const baselineSoft = detectSoft404(
-		{ status: baselineStatus, body: baselineText, headers: baselineRead.headers, path: readPathHint() }, soft404Baseline, ).isSoft404;
+	const baselineSoft = detectSoft404({ status: baselineStatus, body: baselineText, headers: baselineRead.headers, path: readPathHint() }, soft404Baseline).isSoft404;
 	if (!(baselineStatus >= 200 && baselineStatus < 300) || baselineSoft) {
-		return {
-			detected: false, abortedByScope: false, blockReason: `基线请求状态 ${baselineStatus}${baselineSoft ? "（疑似 Soft-404 兜底页）" : ""} 不可用于差分对比`,
+		return { detected: false, abortedByScope: false,
+			blockReason: scrubSecretsInText(`基线请求状态 ${baselineStatus}${baselineSoft ? "（疑似 Soft-404 兜底页）" : ""} 不可用于差分对比`, secrets, rootOrVault),
 			baselineStatus, baselineSoft404: baselineSoft, vulnerableFields: [], cases: [], rollbackExecuted: false, rollbackOk: false,
-			beliefObservation: { type: "soft404_miss", weight: 0.6, note: "基线响应不可信，探测安全终止" }, summary: "基线响应不可作为对照（非 2xx 或 Soft-404），已安全终止。", };
+			beliefObservation: { type: "soft404_miss", weight: 0.6, note: "基线响应不可信，探测安全终止" }, summary: "基线响应不可作为对照（非 2xx 或 Soft-404），已安全终止。" };
 	}
-	let rollbackExecuted = false; let rollbackOk = false;
-	let rollbackTrace: StatefulStepTrace | undefined; let abortedByScope = false; let abortReason: string | undefined;
+	let rollbackExecuted = false; let rollbackOk = false; let rollbackTrace: StatefulStepTrace | undefined;
+	let abortedByScope = false; let abortReason: string | undefined;
 	try {
 		for (const spec of opts.candidateFields ?? SW3_DEFAULT_MASS_FIELDS) {
 			if (!spec || typeof spec.field !== "string" || spec.field.length === 0) continue;
 			const w = await sw3RunStep(withBody({ ...baselineObj, [spec.field]: spec.value }), session, ctx, secrets);
-			if (w.aborted || w.blocked) {
-				abortedByScope = w.aborted; abortReason = w.trace?.blockReason ?? w.error ?? "写入步被策略阻断";
-				break;
-			}
+			if (w.aborted || w.blocked) { abortedByScope = w.aborted; abortReason = w.trace?.blockReason ?? w.error ?? "写入步被策略阻断"; break; }
 			const r = opts.readStep ? await sw3RunStep(opts.readStep, session, ctx, secrets) : w;
-			if (r.aborted || r.blocked) {
-				abortedByScope = r.aborted; abortReason = r.trace?.blockReason ?? r.error ?? "读取步被策略阻断";
-				break;
-			}
+			if (r.aborted || r.blocked) { abortedByScope = r.aborted; abortReason = r.trace?.blockReason ?? r.error ?? "读取步被策略阻断"; break; }
 			const text = r.body ?? ""; const json = r.json ?? sw3Json(text);
-			const soft = detectSoft404({ status: r.status, body: text, headers: r.headers, path: readPathHint() }, soft404Baseline,).isSoft404;
-			const similarity = computeTemplateSimilarity(baselineText, text, readPathHint()); let observed: unknown;
-			try {
-				observed = spec.expectedReadPath ? extractByJsonPath(json, spec.expectedReadPath) : undefined;
-			} catch { observed = undefined; }
-			if (observed === undefined) observed = sw3FindDeep(json, spec.field);
-			const baselineValue = sw3FindDeep(baselineJson, spec.field);
+			const soft = detectSoft404({ status: r.status, body: text, headers: r.headers, path: readPathHint() }, soft404Baseline).isSoft404;
+			const similarity = computeTemplateSimilarity(baselineText, text, readPathHint()); let observed: unknown; let baselineValue: unknown; let echoOnly = false;
+			if (spec.expectedReadPath) {
+				try { observed = extractByJsonPath(json, spec.expectedReadPath); } catch { observed = undefined; }
+				try { baselineValue = extractByJsonPath(baselineJson, spec.expectedReadPath); } catch { baselineValue = undefined; }
+			} else {
+				const probeHits = sw3CollectBusinessPaths(json, spec.field); const baseHits = sw3CollectBusinessPaths(baselineJson, spec.field);
+				if (probeHits.length === 0 && sw3FindDeep(json, spec.field) !== undefined) {
+					echoOnly = true;
+				} else {
+					const matchedHit = probeHits.find((h) => sw3DeepEq(h.value, spec.value)) ?? probeHits[0];
+					if (matchedHit) {
+						observed = matchedHit.value; const baseMatch = baseHits.find((h) => h.path === matchedHit.path) ?? baseHits[0]; baselineValue = baseMatch?.value;
+					}
+				}
+			}
 			const result: MassAssignmentCaseResult = { field: spec.field, label: spec.label, bound: false,
 				writeStatus: w.status, readStatus: r.status, isSoft404: soft, templateSimilarity: Number(similarity.toFixed(4)),
-				observedValueRedacted: sw3RedactValue(spec.field, observed, secrets),
-				baselineValueRedacted: sw3RedactValue(spec.field, baselineValue, secrets), writeTrace: sw3RedactTrace(w.trace, secrets),
-				readTrace: opts.readStep ? sw3RedactTrace(r.trace, secrets) : undefined, };
-			if (r.status >= 400) {
-				result.suppressedReason = `读取状态 ${r.status} >= 400，未形成有效绑定证据`; cases.push(result);
-				continue;
-			}
-			if (soft) {
-				result.suppressedReason = "响应被判为 Soft-404 兜底页，疑似假成功"; cases.push(result);
-				continue;
-			}
-			if (SW3_FIELD_REJECT_RE.test(text.slice(0, 4_000))) {
-				result.suppressedReason = "响应命中未知字段/拒绝提示文本，字段未被服务端接受"; cases.push(result);
-				continue;
-			}
-			if (observed === undefined || observed === null) {
-				result.suppressedReason = `未在响应中找到字段 ${spec.field} 的期望值（模板相似度 ${similarity.toFixed(2)}）`; cases.push(result);
-				continue;
-			}
-			if (!sw3DeepEq(observed, spec.value)) {
-				result.suppressedReason = `字段 ${spec.field} 的实际值与注入值不一致`; cases.push(result);
-				continue;
-			}
+				observedValueRedacted: sw3RedactValue(spec.field, observed, secrets, rootOrVault),
+				baselineValueRedacted: sw3RedactValue(spec.field, baselineValue, secrets, rootOrVault), writeTrace: sw3RedactTrace(w.trace, secrets, rootOrVault),
+				readTrace: opts.readStep ? sw3RedactTrace(r.trace, secrets, rootOrVault) : undefined };
+			if (r.status >= 400) { result.suppressedReason = `读取状态 ${r.status} >= 400，未形成有效绑定证据`; cases.push(result); continue; }
+			if (soft) { result.suppressedReason = "响应被判为 Soft-404 兜底页，疑似假成功"; cases.push(result); continue; }
+			if (SW3_FIELD_REJECT_RE.test(text.slice(0, 4_000))) { result.suppressedReason = "响应命中未知字段/拒绝提示文本，字段未被服务端接受"; cases.push(result); continue; }
+			if (echoOnly) { result.suppressedReason = "字段仅出现在请求回显或报错容器中，业务实体未持久化变更"; cases.push(result); continue; }
+			if (observed === undefined || observed === null) { result.suppressedReason = `未在业务响应中找到字段 ${spec.field} 的期望值（模板相似度 ${similarity.toFixed(2)}）`; cases.push(result); continue; }
+			if (!sw3DeepEq(observed, spec.value)) { result.suppressedReason = `字段 ${spec.field} 的实际值与注入值不一致`; cases.push(result); continue; }
 			if (baselineValue !== undefined && sw3DeepEq(observed, baselineValue)) {
-				result.suppressedReason = similarity >= threshold ? "响应与基线高度同构且字段值未变，判为静态回显" : "字段值与基线一致，未发生实际写入（仅高模板相似度的静态回显）"; cases.push(result);
-				continue;
+				result.suppressedReason = similarity >= threshold ? "响应与基线高度同构且字段值未变，判为静态回显" : "字段值与基线一致，未发生实际写入（仅高模板相似度的静态回显）"; cases.push(result); continue;
 			}
 			result.bound = true; vulnerableFields.push(spec.field); cases.push(result);
 		}
-	} catch (e) {
-		abortReason = `探测过程异常：${sw3Err(e)}`;
-	} finally {
+	} catch (e) { abortReason = `探测过程异常：${sw3Err(e)}`; } finally {
 		if (opts.rollbackStep) {
 			rollbackExecuted = true;
 			try {
-				const rb = await sw3RunStep(opts.rollbackStep, session, ctx, secrets); rollbackTrace = sw3RedactTrace(rb.trace, secrets);
+				const rb = await sw3RunStep(opts.rollbackStep, session, ctx, secrets); rollbackTrace = sw3RedactTrace(rb.trace, secrets, rootOrVault);
 				rollbackOk = rb.ok && !rb.blocked && !rb.aborted && rb.status > 0 && rb.status < 400;
 				if (rb.aborted) abortedByScope = true;
 			} catch (e) { rollbackOk = false; abortReason = abortReason ?? `回滚执行异常：${sw3Err(e)}`; }
 		}
 	}
-	const detected = vulnerableFields.length > 0;
-	const beliefObservation: BeliefObservation = detected ? {
-				type: "confirmed_hit", weight: 1.2, note: `Mass Assignment 绑定成功字段：${vulnerableFields.map((f) => scrubSecretsInText(f, secrets)).join(", ")}`, }
-		: abortedByScope ? { type: "waf_block", weight: 1, note: abortReason ?? "探测过程被 Scope/分级策略阻断" }
-			: { type: "partial_signal", weight: 0.4, note: abortReason ?? "未观察到字段绑定行为" };
-	return {
-		detected, abortedByScope, blockReason: abortReason, baselineStatus, baselineSoft404: baselineSoft, vulnerableFields, cases, rollbackExecuted,
-		rollbackOk, rollbackTrace, beliefObservation, summary: detected
-			? `检测到 ${vulnerableFields.length} 个可被越权绑定的字段：${vulnerableFields.join(", ")}`
-			: abortedByScope ? `探测被策略阻断：${scrubSecretsInText(abortReason ?? "越界访问", secrets)}`
-				: `共测试 ${cases.length} 个候选字段，未观察到有效绑定（含 ${cases.filter((c) => c.suppressedReason).length} 例噪音抑制）。`, };
+	const finalCases = cases.map((c) => ({ ...c, observedValueRedacted: sw3RedactValue(c.field, c.observedValueRedacted, secrets, rootOrVault),
+		baselineValueRedacted: sw3RedactValue(c.field, c.baselineValueRedacted, secrets, rootOrVault), writeTrace: sw3RedactTrace(c.writeTrace, secrets, rootOrVault),
+		readTrace: sw3RedactTrace(c.readTrace, secrets, rootOrVault) }));
+	const detected = vulnerableFields.length > 0; const safeAbort = abortReason ? scrubSecretsInText(abortReason, secrets, rootOrVault) : undefined;
+	const beliefObservation: BeliefObservation = detected
+		? { type: "confirmed_hit", weight: 1.2, note: `Mass Assignment 绑定成功字段：${vulnerableFields.map((f) => scrubSecretsInText(f, secrets, rootOrVault)).join(", ")}` }
+		: abortedByScope ? { type: "waf_block", weight: 1, note: safeAbort ?? "探测过程被 Scope/分级策略阻断" }
+			: { type: "partial_signal", weight: 0.4, note: safeAbort ?? "未观察到字段绑定行为" };
+	return { detected, abortedByScope, blockReason: safeAbort, baselineStatus, baselineSoft404: baselineSoft, vulnerableFields,
+		cases: finalCases, rollbackExecuted, rollbackOk, rollbackTrace: sw3RedactTrace(rollbackTrace, secrets, rootOrVault), beliefObservation,
+		summary: detected ? `检测到 ${vulnerableFields.length} 个可被越权绑定的字段：${vulnerableFields.join(", ")}`
+			: abortedByScope ? `探测被策略阻断：${safeAbort ?? "越界访问"}`
+				: `共测试 ${finalCases.length} 个候选字段，未观察到有效绑定（含 ${finalCases.filter((c) => c.suppressedReason).length} 例噪音抑制）。` };
 }
-
 /* ------------------- 四、二阶有状态工作流验证 ------------------- */
 
 export interface SecondOrderAssertionSpec {
@@ -1261,8 +1293,7 @@ export interface SecondOrderWorkflowResult {
 	beliefPropagation?: BeliefPropagationResult; }
 function sw3StepId(step: StatefulWorkflowStep | undefined, idx: number): string {
 	const raw = String(step?.id ?? step?.name ?? "").trim();
-	return raw.length > 0 ? raw : `step-${idx}`;
-}
+	return raw.length > 0 ? raw : `step-${idx}`; }
 function sw3ClassifyFailure(r: Sw3RunResult): { kind: Sw3FailureKind; reason: string } | null {
 	const trace = r.trace; const errText = `${r.error ?? ""} ${trace?.error ?? ""} ${trace?.blockReason ?? ""}`.trim();
 	if (r.aborted || trace?.abortedByScope === true) {
@@ -1283,7 +1314,7 @@ function sw3ClassifyFailure(r: Sw3RunResult): { kind: Sw3FailureKind; reason: st
 }
 function sw3Snapshot(r: Sw3RunResult): ResponseSnapshot {
 	const body = r.body ?? "";
-	const snap: ResponseSnapshot = { statusCode: r.status, body: body.slice(0, 8_000), bodyBytes: body.length, headers: r.headers, };
+	const snap: ResponseSnapshot = { statusCode: r.status, body: body.slice(0, 65_536), bodyBytes: body.length, headers: r.headers, };
 	try {
 		snap.bodySha256 = computeBodyHash(body).bodyHash;
 	} catch {
@@ -1313,9 +1344,7 @@ function sw3CheckAssertion(spec: SecondOrderAssertionSpec | undefined,
 		try {
 			actual = extractByJsonPath(ctx.json, spec.jsonPath);
 		} catch { actual = undefined; }
-		if (actual === undefined) {
-			const leaf = spec.jsonPath.split(/[.[\]]+/).filter((s) => s.length > 0).pop() ?? spec.jsonPath; actual = sw3FindDeep(ctx.json, leaf);
-		}
+		if (actual === undefined) { const leaf = spec.jsonPath.split(/[.[\]]+/).filter((s) => s.length > 0).pop() ?? spec.jsonPath; actual = sw3FindDeep(ctx.json, leaf); }
 		if (spec.expectedValue !== undefined) {
 			if (!sw3DeepEq(actual, spec.expectedValue)) problems.push(`JSONPath ${spec.jsonPath} 的实际值与期望值不一致`);
 		} else if (actual === undefined) { problems.push(`JSONPath ${spec.jsonPath} 未能提取到值`); }
@@ -1330,13 +1359,14 @@ function sw3CheckAssertion(spec: SecondOrderAssertionSpec | undefined,
  * 二阶有状态工作流验证：写 -> 中间依赖 -> 读验证 的完整链路，
  * 通过软 404、正向证据门与断言三重过滤压制假阳性，并在 finally 中无条件执行清理。
  */
-export async function verifySecondOrderWorkflow(opts: VerifySecondOrderWorkflowOptions, ): Promise<SecondOrderWorkflowResult> {
+export async function verifySecondOrderWorkflow(opts: VerifySecondOrderWorkflowOptions): Promise<SecondOrderWorkflowResult> {
 	const root = opts.root ?? process.cwd(); const mode: Mode | string = opts.mode ?? "standard";
-	const allowDestructive = opts.allowDestructive === true; const secrets = sw3Secrets(opts.extraSecrets);
-	const session: Sw3Session = { vars: { ...(opts.initialVars ?? {}) }, cookies: { ...(opts.initialCookies ?? {}) }, };
+	const allowDestructive = opts.allowDestructive === true; const rootOrVault = opts.vault ?? root;
+	const secrets = sw3Secrets({ root, vault: opts.vault, roleHeaders: opts.roleHeaders, extraHeaders: opts.extraHeaders,
+		initialVars: opts.initialVars, initialCookies: opts.initialCookies, extraSecrets: opts.extraSecrets });
+	const session: Sw3Session = { vars: { ...(opts.initialVars ?? {}) }, cookies: { ...(opts.initialCookies ?? {}) } };
 	const ctx: Sw3RunCtx = { root, scope: opts.scope, mode, allowDestructive, vault: opts.vault, role: opts.role, roleHeaders: opts.roleHeaders,
-		extraHeaders: opts.extraHeaders, fetchFn: opts.fetchFn, recorder: opts.recorder, extraSecrets: opts.extraSecrets,
-		timeoutMs: sw3Timeout(opts.timeoutMs), };
+		extraHeaders: opts.extraHeaders, fetchFn: opts.fetchFn, recorder: opts.recorder, extraSecrets: opts.extraSecrets, timeoutMs: sw3Timeout(opts.timeoutMs) };
 	const writeSteps = opts.writeSteps ?? []; const intermediateSteps = opts.intermediateSteps ?? [];
 	const verifySteps = opts.verifySteps ?? []; const cleanupSteps = opts.cleanupSteps ?? [];
 	const stepTraces: StatefulStepTrace[] = []; const cleanupTraces: StatefulStepTrace[] = [];
@@ -1345,35 +1375,33 @@ export async function verifySecondOrderWorkflow(opts: VerifySecondOrderWorkflowO
 	for (const s of writeSteps) queue.push({ step: s, phase: "write", idx: gIdx++ });
 	for (const s of intermediateSteps) queue.push({ step: s, phase: "intermediate", idx: gIdx++ });
 	for (const s of verifySteps) queue.push({ step: s, phase: "verify", idx: gIdx++ });
-	const preflightTargets: Array<{
-		step?: StatefulWorkflowStep; phase: "write" | "intermediate" | "verify"; idx: number;
-	}> = [...queue.map((q) => ({ step: q.step, phase: q.phase, idx: q.idx })),
+	const preflightTargets: Array<{ step?: StatefulWorkflowStep; phase: "write" | "intermediate" | "verify"; idx: number }> = [
+		...queue.map((q) => ({ step: q.step, phase: q.phase, idx: q.idx })),
 		...(opts.baselineReadStep ? [{ step: opts.baselineReadStep, phase: "write" as const, idx: -1 }] : []) ];
 	for (const target of preflightTargets) {
 		if (!target.step) continue;
 		const verdict = sw3PreflightStep(target.step, opts.scope, mode, allowDestructive, session.vars);
 		if (verdict.ok) continue;
-		return {
-			verified: false, abortedByScope: true, brokenAtStep: target.idx >= 0 ? target.idx : undefined, brokenPhase: target.idx >= 0 ? target.phase : undefined,
-			brokenStepId: sw3StepId(target.step, target.idx), failureKind: verdict.tierBlocked ? "tier_blocked" : "scope_blocked",
-			reason: `预检阻断：${verdict.reason ?? "超出授权范围"}`,
-			stepTraces: [], redactedVariables: sw3RedactVars(session.vars, secrets), cleanupExecuted: false, cleanupOk: false,
-			cleanupTraces: [], beliefObservation: { type: "waf_block", weight: 1, note: "预检阶段发现越界或未授权的写入/读取步骤，未发送任何请求", }, };
+		return { verified: false, abortedByScope: true, brokenAtStep: target.idx >= 0 ? target.idx : undefined,
+			brokenPhase: target.idx >= 0 ? target.phase : undefined, brokenStepId: sw3StepId(target.step, target.idx),
+			failureKind: verdict.tierBlocked ? "tier_blocked" : "scope_blocked", reason: scrubSecretsInText(`预检阻断：${verdict.reason ?? "超出授权范围"}`, secrets, rootOrVault),
+			stepTraces: [], redactedVariables: sw3RedactVars(session.vars, secrets, rootOrVault), cleanupExecuted: false, cleanupOk: false,
+			cleanupTraces: [], beliefObservation: { type: "waf_block", weight: 1, note: "预检阶段发现越界或未授权的写入/读取步骤，未发送任何请求" } };
 	}
 	let soft404Baseline: Soft404BaselineInput | Soft404Baseline | null = opts.soft404Baseline ?? null;
 	if (opts.soft404Baseline === undefined && opts.autoSampleSoft404 !== false) {
-		const firstUrl = writeSteps[0]?.url ?? verifySteps[0]?.url ?? cleanupSteps[0]?.url; const origin = sw3Origin(firstUrl, session.vars);
+		const staticCandidate = [writeSteps[0]?.url, verifySteps[0]?.url, cleanupSteps[0]?.url].find((u) => typeof u === "string" && !u.includes("{{"));
+		const origin = sw3Origin(staticCandidate, session.vars);
 		if (origin && hostAllowed(origin.host, opts.scope)) {
 			try {
-				const fetcher = sw3ScopedFetch(opts.fetchFn as unknown as Sw3FetchLike | undefined, opts.scope, mode, allowDestructive, opts.extraHeaders, secrets,);
+				const fetcher = sw3ScopedFetch(opts.fetchFn as unknown as Sw3FetchLike | undefined, opts.scope, mode, allowDestructive, opts.extraHeaders, secrets);
 				soft404Baseline = await sampleSoft404Baseline(origin.origin, fetcher as unknown as Parameters<typeof sampleSoft404Baseline>[1],
-					{ headers: opts.extraHeaders, timeoutMs: Math.min(ctx.timeoutMs ?? 6_000, 6_000) },);
+					{ headers: opts.extraHeaders, timeoutMs: Math.min(ctx.timeoutMs ?? 6_000, 6_000) });
 			} catch { soft404Baseline = null; }
 		}
 	}
 	let abortedByScope = false; let cleanupExecuted = false; let cleanupOk = false; let verified = false; let reason = ""; let baselineText = "";
-	let lastResult: Sw3RunResult | null = null; let lastPhase: "write" | "intermediate" | "verify" = "verify";
-	let lastVerifyStep: StatefulWorkflowStep | undefined;
+	let lastResult: Sw3RunResult | null = null; let lastPhase: "write" | "intermediate" | "verify" = "verify"; let lastVerifyStep: StatefulWorkflowStep | undefined;
 	let broken: { idx: number;
 		phase: "write" | "intermediate" | "verify"; stepId: string; kind: Sw3FailureKind; reason: string;
 	} | null = null;
@@ -1401,8 +1429,7 @@ export async function verifySecondOrderWorkflow(opts: VerifySecondOrderWorkflowO
 				lastResult = r; lastPhase = item.phase;
 				if (item.phase === "verify") {
 					lastVerifyStep = item.step;
-					const soft = detectSoft404(
-						{ status: r.status, body: r.body ?? "", headers: r.headers, path: sw3Path(item.step.url, session.vars) }, soft404Baseline,);
+					const soft = detectSoft404({ status: r.status, body: r.body ?? "", headers: r.headers, path: sw3Path(item.step.url, session.vars) }, soft404Baseline,);
 					if (soft.isSoft404) {
 						broken = { idx: item.idx, phase: item.phase, stepId: sw3StepId(item.step, item.idx), kind: "soft_404", reason: "验证阶段响应命中 Soft-404 兜底页指纹", };
 						break;
@@ -1420,8 +1447,7 @@ export async function verifySecondOrderWorkflow(opts: VerifySecondOrderWorkflowO
 			} else {
 				let gateOk = true; let gateReason = "";
 				const hasExplicitContentAssertion = Boolean(
-					(opts.verifyAssertion?.bodyIncludes?.length ?? 0) > 0 || opts.verifyAssertion?.bodyRegex || opts.verifyAssertion?.jsonPath,
-				);
+					(opts.verifyAssertion?.bodyIncludes?.length ?? 0) > 0 || opts.verifyAssertion?.bodyRegex || opts.verifyAssertion?.jsonPath, );
 				try {
 					const gate = evaluatePositiveEvidenceGate({ kind: "vuln", title: opts.candidateTitle ?? "二阶有状态工作流漏洞", detail: text.slice(0, 2_000),
 						output: json !== undefined ? scrubSecretsInText(JSON.stringify(json), secrets).slice(0, 2_000) : undefined,
@@ -1449,47 +1475,42 @@ export async function verifySecondOrderWorkflow(opts: VerifySecondOrderWorkflowO
 		reason = msg;
 	} finally {
 		if (cleanupSteps.length > 0) {
-			cleanupExecuted = true;
-			let allCleanOk = true;
+			cleanupExecuted = true; let allCleanOk = true;
 			for (const cStep of cleanupSteps) {
 				try {
 					const cRes = await executeStatefulWorkflowChainInternal({ root, steps: [cStep], scope: opts.scope,
 						mode, allowDestructive, vars: { ...session.vars }, role: opts.role,
 						roleHeaders: opts.roleHeaders, extraHeaders: opts.extraHeaders, vault: opts.vault, fetchFn: opts.fetchFn,
 						recorder: opts.recorder, initialCookies: { ...session.cookies }, extraSecrets: opts.extraSecrets, defaultTimeoutMs: ctx.timeoutMs, });
-					for (const t of cRes.steps) {
-						const redacted = sw3RedactTrace(t, secrets);
-						if (redacted) cleanupTraces.push(redacted);
-					}
+					for (const sVal of cRes.rawSecrets ?? []) { if (sVal && sVal.length >= 3) secrets.add(sVal); }
+					for (const t of cRes.steps) { const redacted = sw3RedactTrace(t, secrets, rootOrVault); if (redacted) cleanupTraces.push(redacted); }
 					const stepOk = cRes.ok === true && cRes.blocked !== true && cRes.abortedByScope !== true &&
 						cRes.steps.every((s) => !s.blocked && !s.abortedByScope && s.status > 0 && s.status < 400);
 					if (!stepOk) allCleanOk = false;
 					session.vars = { ...session.vars, ...(cRes.rawVariables ?? cRes.variables ?? {}) };
 					session.cookies = { ...session.cookies, ...(cRes.rawCookies ?? cRes.cookies ?? {}) };
+					for (const cv of Object.values(session.cookies)) if (typeof cv === "string" && cv.length >= 3) secrets.add(cv);
 				} catch { allCleanOk = false; }
 			}
 			cleanupOk = allCleanOk;
 		}
 	}
 	if (!verified && !reason) reason = broken?.reason ?? "未形成有效二阶状态证据";
+	const safeReason = scrubSecretsInText(reason, secrets, rootOrVault);
 	const beliefObservation: BeliefObservation = verified ? { type: "breakthrough_signal", weight: 1.3, note: "二阶有状态链路验证通过，可进入独立复验候选" }
-		: broken?.kind === "auth_401" || broken?.kind === "auth_403"
-			? { type: "waf_block", weight: 1, note: scrubSecretsInText(reason, secrets) }
-			: broken?.kind === "soft_404" || broken?.kind === "http_404"
-				? { type: "soft404_miss", weight: 0.6, note: scrubSecretsInText(reason, secrets) }
-				: broken?.kind === "timeout" ? { type: "timeout", weight: 0.5, note: scrubSecretsInText(reason, secrets) }
-					: { type: "verifier_reject", weight: 0.7, note: scrubSecretsInText(reason, secrets) };
+		: broken?.kind === "auth_401" || broken?.kind === "auth_403" ? { type: "waf_block", weight: 1, note: safeReason }
+			: broken?.kind === "soft_404" || broken?.kind === "http_404" ? { type: "soft404_miss", weight: 0.6, note: safeReason }
+				: broken?.kind === "timeout" ? { type: "timeout", weight: 0.5, note: safeReason } : { type: "verifier_reject", weight: 0.7, note: safeReason };
 	let candidateFact: Fact | undefined; let verifyRecommendation: SecondOrderVerifyRecommendation | undefined;
 	if (verified) {
 		const rawId = typeof opts.candidateFactId === "string" ? opts.candidateFactId.trim() : ""; const fid = rawId.length > 0 ? rawId : `vuln-${randomUUID()}`;
-		const rawTitle = typeof opts.candidateTitle === "string" && opts.candidateTitle.trim().length > 0
-				? opts.candidateTitle.trim() : "二阶有状态工作流漏洞";
-		const safeTitle = scrubSecretsInText(rawTitle, secrets);
+		const rawTitle = typeof opts.candidateTitle === "string" && opts.candidateTitle.trim().length > 0 ? opts.candidateTitle.trim() : "二阶有状态工作流漏洞";
+		const safeTitle = scrubSecretsInText(rawTitle, secrets, rootOrVault);
 		candidateFact = { id: fid, kind: "vuln", title: safeTitle, detail: scrubSecretsInText(
 				`写 ${writeSteps.length} / 中间 ${intermediateSteps.length} / 验证 ${verifySteps.length} 步链路验证通过。${assertionSummary}`,
-				secrets,), createdAt: new Date().toISOString(), verified: false, verifyStage: "candidate", };
+				secrets, rootOrVault), createdAt: new Date().toISOString(), verified: false, verifyStage: "candidate" };
 		verifyRecommendation = { key: `verify-vuln:${fid}`, factId: fid, phase: "vuln", title: `复验：${safeTitle}`,
-			detail: scrubSecretsInText("二阶有状态链路验证已通过，请以独立身份与全新会话复验。", secrets), priority: 8, from: [`fact:${fid}`], };
+			detail: scrubSecretsInText("二阶有状态链路验证已通过，请以独立身份与全新会话复验。", secrets, rootOrVault), priority: 8, from: [`fact:${fid}`] };
 	}
 	let beliefPropagation: BeliefPropagationResult | undefined;
 	if (opts.applyBeliefUpdate === true && opts.beliefGraph && opts.state) {
@@ -1498,28 +1519,24 @@ export async function verifySecondOrderWorkflow(opts: VerifySecondOrderWorkflowO
 			try {
 				const resolved = resolveBeliefNodeId(opts.beliefGraph, targetNodeId);
 				if (resolved && opts.beliefGraph.nodes[resolved]) {
-					beliefPropagation = propagateBeliefUpdate(opts.beliefGraph, opts.state, { nodeId: resolved, observation: beliefObservation, });
+					beliefPropagation = propagateBeliefUpdate(opts.beliefGraph, opts.state, { nodeId: resolved, observation: beliefObservation });
 				}
-			} catch {
-				/* 节点不存在时静默跳过，不中断主流程 */
-			}
+			} catch { /* 节点不存在时静默跳过 */ }
 		}
 	}
 	if (opts.recordLedger === true && root) {
 		try {
 			recordToolExecution(root, { tool: "nuwa_second_order_workflow", command: "verifySecondOrderWorkflow",
-				output: sw3Note(scrubSecretsInText(`${reason} | verified=${verified}`, secrets), 500), ok: verified, } as Parameters<typeof recordToolExecution>[1]);
-		} catch {
-			/* 账本记录失败不影响主流程 */
-		}
+				output: sw3Note(scrubSecretsInText(`${reason} | verified=${verified}`, secrets, rootOrVault), 500), ok: verified } as Parameters<typeof recordToolExecution>[1]);
+		} catch { /* 账本记录失败不影响主流程 */ }
 	}
-	return {
-		verified, abortedByScope, brokenAtStep: broken && broken.idx >= 0 ? broken.idx : undefined, brokenPhase: broken ? broken.phase : undefined,
-		brokenStepId: broken ? broken.stepId : undefined, failureKind: broken ? broken.kind : undefined, reason: scrubSecretsInText(reason, secrets), stepTraces,
-		redactedVariables: sw3RedactVars(session.vars, secrets), cleanupExecuted, cleanupOk, cleanupTraces,
-		candidateFact, verifyRecommendation, beliefObservation, beliefPropagation, };
+	const finalTraces = stepTraces.map((t) => sw3RedactTrace(t, secrets, rootOrVault)).filter((t): t is StatefulStepTrace => Boolean(t));
+	const finalCleanupTraces = cleanupTraces.map((t) => sw3RedactTrace(t, secrets, rootOrVault)).filter((t): t is StatefulStepTrace => Boolean(t));
+	return { verified, abortedByScope, brokenAtStep: broken && broken.idx >= 0 ? broken.idx : undefined, brokenPhase: broken ? broken.phase : undefined,
+		brokenStepId: broken ? broken.stepId : undefined, failureKind: broken ? broken.kind : undefined, reason: safeReason, stepTraces: finalTraces,
+		redactedVariables: sw3RedactVars(session.vars, secrets, rootOrVault), cleanupExecuted, cleanupOk, cleanupTraces: finalCleanupTraces,
+		candidateFact, verifyRecommendation, beliefObservation, beliefPropagation };
 }
-
 /* ============================================================================
  * 第三部分：同步屏障并发竞态探测。
  * BarrierGate 令全部 worker 在同一事件循环 tick 内同步放行，用于验证服务端
@@ -1565,8 +1582,7 @@ export class BarrierGate {
 	private readonly waiters: Array<(result: BarrierAwaitResult) => void> = []; private timer: ReturnType<typeof setTimeout> | null = null;
 	constructor(parties: number, timeoutMs = 5_000) {
 		const count = Math.floor(Number(parties)); this.parties = Number.isFinite(count) && count > 0 ? count : 1;
-		const limit = Math.floor(Number(timeoutMs)); this.timeoutMs = Number.isFinite(limit) && limit > 0 ? limit : 5_000;
-	}
+		const limit = Math.floor(Number(timeoutMs)); this.timeoutMs = Number.isFinite(limit) && limit > 0 ? limit : 5_000; }
 	public get arrivedCount(): number { return this.arrived; }
 	public get isReleased(): boolean { return this.state === "released"; }
 	public get pendingTimers(): number { return this.timer === null ? 0 : 1; }
@@ -1626,7 +1642,6 @@ export class BarrierGate {
 		}
 	}
 }
-
 /* --------------------------- 文本 / 脱敏 / 数值工具 ------------------------ */
 const RACE_REDACT_RE =
 	/("?(?:authorization|proxy-authorization|set-cookie|cookie|x-api-key|x-auth-token|api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|password|passwd|secret|session[_-]?id)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^,;\r\n}]{0,512})/gi;
@@ -1646,7 +1661,6 @@ function raceRedactText(text: string, secrets: Set<string>, opts: BarrierRacePro
 }
 function raceIsSoft404(body: string, status: number): boolean { try { return Boolean(body) && detectSoft404({ status, body }).isSoft404; } catch { return false; } }
 function raceToBuffer(chunk: unknown): Buffer | undefined { return chunk instanceof Uint8Array ? Buffer.from(chunk) : typeof chunk === "string" ? Buffer.from(chunk, "utf8") : undefined; }
-
 /* ------------------------------ HTTP/1.1 编解码 ---------------------------- */
 interface RacePreparedStep {
 	url: string; method: string; headers: Record<string, string>; body?: string; unresolved: string[]; }
@@ -1658,10 +1672,8 @@ function raceBuildHttpRequest(url: URL, prepared: RacePreparedStep): string {
 	const lines: string[] = [`${prepared.method} ${url.pathname || "/"}${url.search || ""} HTTP/1.1`, `Host: ${url.host}`, "Connection: close"];
 	const seen = new Set<string>(["host", "connection", "content-length", "transfer-encoding"]);
 	for (const [key, value] of Object.entries(prepared.headers)) {
-		const lower = key.toLowerCase();
-		if (seen.has(lower)) continue;
-		seen.add(lower); lines.push(`${key}: ${String(value).replace(/[\r\n]+/g, " ")}`);
-	}
+		const lower = key.toLowerCase(); if (seen.has(lower)) continue;
+		seen.add(lower); lines.push(`${key}: ${String(value).replace(/[\r\n]+/g, " ")}`); }
 	const body = prepared.body ?? ""; const hasBody = body.length > 0;
 	if (hasBody) lines.push(`Content-Length: ${Buffer.byteLength(body, "utf8")}`);
 	lines.push("", ""); const head = lines.join("\r\n");
@@ -1700,17 +1712,51 @@ function raceParseHttpResponse(raw: Buffer): RaceRawResponse | undefined {
 	}
 	return { status, headers, body };
 }
+function raceIsChunkedComplete(body: Buffer): boolean {
+	let pos = 0;
+	while (pos < body.length) {
+		const lineEnd = body.indexOf("\r\n", pos, "latin1");
+		if (lineEnd < 0) return false;
+		const sizeHex = body.toString("latin1", pos, lineEnd).split(";")[0]?.trim() ?? ""; const size = Number.parseInt(sizeHex, 16);
+		if (!Number.isFinite(size) || size < 0) return false;
+		pos = lineEnd + 2;
+		if (size === 0) return body.indexOf("\r\n", pos, "latin1") >= 0 || body.length >= pos + 2;
+		if (pos + size + 2 > body.length) return false;
+		pos += size + 2;
+	}
+	return false;
+}
+function raceHasCompleteHttpResponse(raw: Buffer, method: string): boolean {
+	const headerEnd = raw.indexOf("\r\n\r\n", 0, "latin1");
+	if (headerEnd < 0) return false;
+	const lines = raw.toString("latin1", 0, headerEnd).split("\r\n"); const statusLine = lines.shift() ?? "";
+	const matched = /^HTTP\/\d(?:\.\d)?\s+(\d{3})/.exec(statusLine);
+	const status = matched && matched[1] ? Number.parseInt(matched[1], 10) : 0;
+	if (method.toUpperCase() === "HEAD" || status === 204 || status === 304 || (status >= 100 && status < 200)) return true;
+	let te = ""; let cl = "";
+	for (const line of lines) {
+		const idx = line.indexOf(":");
+		if (idx <= 0) continue;
+		const k = line.slice(0, idx).trim().toLowerCase(); const v = line.slice(idx + 1).trim();
+		if (k === "transfer-encoding") te += (te ? "," : "") + v.toLowerCase();
+		else if (k === "content-length") cl = v;
+	}
+	const body = raw.subarray(headerEnd + 4);
+	if (te.includes("chunked")) return raceIsChunkedComplete(body);
+	if (cl) {
+		const len = Number.parseInt(cl, 10);
+		if (Number.isFinite(len) && len >= 0) return body.length >= len;
+	}
+	return false;
+}
 function raceExchange(socket: Socket, rawRequest: string, timeoutMs: number,
 	activeTimers: Set<ReturnType<typeof setTimeout>>, onTimeout: () => void): Promise<RaceRawResponse> {
+	const reqMethod = rawRequest.slice(0, Math.max(0, rawRequest.indexOf(" "))).toUpperCase();
 	return new Promise<RaceRawResponse>((resolve, reject) => {
 		const chunks: Buffer[] = []; let total = 0; let settled = false; let timer: ReturnType<typeof setTimeout> | undefined;
 		const clearTimer = (): void => {
 			if (timer === undefined) return;
-			try {
-				clearTimeout(timer);
-			} catch {
-				/* 忽略 */
-			}
+			try { clearTimeout(timer); } catch { /* 忽略 */ }
 			activeTimers.delete(timer); timer = undefined;
 		};
 		const finish = (fn: () => void): void => {
@@ -1720,44 +1766,53 @@ function raceExchange(socket: Socket, rawRequest: string, timeoutMs: number,
 		const done = (): void => {
 			finish(() => {
 				const parsed = raceParseHttpResponse(Buffer.concat(chunks, total));
-				if (parsed) resolve(parsed);
-				else reject(new Error("无法解析 HTTP 响应"));
+				try { if (!socket.destroyed) socket.destroy(); } catch { /* 忽略 */ }
+				if (parsed) resolve(parsed); else reject(new Error("无法解析 HTTP 响应"));
 			});
 		};
-		timer = setTimeout(() => {
-			onTimeout(); finish(() => reject(new Error("响应读取超时")));
-		}, timeoutMs);
+		timer = setTimeout(() => { onTimeout(); finish(() => reject(new Error("响应读取超时"))); }, timeoutMs);
 		activeTimers.add(timer);
 		socket.on("data", (chunk: unknown) => {
 			const bytes = raceToBuffer(chunk);
 			if (!bytes) return;
 			if (total < 1_048_576) { chunks.push(bytes); total += bytes.length; }
+			if (!settled && raceHasCompleteHttpResponse(Buffer.concat(chunks, total), reqMethod)) done();
 		});
-		socket.on("error", (err: unknown) => {
-			finish(() => reject(err instanceof Error ? err : new Error(String(err))));
-		});
+		socket.on("error", (err: unknown) => { finish(() => reject(err instanceof Error ? err : new Error(String(err)))); });
 		socket.on("end", done); socket.on("close", done);
-		try {
-			socket.write(rawRequest);
-		} catch (err) { finish(() => reject(err instanceof Error ? err : new Error(String(err)))); }
+		try { socket.write(rawRequest); } catch (err) { finish(() => reject(err instanceof Error ? err : new Error(String(err)))); }
 	});
 }
-
 /* ------------------------- 步骤准备 / 作用域 / 密钥采集 ---------------------- */
 function raceScopeDecision(raw: { ok: boolean; reason?: string }): RaceScopeDecision { return { blocked: !raw.ok, reason: raw.reason ?? (raw.ok ? undefined : "Scope 校验拒绝") }; }
 function raceMergeHeaders(step: StatefulWorkflowStep, opts: BarrierRaceProbeOptions, role: string | undefined): Record<string, string> {
 	const merged: Record<string, string> = {};
-	const push = (source?: Record<string, string>): void => {
+	const keyCase = new Map<string, string>();
+	const push = (source?: Record<string, string> | null): void => {
 		if (!source) return;
-		for (const [key, value] of Object.entries(source)) if (typeof value === "string") merged[key] = value;
+		for (const [key, value] of Object.entries(source)) {
+			if (typeof value !== "string") continue;
+			const lk = key.toLowerCase(); const prevKey = keyCase.get(lk);
+			if (prevKey && prevKey !== key) delete merged[prevKey];
+			keyCase.set(lk, key); merged[key] = value;
+		}
 	};
-	push(step.headers);
-	if (role) push(opts.roleHeaders?.[role]);
-	push(opts.extraHeaders);
+	if (role) {
+		try {
+			const vaultMap = getRoleHeadersMap(opts.vault ?? opts.root ?? process.cwd(), role);
+			if (vaultMap) push(vaultMap);
+		} catch { /* 忽略角色加载失败 */ }
+		push(opts.roleHeaders?.[role]);
+	}
+	push(opts.extraHeaders); push(step.extraHeaders); push(step.headers);
+	const initCookiePairs = Object.entries(opts.initialCookies ?? {}).filter(([k, v]) => k && typeof v === "string").map(([k, v]) => `${k}=${v}`);
+	if (initCookiePairs.length > 0) {
+		const ckKey = keyCase.get("cookie") ?? "cookie"; const initStr = initCookiePairs.join("; ");
+		merged[ckKey] = merged[ckKey] ? `${initStr}; ${merged[ckKey]}` : initStr; keyCase.set("cookie", ckKey);
+	}
 	return merged;
 }
-function racePrepareStep(step: StatefulWorkflowStep, opts: BarrierRaceProbeOptions,
-	vars: Record<string, string>, role: string | undefined): RacePreparedStep {
+function racePrepareStep(step: StatefulWorkflowStep, opts: BarrierRaceProbeOptions, vars: Record<string, string>, role: string | undefined): RacePreparedStep {
 	const unresolved: string[] = [];
 	const interpolate = (text: string): string => {
 		const result = interpolateTemplate(text, vars);
@@ -1769,9 +1824,12 @@ function racePrepareStep(step: StatefulWorkflowStep, opts: BarrierRaceProbeOptio
 	let body: string | undefined;
 	try {
 		if (typeof step.body === "string") body = interpolate(step.body);
-		else if (step.body && typeof step.body === "object") body = interpolate(JSON.stringify(step.body));
+		else if (step.body && typeof step.body === "object") {
+			body = interpolate(JSON.stringify(step.body));
+			if (!Object.keys(headers).some((k) => k.toLowerCase() === "content-type")) headers["content-type"] = "application/json";
+		}
 	} catch { body = undefined; }
-	const prepared: RacePreparedStep = { url: interpolate(step.url), method: (step.method ?? "GET").toUpperCase(), headers, unresolved, };
+	const prepared: RacePreparedStep = { url: interpolate(step.url), method: (step.method ?? "GET").toUpperCase(), headers, unresolved };
 	if (body !== undefined) prepared.body = body;
 	return prepared;
 }
@@ -1792,22 +1850,23 @@ function raceValidateStep(prepared: RacePreparedStep, opts: BarrierRaceProbeOpti
 }
 function raceCollectSecrets(opts: BarrierRaceProbeOptions, vars: Record<string, string>,
 	cookies: Record<string, string>, headerSets: Array<Record<string, string>>): Set<string> {
-	let secrets: Set<string>;
-	try {
-		secrets = collectSecretSet({ root: opts.root, vault: opts.vault, extraSecrets: opts.extraSecrets, vars, cookies, role: undefined } as {
-			root?: string; vault?: SessionVault; extraSecrets?: string[]; vars?: Record<string, string>;
-			cookies?: Record<string, string>; });
-	} catch { secrets = new Set<string>(); }
-	if (!(secrets instanceof Set)) secrets = new Set<string>();
-	const add = (value: unknown): void => {
-		if (typeof value !== "string") return;
-		const trimmed = value.trim();
-		if (trimmed.length >= 4) secrets.add(trimmed);
-	};
-	for (const [key, value] of Object.entries(vars)) if (isSensitiveKeyName(key)) add(value);
-	for (const value of Object.values(cookies)) add(value);
-	for (const set of headerSets) { for (const [key, value] of Object.entries(set)) if (isSensitiveKeyName(key)) add(value); }
-	if (opts.extraSecrets) for (const value of opts.extraSecrets) add(value);
+	const combinedHeaders: Record<string, string> = {};
+	for (const set of headerSets) {
+		for (const [k, v] of Object.entries(set)) {
+			combinedHeaders[k] = v;
+			if (typeof v === "string" && v.trim().length >= 4 && (isSensitiveKeyName(k) || opts.role)) combinedHeaders[k] = v;
+		}
+	}
+	const secrets = collectSecretSet({ root: opts.root, vault: opts.vault, extraSecrets: opts.extraSecrets,
+		headers: combinedHeaders, roleHeaders: opts.roleHeaders, vars, cookies });
+	for (const set of headerSets) {
+		for (const [k, v] of Object.entries(set)) {
+			if (typeof v === "string" && v.trim().length >= 4 && (isSensitiveKeyName(k) || opts.role)) {
+				secrets.add(v.trim()); const bare = v.replace(/^(?:Bearer|Basic|Token|JWT|Digest)\s+/i, "").trim();
+				if (bare.length >= 4) secrets.add(bare);
+			}
+		}
+	}
 	return secrets;
 }
 function raceExtractNumeric(value: unknown, path: string | undefined): number | undefined {
@@ -1879,11 +1938,9 @@ async function raceRunReadStep(step: StatefulWorkflowStep, opts: BarrierRaceProb
 		const result = await executeStatefulWorkflowChainInternal({ root: opts.root ?? process.cwd(),
 			steps: [step], scope: opts.scope, mode: opts.mode, allowDestructive: opts.allowDestructive,
 			vars, role: opts.role, roleHeaders: opts.roleHeaders, extraHeaders: opts.extraHeaders,
-			vault: opts.vault, fetchFn: opts.fetchFn, initialCookies: cookies, extraSecrets: opts.extraSecrets,
-			recordTraffic: false, defaultTimeoutMs: opts.timeoutMs, });
+			vault: opts.vault, fetchFn: opts.fetchFn, initialCookies: cookies, extraSecrets: opts.extraSecrets, recordTraffic: false, defaultTimeoutMs: opts.timeoutMs, });
 		if (result.abortedByScope || result.blocked) {
-			return { blocked: true, reason: raceRedactText(result.error ?? "作用域阻断", secrets, opts, 300) };
-		}
+			return { blocked: true, reason: raceRedactText(result.error ?? "作用域阻断", secrets, opts, 300) }; }
 		return { blocked: false, bodyText: result.rawStepBodies?.[0] ?? result.rawLastResponseBody };
 	} catch (err) {
 		return { blocked: true, reason: raceRedactText(err instanceof Error ? err.message : String(err), secrets, opts, 300) };
@@ -1904,7 +1961,6 @@ interface RaceFetchInit {
 interface RaceFetchLikeResponse {
 	status: number; text(): Promise<string>; }
 type RaceFetchLike = (url: string, init: RaceFetchInit) => Promise<RaceFetchLikeResponse>;
-
 /* --------------------------------- 主入口 -------------------------------- */
 
 export async function runBarrierRaceProbe(opts: BarrierRaceProbeOptions): Promise<BarrierRaceProbeResult> {
@@ -1919,8 +1975,7 @@ export async function runBarrierRaceProbe(opts: BarrierRaceProbeOptions): Promis
 	const mainDecision = raceValidateStep(mainPrepared, opts);
 	if (mainDecision.blocked) {
 		const secrets = raceCollectSecrets(opts, vars, cookies, headerSets);
-		return raceScopeBlockedResult(mainDecision.reason ?? "主请求作用域校验未通过", requestedConcurrency, concurrency, transportUsed, secrets, opts);
-	}
+		return raceScopeBlockedResult(mainDecision.reason ?? "主请求作用域校验未通过", requestedConcurrency, concurrency, transportUsed, secrets, opts); }
 	let beforePrepared: RacePreparedStep | undefined;
 	if (opts.beforeReadStep) {
 		beforePrepared = racePrepareStep(opts.beforeReadStep, opts, vars, opts.role); headerSets.push(beforePrepared.headers);
@@ -2018,8 +2073,7 @@ export async function runBarrierRaceProbe(opts: BarrierRaceProbeOptions): Promis
 		} else {
 			const rawFetch = opts.fetchFn ?? (globalThis.fetch as unknown as TrafficFetchFn | undefined);
 			if (!rawFetch) {
-				results.push({ index: 0, status: 0, ok: false, timedOut: false, error: "无可用 fetch 实现",
-					durationMs: 0, bodyHash: "", bodyBytes: 0, redactedResponseSnippet: "" });
+				results.push({ index: 0, status: 0, ok: false, timedOut: false, error: "无可用 fetch 实现", durationMs: 0, bodyHash: "", bodyBytes: 0, redactedResponseSnippet: "" });
 			} else {
 				const fetchFn = rawFetch as unknown as RaceFetchLike;
 				const workers = Array.from({ length: concurrency }, (_, index) => (async (): Promise<RaceWorkerOutcome> => {
@@ -2039,8 +2093,7 @@ export async function runBarrierRaceProbe(opts: BarrierRaceProbeOptions): Promis
 						activeTimers.add(workerTimer);
 						const init: RaceFetchInit = { method: mainPrepared.method, headers: mainPrepared.headers, redirect: "manual", signal: controller.signal };
 						if (mainPrepared.body !== undefined) init.body = mainPrepared.body;
-						const response = await fetchFn(mainPrepared.url, init); const text = await response.text();
-						const bodyInfo = computeBodyHash(Buffer.from(text, "utf8"));
+						const response = await fetchFn(mainPrepared.url, init); const text = await response.text(); const bodyInfo = computeBodyHash(Buffer.from(text, "utf8"));
 						const ok = response.status >= 200 && response.status < 300 && !raceIsSoft404(text, response.status);
 						return { index, status: response.status, ok, timedOut: false, error: undefined,
 							durationMs: Date.now() - started, bodyHash: bodyInfo.bodyHash, bodyBytes: bodyInfo.bodyBytes,
@@ -2101,12 +2154,13 @@ export async function runBarrierRaceProbe(opts: BarrierRaceProbeOptions): Promis
 	}
 	let numericDelta: number | undefined;
 	if (beforeValue !== undefined && afterValue !== undefined) numericDelta = afterValue - beforeValue;
-	let numericAnomaly = false;
+	const maxAllowed = Math.max(1, opts.maxExpectedSuccesses ?? 1); let raceConditionDetected = false; let numericAnomaly = false;
 	if (beforeValue !== undefined && afterValue !== undefined && opts.expectedSingleDelta !== undefined) {
-		const expected = opts.expectedSingleDelta;
-		if (Math.abs(numericDelta ?? 0) > Math.abs(expected) + 1e-6 || (expected < 0 && afterValue < 0)) numericAnomaly = true;
+		const expected = opts.expectedSingleDelta; const delta = numericDelta ?? 0;
+		const ledgerMismatch = successCount > 0 && Math.abs(Math.abs(delta) - successCount * Math.abs(expected)) > 1e-6;
+		const overQuota = Math.abs(delta) > maxAllowed * Math.abs(expected) + 1e-6; const negativeOverdraft = expected < 0 && (afterValue < 0 || delta > 1e-6);
+		if (ledgerMismatch || overQuota || negativeOverdraft) numericAnomaly = true;
 	}
-	const maxAllowed = Math.max(1, opts.maxExpectedSuccesses ?? 1); let raceConditionDetected = false;
 	let classification: RaceProbeClassification = "no_success";
 	if (successCount > maxAllowed || numericAnomaly) {
 		raceConditionDetected = true; classification = "race_confirmed";

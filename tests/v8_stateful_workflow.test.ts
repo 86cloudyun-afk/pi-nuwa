@@ -15,31 +15,22 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer as createNetServer, type Socket as NetSocket } from "node:net";
 import { join } from "node:path";
 import { initBeliefGraphFromState } from "../omp/belief-search";
 import { defaultScopeForTarget, type ScopePolicy } from "../omp/scope";
-import { upsertSessionRole } from "../omp/session-vault";
+import { loadSessionVault, upsertSessionRole } from "../omp/session-vault";
 import {
-	BarrierGate,
-	CookieJar,
-	MAX_RACE_CONCURRENCY,
-	WORKFLOW_ACTION_TIERS,
-	classifyWorkflowAction,
-	collectSecretSet,
-	computeTemplateSimilarity,
-	executeStatefulWorkflowChain,
-	executeStatefulWorkflowChainInternal,
-	extractByJsonPath,
-	interpolateTemplate,
-	isSensitiveKeyName,
-	probeMassAssignment,
-	redactRecordDeep,
-	runBarrierRaceProbe,
-	scrubSecretsInText,
-	validateUrlAndActionScope,
-	verifySecondOrderWorkflow,
-	type BarrierAwaitResult,
-	type ExecuteStatefulWorkflowOptions,
+	BarrierGate, CookieJar,
+	MAX_RACE_CONCURRENCY, WORKFLOW_ACTION_TIERS,
+	classifyWorkflowAction, collectSecretSet,
+	computeTemplateSimilarity, executeStatefulWorkflowChain,
+	executeStatefulWorkflowChainInternal, extractByJsonPath,
+	interpolateTemplate, isSensitiveKeyName,
+	probeMassAssignment, redactRecordDeep,
+	runBarrierRaceProbe, scrubSecretsInText,
+	validateUrlAndActionScope, verifySecondOrderWorkflow,
+	type BarrierAwaitResult, type ExecuteStatefulWorkflowOptions,
 } from "../omp/stateful-workflow";
 import { TrafficRecorder } from "../omp/traffic-workbench";
 import type { Fact, NuwaState } from "../omp/types";
@@ -58,12 +49,9 @@ function makeTempWorkspace(prefix: string): string {
 function makeScope(target: string): ScopePolicy {
 	const base = defaultScopeForTarget(target);
 	return {
-		...base,
-		allowHosts: ["127.0.0.1"],
-		allowLoopback: true,
-		allowPrivateNetwork: false,
-		allowDestructive: false,
-	};
+		...base, allowHosts: ["127.0.0.1"],
+		allowLoopback: true, allowPrivateNetwork: false,
+		allowDestructive: false, };
 }
 
 function makeState(target: string, facts: Fact[] = []): NuwaState {
@@ -71,47 +59,29 @@ function makeState(target: string, facts: Fact[] = []): NuwaState {
 	const factMap: Record<string, Fact> = {};
 	for (const f of facts) factMap[f.id] = f;
 	return {
-		schema: 6,
-		version: "8.0.0",
+		schema: 6, version: "8.0.0",
 		project: {
-			id: "proj-v8-stateful",
-			target,
-			url: target,
-			host: u.hostname,
-			port: Number(u.port) || 80,
-			scheme: u.protocol.replace(":", ""),
-			goal: "验证 v8 有状态多步工作流引擎",
-			mode: "audit",
-			status: "active",
-			phase: "vuln",
-			createdAt: NOW_ISO,
-			updatedAt: NOW_ISO,
-			scope: makeScope(target),
-		},
-		facts: factMap,
-		intents: {},
-		seq: { fact: facts.length, intent: 0 },
-		runtime: {
-			startedAt: Date.now(),
-			turns: 1,
-			stall: 0,
-			idle: 0,
-			blockStreak: 0,
-			toolCalls: 0,
-			lastToolCalls: 0,
-			tokens: 0,
-			lastSig: "",
-			lastDirective: "",
-			completionRejects: 0,
-			emptyRounds: 0,
-		},
-	} as unknown as NuwaState;
+			id: "proj-v8-stateful", target,
+			url: target, host: u.hostname,
+			port: Number(u.port) || 80, scheme: u.protocol.replace(":", ""),
+			goal: "验证 v8 有状态多步工作流引擎", mode: "audit",
+			status: "active", phase: "vuln",
+			createdAt: NOW_ISO, updatedAt: NOW_ISO,
+			scope: makeScope(target), },
+		facts: factMap, intents: {},
+		seq: { fact: facts.length, intent: 0 }, runtime: {
+			startedAt: Date.now(), turns: 1,
+			stall: 0, idle: 0,
+			blockStreak: 0, toolCalls: 0,
+			lastToolCalls: 0, tokens: 0,
+			lastSig: "", lastDirective: "",
+			completionRejects: 0, emptyRounds: 0,
+		}, } as unknown as NuwaState;
 }
 
 function jsonRes(data: unknown, status = 200): Response {
 	return new Response(JSON.stringify(data), {
-		status,
-		headers: { "content-type": "application/json" },
+		status, headers: { "content-type": "application/json" },
 	});
 }
 
@@ -165,12 +135,9 @@ let chainBase = "";
 
 type Profile = { id: number; name: string; role: string; isAdmin: boolean; email: string };
 const MASS_BASELINE: Profile = {
-	id: 1,
-	name: "alice",
-	role: "user",
-	isAdmin: false,
-	email: "alice@example.com",
-};
+	id: 1, name: "alice",
+	role: "user", isAdmin: false,
+	email: "alice@example.com", };
 let massProfile: Profile = { ...MASS_BASELINE };
 const MASS_SOFT404_HTML =
 	"<html><head><title>Not Found</title></head><body><h1>Page Not Found</h1><p>404</p></body></html>";
@@ -197,31 +164,24 @@ let raceBase = "";
 beforeAll(() => {
 	// ---------- 靶机 A ----------
 	serverChain = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
+		hostname: "127.0.0.1", port: 0,
 		async fetch(req) {
 			const u = new URL(req.url);
 			const p = u.pathname;
 			const m = req.method.toUpperCase();
 			chainLog.push({
-				method: m,
-				path: p,
-				auth: req.headers.get("authorization") ?? undefined,
-				trace: req.headers.get("x-trace-id") ?? undefined,
-				csrf: req.headers.get("x-csrf-token") ?? undefined,
-			});
+				method: m, path: p,
+				auth: req.headers.get("authorization") ?? undefined, trace: req.headers.get("x-trace-id") ?? undefined,
+				csrf: req.headers.get("x-csrf-token") ?? undefined, });
 
 			if (p === "/api/login" && m === "POST") {
 				await req.json().catch(() => null);
 				return new Response(
-					JSON.stringify({ data: { csrfToken: chainToken, user: "alice" } }),
-					{
-						status: 200,
-						headers: {
+					JSON.stringify({ data: { csrfToken: chainToken, user: "alice" } }), {
+						status: 200, headers: {
 							"content-type": "application/json",
 							"set-cookie": `sid=${chainSession}; Path=/; HttpOnly; SameSite=Lax`,
-						},
-					},
+						}, },
 				);
 			}
 
@@ -278,14 +238,12 @@ beforeAll(() => {
 				return jsonRes({ ok: true }, 200);
 			}
 			return jsonRes({ error: "not found" }, 404);
-		},
-	});
+		}, });
 	chainBase = `http://127.0.0.1:${serverChain.port}`;
 
 	// ---------- 靶机 B ----------
 	serverMass = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
+		hostname: "127.0.0.1", port: 0,
 		async fetch(req) {
 			const u = new URL(req.url);
 			const p = u.pathname;
@@ -297,10 +255,8 @@ beforeAll(() => {
 				const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
 				// 真实漏洞：未做字段白名单过滤
 				massProfile = {
-					...massProfile,
-					role: body.role !== undefined ? String(body.role) : massProfile.role,
-					isAdmin: body.isAdmin !== undefined ? Boolean(body.isAdmin) : massProfile.isAdmin,
-				};
+					...massProfile, role: body.role !== undefined ? String(body.role) : massProfile.role,
+					isAdmin: body.isAdmin !== undefined ? Boolean(body.isAdmin) : massProfile.isAdmin, };
 				return jsonRes({ data: massProfile }, 200);
 			}
 
@@ -323,14 +279,12 @@ beforeAll(() => {
 
 			// 兜底：任何未知路径均返回 200 Soft-404 HTML（供 autoSampleSoft404 采样）
 			return htmlRes(MASS_SOFT404_HTML, 200);
-		},
-	});
+		}, });
 	massBase = `http://127.0.0.1:${serverMass.port}`;
 
 	// ---------- 靶机 C ----------
 	serverSecond = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
+		hostname: "127.0.0.1", port: 0,
 		async fetch(req) {
 			const u = new URL(req.url);
 			const p = u.pathname;
@@ -355,22 +309,19 @@ beforeAll(() => {
 			if (p === "/api/reports/export" && m === "GET") {
 				secondVerifyHits += 1;
 				return new Response("report:SECRET-EXPORT-9", {
-					status: 200,
-					headers: { "content-type": "text/plain" },
+					status: 200, headers: { "content-type": "text/plain" },
 				});
 			}
 			if (/^\/api\/tickets\/[^/]+$/.test(p) && m === "DELETE") {
 				return new Response(null, { status: 204 });
 			}
 			return jsonRes({ error: "not found" }, 404);
-		},
-	});
+		}, });
 	secondBase = `http://127.0.0.1:${serverSecond.port}`;
 
 	// ---------- 靶机 D ----------
 	serverRace = Bun.serve({
-		hostname: "127.0.0.1",
-		port: 0,
+		hostname: "127.0.0.1", port: 0,
 		async fetch(req) {
 			const u = new URL(req.url);
 			const p = u.pathname;
@@ -421,8 +372,7 @@ beforeAll(() => {
 			}
 
 			return jsonRes({ error: "not found" }, 404);
-		},
-	});
+		}, });
 	raceBase = `http://127.0.0.1:${serverRace.port}`;
 });
 
@@ -470,8 +420,7 @@ describe("动作风险分级（classifyWorkflowAction）", () => {
 		const graphql = classifyWorkflowAction({
 			method: "POST",
 			url: "http://127.0.0.1:8080/graphql",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ query: "{ me { id name } }" }),
+			headers: { "content-type": "application/json" }, body: JSON.stringify({ query: "{ me { id name } }" }),
 		});
 		expect(graphql.tier).toBe("L1_SEMANTIC_READ");
 		expect(graphql.allowedByDefault).toBe(true);
@@ -479,15 +428,13 @@ describe("动作风险分级（classifyWorkflowAction）", () => {
 		const esSearch = classifyWorkflowAction({
 			method: "POST",
 			url: "http://127.0.0.1:8080/api/_search",
-			body: { query: { match_all: {} } },
-		});
+			body: { query: { match_all: {} } }, });
 		expect(esSearch.tier).toBe("L1_SEMANTIC_READ");
 
 		const userSearch = classifyWorkflowAction({
 			method: "POST",
 			url: "http://127.0.0.1:8080/users/search",
-			body: { keyword: "alice" },
-		});
+			body: { keyword: "alice" }, });
 		expect(userSearch.tier).toBe("L1_SEMANTIC_READ");
 	});
 
@@ -495,16 +442,14 @@ describe("动作风险分级（classifyWorkflowAction）", () => {
 		const mutation = classifyWorkflowAction({
 			method: "POST",
 			url: "http://127.0.0.1:8080/graphql",
-			body: JSON.stringify({ query: "mutation { updateUser(id: 1) { id } }" }),
-		});
+			body: JSON.stringify({ query: "mutation { updateUser(id: 1) { id } }" }), });
 		expect(mutation.tier).toBe("L2_SCOPED_STATEFUL");
 		expect(mutation.tier).not.toBe("L1_SEMANTIC_READ");
 
 		const destroy = classifyWorkflowAction({
 			method: "POST",
 			url: "http://127.0.0.1:8080/graphql",
-			body: JSON.stringify({ query: "mutation { deleteAllUsers { ok } }" }),
-		});
+			body: JSON.stringify({ query: "mutation { deleteAllUsers { ok } }" }), });
 		expect(destroy.tier).toBe("L3_RESTRICTED_DESTRUCTIVE");
 		expect(destroy.allowedByDefault).toBe(false);
 		expect(destroy.isDestructive).toBe(true);
@@ -515,8 +460,7 @@ describe("动作风险分级（classifyWorkflowAction）", () => {
 			const c = classifyWorkflowAction({
 				method,
 				url: "http://127.0.0.1:8080/api/orders/123",
-				body: { qty: 2 },
-			});
+				body: { qty: 2 }, });
 			expect(c.tier).toBe("L2_SCOPED_STATEFUL");
 			expect(c.isStateChanging).toBe(true);
 			expect(c.allowedByDefault).toBe(true);
@@ -547,8 +491,7 @@ describe("动作风险分级（classifyWorkflowAction）", () => {
 		const allowed = classifyWorkflowAction({
 			method: "DELETE",
 			url: "http://127.0.0.1:8080/api/tenants",
-			allowDestructive: true,
-		});
+			allowDestructive: true, });
 		expect(allowed.tier).toBe("L3_RESTRICTED_DESTRUCTIVE");
 		expect(allowed.allowedByDefault).toBe(true);
 	});
@@ -557,22 +500,16 @@ describe("动作风险分级（classifyWorkflowAction）", () => {
 		const scope = makeScope(chainBase);
 		const oob = validateUrlAndActionScope(
 			"http://169.254.169.254/latest/meta-data",
-			"GET",
-			undefined,
-			scope,
-			"audit",
-			false,
-		);
+			"GET", undefined,
+			scope, "audit",
+			false,);
 		expect(oob.ok).toBe(false);
 
 		const drop = validateUrlAndActionScope(
 			`${chainBase}/api/db/drop`,
-			"POST",
-			undefined,
-			scope,
-			"audit",
-			false,
-		);
+			"POST", undefined,
+			scope, "audit",
+			false,);
 		expect(drop.ok).toBe(false);
 
 		const read = validateUrlAndActionScope(`${chainBase}/v2/profile`, "GET", undefined, scope, "audit", false);
@@ -606,8 +543,7 @@ describe("核心导出完整性", () => {
 		expect(scrubbed).not.toContain("abc123");
 
 		const redacted = redactRecordDeep(
-			{ password: "p@ss", nested: { apiKey: "k-999" }, ok: 1 },
-			new Set(["p@ss", "k-999"]),
+			{ password: "p@ss", nested: { apiKey: "k-999" }, ok: 1 }, new Set(["p@ss", "k-999"]),
 		);
 		const redactedJson = JSON.stringify(redacted);
 		expect(redactedJson).not.toContain("p@ss");
@@ -620,8 +556,7 @@ describe("核心导出完整性", () => {
 		expect(extractByJsonPath({ a: { b: [{ c: 5 }] } }, "$.a.b[0].c")).toBe(5);
 
 		const secrets = collectSecretSet({
-			headers: { authorization: "Bearer zzz-token-value" },
-			vars: { password: "p@ss" },
+			headers: { authorization: "Bearer zzz-token-value" }, vars: { password: "p@ss" },
 		});
 		expect(secrets.size).toBeGreaterThan(0);
 
@@ -636,55 +571,35 @@ describe("多步状态链重放（executeStatefulWorkflowChain）", () => {
 		chainLog = [];
 		const counter = makeCountingFetch();
 		const result = await executeStatefulWorkflowChain({
-			root: makeTempWorkspace("nuwa-chain-"),
-			scope: makeScope(chainBase),
-			mode: "audit",
-			vars: { tenant: "acme" },
-			role: "member",
-			roleHeaders: { member: { authorization: "Bearer member-token-abc" } },
+			root: makeTempWorkspace("nuwa-chain-"), scope: makeScope(chainBase),
+			mode: "audit", vars: { tenant: "acme" },
+			role: "member", roleHeaders: { member: { authorization: "Bearer member-token-abc" } },
 			extraHeaders: { "x-trace-id": "trace-1", "x-api-key": chainApiKey },
-			extraSecrets: [chainPassword, chainToken, chainSession, chainApiKey],
-			initialCookies: { locale: "zh-CN" },
-			fetchFn: counter.fn,
-			steps: [
+			extraSecrets: [chainPassword, chainToken, chainSession, chainApiKey], initialCookies: { locale: "zh-CN" },
+			fetchFn: counter.fn, steps: [
 				{
-					id: "login",
-					method: "POST",
+					id: "login", method: "POST",
 					url: `${chainBase}/api/login`,
-					body: { username: "alice", password: chainPassword },
-					extract: { csrfToken: "$.data.csrfToken" },
-					expectStatus: 200,
-				},
+					body: { username: "alice", password: chainPassword }, extract: { csrfToken: "$.data.csrfToken" },
+					expectStatus: 200, },
 				{
-					id: "create-order",
-					method: "POST",
+					id: "create-order", method: "POST",
 					url: `${chainBase}/api/orders`,
-					headers: { "x-csrf-token": "{{csrfToken}}" },
-					body: { item: "book", qty: 2 },
-					extract: { orderId: "$.data.id" },
-					expectStatus: [200, 201],
-				},
-				{
-					id: "update-order",
-					method: "PATCH",
+					headers: { "x-csrf-token": "{{csrfToken}}" }, body: { item: "book", qty: 2 },
+					extract: { orderId: "$.data.id" }, expectStatus: [200, 201],
+				}, {
+					id: "update-order", method: "PATCH",
 					url: `${chainBase}/api/orders/{{orderId}}`,
-					body: { qty: 3 },
-					expectStatus: 200,
-				},
-				{
-					id: "delete-order",
-					method: "DELETE",
+					body: { qty: 3 }, expectStatus: 200,
+				}, {
+					id: "delete-order", method: "DELETE",
 					url: `${chainBase}/api/orders/{{orderId}}`,
-					expectStatus: [200, 204],
-				},
+					expectStatus: [200, 204], },
 				{
-					id: "read-order",
-					method: "GET",
+					id: "read-order", method: "GET",
 					url: `${chainBase}/api/orders/{{orderId}}`,
-					expectStatus: 404,
-				},
-			],
-		});
+					expectStatus: 404, },
+			], });
 
 		expect(result.redacted).toBe(true);
 		expect(result.abortedByScope).toBe(false);
@@ -711,10 +626,8 @@ describe("多步状态链重放（executeStatefulWorkflowChain）", () => {
 
 	test("302 手动重定向：Scope 内跟随，越界立即拦截", async () => {
 		const inScope = await executeStatefulWorkflowChain({
-			root: makeTempWorkspace("nuwa-redirect-"),
-			scope: makeScope(chainBase),
-			fetchFn: makeCountingFetch().fn,
-			followRedirects: true,
+			root: makeTempWorkspace("nuwa-redirect-"), scope: makeScope(chainBase),
+			fetchFn: makeCountingFetch().fn, followRedirects: true,
 			maxRedirects: 5,
 			steps: [{ id: "in", method: "GET", url: `${chainBase}/redirect-in-scope`, followRedirects: true }],
 		});
@@ -725,8 +638,7 @@ describe("多步状态链重放（executeStatefulWorkflowChain）", () => {
 		expect(inScope.steps[0]?.redirectBlocked ?? false).toBe(false);
 
 		const outOfScope = await executeStatefulWorkflowChain({
-			root: makeTempWorkspace("nuwa-redirect-"),
-			scope: makeScope(chainBase),
+			root: makeTempWorkspace("nuwa-redirect-"), scope: makeScope(chainBase),
 			fetchFn: makeCountingFetch().fn,
 			steps: [{ method: "GET", url: `${chainBase}/redirect-out-scope`, followRedirects: true }],
 		});
@@ -734,8 +646,7 @@ describe("多步状态链重放（executeStatefulWorkflowChain）", () => {
 		expect(outOfScope.steps[0]?.redirectBlocked).toBe(true);
 
 		const metadata = await executeStatefulWorkflowChain({
-			root: makeTempWorkspace("nuwa-redirect-"),
-			scope: makeScope(chainBase),
+			root: makeTempWorkspace("nuwa-redirect-"), scope: makeScope(chainBase),
 			fetchFn: makeCountingFetch().fn,
 			steps: [{ method: "GET", url: `${chainBase}/redirect-metadata`, followRedirects: true }],
 		});
@@ -746,8 +657,7 @@ describe("多步状态链重放（executeStatefulWorkflowChain）", () => {
 	test("越界 URL 与未授权 L3 动作零发包拦截", async () => {
 		const oobCounter = makeCountingFetch();
 		const oob = await executeStatefulWorkflowChain({
-			root: makeTempWorkspace("nuwa-scope-"),
-			scope: makeScope(chainBase),
+			root: makeTempWorkspace("nuwa-scope-"), scope: makeScope(chainBase),
 			fetchFn: oobCounter.fn,
 			steps: [{ method: "GET", url: "http://169.254.169.254/latest/meta-data" }],
 		});
@@ -757,18 +667,13 @@ describe("多步状态链重放（executeStatefulWorkflowChain）", () => {
 		const l3Counter = makeCountingFetch();
 		const before = destructiveHits;
 		const l3 = await executeStatefulWorkflowChain({
-			root: makeTempWorkspace("nuwa-scope-"),
-			scope: makeScope(chainBase),
-			fetchFn: l3Counter.fn,
-			steps: [
+			root: makeTempWorkspace("nuwa-scope-"), scope: makeScope(chainBase),
+			fetchFn: l3Counter.fn, steps: [
 				{
-					id: "drop-db",
-					method: "POST",
+					id: "drop-db", method: "POST",
 					url: `${chainBase}/api/db/drop`,
-					body: { confirm: true },
-				},
-			],
-		});
+					body: { confirm: true }, },
+			], });
 		expect(l3.abortedByScope).toBe(true);
 		expect(l3Counter.calls.length).toBe(0);
 		expect(Boolean(l3.steps[0]?.blockReason)).toBe(true);
@@ -783,25 +688,19 @@ describe("Mass Assignment 检测（probeMassAssignment）", () => {
 		massProfile = { ...MASS_BASELINE };
 		const counter = makeCountingFetch();
 		const res = await probeMassAssignment({
-			scope: makeScope(massBase),
-			root: makeTempWorkspace("nuwa-mass-"),
+			scope: makeScope(massBase), root: makeTempWorkspace("nuwa-mass-"),
 			mode: "audit",
 			writeStep: { method: "PATCH", url: `${massBase}/api/profile`, body: { name: "alice" } },
 			readStep: { method: "GET", url: `${massBase}/api/profile` },
-			baselineBody: { ...MASS_BASELINE },
-			candidateFields: [
+			baselineBody: { ...MASS_BASELINE }, candidateFields: [
 				{ field: "role", value: "admin", label: "提权到管理员", expectedReadPath: "$.data.role" },
-				{ field: "isAdmin", value: true, label: "管理员标志", expectedReadPath: "$.data.isAdmin" },
-			],
+				{ field: "isAdmin", value: true, label: "管理员标志", expectedReadPath: "$.data.isAdmin" },],
 			rollbackStep: {
 				method: "PATCH",
 				url: `${massBase}/api/profile`,
-				body: { role: "user", isAdmin: false },
-			},
-			fetchFn: counter.fn,
-			timeoutMs: 5000,
-			extraSecrets: [],
-		});
+				body: { role: "user", isAdmin: false }, },
+			fetchFn: counter.fn, timeoutMs: 5000,
+			extraSecrets: [], });
 
 		expect(res.abortedByScope).toBe(false);
 		expect(res.detected).toBe(true);
@@ -822,16 +721,12 @@ describe("Mass Assignment 检测（probeMassAssignment）", () => {
 	test("模板高度同构的 200 响应被去噪", async () => {
 		massProfile = { ...MASS_BASELINE };
 		const res = await probeMassAssignment({
-			scope: makeScope(massBase),
-			root: makeTempWorkspace("nuwa-mass-"),
+			scope: makeScope(massBase), root: makeTempWorkspace("nuwa-mass-"),
 			writeStep: { method: "PATCH", url: `${massBase}/api/profile-strict`, body: { name: "alice" } },
 			readStep: { method: "GET", url: `${massBase}/api/profile` },
-			baselineBody: { ...MASS_BASELINE },
-			candidateFields: [{ field: "role", value: "admin", expectedReadPath: "$.data.role" }],
-			templateSimilarityThreshold: 0.85,
-			fetchFn: makeCountingFetch().fn,
-			extraSecrets: [],
-		});
+			baselineBody: { ...MASS_BASELINE }, candidateFields: [{ field: "role", value: "admin", expectedReadPath: "$.data.role" }],
+			templateSimilarityThreshold: 0.85, fetchFn: makeCountingFetch().fn,
+			extraSecrets: [], });
 		expect(res.detected).toBe(false);
 		expect(res.vulnerableFields.length).toBe(0);
 		expect(res.cases.every((c) => c.bound === false)).toBe(true);
@@ -840,16 +735,12 @@ describe("Mass Assignment 检测（probeMassAssignment）", () => {
 	test("Soft-404 兜底 HTML 200 被识别并过滤", async () => {
 		massProfile = { ...MASS_BASELINE };
 		const res = await probeMassAssignment({
-			scope: makeScope(massBase),
-			root: makeTempWorkspace("nuwa-mass-"),
+			scope: makeScope(massBase), root: makeTempWorkspace("nuwa-mass-"),
 			writeStep: { method: "PATCH", url: `${massBase}/api/profile-soft404`, body: { name: "alice" } },
 			readStep: { method: "GET", url: `${massBase}/soft/profile` },
-			baselineBody: { ...MASS_BASELINE },
-			candidateFields: [{ field: "role", value: "admin", expectedReadPath: "$.data.role" }],
-			autoSampleSoft404: true,
-			fetchFn: makeCountingFetch().fn,
-			extraSecrets: [],
-		});
+			baselineBody: { ...MASS_BASELINE }, candidateFields: [{ field: "role", value: "admin", expectedReadPath: "$.data.role" }],
+			autoSampleSoft404: true, fetchFn: makeCountingFetch().fn,
+			extraSecrets: [], });
 		expect(res.detected).toBe(false);
 		const first = res.cases[0];
 		if (first) {
@@ -860,18 +751,14 @@ describe("Mass Assignment 检测（probeMassAssignment）", () => {
 	test("400 Unknown field 反射错误被过滤", async () => {
 		massProfile = { ...MASS_BASELINE };
 		const res = await probeMassAssignment({
-			scope: makeScope(massBase),
-			root: makeTempWorkspace("nuwa-mass-"),
+			scope: makeScope(massBase), root: makeTempWorkspace("nuwa-mass-"),
 			writeStep: {
 				method: "PATCH",
 				url: `${massBase}/api/profile-reflect`,
-				body: { name: "alice" },
-			},
+				body: { name: "alice" }, },
 			readStep: { method: "GET", url: `${massBase}/api/profile` },
-			baselineBody: { ...MASS_BASELINE },
-			candidateFields: [{ field: "role", value: "admin", expectedReadPath: "$.data.role" }],
-			fetchFn: makeCountingFetch().fn,
-			extraSecrets: [],
+			baselineBody: { ...MASS_BASELINE }, candidateFields: [{ field: "role", value: "admin", expectedReadPath: "$.data.role" }],
+			fetchFn: makeCountingFetch().fn, extraSecrets: [],
 		});
 		expect(res.detected).toBe(false);
 		expect(res.vulnerableFields.length).toBe(0);
@@ -880,18 +767,14 @@ describe("Mass Assignment 检测（probeMassAssignment）", () => {
 	test("越界目标 0 发包且判定 abortedByScope", async () => {
 		const counter = makeCountingFetch();
 		const res = await probeMassAssignment({
-			scope: makeScope(massBase),
-			root: makeTempWorkspace("nuwa-mass-"),
+			scope: makeScope(massBase), root: makeTempWorkspace("nuwa-mass-"),
 			writeStep: {
 				method: "PATCH",
 				url: "http://169.254.169.254/latest/meta-data",
-				body: { role: "admin" },
-			},
+				body: { role: "admin" }, },
 			readStep: { method: "GET", url: `${massBase}/api/profile` },
-			candidateFields: [{ field: "role", value: "admin" }],
-			fetchFn: counter.fn,
-			extraSecrets: [],
-		});
+			candidateFields: [{ field: "role", value: "admin" }], fetchFn: counter.fn,
+			extraSecrets: [], });
 		expect(res.abortedByScope).toBe(true);
 		expect(counter.calls.length).toBe(0);
 		expect(res.detected).toBe(false);
@@ -908,57 +791,36 @@ describe("二阶有状态工作流验证（verifySecondOrderWorkflow）", () => 
 		const counter = makeCountingFetch();
 
 		const res = await verifySecondOrderWorkflow({
-			scope: makeScope(secondBase),
-			root: makeTempWorkspace("nuwa-so-"),
-			mode: "audit",
-			state,
-			beliefGraph,
-			applyBeliefUpdate: true,
-			recordLedger: true,
-			candidateFactId: "f-so-1",
-			candidateTitle: "二阶越权导出敏感报表",
-			writeSteps: [
+			scope: makeScope(secondBase), root: makeTempWorkspace("nuwa-so-"),
+			mode: "audit", state,
+			beliefGraph, applyBeliefUpdate: true,
+			recordLedger: true, candidateFactId: "f-so-1",
+			candidateTitle: "二阶越权导出敏感报表", writeSteps: [
 				{
-					id: "create-ticket",
-					method: "POST",
+					id: "create-ticket", method: "POST",
 					url: `${secondBase}/api/tickets`,
-					body: { title: "报销单" },
-					extract: { ticketId: "$.data.ticketId" },
-					expectStatus: [200, 201],
-				},
-			],
-			intermediateSteps: [
+					body: { title: "报销单" }, extract: { ticketId: "$.data.ticketId" },
+					expectStatus: [200, 201], },
+			], intermediateSteps: [
 				{
-					id: "approve-ticket",
-					method: "POST",
+					id: "approve-ticket", method: "POST",
 					url: `${secondBase}/api/tickets/{{ticketId}}/approve`,
-					expectStatus: 200,
-				},
-			],
-			verifySteps: [
+					expectStatus: 200, },
+			], verifySteps: [
 				{
-					id: "export-report",
-					method: "GET",
+					id: "export-report", method: "GET",
 					url: `${secondBase}/api/reports/export`,
-					expectStatus: 200,
-				},
-			],
-			verifyAssertion: {
-				expectedStatus: 200,
-				bodyIncludes: ["SECRET-EXPORT-9"],
-				requireChangedFromBaseline: false,
-			},
+					expectStatus: 200, },
+			], verifyAssertion: {
+				expectedStatus: 200, bodyIncludes: ["SECRET-EXPORT-9"],
+				requireChangedFromBaseline: false, },
 			cleanupSteps: [
 				{
-					id: "cleanup-ticket",
-					method: "DELETE",
+					id: "cleanup-ticket", method: "DELETE",
 					url: `${secondBase}/api/tickets/{{ticketId}}`,
-					expectStatus: [200, 204],
-				},
-			],
-			fetchFn: counter.fn,
-			extraSecrets: ["SECRET-EXPORT-9"],
-		});
+					expectStatus: [200, 204], },
+			], fetchFn: counter.fn,
+			extraSecrets: ["SECRET-EXPORT-9"], });
 
 		expect(res.verified).toBe(true);
 		expect(res.abortedByScope).toBe(false);
@@ -981,44 +843,31 @@ describe("二阶有状态工作流验证（verifySecondOrderWorkflow）", () => 
 		secondVerifyHits = 0;
 		const counter = makeCountingFetch();
 		const res = await verifySecondOrderWorkflow({
-			scope: makeScope(secondBase),
-			root: makeTempWorkspace("nuwa-so-"),
-			mode: "audit",
-			state: makeState(secondBase),
+			scope: makeScope(secondBase), root: makeTempWorkspace("nuwa-so-"),
+			mode: "audit", state: makeState(secondBase),
 			writeSteps: [
 				{
-					id: "create-ticket-403",
-					method: "POST",
+					id: "create-ticket-403", method: "POST",
 					url: `${secondBase}/api/tickets-403`,
-					body: { title: "越权工单" },
-					extract: { ticketId: "$.data.ticketId" },
-					expectStatus: [200, 201],
-				},
-			],
-			intermediateSteps: [
+					body: { title: "越权工单" }, extract: { ticketId: "$.data.ticketId" },
+					expectStatus: [200, 201], },
+			], intermediateSteps: [
 				{
-					id: "approve-403",
-					method: "POST",
+					id: "approve-403", method: "POST",
 					url: `${secondBase}/api/tickets-403/{{ticketId}}/approve`,
-					expectStatus: 200,
-				},
+					expectStatus: 200, },
 			],
 			verifySteps: [{ id: "export", method: "GET", url: `${secondBase}/api/reports/export` }],
 			cleanupSteps: [
 				{
-					id: "cleanup-in-scope",
-					method: "DELETE",
+					id: "cleanup-in-scope", method: "DELETE",
 					url: `${secondBase}/api/tickets/{{ticketId}}`,
-					expectStatus: [200, 204],
-				},
+					expectStatus: [200, 204], },
 				{
-					id: "cleanup-oob",
-					method: "GET",
+					id: "cleanup-oob", method: "GET",
 					url: "http://169.254.169.254/latest/meta-data",
-				},
-			],
-			fetchFn: counter.fn,
-			extraSecrets: [],
+				},],
+			fetchFn: counter.fn, extraSecrets: [],
 		});
 
 		expect(res.verified).toBe(false);
@@ -1094,17 +943,12 @@ describe("同步屏障并发竞态探测（runBarrierRaceProbe）", () => {
 	test("并发硬上限钳制与越界 0 发包", async () => {
 		raceBalance = 100;
 		const clamped = await runBarrierRaceProbe({
-			scope: makeScope(raceBase),
-			root: makeTempWorkspace("nuwa-race-"),
+			scope: makeScope(raceBase), root: makeTempWorkspace("nuwa-race-"),
 			request: { method: "POST", url: `${raceBase}/api/redeem-race` },
-			concurrency: 100,
-			transport: "fetch",
-			expectedSingleDelta: 60,
-			maxExpectedSuccesses: 1,
-			timeoutMs: 8000,
-			fetchFn: makeCountingFetch().fn,
-			extraSecrets: [],
-		});
+			concurrency: 100, transport: "fetch",
+			expectedSingleDelta: 60, maxExpectedSuccesses: 1,
+			timeoutMs: 8000, fetchFn: makeCountingFetch().fn,
+			extraSecrets: [], });
 		expect(clamped.requestedConcurrency).toBe(100);
 		expect(clamped.concurrency).toBe(MAX_RACE_CONCURRENCY);
 		expect(clamped.concurrency).toBe(32);
@@ -1114,15 +958,11 @@ describe("同步屏障并发竞态探测（runBarrierRaceProbe）", () => {
 
 		const oobCounter = makeCountingFetch();
 		const oob = await runBarrierRaceProbe({
-			scope: makeScope(raceBase),
-			root: makeTempWorkspace("nuwa-race-"),
+			scope: makeScope(raceBase), root: makeTempWorkspace("nuwa-race-"),
 			request: { method: "POST", url: "http://169.254.169.254/latest/meta-data" },
-			concurrency: 8,
-			transport: "fetch",
-			timeoutMs: 2000,
-			fetchFn: oobCounter.fn,
-			extraSecrets: [],
-		});
+			concurrency: 8, transport: "fetch",
+			timeoutMs: 2000, fetchFn: oobCounter.fn,
+			extraSecrets: [], });
 		expect(oob.abortedByScope).toBe(true);
 		expect(oobCounter.calls.length).toBe(0);
 		expect(oob.raceConditionDetected).toBe(false);
@@ -1133,25 +973,18 @@ describe("同步屏障并发竞态探测（runBarrierRaceProbe）", () => {
 	test("真实 TOCTOU 并发竞争被实锤为 race_confirmed", async () => {
 		raceBalance = 100;
 		const res = await runBarrierRaceProbe({
-			scope: makeScope(raceBase),
-			root: makeTempWorkspace("nuwa-race-"),
-			mode: "audit",
-			request: {
+			scope: makeScope(raceBase), root: makeTempWorkspace("nuwa-race-"),
+			mode: "audit", request: {
 				method: "POST",
 				url: `${raceBase}/api/redeem-race`,
-				headers: { "content-type": "application/json" },
-				body: { amount: 60 },
-			},
-			concurrency: 8,
+				headers: { "content-type": "application/json" }, body: { amount: 60 },
+			}, concurrency: 8,
 			transport: "net",
 			beforeReadStep: { method: "GET", url: `${raceBase}/api/balance` },
 			afterReadStep: { method: "GET", url: `${raceBase}/api/balance` },
-			numericFieldPath: "balance",
-			expectedSingleDelta: 60,
-			maxExpectedSuccesses: 1,
-			barrierTimeoutMs: 3000,
-			timeoutMs: 8000,
-			extraSecrets: [],
+			numericFieldPath: "balance", expectedSingleDelta: 60,
+			maxExpectedSuccesses: 1, barrierTimeoutMs: 3000,
+			timeoutMs: 8000, extraSecrets: [],
 		});
 
 		expect(res.abortedByScope).toBe(false);
@@ -1171,21 +1004,15 @@ describe("同步屏障并发竞态探测（runBarrierRaceProbe）", () => {
 		raceBalance = 100;
 		rateWindowCount = 0;
 		const res = await runBarrierRaceProbe({
-			scope: makeScope(raceBase),
-			root: makeTempWorkspace("nuwa-race-"),
+			scope: makeScope(raceBase), root: makeTempWorkspace("nuwa-race-"),
 			request: { method: "POST", url: `${raceBase}/api/redeem-rate`, body: { amount: 60 } },
-			concurrency: 6,
-			transport: "fetch",
+			concurrency: 6, transport: "fetch",
 			beforeReadStep: { method: "GET", url: `${raceBase}/api/balance` },
 			afterReadStep: { method: "GET", url: `${raceBase}/api/balance` },
-			numericFieldPath: "balance",
-			expectedSingleDelta: 60,
-			maxExpectedSuccesses: 1,
-			barrierTimeoutMs: 3000,
-			timeoutMs: 8000,
-			fetchFn: makeCountingFetch().fn,
-			extraSecrets: [],
-		});
+			numericFieldPath: "balance", expectedSingleDelta: 60,
+			maxExpectedSuccesses: 1, barrierTimeoutMs: 3000,
+			timeoutMs: 8000, fetchFn: makeCountingFetch().fn,
+			extraSecrets: [], });
 
 		expect(res.abortedByScope).toBe(false);
 		expect(res.transportUsed).toBe("fetch");
@@ -1202,19 +1029,14 @@ describe("同步屏障并发竞态探测（runBarrierRaceProbe）", () => {
 		raceBalance = 100;
 		mutexBusy = false;
 		const res = await runBarrierRaceProbe({
-			scope: makeScope(raceBase),
-			root: makeTempWorkspace("nuwa-race-"),
+			scope: makeScope(raceBase), root: makeTempWorkspace("nuwa-race-"),
 			request: { method: "POST", url: `${raceBase}/api/redeem-mutex`, body: { amount: 60 } },
-			concurrency: 6,
-			transport: "net",
+			concurrency: 6, transport: "net",
 			beforeReadStep: { method: "GET", url: `${raceBase}/api/balance` },
 			afterReadStep: { method: "GET", url: `${raceBase}/api/balance` },
-			numericFieldPath: "balance",
-			expectedSingleDelta: 60,
-			maxExpectedSuccesses: 1,
-			barrierTimeoutMs: 3000,
-			timeoutMs: 8000,
-			extraSecrets: [],
+			numericFieldPath: "balance", expectedSingleDelta: 60,
+			maxExpectedSuccesses: 1, barrierTimeoutMs: 3000,
+			timeoutMs: 8000, extraSecrets: [],
 		});
 
 		expect(res.abortedByScope).toBe(false);
@@ -1231,15 +1053,11 @@ describe("同步屏障并发竞态探测（runBarrierRaceProbe）", () => {
 	test("慢响应超时后句柄零泄漏且无未决 Promise", async () => {
 		const started = Date.now();
 		const res = await runBarrierRaceProbe({
-			scope: makeScope(raceBase),
-			root: makeTempWorkspace("nuwa-race-"),
+			scope: makeScope(raceBase), root: makeTempWorkspace("nuwa-race-"),
 			request: { method: "POST", url: `${raceBase}/api/slow` },
-			concurrency: 4,
-			transport: "fetch",
-			timeoutMs: 100,
-			barrierTimeoutMs: 1000,
-			fetchFn: makeCountingFetch().fn,
-			extraSecrets: [],
+			concurrency: 4, transport: "fetch",
+			timeoutMs: 100, barrierTimeoutMs: 1000,
+			fetchFn: makeCountingFetch().fn, extraSecrets: [],
 		});
 		const elapsed = Date.now() - started;
 
@@ -1258,31 +1076,20 @@ describe("内部执行结果（executeStatefulWorkflowChainInternal）", () => {
 	test("保留原始变量与 Cookie，但对外结果已脱敏", async () => {
 		const counter = makeCountingFetch();
 		const internal = await executeStatefulWorkflowChainInternal({
-			root: makeTempWorkspace("nuwa-internal-"),
-			scope: makeScope(chainBase),
-			mode: "audit",
-			roleHeaders: { member: { authorization: "Bearer member-token-abc" } },
-			role: "member",
-			extraSecrets: [chainPassword, chainToken, chainSession],
-			fetchFn: counter.fn,
-			steps: [
+			root: makeTempWorkspace("nuwa-internal-"), scope: makeScope(chainBase),
+			mode: "audit", roleHeaders: { member: { authorization: "Bearer member-token-abc" } },
+			role: "member", extraSecrets: [chainPassword, chainToken, chainSession],
+			fetchFn: counter.fn, steps: [
 				{
-					id: "login",
-					method: "POST",
+					id: "login", method: "POST",
 					url: `${chainBase}/api/login`,
-					body: { username: "alice", password: chainPassword },
-					extract: { csrfToken: "$.data.csrfToken" },
-				},
-				{
-					id: "create",
-					method: "POST",
+					body: { username: "alice", password: chainPassword }, extract: { csrfToken: "$.data.csrfToken" },
+				}, {
+					id: "create", method: "POST",
 					url: `${chainBase}/api/orders`,
-					headers: { "x-csrf-token": "{{csrfToken}}" },
-					body: { item: "pen" },
-					extract: { orderId: "$.data.id" },
-					expectStatus: [200, 201],
-				},
-			],
+					headers: { "x-csrf-token": "{{csrfToken}}" }, body: { item: "pen" },
+					extract: { orderId: "$.data.id" }, expectStatus: [200, 201],
+				},],
 		});
 
 		expect(internal.redacted).toBe(true);
@@ -1293,22 +1100,15 @@ describe("内部执行结果（executeStatefulWorkflowChainInternal）", () => {
 
 		// 内部结构含原始值（供后续引擎复用），但对外序列化应全脱敏
 		const publicView = await executeStatefulWorkflowChain({
-			root: makeTempWorkspace("nuwa-internal-"),
-			scope: makeScope(chainBase),
-			mode: "audit",
-			roleHeaders: { member: { authorization: "Bearer member-token-abc" } },
-			role: "member",
-			extraSecrets: [chainPassword, chainToken, chainSession],
-			fetchFn: counter.fn,
-			steps: [
+			root: makeTempWorkspace("nuwa-internal-"), scope: makeScope(chainBase),
+			mode: "audit", roleHeaders: { member: { authorization: "Bearer member-token-abc" } },
+			role: "member", extraSecrets: [chainPassword, chainToken, chainSession],
+			fetchFn: counter.fn, steps: [
 				{
-					id: "login",
-					method: "POST",
+					id: "login", method: "POST",
 					url: `${chainBase}/api/login`,
-					body: { username: "alice", password: chainPassword },
-					extract: { csrfToken: "$.data.csrfToken" },
-				},
-			],
+					body: { username: "alice", password: chainPassword }, extract: { csrfToken: "$.data.csrfToken" },
+				},],
 		});
 		const dump = JSON.stringify(publicView);
 		for (const secret of [chainPassword, chainToken, chainSession]) {
@@ -1338,39 +1138,213 @@ describe("SessionVault 角色注入闭环", () => {
 		const vaultResult = await Promise.resolve()
 			.then(() =>
 				upsertSessionRole({
-					root,
-					role: "member",
-					headers: { authorization: "Bearer member-token-abc" },
-				} as unknown as Parameters<typeof upsertSessionRole>[0]),
+					root, role: "member",
+					headers: { authorization: "Bearer member-token-abc" }, } as unknown as Parameters<typeof upsertSessionRole>[0]),
 			)
 			.catch(() => null);
 
 		// 允许 vault 落盘 API 变体差异：即便写入形态不同，也应通过 roleHeaders 回退注入
 		const counter = makeCountingFetch();
 		const res = await executeStatefulWorkflowChain({
-			root,
-			scope: makeScope(chainBase),
-			mode: "audit",
-			role: "member",
-			roleHeaders: { member: { authorization: "Bearer member-token-abc" } },
-			extraSecrets: [chainPassword, chainToken],
-			fetchFn: counter.fn,
-			vars: { csrfToken: chainToken },
+			root, scope: makeScope(chainBase),
+			mode: "audit", role: "member",
+			roleHeaders: { member: { authorization: "Bearer member-token-abc" } }, extraSecrets: [chainPassword, chainToken],
+			fetchFn: counter.fn, vars: { csrfToken: chainToken },
 			steps: [
 				{
-					id: "create",
-					method: "POST",
+					id: "create", method: "POST",
 					url: `${chainBase}/api/orders`,
-					headers: { "x-csrf-token": "{{csrfToken}}" },
-					body: { item: "pen" },
-					expectStatus: [200, 201],
-				},
-			],
-		});
+					headers: { "x-csrf-token": "{{csrfToken}}" }, body: { item: "pen" },
+					expectStatus: [200, 201], },
+			], });
 
 		expect(vaultResult === null || typeof vaultResult === "object").toBe(true);
 		expect(res.steps[0]?.status).toBe(201);
 		const hit = chainLog.find((e) => e.method === "POST" && e.path === "/api/orders");
 		expect(hit?.auth ?? "").toContain("member-token");
+	});
+});
+// ==================== 覆盖 8：异构审查 6 项 P1 边界回归 ====================
+
+describe("异构审查 P1 边界回归", () => {
+	test("[P1-1] 长请求体 600B 后破坏指令与 .nuwa 防篡改 (N-003) 严防绕过", () => {
+		const scope = makeScope("http://127.0.0.1:8080");
+		const longBody = JSON.stringify({ pad: "a".repeat(620), hook: "x; mkfs.ext4 /dev/sda" });
+		const clsLong = classifyWorkflowAction({ method: "POST", url: "http://127.0.0.1:8080/api/items", body: longBody, scope });
+		expect(clsLong.tier).toBe("L3_RESTRICTED_DESTRUCTIVE");
+		expect(clsLong.allowedByDefault).toBe(false);
+		expect(validateUrlAndActionScope("http://127.0.0.1:8080/api/items", "POST", longBody, scope, "audit", false).ok).toBe(false);
+
+		const nuwaBody = JSON.stringify({ path: ".nuwa/sessions/vault.json", op: "cat" });
+		const vNuwaUrl = validateUrlAndActionScope("http://127.0.0.1:8080/read?f=.nuwa/sessions/vault.json", "GET", undefined, scope, "audit", true);
+		const vNuwaBody = validateUrlAndActionScope("http://127.0.0.1:8080/api/read", "POST", nuwaBody, scope, "audit", true);
+		expect(vNuwaUrl.ok).toBe(false);
+		expect(vNuwaBody.ok).toBe(false);
+	});
+
+	test("[P1-2] SessionVault password/bearer/cookie/自定义头全链路零明文", async () => {
+		const root = makeTempWorkspace("nuwa-p1-vault-");
+		const vPass = "VaultPass#9988"; const vBearer = "vault-jwt-secret-7766";
+		const vCookie = "vsess_secret_5544"; const vCustom = "gw-custom-secret-3322";
+		upsertSessionRole(root, { role: "auditor", password: vPass, bearer: vBearer,
+			cookie: `vsid=${vCookie}`, headers: { "X-Gateway-Secret": vCustom } });
+		const vault = loadSessionVault(root);
+		const echoSrv = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+			const u = new URL(req.url);
+			if (u.pathname === "/echo") {
+				return new Response(JSON.stringify({ ok: true, data: { role: "user" },
+					echo: `${vPass}|${vBearer}|${vCookie}|${vCustom}`, h: req.headers.get("x-gateway-secret") }),
+					{ status: 200, headers: { "content-type": "application/json", "set-cookie": "dyn_c=dyn-cookie-secret-1100; Path=/" } });
+			}
+			return new Response("ok", { status: 200 });
+		} });
+		try {
+			const base = `http://127.0.0.1:${echoSrv.port}`; const sc = makeScope(base);
+			const chainRes = await executeStatefulWorkflowChain({ root, vault, scope: sc, role: "auditor",
+				steps: [{ id: "e", method: "POST", url: `${base}/echo`, body: { x: 1 } }] });
+			const massRes = await probeMassAssignment({ root, vault, scope: sc, role: "auditor", soft404Baseline: null,
+				writeStep: { method: "POST", url: `${base}/echo`, body: { name: "a" } }, candidateFields: [{ field: "role", value: "admin" }] });
+			const secRes = await verifySecondOrderWorkflow({ root, vault, scope: sc, role: "auditor", soft404Baseline: null,
+				writeSteps: [{ method: "POST", url: `${base}/echo`, body: { x: 1 } }],
+				verifySteps: [{ method: "GET", url: `${base}/echo` }],
+				verifyAssertion: { expectedStatus: 200, bodyIncludes: ["data"] } });
+			for (const dump of [JSON.stringify(chainRes), JSON.stringify(massRes), JSON.stringify(secRes)]) {
+				for (const sec of [vPass, vBearer, vCookie, vCustom, "dyn-cookie-secret-1100"]) expect(dump).not.toContain(sec);
+			}
+		} finally { echoSrv.stop(true); }
+	});
+
+	test("[P1-3] 运行期动态提取 {{dynUrl}} 不被预检误杀，且越界动态目标发包前阻断", async () => {
+		let evilHits = 0;
+		const dynSrv = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+			const p = new URL(req.url).pathname;
+			if (p === "/api/start-ok") return jsonRes({ nextUrl: `${`http://127.0.0.1:${dynSrv.port}`}/api/final-ok` }, 200);
+			if (p === "/api/start-evil") return jsonRes({ nextUrl: "http://169.254.169.254/latest/meta-data" }, 200);
+			if (p === "/api/final-ok") return jsonRes({ proof: "second-order-dynamic-verified-payload-ok", amount: 99 }, 200);
+			return jsonRes({ error: "not found" }, 404);
+		} });
+		const counter: ChainFetch = ((input: unknown, init?: unknown) => {
+			const u = normalizeUrl(input); if (u.includes("169.254.169.254")) evilHits += 1;
+			return fetch(u, init as RequestInit | undefined);
+		}) as unknown as ChainFetch;
+		try {
+			const base = `http://127.0.0.1:${dynSrv.port}`; const sc = makeScope(base);
+			const okRes = await verifySecondOrderWorkflow({ scope: sc, soft404Baseline: null, fetchFn: counter,
+				writeSteps: [{ id: "w", method: "POST", url: `${base}/api/start-ok`, body: {}, extract: { dynUrl: "$.nextUrl" } }],
+				verifySteps: [{ id: "v", method: "GET", url: "{{dynUrl}}" }],
+				verifyAssertion: { expectedStatus: 200, bodyIncludes: ["second-order-dynamic-verified-payload-ok"] } });
+			expect(okRes.verified).toBe(true);
+			expect(okRes.abortedByScope).toBe(false);
+
+			const evilRes = await verifySecondOrderWorkflow({ scope: sc, soft404Baseline: null, fetchFn: counter,
+				writeSteps: [{ id: "w", method: "POST", url: `${base}/api/start-evil`, body: {}, extract: { dynUrl: "$.nextUrl" } }],
+				verifySteps: [{ id: "v", method: "GET", url: "{{dynUrl}}" }] });
+			expect(evilRes.verified).toBe(false);
+			expect(evilRes.abortedByScope).toBe(true);
+			expect(evilHits).toBe(0);
+		} finally { dynSrv.stop(true); }
+	});
+
+	test("[P1-4] Mass Assignment 过滤 requestEcho 容器回显，杜绝假阳性", async () => {
+		const echoSrv = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+			const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+			return jsonRes({ requestEcho: { name: "alice", role: body.role ?? "member", ...(body.isAdmin !== undefined ? { isAdmin: body.isAdmin } : {}) },
+				data: { name: "alice", role: "member" } }, 200);
+		} });
+		try {
+			const base = `http://127.0.0.1:${echoSrv.port}`;
+			const res = await probeMassAssignment({ scope: makeScope(base), soft404Baseline: null,
+				writeStep: { method: "PATCH", url: `${base}/api/profile`, body: { name: "alice" } },
+				candidateFields: [{ field: "role", value: "admin" }, { field: "isAdmin", value: true }] });
+			expect(res.detected).toBe(false);
+			expect(res.cases.every((c) => !c.bound)).toBe(true);
+			expect(res.cases[0]?.suppressedReason).toBeTruthy();
+			expect(res.cases[1]?.suppressedReason).toContain("回显");
+		} finally { echoSrv.stop(true); }
+	});
+
+	test("[P1-5] runBarrierRaceProbe net 模式合并 Vault/优先级请求头、initialCookies 与 Content-Type", async () => {
+		const root = makeTempWorkspace("nuwa-p1-race-hdr-");
+		upsertSessionRole(root, { role: "worker", bearer: "vault-tok", headers: { "x-vault": "from-vault", "x-prio": "vault" } });
+		let seen: { auth?: string; xVault?: string; xPrio?: string; cookie?: string; ct?: string } = {};
+		const hdrSrv = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+			await req.text();
+			seen = { auth: req.headers.get("authorization") ?? undefined, xVault: req.headers.get("x-vault") ?? undefined,
+				xPrio: req.headers.get("x-prio") ?? undefined, cookie: req.headers.get("cookie") ?? undefined,
+				ct: req.headers.get("content-type") ?? undefined };
+			return jsonRes({ ok: true }, 200);
+		} });
+		try {
+			const base = `http://127.0.0.1:${hdrSrv.port}`;
+			const res = await runBarrierRaceProbe({ root, scope: makeScope(base), role: "worker", transport: "net", concurrency: 2,
+				roleHeaders: { worker: { "x-prio": "roleHeaders" } }, extraHeaders: { "x-prio": "optsExtra" },
+				initialCookies: { sid: "cookie-123" },
+				request: { method: "POST", url: `${base}/api/test`, extraHeaders: { "x-prio": "stepExtra" },
+					headers: { "x-prio": "stepHeaders" }, body: { a: 1 } } });
+			expect(res.successCount).toBe(2);
+			expect(seen.auth).toBe("Bearer vault-tok");
+			expect(seen.xVault).toBe("from-vault");
+			expect(seen.xPrio).toBe("stepHeaders");
+			expect(seen.cookie).toContain("sid=cookie-123");
+			expect(seen.ct).toBe("application/json");
+		} finally { hdrSrv.stop(true); }
+	});
+
+	test("[P1-6] 配额 429 不误报、丢失更新必捕获与 net Keep-Alive 即收即结", async () => {
+		let quotaBal = 100; let quotaOk = 0; let lostBal = 100;
+		const kaSockets = new Set<NetSocket>();
+		const kaSrv = createNetServer((sock) => {
+			kaSockets.add(sock); sock.on("close", () => kaSockets.delete(sock));
+			sock.once("data", () => {
+				const body = JSON.stringify({ ok: true, mode: "keepalive" });
+				sock.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`);
+				// 故意保持连接开启不主动关闭，测试即收即结
+			});
+		});
+		await new Promise<void>((r) => kaSrv.listen(0, "127.0.0.1", () => r()));
+		const kaPort = (kaSrv.address() as { port: number }).port;
+		const raceSrv = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+			const p = new URL(req.url).pathname;
+			if (p === "/q/bal") return jsonRes({ balance: quotaBal }, 200);
+			if (p === "/q/hit") {
+				if (quotaOk < 3) { quotaOk += 1; quotaBal -= 10; return jsonRes({ ok: true }, 200); }
+				return jsonRes({ error: "rate" }, 429);
+			}
+			if (p === "/l/bal") return jsonRes({ balance: lostBal }, 200);
+			if (p === "/l/hit") { lostBal = 90; return jsonRes({ ok: true }, 200); } // 并发丢失更新：5 次 200 仅扣减 10
+			return jsonRes({}, 404);
+		} });
+		try {
+			const base = `http://127.0.0.1:${raceSrv.port}`;
+			const quotaRes = await runBarrierRaceProbe({ scope: makeScope(base), transport: "fetch", concurrency: 8,
+				request: { method: "POST", url: `${base}/q/hit` }, beforeReadStep: { method: "GET", url: `${base}/q/bal` },
+				afterReadStep: { method: "GET", url: `${base}/q/bal` }, numericFieldPath: "balance", expectedSingleDelta: -10, maxExpectedSuccesses: 5 });
+			expect(quotaRes.numericDelta).toBe(-30);
+			expect(quotaRes.numericAnomaly).toBe(false);
+			expect(quotaRes.raceConditionDetected).toBe(false);
+			expect(quotaRes.classification).toBe("rate_limited");
+
+			const lostRes = await runBarrierRaceProbe({ scope: makeScope(base), transport: "fetch", concurrency: 5,
+				request: { method: "POST", url: `${base}/l/hit` }, beforeReadStep: { method: "GET", url: `${base}/l/bal` },
+				afterReadStep: { method: "GET", url: `${base}/l/bal` }, numericFieldPath: "balance", expectedSingleDelta: -10, maxExpectedSuccesses: 5 });
+			expect(lostRes.successCount).toBe(5);
+			expect(lostRes.numericDelta).toBe(-10);
+			expect(lostRes.numericAnomaly).toBe(true);
+			expect(lostRes.raceConditionDetected).toBe(true);
+			expect(lostRes.classification).toBe("race_confirmed");
+
+			const kaBase = `http://127.0.0.1:${kaPort}`;
+			const t0 = Date.now();
+			const kaRes = await runBarrierRaceProbe({ scope: makeScope(kaBase), transport: "net", concurrency: 3, timeoutMs: 2500,
+				request: { method: "POST", url: `${kaBase}/ka`, body: { ping: 1 } } });
+			expect(kaRes.successCount).toBe(3);
+			expect(kaRes.results.every((r) => r.status === 200 && !r.timedOut)).toBe(true);
+			expect(Date.now() - t0).toBeLessThan(1500);
+			expect(kaRes.leakedSockets).toBe(0);
+		} finally {
+			raceSrv.stop(true);
+			for (const sk of kaSockets) sk.destroy();
+			kaSrv.close();
+		}
 	});
 });
