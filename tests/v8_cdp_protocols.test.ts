@@ -1195,7 +1195,7 @@ describe("v8 Next.js RSC Flight 与 gRPC-Web 编解码", () => {
     const server = http.createServer((req, res) => {
       const auth = String(req.headers.authorization ?? "");
       res.writeHead(200, { "content-type": "text/x-component" });
-      if (req.url === "/rsc-safe" && !auth.includes("admin-rsc-token")) {
+      if ((req.url === "/rsc-safe" && !auth.includes("admin-rsc-token")) || (req.url === "/rsc-leaky" && !auth)) {
         res.end('0:E{"digest":"FORBIDDEN"}\n');
         return;
       }
@@ -1259,7 +1259,7 @@ describe("v8 Next.js RSC Flight 与 gRPC-Web 编解码", () => {
       req.on("data", (c) => (body = Buffer.concat([body, c])));
       req.on("end", () => {
         const auth = String(req.headers.authorization ?? "");
-        const denied = req.url?.includes("SafeAdmin") && !auth.includes("admin-grpc-token");
+        const denied = (req.url?.includes("SafeAdmin") && !auth.includes("admin-grpc-token")) || (req.url?.includes("LeakyAdmin") && !auth);
         const dataFrame = denied
           ? new Uint8Array(0)
           : encodeGrpcWebFrame(encodeProtobufFields([{ fieldNumber: 1, wireType: 2, value: "admin-secret-data" }]));
@@ -1409,6 +1409,7 @@ describe("v8 异构审查 P1 对抗边界回归", () => {
           res.end(JSON.stringify({ data: { billing: { apiKey: "sk-live-org", plan: "ent" } } }));
           return;
         }
+        if (body.includes("PublicStatus")) { res.end(JSON.stringify({ data: { version: "8.0.0", status: "ok" } })); return; }
         res.end(JSON.stringify({ errors: [{ message: "unknown" }] }));
       });
     });
@@ -1422,10 +1423,12 @@ describe("v8 异构审查 P1 对抗边界回归", () => {
 
     const diff = await runGraphQLNestedAuthDiff(`${base}/graphql`, [
       { name: "GetMyProfile", query: "query GetMyProfile { me { id email } }" },
+      { name: "PublicStatus", query: "query PublicStatus { version status }" },
       { name: "GetOrderById", query: 'query GetOrderById { order(id: "ord-alice-1") { id ownerId amount } }' },
       { name: "GetOrgBilling", query: "query GetOrgBilling { billing { apiKey plan } }" },
     ], root, scope, { roles: ["admin", "alice", "bob"] });
-    expect(diff.findings.some((f) => f.name === "GetMyProfile" && f.kind === "horizontal_bola")).toBe(false);
+    expect(diff.findings.some((f) => f.name === "GetMyProfile" && (f.kind === "horizontal_bola" || f.kind === "vertical_bfla"))).toBe(false);
+    expect(diff.findings.some((f) => f.name === "PublicStatus")).toBe(false);
     expect(diff.findings.some((f) => f.name === "GetOrderById" && f.kind === "horizontal_bola")).toBe(true);
     expect(diff.findings.some((f) => f.name === "GetOrgBilling" && f.kind === "vertical_bfla")).toBe(true);
   });
@@ -1439,11 +1442,14 @@ describe("v8 异构审查 P1 对抗边界回归", () => {
     expect(() => decodeGrpcWebFrames(new Uint8Array([0x01, 0, 0, 0, 3, 0x01, 0x02, 0x03]))).toThrow();
 
     const root = tmpRoot();
+    upsertSessionRole(root, { role: "admin", bearer: "adm-tok" });
     upsertSessionRole(root, { role: "user1", bearer: "u1-tok" });
     upsertSessionRole(root, { role: "user2", bearer: "u2-tok" });
+    const observedAuths = new Set<string>();
     const srv = http.createServer((req, res) => {
       const auth = String(req.headers.authorization ?? "");
-      const who = auth.includes("u1") ? "u1" : auth.includes("u2") ? "u2" : "anon";
+      if (auth) observedAuths.add(auth);
+      const who = auth.includes("adm") ? "admin" : auth.includes("u1") ? "u1" : auth.includes("u2") ? "u2" : "anon";
       if (req.url === "/api/me") {
         if (who === "anon") { res.writeHead(401); res.end('{"error":"no"}'); return; }
         res.writeHead(200, { "content-type": "application/json" });
@@ -1454,6 +1460,14 @@ describe("v8 异构审查 P1 对抗边界回归", () => {
         if (who === "anon") { res.writeHead(403); res.end('0:E{"digest":"DENY"}\n'); return; }
         res.writeHead(200, { "content-type": "text/x-component" });
         res.end(`0:${JSON.stringify({ ok: true, user: who, error: null })}\n`);
+        return;
+      }
+      if (req.url === "/pkg.Svc/UserSelf") {
+        if (who === "anon") { res.writeHead(200, { "content-type": "application/grpc-web+proto" }); res.end(Buffer.from(encodeGrpcWebFrame(new TextEncoder().encode("grpc-status:7\r\n"), { isTrailer: true }))); return; }
+        const df = encodeGrpcWebFrame(encodeProtobufFields([{ fieldNumber: 1, wireType: 2, value: `self-${who}` }]));
+        const tf = encodeGrpcWebFrame(new TextEncoder().encode("grpc-status:0\r\n"), { isTrailer: true });
+        res.writeHead(200, { "content-type": "application/grpc-web+proto" });
+        res.end(Buffer.from(new Uint8Array([...df, ...tf])));
         return;
       }
       if (req.url === "/pkg.Svc/DeniedAdmin") {
@@ -1470,9 +1484,13 @@ describe("v8 异构审查 P1 对抗边界回归", () => {
     const { session } = await createMockSession("p14");
     const cdpDiff = await runCdpStatefulSignedAuthDiff(base, [{ path: "/api/me", method: "GET" }], root, scope, { session, signerHook: "__nuwaSign", autoSampleSoft404: false });
     expect(cdpDiff.findings.some((f) => f.kind === "horizontal_bola")).toBe(false);
-    const rscDiff = await diffRscActionRoles([{ name: "GetMyRsc", url: `${base}/rsc/profile`, actionId: "a1", args: [{ page: 1 }] }], root, scope, { roles: ["user1", "user2"] });
-    expect(rscDiff.findings.some((f) => f.kind === "horizontal_bola")).toBe(false);
+    const rscDiff = await diffRscActionRoles([{ name: "UserService/GetSelf", url: `${base}/rsc/profile`, actionId: "a1", args: [{ page: 1 }] }], root, scope);
+    expect(rscDiff.findings.some((f) => f.kind === "horizontal_bola" || f.kind === "vertical_bfla")).toBe(false);
+    const grpcSelf = await diffGrpcWebMethodRoles([{ name: "UserService/GetSelf", url: `${base}/pkg.Svc/UserSelf`, requestFields: [{ fieldNumber: 1, wireType: 2, value: "me" }] }], root, scope);
+    expect(grpcSelf.findings.length).toBe(0);
+    observedAuths.clear();
     const grpcDiff = await diffGrpcWebMethodRoles([{ name: "DeniedAdmin", url: `${base}/pkg.Svc/DeniedAdmin`, requestFields: [{ fieldNumber: 1, wireType: 2, value: "x" }], expectedAdminOnly: true, useBase64Text: true }], root, scope, { roles: ["user1", "user2"] });
     expect(grpcDiff.findings.length).toBe(0);
+    expect([...observedAuths].some((h) => h.includes("adm-tok"))).toBe(false);
   });
 });

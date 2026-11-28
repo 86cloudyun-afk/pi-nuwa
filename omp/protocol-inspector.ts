@@ -138,6 +138,19 @@ function scrubProtocolText(text: string, extraSecrets?: readonly string[], rootO
 	return out;
 }
 
+const HIGH_SENSITIVE_GQL_KEY_RE = /admin|secret|apiKey|privateKey|billing|cardLast4|password|passwd|ssn|salary|permission|auditLog/i;
+const ADMIN_GQL_SEMANTIC_RE = /\b(?:admin|manage|internal|system|audit|purge|grant|revoke)\b/i;
+const PUBLIC_METADATA_GQL_KEY_RE = /^(?:data\.)?(?:[A-Za-z_][A-Za-z0-9_]*\.)*(?:version|status|health|healthz|ready|readyz|ping|uptime|build|commit|env|__typename)$/i;
+
+function isPrivilegedActionTarget(spec: { name: string; url: string; expectedAdminOnly?: boolean }): boolean {
+	return (
+		spec.expectedAdminOnly === true ||
+		isAdminLikePath(spec.name) ||
+		isAdminLikePath(spec.url) ||
+		/admin|manage|internal|system|audit|purge|deleteall|grant|revoke|config|billing/i.test(spec.name)
+	);
+}
+
 function resolveRoleHeadersBundle(rootOrVault: string | SessionVault, opts?: { roles?: string[]; extraRoleHeaders?: Record<string, Record<string, string>>; adminRoles?: string[]; }): {
 	roleOrder: string[];
 	roleHeaders: Map<string, Record<string, string>>;
@@ -148,9 +161,12 @@ function resolveRoleHeadersBundle(rootOrVault: string | SessionVault, opts?: { r
 	const vault = typeof rootOrVault === "string" ? loadSessionVault(rootOrVault) : rootOrVault;
 	const rootDir = typeof rootOrVault === "string" ? resolve(rootOrVault) : undefined;
 	const roleSet = new Set<string>(["anon"]);
-	for (const role of opts?.roles ?? []) roleSet.add(role);
-	for (const role of Object.keys(vault.roles ?? {})) roleSet.add(role);
-	for (const role of Object.keys(opts?.extraRoleHeaders ?? {})) roleSet.add(role);
+	if (opts?.roles && opts.roles.length > 0) {
+		for (const role of opts.roles) roleSet.add(role);
+	} else {
+		for (const role of Object.keys(vault.roles ?? {})) roleSet.add(role);
+		for (const role of Object.keys(opts?.extraRoleHeaders ?? {})) roleSet.add(role);
+	}
 	const roleOrder = [...roleSet];
 	const roleHeaders = new Map<string, Record<string, string>>();
 	const extraSecrets = new Set<string>();
@@ -573,18 +589,20 @@ export async function runGraphQLNestedAuthDiff(endpointUrl: string, queries: rea
 		const baseline = adminProbe ?? usable[0]!;
 		const baselineKeys = new Set(baseline.dataKeys);
 		const similarityToBaseline = (keys: string[]): number => computeKeyJaccard([...baselineKeys], keys);
-		const exposedFor = (keys: string[]): string[] => {
-			const shared = keys.filter((k) => baselineKeys.has(k));
-			const sensitive = shared.filter((k) => /admin|secret|apiKey|billing|token|role|permission|key|salary|balance|ssn|email/i.test(k));
-			if (sensitive.length > 0) return sensitive.slice(0, 40);
-			return (shared.length > 0 ? shared : keys).slice(0, 40);
-		};
+		const isAdminTarget = Boolean(spec.expectedAdminOnly) || isAdminLikePath(spec.name) || ADMIN_GQL_SEMANTIC_RE.test(`${spec.name}\n${spec.query}`);
+		const isMutation = /^\s*mutation\b/i.test(spec.query);
 		const anonProbe = byRole.get("anon");
 		const anonUsable = Boolean(anonProbe && usable.includes(anonProbe));
 		if (anonProbe && anonUsable && baseline.role !== "anon") {
 			const similarity = similarityToBaseline(anonProbe.dataKeys);
-			const sensitiveBaseline = baseline.dataKeys.some((key) => /admin|secret|apiKey|role|permission|token/i.test(key));
-			if (similarity >= 0.25 || spec.expectedAdminOnly || isAdminLikePath(spec.name) || sensitiveBaseline) {
+			const sensitiveBaseline = baseline.dataKeys.some((key) => HIGH_SENSITIVE_GQL_KEY_RE.test(key) || /token/i.test(key));
+			const isPublicMetadataOnly =
+				!isMutation &&
+				!isAdminTarget &&
+				!sensitiveBaseline &&
+				anonProbe.dataKeys.length > 0 &&
+				anonProbe.dataKeys.every((key) => PUBLIC_METADATA_GQL_KEY_RE.test(key));
+			if (!isPublicMetadataOnly && (similarity >= 0.25 || spec.expectedAdminOnly || isAdminLikePath(spec.name) || sensitiveBaseline)) {
 				addFinding({
 					name: spec.name, kind: "unauth_access", severity: spec.expectedAdminOnly || isAdminLikePath(spec.name) ? "high" : "medium",
 					summary: scrubProtocolText(`Anonymous role returned ${anonProbe.dataKeys.length} data key(s) for ${spec.name}`, extraSecrets, bundle.vaultRef ?? rootOrVault),
@@ -597,9 +615,12 @@ export async function runGraphQLNestedAuthDiff(endpointUrl: string, queries: rea
 			for (const probe of usable) {
 				if (probe.role === adminProbe.role || probe.role === "anon" || isAdminLikeRole(probe.role, opts.adminRoles)) continue;
 				const similarity = similarityToBaseline(probe.dataKeys);
-				const exposed = exposedFor(probe.dataKeys);
+				const shared = probe.dataKeys.filter((k) => baselineKeys.has(k));
+				const sensitiveShared = shared.filter((k) => HIGH_SENSITIVE_GQL_KEY_RE.test(k));
+				const hasSensitiveShared = sensitiveShared.length > 0;
 				const anonEquivalent = anonUsable && anonProbe ? computeKeyJaccard(anonProbe.dataKeys, probe.dataKeys) >= 0.85 : false;
-				if (!anonEquivalent && ((similarity >= 0.6 && exposed.length > 0) || (spec.expectedAdminOnly && similarity >= 0.2) || (isAdminLikePath(spec.name) && similarity >= 0.3))) {
+				if (!anonEquivalent && (isAdminTarget || hasSensitiveShared) && ((similarity >= 0.6 && hasSensitiveShared) || (spec.expectedAdminOnly && similarity >= 0.2) || (isAdminTarget && similarity >= 0.3))) {
+					const exposed = (hasSensitiveShared ? sensitiveShared : shared).slice(0, 40);
 					addFinding({
 						name: spec.name, kind: "vertical_bfla", severity: spec.expectedAdminOnly || isAdminLikePath(spec.name) ? "high" : "medium",
 						summary: scrubProtocolText(`Role ${probe.role} reached admin-like data for ${spec.name}`, extraSecrets, bundle.vaultRef ?? rootOrVault),
@@ -1489,11 +1510,12 @@ export async function diffRscActionRoles(
 		const anonProbe = probes.find((p) => p.role === "anon");
 		const anonSucceeded = Boolean(anonProbe && isSuccessHttp(anonProbe.status) && !anonProbe.hasErrorDigest && anonProbe.chunkCount > 0);
 		const hasObjectParam = isObjectResourcePath(spec.name) || isObjectResourcePath(spec.url) || /"(?:id|userId|accountId|orderId|tenantId)"/i.test(JSON.stringify(spec.args ?? []));
+		const isAdminTarget = isPrivilegedActionTarget(spec);
 		for (const probe of probes) {
 			if (probe.role === baselineRole || !isSuccessHttp(probe.status) || probe.hasErrorDigest || probe.chunkCount === 0) continue;
 			let kind: AuthDiffAnomalyKind | null = null;
 			if (probe.role === "anon") kind = "unauth_access";
-			else if (spec.expectedAdminOnly || (isAdminLikeRole(baselineRole, adminRoles) && !isAdminLikeRole(probe.role, adminRoles))) kind = "vertical_bfla";
+			else if (isAdminTarget && !anonSucceeded && (spec.expectedAdminOnly || (isAdminLikeRole(baselineRole, adminRoles) && !isAdminLikeRole(probe.role, adminRoles)))) kind = "vertical_bfla";
 			else if (hasObjectParam && !anonSucceeded && probe.bodyHash && probe.bodyHash === baselineProbe.bodyHash) kind = "horizontal_bola";
 			if (!kind) continue;
 			const severity: "high" | "medium" = kind === "horizontal_bola" ? "medium" : "high";
@@ -2073,11 +2095,12 @@ export async function diffGrpcWebMethodRoles(
 		const baselineProbe = probes.find((p) => p.role === baselineRole);
 		const anonSucceeded = successfulRoles.has("anon");
 		const hasObjectTarget = isObjectResourcePath(spec.name) || isObjectResourcePath(spec.url) || spec.requestFields.some((f) => typeof f.value === "string" && /(?:id|ord|acc|usr|doc)[_-]?\d+/i.test(f.value));
+		const isAdminTarget = isPrivilegedActionTarget(spec);
 		for (const probe of probes) {
 			if (probe.role === baselineRole || !successfulRoles.has(probe.role)) continue;
 			let kind: AuthDiffAnomalyKind | null = null;
 			if (probe.role === "anon") kind = "unauth_access";
-			else if (spec.expectedAdminOnly || (isAdminLikeRole(baselineRole, adminRoles) && !isAdminLikeRole(probe.role, adminRoles))) kind = "vertical_bfla";
+			else if (isAdminTarget && !anonSucceeded && (spec.expectedAdminOnly || (isAdminLikeRole(baselineRole, adminRoles) && !isAdminLikeRole(probe.role, adminRoles)))) kind = "vertical_bfla";
 			else if (hasObjectTarget && !anonSucceeded && baselineProbe && probe.bodyHash && probe.bodyHash === baselineProbe.bodyHash) kind = "horizontal_bola";
 			if (!kind) continue;
 			const severity: "high" | "medium" = kind === "horizontal_bola" ? "medium" : "high";
