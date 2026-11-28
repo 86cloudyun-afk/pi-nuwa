@@ -329,21 +329,39 @@ export function extractSecretsFromHeadersMap(headers?: Record<string, string>): 
 	return [...out];
 }
 
-/** 对任意文本执行 SessionVault 与额外运行时密钥（含 URL 编码变体）的零明文脱敏。 */
+function collectVaultSecretValues(rootOrVault?: string | SessionVault): string[] {
+	if (!rootOrVault) return [];
+	try {
+		const vault = typeof rootOrVault === "string" ? loadSessionVault(rootOrVault) : rootOrVault;
+		const out = new Set<string>();
+		for (const entry of Object.values(vault.roles ?? {})) {
+			if (!entry) continue;
+			if (entry.password) pushSecret(out, entry.password);
+			if (entry.bearer) {
+				pushSecret(out, entry.bearer);
+				pushSecret(out, entry.bearer.replace(/^Bearer\s+/i, "").trim());
+			}
+			if (entry.cookie) {
+				for (const s of extractSecretsFromHeadersMap({ cookie: entry.cookie })) pushSecret(out, s);
+			}
+			if (entry.headers) {
+				for (const s of extractSecretsFromHeadersMap(entry.headers)) pushSecret(out, s);
+			}
+		}
+		return [...out];
+	} catch {
+		return [];
+	}
+}
+
+/** 对任意文本执行额外运行时密钥与 SessionVault（优先全掩码再兜底局部掩码）的零明文脱敏。 */
 export function scrubTextWithExtraSecrets(
 	text: string,
 	extraSecrets?: readonly string[],
 	rootOrVault?: string | SessionVault,
 ): string {
 	let out = String(text ?? "");
-	if (rootOrVault) {
-		try {
-			out = redactVaultSecrets(out, rootOrVault);
-		} catch {
-			/* 保持后续兜底脱敏 */
-		}
-	}
-	const values = [...(extraSecrets ?? [])]
+	const values = [...new Set([...(extraSecrets ?? []), ...collectVaultSecretValues(rootOrVault)])]
 		.map((s) => String(s ?? "").trim())
 		.filter((s) => s.length >= 4 && s !== REDACTED)
 		.sort((a, b) => b.length - a.length);
@@ -354,12 +372,13 @@ export function scrubTextWithExtraSecrets(
 			const encoded = encodeURIComponent(secret);
 			variants.add(encoded);
 			variants.add(encoded.replace(/%20/g, "+"));
-		} catch {
-			/* ignore */
-		}
+		} catch { /* ignore */ }
 		for (const variant of variants) {
 			if (variant && out.includes(variant)) out = out.split(variant).join(REDACTED);
 		}
+	}
+	if (rootOrVault) {
+		try { out = redactVaultSecrets(out, rootOrVault); } catch { /* 保持兜底 */ }
 	}
 	return out;
 }
@@ -1096,14 +1115,14 @@ export async function runCdpStatefulSignedAuthDiff(
 			}
 
 			const lowPrivileged = Array.from(perRole.entries()).filter(([r, p]) => r !== "anon" && !isAdminLikeRole(r) && signedProbeSucceeded(p.status, p.isSoft404, p.bodySnippet));
-			if (lowPrivileged.length >= 2 && (endpointIsObject || (!endpointIsAdmin && !anonSucceeded))) {
+			if (lowPrivileged.length >= 2 && endpointIsObject && !anonSucceeded) {
 				for (let i = 0; i < lowPrivileged.length; i += 1) {
 					for (let j = i + 1; j < lowPrivileged.length; j += 1) {
 						const [roleA, probeA] = lowPrivileged[i]!;
 						const [roleB, probeB] = lowPrivileged[j]!;
 						const similarity = signedProbePairSimilarity(probeA, probeB);
-						if (probeA.status === probeB.status && (similarity >= 0.65 || (probeA.bodyHash.length > 0 && probeA.bodyHash === probeB.bodyHash))) {
-							findings.push({ path: ep.path, method: ep.method, url: endpointUrl, kind: "horizontal_bola", severity: "medium", summary: `同级角色 ${roleA}/${roleB} 在 ${ep.method} ${ep.path} 存在水平越权对象共享`, baselineRole, testedRole: roleA, similarity, unsignedStatus: unsignedStatuses[epLabel], probes });
+						if (probeA.status === probeB.status && probeA.bodyHash.length > 0 && probeA.bodyHash === probeB.bodyHash) {
+							findings.push({ path: ep.path, method: ep.method, url: endpointUrl, kind: "horizontal_bola", severity: "medium", summary: `同级角色 ${roleA}/${roleB} 在 ${ep.method} ${ep.path} 返回完全相同的业务对象实体`, baselineRole, testedRole: roleA, similarity, unsignedStatus: unsignedStatuses[epLabel], probes });
 						}
 					}
 				}

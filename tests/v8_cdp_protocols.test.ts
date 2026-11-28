@@ -8,39 +8,16 @@ import { gzipSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
 
 import {
-  DEFAULT_AUTH_FAILURE_THRESHOLD,
-  DEFAULT_SESSION_MIN_TTL_SECONDS,
-  decodeBase32Secret,
-  ensureSessionFresh,
-  generateHotpCode,
-  generateTotpCode,
-  getRoleConsecutiveAuthFailures,
-  parseOtpAuthUri,
-  recordRoleAuthStatus,
-  resetRoleAuthFailures,
-  runInteractiveAuthPlaybook,
-  verifyTotpCode,
+  DEFAULT_AUTH_FAILURE_THRESHOLD, DEFAULT_SESSION_MIN_TTL_SECONDS, decodeBase32Secret, ensureSessionFresh,
+  generateHotpCode, generateTotpCode, getRoleConsecutiveAuthFailures, parseOtpAuthUri, recordRoleAuthStatus,
+  resetRoleAuthFailures, runInteractiveAuthPlaybook, verifyTotpCode,
 } from "../omp/cdp-auth";
-import { executeInPageStatefulSignedProbe, runCdpStatefulSignedAuthDiff } from "../omp/cdp-signed-probe";
+import { executeInPageStatefulSignedProbe, runCdpStatefulSignedAuthDiff, scrubTextWithExtraSecrets } from "../omp/cdp-signed-probe";
 import {
-  attachCdpWebSocketAuditor,
-  auditWebSocketCrossTenantPush,
-  buildGraphQLAliasQuery,
-  buildGraphQLBatchPayload,
-  buildRscActionRequest,
-  decodeGrpcWebFrames,
-  decodeProtobufFields,
-  decodeVarint,
-  diffGrpcWebMethodRoles,
-  diffRscActionRoles,
-  encodeGrpcWebFrame,
-  encodeProtobufFields,
-  encodeVarint,
-  inspectGraphQLSchema,
-  parseGraphQLIntrospection,
-  parseGraphQLSuggestionsFromErrors,
-  parseRscFlightStream,
-  runGraphQLNestedAuthDiff,
+  attachCdpWebSocketAuditor, auditWebSocketCrossTenantPush, buildGraphQLAliasQuery, buildGraphQLBatchPayload,
+  buildRscActionRequest, decodeGrpcWebFrames, decodeProtobufFields, decodeVarint, diffGrpcWebMethodRoles,
+  diffRscActionRoles, encodeGrpcWebFrame, encodeProtobufFields, encodeVarint, inspectGraphQLSchema,
+  parseGraphQLIntrospection, parseGraphQLSuggestionsFromErrors, parseRscFlightStream, runGraphQLNestedAuthDiff,
 } from "../omp/protocol-inspector";
 import { defaultScopeForTarget } from "../omp/scope";
 import type { ScopePolicy } from "../omp/scope";
@@ -58,22 +35,8 @@ function cleanupRegister(fn: () => void | Promise<void>): void {
 
 afterEach(async () => {
   while (timers.length > 0) clearTimeout(timers.pop()!);
-  while (servers.length > 0) {
-    const s = servers.pop()!;
-    try {
-      await s.close();
-    } catch {
-      /* 幂等清理 */
-    }
-  }
-  while (dirs.length > 0) {
-    const d = dirs.pop()!;
-    try {
-      rmSync(d, { recursive: true, force: true });
-    } catch {
-      /* 幂等清理 */
-    }
-  }
+  while (servers.length > 0) { try { await servers.pop()!.close(); } catch { /* 幂等清理 */ } }
+  while (dirs.length > 0) { try { rmSync(dirs.pop()!, { recursive: true, force: true }); } catch { /* 幂等清理 */ } }
 });
 
 async function listenHttp(server: http.Server): Promise<string> {
@@ -113,18 +76,8 @@ function tmpRoot(): string {
 }
 
 function makeScope(url: string): ScopePolicy {
-  try {
-    return defaultScopeForTarget(url);
-  } catch {
-    return {
-      allowHosts: [new URL(url).hostname],
-      allowCidrs: ["127.0.0.1/32"],
-      denyHosts: [],
-      allowSubdomains: false,
-      allowPrivateNetwork: true,
-      allowDestructive: false,
-      allowLoopback: true,
-    };
+  try { return defaultScopeForTarget(url); } catch {
+    return { allowHosts: [new URL(url).hostname], allowCidrs: ["127.0.0.1/32"], denyHosts: [], allowSubdomains: false, allowPrivateNetwork: true, allowDestructive: false, allowLoopback: true };
   }
 }
 
@@ -184,6 +137,7 @@ function createMockCdpTransport(seed = "default", hooks: MockBrowserHooks = {}):
   const state = {
     currentUrl: "about:blank",
     cookies: new Map<string, string>(),
+    cookieExpires: new Map<string, number>(),
     localStorage: new Map<string, string>(),
     sessionStorage: new Map<string, string>(),
     closed: false,
@@ -211,9 +165,20 @@ function createMockCdpTransport(seed = "default", hooks: MockBrowserHooks = {}):
   const applySetCookies = (setCookieRaw: string | null): void => {
     if (!setCookieRaw) return;
     for (const part of setCookieRaw.split(/,(?=[^;]+=)/)) {
-      const pair = part.split(";")[0]?.trim() ?? "";
-      const idx = pair.indexOf("=");
-      if (idx > 0) state.cookies.set(pair.slice(0, idx).trim(), pair.slice(idx + 1).trim());
+      const segs = part.split(";").map((s) => s.trim());
+      const idx = (segs[0] ?? "").indexOf("=");
+      if (idx <= 0) continue;
+      const name = segs[0]!.slice(0, idx).trim();
+      const val = segs[0]!.slice(idx + 1).trim();
+      state.cookies.set(name, val);
+      for (const attr of segs.slice(1)) {
+        const eq = attr.indexOf("=");
+        if (eq <= 0) continue;
+        const ak = attr.slice(0, eq).trim().toLowerCase();
+        const av = attr.slice(eq + 1).trim();
+        if (ak === "max-age" && Number.isFinite(Number(av))) state.cookieExpires.set(name, Math.floor(Date.now() / 1000) + Number(av));
+        else if (ak === "expires" && Number.isFinite(Date.parse(av))) state.cookieExpires.set(name, Math.floor(Date.parse(av) / 1000));
+      }
     }
   };
 
@@ -294,6 +259,10 @@ function createMockCdpTransport(seed = "default", hooks: MockBrowserHooks = {}):
       focus: () => {},
       scrollIntoView: () => {},
       click: () => {
+        if (selector.includes("sso-external")) {
+          state.currentUrl = "http://evil.outside.invalid/steal?code=evil-sso-code";
+          return;
+        }
         state.pendingNav = (async () => {
           const res = await wrappedFetch(state.currentUrl, { method: "GET", redirect: "follow" });
           const html = await res.text();
@@ -418,8 +387,13 @@ function createMockCdpTransport(seed = "default", hooks: MockBrowserHooks = {}):
             return reply({});
           }
           if (msg.method === "Network.setCookies") {
-            const cookies = params.cookies as Array<{ name: string; value: string }> | undefined;
-            if (Array.isArray(cookies)) for (const c of cookies) state.cookies.set(c.name, c.value);
+            const cookies = params.cookies as Array<{ name: string; value: string; expires?: number }> | undefined;
+            if (Array.isArray(cookies)) {
+              for (const c of cookies) {
+                state.cookies.set(c.name, c.value);
+                if (typeof c.expires === "number") state.cookieExpires.set(c.name, c.expires);
+              }
+            }
             return reply({});
           }
           if (msg.method === "Network.setExtraHTTPHeaders") {
@@ -428,7 +402,12 @@ function createMockCdpTransport(seed = "default", hooks: MockBrowserHooks = {}):
             return reply({});
           }
           if (msg.method === "Network.getAllCookies" || msg.method === "Network.getCookies") {
-            return reply({ cookies: [...state.cookies.entries()].map(([name, value]) => ({ name, value, domain: "127.0.0.1", path: "/" })) });
+            return reply({
+              cookies: [...state.cookies.entries()].map(([name, value]) => ({
+                name, value, domain: "127.0.0.1", path: "/",
+                ...(state.cookieExpires.has(name) ? { expires: state.cookieExpires.get(name) } : {}),
+              })),
+            });
           }
           if (msg.method === "Page.navigate") {
             const target = resolveUrl(String(params.url ?? "about:blank"));
@@ -1071,7 +1050,8 @@ describe("v8 GraphQL 深度引擎", () => {
           res.end(JSON.stringify({ errors: [{ message: "forbidden" }], data: { viewer: null } }));
           return;
         }
-        if (body.includes("leakyAdminSecret")) {
+        if (body.includes("adminSettings")) {
+          if (!auth) { res.end(JSON.stringify({ errors: [{ message: "unauth" }], data: null })); return; }
           res.end(JSON.stringify({ data: { adminSettings: { apiKey: "gql-api-key-leak", tier: "enterprise" } } }));
           return;
         }
@@ -1330,5 +1310,169 @@ describe("v8 清理不变量", () => {
     const res = await fetch(base);
     expect(await res.text()).toBe("ok");
     expect(root.length).toBeGreaterThan(0);
+  });
+});
+
+describe("v8 异构审查 P1 对抗边界回归", () => {
+  test("P1-1: 前置越界与点击外跳均关闭外部会话，纯 Cookie 过期时间落盘 Vault", async () => {
+    const root1 = tmpRoot();
+    const s1 = (await createMockSession("p1-pre")).session;
+    const preBlocked = await runInteractiveAuthPlaybook({
+      session: s1, role: "alice", root: root1,
+      scope: { allowHosts: ["example.com"], allowCidrs: [], denyHosts: [], allowSubdomains: false, allowPrivateNetwork: false, allowDestructive: false, allowLoopback: false },
+      steps: [{ action: "goto", url: "http://127.0.0.1:9/evil" }],
+    });
+    expect(preBlocked.blockedByScope).toBe(true);
+    expect(preBlocked.sessionClosed).toBe(true);
+    expect(s1.closed).toBe(true);
+
+    const server = http.createServer((req, res) => {
+      if (req.url === "/login") {
+        res.writeHead(200, { "content-type": "text/html", "set-cookie": "sess=CookieVal9956; Max-Age=3600; Path=/" });
+        res.end('<html><body><button id="sso-external">SSO</button><button id="ok-btn">OK</button></body></html>');
+        return;
+      }
+      res.writeHead(200); res.end("ok");
+    });
+    const base = await listenHttp(server);
+    const root2 = tmpRoot();
+    const s2 = (await createMockSession("p1-sso")).session;
+    const ssoRes = await runInteractiveAuthPlaybook({
+      session: s2, role: "alice", root: root2, scope: makeScope(base),
+      steps: [{ action: "goto", url: `${base}/login` }, { action: "click", selector: "#sso-external", waitForNavigation: false }],
+    });
+    expect(ssoRes.ok).toBe(false);
+    expect(ssoRes.blockedByScope).toBe(true);
+    expect(ssoRes.sessionClosed).toBe(true);
+    expect(loadSessionVault(root2).roles.alice).toBeUndefined();
+
+    const root3 = tmpRoot();
+    const s3 = (await createMockSession("p1-cookie")).session;
+    const cookieRes = await runInteractiveAuthPlaybook({
+      session: s3, role: "bob", root: root3, scope: makeScope(base), closeSessionOnSuccess: true,
+      steps: [{ action: "goto", url: `${base}/login` }],
+    });
+    expect(cookieRes.ok).toBe(true);
+    expect(cookieRes.expiresAt).toBeTruthy();
+    expect(loadSessionVault(root3).roles.bob?.expiresAt).toBe(cookieRes.expiresAt);
+  });
+
+  test("P1-2: otpauth 裸密钥零明文脱敏与全掩码优先顺序", async () => {
+    const root = tmpRoot();
+    const rawSecret = "JBSWY3DPEHPK3PXP";
+    upsertSessionRole(root, { role: "alice", cookie: "sid=CookieVal9956", bearer: "BearerTokenXYZ99" });
+    const scrubbed = scrubTextWithExtraSecrets("leak CookieVal9956 and BearerTokenXYZ99", ["CookieVal9956", "BearerTokenXYZ99"], root);
+    expect(scrubbed).toBe("leak [REDACTED] and [REDACTED]");
+    expect(scrubbed).not.toContain("Coo***");
+
+    const srv = http.createServer((_req, res) => { res.writeHead(200, { "content-type": "text/html" }); res.end('<input id="totp" />'); });
+    const base = await listenHttp(srv);
+    const { session } = await createMockSession("p1-otp");
+    const recorder = new TrafficRecorder(root);
+    const res = await runInteractiveAuthPlaybook({
+      session, role: "otpuser", root, scope: makeScope(base), recorder, closeSessionOnSuccess: true,
+      steps: [{ action: "goto", url: `${base}/login` }, { action: "fillTotp", selector: "#totp", secret: `otpauth://totp/ACME:u?secret=${rawSecret.toLowerCase()}&digits=6` }, { action: "waitForSelector", selector: "#missing-abort", timeoutMs: 220 }],
+    });
+    expect(res.ok).toBe(false);
+    expect(JSON.stringify(res)).not.toContain(rawSecret);
+    expect(JSON.stringify(res)).not.toContain(rawSecret.toLowerCase());
+  });
+
+  test("P1-3 & P1-5: GraphQL 隔离查询不误报 BOLA、同 ID 跨租户与同键 BFLA 必报、禁内省盲还原标量与必填参", async () => {
+    const root = tmpRoot();
+    upsertSessionRole(root, { role: "admin", bearer: "adm-gql-p13" });
+    upsertSessionRole(root, { role: "alice", bearer: "ali-gql-p13" });
+    upsertSessionRole(root, { role: "bob", bearer: "bob-gql-p13" });
+    const srv = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        const auth = String(req.headers.authorization ?? "");
+        res.writeHead(200, { "content-type": "application/json" });
+        if (body.includes("__schema")) { res.end(JSON.stringify({ errors: [{ message: "introspection disabled" }] })); return; }
+        if (body.includes("version { __typename }")) { res.end(JSON.stringify({ errors: [{ message: 'Field "version" must not have a selection since type "String" has no subfields.' }] })); return; }
+        if (body.includes("user { __typename }")) { res.end(JSON.stringify({ errors: [{ message: 'Field "user" argument "id" of type "ID!" is required.' }] })); return; }
+        if (body.includes("user(id:") && body.includes("__nuwa_probe_")) { res.end(JSON.stringify({ errors: [{ message: 'Cannot query field "__nuwa" on type "User". Did you mean "email", "phone"?' }] })); return; }
+        if (body.includes("GetMyProfile")) {
+          if (!auth) { res.end(JSON.stringify({ errors: [{ message: "unauth" }], data: null })); return; }
+          const who = auth.includes("ali") ? "alice" : auth.includes("bob") ? "bob" : "admin";
+          res.end(JSON.stringify({ data: { me: { id: `u-${who}`, email: `${who}@x.test` } } }));
+          return;
+        }
+        if (body.includes("GetOrderById")) {
+          if (!auth) { res.end(JSON.stringify({ errors: [{ message: "unauth" }], data: null })); return; }
+          res.end(JSON.stringify({ data: { order: { id: "ord-alice-1", ownerId: "alice", amount: 500 } } }));
+          return;
+        }
+        if (body.includes("GetOrgBilling")) {
+          if (!auth) { res.end(JSON.stringify({ errors: [{ message: "unauth" }], data: null })); return; }
+          res.end(JSON.stringify({ data: { billing: { apiKey: "sk-live-org", plan: "ent" } } }));
+          return;
+        }
+        res.end(JSON.stringify({ errors: [{ message: "unknown" }] }));
+      });
+    });
+    const base = await listenHttp(srv);
+    const scope = makeScope(base);
+    const schema = await inspectGraphQLSchema(`${base}/graphql`, scope, { dictionary: ["version", "user"] });
+    expect(schema.ok).toBe(true);
+    expect(schema.discoveredQueries).toContain("version");
+    expect(schema.discoveredQueries).toContain("user");
+    expect(schema.types.User?.fields.map((f) => f.name)).toContain("email");
+
+    const diff = await runGraphQLNestedAuthDiff(`${base}/graphql`, [
+      { name: "GetMyProfile", query: "query GetMyProfile { me { id email } }" },
+      { name: "GetOrderById", query: 'query GetOrderById { order(id: "ord-alice-1") { id ownerId amount } }' },
+      { name: "GetOrgBilling", query: "query GetOrgBilling { billing { apiKey plan } }" },
+    ], root, scope, { roles: ["admin", "alice", "bob"] });
+    expect(diff.findings.some((f) => f.name === "GetMyProfile" && f.kind === "horizontal_bola")).toBe(false);
+    expect(diff.findings.some((f) => f.name === "GetOrderById" && f.kind === "horizontal_bola")).toBe(true);
+    expect(diff.findings.some((f) => f.name === "GetOrgBilling" && f.kind === "vertical_bfla")).toBe(true);
+  });
+
+  test("P1-4 & P1-6: 非对象接口零误报 BOLA、RSC error:null 非错误、Envoy 多段 grpc-web-text 精准识别 7", async () => {
+    const chunks = parseRscFlightStream('0:{"ok":true,"error":null}\n1:TextPlainStart\n');
+    expect(chunks[0]?.isErrorDigest).toBe(false);
+    expect(chunks[1]?.tag).toBe("");
+    expect(chunks[1]?.rawPayload).toBe("TextPlainStart");
+    expect(() => decodeGrpcWebFrames(new Uint8Array([0x02, 0, 0, 0, 1, 0x00]))).toThrow();
+    expect(() => decodeGrpcWebFrames(new Uint8Array([0x01, 0, 0, 0, 3, 0x01, 0x02, 0x03]))).toThrow();
+
+    const root = tmpRoot();
+    upsertSessionRole(root, { role: "user1", bearer: "u1-tok" });
+    upsertSessionRole(root, { role: "user2", bearer: "u2-tok" });
+    const srv = http.createServer((req, res) => {
+      const auth = String(req.headers.authorization ?? "");
+      const who = auth.includes("u1") ? "u1" : auth.includes("u2") ? "u2" : "anon";
+      if (req.url === "/api/me") {
+        if (who === "anon") { res.writeHead(401); res.end('{"error":"no"}'); return; }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: who, name: `name-${who}` }));
+        return;
+      }
+      if (req.url === "/rsc/profile") {
+        if (who === "anon") { res.writeHead(403); res.end('0:E{"digest":"DENY"}\n'); return; }
+        res.writeHead(200, { "content-type": "text/x-component" });
+        res.end(`0:${JSON.stringify({ ok: true, user: who, error: null })}\n`);
+        return;
+      }
+      if (req.url === "/pkg.Svc/DeniedAdmin") {
+        const dFrame = Buffer.from(encodeGrpcWebFrame(encodeProtobufFields([{ fieldNumber: 1, wireType: 2, value: "ok" }]))).toString("base64");
+        const tFrame = Buffer.from(encodeGrpcWebFrame(new TextEncoder().encode("grpc-status:7\r\n"), { isTrailer: true })).toString("base64");
+        res.writeHead(200, { "content-type": "application/grpc-web-text" });
+        res.end(`${dFrame}${tFrame}`);
+        return;
+      }
+      res.writeHead(404); res.end("nf");
+    });
+    const base = await listenHttp(srv);
+    const scope = makeScope(base);
+    const { session } = await createMockSession("p14");
+    const cdpDiff = await runCdpStatefulSignedAuthDiff(base, [{ path: "/api/me", method: "GET" }], root, scope, { session, signerHook: "__nuwaSign", autoSampleSoft404: false });
+    expect(cdpDiff.findings.some((f) => f.kind === "horizontal_bola")).toBe(false);
+    const rscDiff = await diffRscActionRoles([{ name: "GetMyRsc", url: `${base}/rsc/profile`, actionId: "a1", args: [{ page: 1 }] }], root, scope, { roles: ["user1", "user2"] });
+    expect(rscDiff.findings.some((f) => f.kind === "horizontal_bola")).toBe(false);
+    const grpcDiff = await diffGrpcWebMethodRoles([{ name: "DeniedAdmin", url: `${base}/pkg.Svc/DeniedAdmin`, requestFields: [{ fieldNumber: 1, wireType: 2, value: "x" }], expectedAdminOnly: true, useBase64Text: true }], root, scope, { roles: ["user1", "user2"] });
+    expect(grpcDiff.findings.length).toBe(0);
   });
 });

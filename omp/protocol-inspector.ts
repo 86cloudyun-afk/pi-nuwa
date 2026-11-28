@@ -100,9 +100,33 @@ function collectSecretsFromHeaders(headers?: Record<string, string>): string[] {
 	return [...out];
 }
 
+function collectVaultSecretsForProtocol(rootOrVault?: string | SessionVault): string[] {
+	if (!rootOrVault) return [];
+	try {
+		const vault = typeof rootOrVault === "string" ? loadSessionVault(rootOrVault) : rootOrVault;
+		const out = new Set<string>();
+		for (const entry of Object.values(vault.roles ?? {})) {
+			if (!entry) continue;
+			if (entry.password && entry.password.length >= 3) out.add(entry.password);
+			if (entry.bearer && entry.bearer.length >= 3) {
+				out.add(entry.bearer);
+				const bare = entry.bearer.replace(/^Bearer\s+/i, "").trim();
+				if (bare.length >= 3) out.add(bare);
+			}
+			if (entry.cookie) for (const s of collectSecretsFromHeaders({ cookie: entry.cookie })) out.add(s);
+			if (entry.headers) for (const s of collectSecretsFromHeaders(entry.headers)) out.add(s);
+		}
+		return [...out];
+	} catch {
+		return [];
+	}
+}
+
 function scrubProtocolText(text: string, extraSecrets?: readonly string[], rootOrVault?: string | SessionVault): string {
 	let out = text;
-	const secrets = uniqueStrings([...(extraSecrets ?? [])]).filter((s) => s.length >= 3).sort((a, b) => b.length - a.length);
+	const secrets = uniqueStrings([...(extraSecrets ?? []), ...collectVaultSecretsForProtocol(rootOrVault)])
+		.filter((s) => s.length >= 3)
+		.sort((a, b) => b.length - a.length);
 	for (const secret of secrets) {
 		const variants = new Set<string>([secret]);
 		try { const encoded = encodeURIComponent(secret); if (encoded !== secret) variants.add(encoded); } catch { /* ignore */ }
@@ -148,13 +172,12 @@ function clipSafeSnippet(raw: string, opts?: { root?: string; vault?: SessionVau
 
 function headersToRecord(headers: Headers | Record<string, string> | undefined): Record<string, string> {
 	if (!headers) return {};
+	const out: Record<string, string> = {};
 	if (headers instanceof Headers) {
-		const out: Record<string, string> = {};
-		headers.forEach((value, key) => { out[key] = value; });
+		headers.forEach((value, key) => { out[key.toLowerCase()] = value; });
 		return out;
 	}
-	const out: Record<string, string> = {};
-	for (const [key, value] of Object.entries(headers)) out[key] = String(value);
+	for (const [key, value] of Object.entries(headers)) out[key.toLowerCase()] = String(value);
 	return out;
 }
 
@@ -383,55 +406,88 @@ export async function inspectGraphQLSchema(endpointUrl: string, scope: ScopePoli
 		const parsed = parseGraphQLIntrospection(intro.json);
 		if (parsed.introspectionEnabled) return { ...parsed, ok: true, blockedByScope: false };
 	}
+	const discoveredFieldSpecs = new Map<string, GraphQLTypeField>();
+	const ensureFieldSpec = (name: string, patch?: Partial<GraphQLTypeField>): void => {
+		const prev = discoveredFieldSpecs.get(name) ?? { name, typeName: "Unknown", isList: false, isNonNull: false, args: [] };
+		discoveredFieldSpecs.set(name, { ...prev, ...patch, args: patch?.args?.length ? patch.args : prev.args });
+	};
+	const parseValidationHints = (errors: unknown): void => {
+		for (const msg of collectErrorMessages(errors)) {
+			const scalarM = /Field\s+["']([A-Za-z_][A-Za-z0-9_]*)["']\s+must not have a selection(?:\s+since\s+type\s+["']?([A-Za-z0-9_!\[\]]+)["']?\s+has no subfields)?/i.exec(msg);
+			if (scalarM?.[1]) {
+				discoveredQueries.add(scalarM[1]);
+				ensureFieldSpec(scalarM[1], { typeName: scalarM[2] ?? "Scalar" });
+			}
+			const reqArgM = /Field\s+["']([A-Za-z_][A-Za-z0-9_]*)["']\s+argument\s+["']([A-Za-z_][A-Za-z0-9_]*)["']\s+of\s+type\s+["']?([^"'\s]+)["']?\s+is\s+required/i.exec(msg);
+			if (reqArgM?.[1] && reqArgM[2]) {
+				discoveredQueries.add(reqArgM[1]);
+				ensureFieldSpec(reqArgM[1], { args: [{ name: reqArgM[2], typeName: reqArgM[3] ?? "String!" }] });
+			}
+		}
+	};
 	const suggestions: Record<string, string[]> = {};
 	const discoveredQueries = new Set<string>();
 	const discoveredMutations = new Set<string>();
 	const probeSuffix = `__nuwa_probe_${randomBytes(4).toString("hex")}`;
 	const dictionary = uniqueStrings([...(opts.dictionary ?? []), ...DEFAULT_GRAPHQL_FIELD_DICTIONARY]).slice(0, opts.dictionary?.length ? Math.min(opts.dictionary.length, 96) : 48);
 	const rootQueryError = await graphqlHttpPost(endpointUrl, { query: `query ${makeProbeOperationName("NuwaQueryProbe")} { ${probeSuffix} }` }, headers, { ...httpOpts, note: "graphql root query suggestion probe" });
-	for (const suggestion of parseGraphQLSuggestionsFromErrors(asRecord(rootQueryError.json)?.errors)) discoveredQueries.add(suggestion);
+	for (const suggestion of parseGraphQLSuggestionsFromErrors(asRecord(rootQueryError.json)?.errors)) { discoveredQueries.add(suggestion); ensureFieldSpec(suggestion); }
 	if (discoveredQueries.size) suggestions.Query = [...discoveredQueries];
 	const rootMutationError = await graphqlHttpPost(endpointUrl, { query: `mutation ${makeProbeOperationName("NuwaMutationProbe")} { ${probeSuffix} }` }, headers, { ...httpOpts, note: "graphql root mutation suggestion probe" });
 	for (const suggestion of parseGraphQLSuggestionsFromErrors(asRecord(rootMutationError.json)?.errors)) discoveredMutations.add(suggestion);
 	if (discoveredMutations.size) suggestions.Mutation = [...discoveredMutations];
+	const probedSubFields = new Set<string>();
+	const probeObjectSubFields = async (field: string): Promise<void> => {
+		if (probedSubFields.has(field)) return;
+		probedSubFields.add(field);
+		const spec = discoveredFieldSpecs.get(field);
+		const argPart = spec?.args.length ? `(${spec.args.map((a) => `${a.name}: ${/int|float/i.test(a.typeName) ? "1" : "\"1\""}`).join(", ")})` : "";
+		const sub = await graphqlHttpPost(endpointUrl, { query: `query ${makeProbeOperationName("NuwaSubFieldProbe")} { ${field}${argPart} { ${probeSuffix} } }` }, headers, { ...httpOpts, note: `graphql subfield probe ${field}` });
+		const subErrors = asRecord(sub.json)?.errors;
+		parseValidationHints(subErrors);
+		const subSuggestions = parseGraphQLSuggestionsFromErrors(subErrors);
+		if (subSuggestions.length) suggestions[field] = uniqueStrings([...(suggestions[field] ?? []), ...subSuggestions]);
+	};
 	for (const field of dictionary) {
 		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(field)) continue;
 		const probe = await graphqlHttpPost(endpointUrl, { query: `query ${makeProbeOperationName("NuwaFieldProbe")} { ${field} { __typename } }` }, headers, { ...httpOpts, note: `graphql field probe ${field}` });
 		const data = asRecord(asRecord(probe.json)?.data);
-		const fieldSuggestions = parseGraphQLSuggestionsFromErrors(asRecord(probe.json)?.errors);
+		const probeErrors = asRecord(probe.json)?.errors;
+		parseValidationHints(probeErrors);
+		const fieldSuggestions = parseGraphQLSuggestionsFromErrors(probeErrors);
 		if (fieldSuggestions.length) {
 			suggestions[field] = uniqueStrings([...(suggestions[field] ?? []), ...fieldSuggestions]);
-			for (const suggestion of fieldSuggestions) discoveredQueries.add(suggestion);
+			for (const suggestion of fieldSuggestions) { discoveredQueries.add(suggestion); ensureFieldSpec(suggestion); }
 		}
 		if (data && Object.prototype.hasOwnProperty.call(data, field)) {
 			discoveredQueries.add(field);
-			const value = data[field];
-			if (value !== null && typeof value === "object") {
-				const sub = await graphqlHttpPost(endpointUrl, { query: `query ${makeProbeOperationName("NuwaSubFieldProbe")} { ${field} { ${probeSuffix} } }` }, headers, { ...httpOpts, note: `graphql subfield probe ${field}` });
-				const subSuggestions = parseGraphQLSuggestionsFromErrors(asRecord(sub.json)?.errors);
-				if (subSuggestions.length) suggestions[field] = uniqueStrings([...(suggestions[field] ?? []), ...subSuggestions]);
-			}
+			ensureFieldSpec(field);
+			if (data[field] !== null && typeof data[field] === "object") await probeObjectSubFields(field);
 		}
+	}
+	for (const found of [...discoveredQueries].slice(0, 20)) {
+		const spec = discoveredFieldSpecs.get(found);
+		if (spec && /^(String|Int|Float|Boolean|ID|Scalar)[!\[\]]*$/i.test(spec.typeName)) continue;
+		await probeObjectSubFields(found);
 	}
 	const types: Record<string, GraphQLObjectSchema> = {
 		Query: {
-			name: "Query",
-			kind: "OBJECT",
-			fields: [...discoveredQueries].map((name) => ({ name, typeName: "Unknown", isList: false, isNonNull: false, args: [] })),
+			name: "Query", kind: "OBJECT",
+			fields: [...discoveredQueries].map((name) => discoveredFieldSpecs.get(name) ?? { name, typeName: "Unknown", isList: false, isNonNull: false, args: [] }),
 		},
 	};
+	for (const [parentField, childNames] of Object.entries(suggestions)) {
+		if (parentField === "Query" || parentField === "Mutation" || !discoveredQueries.has(parentField) || !childNames.length) continue;
+		const typeKey = `${parentField[0]!.toUpperCase()}${parentField.slice(1)}`;
+		types[typeKey] = { name: typeKey, kind: "OBJECT", fields: childNames.map((name) => ({ name, typeName: "Unknown", isList: false, isNonNull: false, args: [] })) };
+	}
 	const mutationTypeName = discoveredMutations.size ? "Mutation" : undefined;
 	if (mutationTypeName) {
 		types.Mutation = { name: "Mutation", kind: "OBJECT", fields: [...discoveredMutations].map((name) => ({ name, typeName: "Unknown", isList: false, isNonNull: false, args: [] })) };
 	}
 	const summary: GraphQLSchemaSummary = {
-		introspectionEnabled: false,
-		queryTypeName: "Query",
-		...(mutationTypeName ? { mutationTypeName } : {}),
-		types,
-		discoveredQueries: [...discoveredQueries],
-		discoveredMutations: [...discoveredMutations],
-		discoveredSuggestions: suggestions,
+		introspectionEnabled: false, queryTypeName: "Query", ...(mutationTypeName ? { mutationTypeName } : {}), types,
+		discoveredQueries: [...discoveredQueries], discoveredMutations: [...discoveredMutations], discoveredSuggestions: suggestions,
 	};
 	const ok = discoveredQueries.size > 0 || discoveredMutations.size > 0 || Object.keys(suggestions).length > 0;
 	return { ...summary, ok, blockedByScope: false, ...(intro.error ? { error: intro.error } : {}) };
@@ -442,13 +498,7 @@ function makeProbeOperationName(prefix: string): string {
 }
 
 interface GraphQLProbeResult {
-	role: string;
-	status: number;
-	bodyHash: string;
-	dataKeys: string[];
-	hasErrors: boolean;
-	sampleSnippet: string;
-	dataMap: Map<string, unknown>;
+	role: string; status: number; bodyHash: string; dataKeys: string[]; hasErrors: boolean; sampleSnippet: string; dataMap: Map<string, unknown>;
 }
 
 function flattenGraphQLData(value: unknown, prefix: string, out: Map<string, unknown>, depth = 0): void {
@@ -466,16 +516,20 @@ function flattenGraphQLData(value: unknown, prefix: string, out: Map<string, unk
 	}
 }
 
-function hasDifferingObjectLeaf(a: GraphQLProbeResult, b: GraphQLProbeResult): boolean {
+function sharesSameObjectEntity(a: GraphQLProbeResult, b: GraphQLProbeResult): boolean {
+	if (a.bodyHash.length > 0 && a.bodyHash === b.bodyHash) return true;
+	let matchedIdCount = 0;
 	for (const [path, valueA] of a.dataMap) {
 		if (!/(^|\.)(id|userId|accountId|ownerId|email|orderId|tenantId)($|\.|\[\])/i.test(path)) continue;
 		if (!b.dataMap.has(path)) continue;
 		const valueB = b.dataMap.get(path);
-		if (valueA !== null && typeof valueA === "object") continue;
-		if (valueB !== null && typeof valueB === "object") continue;
-		if (JSON.stringify(valueA) !== JSON.stringify(valueB)) return true;
+		if (valueA === null || valueA === undefined || typeof valueA === "object") continue;
+		if (valueB === null || valueB === undefined || typeof valueB === "object") continue;
+		if (String(valueA).trim() === "" || String(valueB).trim() === "") continue;
+		if (JSON.stringify(valueA) !== JSON.stringify(valueB)) return false;
+		matchedIdCount += 1;
 	}
-	return false;
+	return matchedIdCount > 0;
 }
 
 export async function runGraphQLNestedAuthDiff(endpointUrl: string, queries: readonly GraphQLQuerySpec[], rootOrVault: string | SessionVault, scope: ScopePolicy, opts: GraphQLAuthDiffOptions = {}): Promise<GraphQLAuthDiffResult> {
@@ -506,13 +560,9 @@ export async function runGraphQLNestedAuthDiff(endpointUrl: string, queries: rea
 			if (data !== undefined && data !== null) flattenGraphQLData(data, "data", dataMap);
 			extractJsonTopKeys(response.body);
 			probes.push({
-				role,
-				status: response.status,
-				bodyHash: computeBodyHash(response.body).bodyHash,
-				dataKeys: [...dataMap.keys()].sort(),
-				hasErrors,
-				sampleSnippet: clipSafeSnippet(response.body, { extraSecrets, maxChars: 420 }),
-				dataMap,
+				role, status: response.status, bodyHash: computeBodyHash(response.body).bodyHash,
+				dataKeys: [...dataMap.keys()].sort(), hasErrors,
+				sampleSnippet: clipSafeSnippet(response.body, { vault: bundle.vaultRef, root: bundle.rootDir, extraSecrets, maxChars: 420 }), dataMap,
 			});
 		}
 		const byRole = new Map(probes.map((probe) => [probe.role, probe] as const));
@@ -523,15 +573,21 @@ export async function runGraphQLNestedAuthDiff(endpointUrl: string, queries: rea
 		const baseline = adminProbe ?? usable[0]!;
 		const baselineKeys = new Set(baseline.dataKeys);
 		const similarityToBaseline = (keys: string[]): number => computeKeyJaccard([...baselineKeys], keys);
-		const exposedFor = (keys: string[]): string[] => keys.filter((key) => !baselineKeys.has(key)).slice(0, 40);
+		const exposedFor = (keys: string[]): string[] => {
+			const shared = keys.filter((k) => baselineKeys.has(k));
+			const sensitive = shared.filter((k) => /admin|secret|apiKey|billing|token|role|permission|key|salary|balance|ssn|email/i.test(k));
+			if (sensitive.length > 0) return sensitive.slice(0, 40);
+			return (shared.length > 0 ? shared : keys).slice(0, 40);
+		};
 		const anonProbe = byRole.get("anon");
-		if (anonProbe && usable.includes(anonProbe) && baseline.role !== "anon") {
+		const anonUsable = Boolean(anonProbe && usable.includes(anonProbe));
+		if (anonProbe && anonUsable && baseline.role !== "anon") {
 			const similarity = similarityToBaseline(anonProbe.dataKeys);
 			const sensitiveBaseline = baseline.dataKeys.some((key) => /admin|secret|apiKey|role|permission|token/i.test(key));
 			if (similarity >= 0.25 || spec.expectedAdminOnly || isAdminLikePath(spec.name) || sensitiveBaseline) {
 				addFinding({
 					name: spec.name, kind: "unauth_access", severity: spec.expectedAdminOnly || isAdminLikePath(spec.name) ? "high" : "medium",
-					summary: scrubProtocolText(`Anonymous role returned ${anonProbe.dataKeys.length} data key(s) for ${spec.name}`, extraSecrets, rootOrVault),
+					summary: scrubProtocolText(`Anonymous role returned ${anonProbe.dataKeys.length} data key(s) for ${spec.name}`, extraSecrets, bundle.vaultRef ?? rootOrVault),
 					baselineRole: baseline.role, testedRole: "anon", similarity, exposedKeys: anonProbe.dataKeys.slice(0, 40),
 					probes: probes.map((probe) => ({ role: probe.role, status: probe.status, bodyHash: probe.bodyHash, dataKeys: probe.dataKeys, hasErrors: probe.hasErrors, sampleSnippet: probe.sampleSnippet })),
 				});
@@ -542,35 +598,41 @@ export async function runGraphQLNestedAuthDiff(endpointUrl: string, queries: rea
 				if (probe.role === adminProbe.role || probe.role === "anon" || isAdminLikeRole(probe.role, opts.adminRoles)) continue;
 				const similarity = similarityToBaseline(probe.dataKeys);
 				const exposed = exposedFor(probe.dataKeys);
-				if ((similarity >= 0.6 && exposed.length > 0) || (spec.expectedAdminOnly && similarity >= 0.2) || (isAdminLikePath(spec.name) && similarity >= 0.3)) {
+				const anonEquivalent = anonUsable && anonProbe ? computeKeyJaccard(anonProbe.dataKeys, probe.dataKeys) >= 0.85 : false;
+				if (!anonEquivalent && ((similarity >= 0.6 && exposed.length > 0) || (spec.expectedAdminOnly && similarity >= 0.2) || (isAdminLikePath(spec.name) && similarity >= 0.3))) {
 					addFinding({
 						name: spec.name, kind: "vertical_bfla", severity: spec.expectedAdminOnly || isAdminLikePath(spec.name) ? "high" : "medium",
-						summary: scrubProtocolText(`Role ${probe.role} reached admin-like data for ${spec.name}`, extraSecrets, rootOrVault),
+						summary: scrubProtocolText(`Role ${probe.role} reached admin-like data for ${spec.name}`, extraSecrets, bundle.vaultRef ?? rootOrVault),
 						baselineRole: adminProbe.role, testedRole: probe.role, similarity, exposedKeys: exposed,
 						probes: probes.map((item) => ({ role: item.role, status: item.status, bodyHash: item.bodyHash, dataKeys: item.dataKeys, hasErrors: item.hasErrors, sampleSnippet: item.sampleSnippet })),
 					});
 				}
 			}
 		}
+		const hasObjectTarget =
+			isObjectResourcePath(spec.name) ||
+			/\([^)]*\b(?:id|userId|accountId|ownerId|orderId|tenantId|code|slug)\b\s*:/i.test(spec.query) ||
+			Boolean(spec.variables && Object.keys(spec.variables).some((k) => /id$/i.test(k) || k === "id")) ||
+			/\b(?:order|user|account|invoice|doc|document|record|item)\s*\(/i.test(spec.query);
 		const nonAdminUsable = usable.filter((probe) => probe.role !== "anon" && !isAdminLikeRole(probe.role, opts.adminRoles));
-		for (let i = 0; i < nonAdminUsable.length; i += 1) {
-			for (let j = i + 1; j < nonAdminUsable.length; j += 1) {
-				const left = nonAdminUsable[i]!;
-				const right = nonAdminUsable[j]!;
-				const similarity = computeKeyJaccard(left.dataKeys, right.dataKeys);
-				if (similarity < 0.8) continue;
-				const objectLike = isObjectResourcePath(spec.name) || /(^|[._])(id|userId|accountId|ownerId|email|orderId|tenantId)($|[._])/i.test(left.dataKeys.join(" "));
-				if (!objectLike || !hasDifferingObjectLeaf(left, right)) continue;
-				addFinding({
-					name: spec.name, kind: "horizontal_bola", severity: "medium",
-					summary: scrubProtocolText(`Roles ${left.role} and ${right.role} returned overlapping object data for ${spec.name}`, extraSecrets, rootOrVault),
-					baselineRole: left.role, testedRole: right.role, similarity, exposedKeys: left.dataKeys.filter((key) => right.dataKeys.includes(key)).slice(0, 40),
-					probes: probes.map((probe) => ({ role: probe.role, status: probe.status, bodyHash: probe.bodyHash, dataKeys: probe.dataKeys, hasErrors: probe.hasErrors, sampleSnippet: probe.sampleSnippet })),
-				});
+		if (hasObjectTarget && !anonUsable) {
+			for (let i = 0; i < nonAdminUsable.length; i += 1) {
+				for (let j = i + 1; j < nonAdminUsable.length; j += 1) {
+					const left = nonAdminUsable[i]!;
+					const right = nonAdminUsable[j]!;
+					const similarity = computeKeyJaccard(left.dataKeys, right.dataKeys);
+					if (similarity < 0.8 || !sharesSameObjectEntity(left, right)) continue;
+					addFinding({
+						name: spec.name, kind: "horizontal_bola", severity: "medium",
+						summary: scrubProtocolText(`Roles ${left.role} and ${right.role} returned identical object entity for ${spec.name}`, extraSecrets, bundle.vaultRef ?? rootOrVault),
+						baselineRole: left.role, testedRole: right.role, similarity, exposedKeys: left.dataKeys.filter((key) => right.dataKeys.includes(key)).slice(0, 40),
+						probes: probes.map((probe) => ({ role: probe.role, status: probe.status, bodyHash: probe.bodyHash, dataKeys: probe.dataKeys, hasErrors: probe.hasErrors, sampleSnippet: probe.sampleSnippet })),
+					});
+				}
 			}
 		}
 	}
-	const fact = findings.length ? buildGraphQLAuthDiffFact(endpointUrl, findings, extraSecrets, rootOrVault) : null;
+	const fact = findings.length ? buildGraphQLAuthDiffFact(endpointUrl, findings, extraSecrets, bundle.vaultRef ?? rootOrVault) : null;
 	return { ok: true, endpointUrl, blockedByScope: false, testedQueries, findings, fact };
 }
 
@@ -739,7 +801,7 @@ export function attachCdpWebSocketAuditor(
 	};
 
 	const redactText = (text: string): string =>
-		scrubProtocolText(text, opts?.extraSecrets, opts?.root ?? opts?.vault);
+		scrubProtocolText(text, opts?.extraSecrets, opts?.vault ?? opts?.root);
 
 	const pushFrame = (frame: CdpWebSocketFrameEvent): void => {
 		if (detached) return;
@@ -872,7 +934,8 @@ export async function auditWebSocketCrossTenantPush(
 		}
 	}
 
-	const baseSecrets = [...(opts?.extraSecrets ?? [])];
+	const allAuditSecrets = new Set<string>(opts?.extraSecrets ?? []);
+	const baseSecrets = [...allAuditSecrets];
 	const findingKeys = new Set<string>();
 	const addFinding = (finding: WebSocketAuditFinding): void => {
 		const key = `${finding.kind}|${finding.url}|${finding.role}`;
@@ -891,6 +954,7 @@ export async function auditWebSocketCrossTenantPush(
 		}
 		const mergedHeaders: Record<string, string> = { ...roleHeaders, ...(spec.headers ?? {}) };
 		const extraSecrets = [...baseSecrets, ...collectSecretsFromHeaders(mergedHeaders)];
+		for (const s of extraSecrets) allAuditSecrets.add(s);
 		const redactedHeaders = redactTrafficHeaders(mergedHeaders, {
 			root: opts?.root,
 			vault: vaultRef,
@@ -972,15 +1036,10 @@ export async function auditWebSocketCrossTenantPush(
 					} catch {
 						break;
 					}
-					const scrubbedSent = scrubProtocolText(text, extraSecrets, opts?.root ?? vaultRef);
+					const scrubbedSent = scrubProtocolText(text, extraSecrets, vaultRef ?? opts?.root);
 					specFrames.push({
-						requestId: `local:${role}:${Date.now()}:${index}`,
-						url: safeUrl,
-						direction: "sent",
-						opcode: 1,
-						payloadData: scrubbedSent,
-						timestamp: Date.now(),
-						parsedJson: wsSafeJsonParse(scrubbedSent),
+						requestId: `local:${role}:${Date.now()}:${index}`, url: safeUrl, direction: "sent", opcode: 1,
+						payloadData: scrubbedSent, timestamp: Date.now(), parsedJson: wsSafeJsonParse(scrubbedSent),
 					});
 				}
 				settleTimer = setTimeout(finish, settleMs);
@@ -989,55 +1048,28 @@ export async function auditWebSocketCrossTenantPush(
 			ws.onmessage = (event: { data: unknown }) => {
 				if (settled) return;
 				const rawText = wsDataToText(event.data);
-				const scrubbed = scrubProtocolText(rawText, extraSecrets, opts?.root ?? vaultRef);
+				const scrubbed = scrubProtocolText(rawText, extraSecrets, vaultRef ?? opts?.root);
 				const parsed = wsSafeJsonParse(scrubbed);
 				specFrames.push({
-					requestId: `local:${role}:${Date.now()}`,
-					url: safeUrl,
-					direction: "received",
-					opcode: typeof event.data === "string" ? 1 : 2,
-					payloadData: scrubbed,
-					timestamp: Date.now(),
-					parsedJson: parsed,
+					requestId: `local:${role}:${Date.now()}`, url: safeUrl, direction: "received",
+					opcode: typeof event.data === "string" ? 1 : 2, payloadData: scrubbed, timestamp: Date.now(), parsedJson: parsed,
 				});
 
-				const sampleFrame = clipSafeSnippet(scrubbed, {
-					root: opts?.root,
-					vault: vaultRef,
-					extraSecrets,
-					maxChars: 300,
-				});
+				const sampleFrame = clipSafeSnippet(scrubbed, { root: opts?.root, vault: vaultRef, extraSecrets, maxChars: 300 });
 
 				if (wsIsAnonRole(role) && !wsIsLikelyAckOrErrorText(scrubbed)) {
-					addSpecFinding(
-						"unauth_ws_subscription",
-						"high",
-						`匿名角色 ${role} 订阅后收到实质业务推送`,
-						sampleFrame,
-					);
+					addSpecFinding("unauth_ws_subscription", "high", `匿名角色 ${role} 订阅后收到实质业务推送`, sampleFrame);
 				}
 
 				const foreignMarkers = spec.foreignTenantMarkers ?? [];
 				const hitMarkers = foreignMarkers.filter((marker) => marker && rawText.includes(marker));
 				if (hitMarkers.length > 0) {
-					const safeMarkers = hitMarkers
-						.map((marker) => scrubProtocolText(marker, extraSecrets, opts?.root ?? vaultRef))
-						.join("，");
-					addSpecFinding(
-						"cross_tenant_push",
-						"high",
-						`角色 ${role} 收到跨租户推送，命中标识：${safeMarkers}`,
-						sampleFrame,
-					);
+					const safeMarkers = hitMarkers.map((marker) => scrubProtocolText(marker, extraSecrets, vaultRef ?? opts?.root)).join("，");
+					addSpecFinding("cross_tenant_push", "high", `角色 ${role} 收到跨租户推送，命中标识：${safeMarkers}`, sampleFrame);
 				}
 
 				if (wsLooksLikeSensitiveLeak(rawText)) {
-					addSpecFinding(
-						"sensitive_frame_leak",
-						"high",
-						`角色 ${role} 接收帧疑似暴露 token/secret/password 等凭据字段`,
-						sampleFrame,
-					);
+					addSpecFinding("sensitive_frame_leak", "high", `角色 ${role} 接收帧疑似暴露 token/secret/password 等凭据字段`, sampleFrame);
 				}
 			};
 
@@ -1079,27 +1111,21 @@ export async function auditWebSocketCrossTenantPush(
 
 	let fact: AutoFact | null = null;
 	if (findings.length > 0) {
+		const mergedAuditSecrets = [...allAuditSecrets];
 		const detail = scrubProtocolText(
-			findings
-				.map((finding) => `[${finding.severity}] ${finding.kind} @ ${finding.url} (${finding.role})：${finding.summary}`)
-				.join("\n"),
-			baseSecrets,
-			opts?.root ?? vaultRef,
+			findings.map((finding) => `[${finding.severity}] ${finding.kind} @ ${finding.url} (${finding.role})：${finding.summary}`).join("\n"),
+			mergedAuditSecrets,
+			vaultRef ?? opts?.root,
 		);
 		const output = clipSafeSnippet(
 			findings.map((finding) => finding.sampleFrame).join("\n---\n"),
-			{ root: opts?.root, vault: vaultRef, extraSecrets: baseSecrets, maxChars: 2_000 },
+			{ root: opts?.root, vault: vaultRef, extraSecrets: mergedAuditSecrets, maxChars: 2_000 },
 		);
 		fact = {
-			kind: "vuln",
-			title: "WebSocket 跨租户/未授权推送风险",
-			detail,
+			kind: "vuln", title: "WebSocket 跨租户/未授权推送风险", detail,
 			command: `ws-audit ${allowedSpecs.map((spec) => redactWsUrl(spec.wsUrl)).join(" ")}`,
-			output: scrubProtocolText(output, baseSecrets, opts?.root ?? vaultRef),
-			meta: {
-				paths: allowedSpecs.map((spec) => redactWsUrl(spec.wsUrl)),
-				status: 101,
-			},
+			output: scrubProtocolText(output, mergedAuditSecrets, vaultRef ?? opts?.root),
+			meta: { paths: allowedSpecs.map((spec) => redactWsUrl(spec.wsUrl)), status: 101 },
 		};
 	}
 
@@ -1168,33 +1194,25 @@ export function parseRscFlightStream(body: string): RscFlightChunk[] {
 		const id = line.slice(0, colon).trim();
 		if (!id) continue;
 		const rest = line.slice(colon + 1);
-		const match = /^([A-Z]*)([\s\S]*)$/.exec(rest);
-		const tag = match ? match[1] : "";
-		const rawPayload = match ? match[2] : rest;
-		let parsedJson: unknown;
-		try {
-			parsedJson = JSON.parse(rawPayload);
-		} catch {
-			parsedJson = undefined;
-		}
-		let isErrorDigest = tag === "E";
-		if (
-			!isErrorDigest &&
-			parsedJson &&
-			typeof parsedJson === "object" &&
-			!Array.isArray(parsedJson)
-		) {
-			const obj = parsedJson as Record<string, unknown>;
-			if (
-				"digest" in obj ||
-				"error" in obj ||
-				(typeof obj.message === "string" && /error/i.test(obj.message))
-			) {
-				isErrorDigest = true;
+		let tag = "";
+		let rawPayload = rest;
+		const textMatch = /^T([0-9a-f]+),([\s\S]*)$/i.exec(rest);
+		if (textMatch) {
+			tag = "T";
+			rawPayload = textMatch[2] ?? "";
+		} else {
+			const tagMatch = /^(HL|I|E|D|M|S|N|H)(?=[\[{"])([\s\S]*)$/.exec(rest);
+			if (tagMatch) {
+				tag = tagMatch[1] ?? "";
+				rawPayload = tagMatch[2] ?? "";
 			}
 		}
-		if (!isErrorDigest && /"digest"\s*:/.test(rawPayload)) {
-			isErrorDigest = true;
+		let parsedJson: unknown;
+		try { parsedJson = JSON.parse(rawPayload); } catch { parsedJson = undefined; }
+		let isErrorDigest = tag === "E";
+		if (!isErrorDigest && parsedJson && typeof parsedJson === "object" && !Array.isArray(parsedJson)) {
+			const obj = parsedJson as Record<string, unknown>;
+			if (Boolean(obj.digest) || Boolean(obj.error)) isErrorDigest = true;
 		}
 		chunks.push({ id, tag, rawPayload, parsedJson, isErrorDigest });
 	}
@@ -1467,63 +1485,24 @@ export async function diffRscActionRoles(
 		}
 
 		const baselineProbe = probes.find((probe) => probe.role === baselineRole);
-		if (
-			!baselineProbe ||
-			!isSuccessHttp(baselineProbe.status) ||
-			baselineProbe.hasErrorDigest ||
-			baselineProbe.chunkCount === 0
-		) {
-			continue;
-		}
+		if (!baselineProbe || !isSuccessHttp(baselineProbe.status) || baselineProbe.hasErrorDigest || baselineProbe.chunkCount === 0) continue;
+		const anonProbe = probes.find((p) => p.role === "anon");
+		const anonSucceeded = Boolean(anonProbe && isSuccessHttp(anonProbe.status) && !anonProbe.hasErrorDigest && anonProbe.chunkCount > 0);
+		const hasObjectParam = isObjectResourcePath(spec.name) || isObjectResourcePath(spec.url) || /"(?:id|userId|accountId|orderId|tenantId)"/i.test(JSON.stringify(spec.args ?? []));
 		for (const probe of probes) {
-			if (probe.role === baselineRole) continue;
-			if (
-				!isSuccessHttp(probe.status) ||
-				probe.hasErrorDigest ||
-				probe.chunkCount === 0
-			) {
-				continue;
-			}
-			let kind: AuthDiffAnomalyKind;
-			if (probe.role === "anon") {
-				kind = "unauth_access";
-			} else if (
-				spec.expectedAdminOnly ||
-				(isAdminLikeRole(baselineRole, adminRoles) &&
-					!isAdminLikeRole(probe.role, adminRoles))
-			) {
-				kind = "vertical_bfla";
-			} else {
-				kind = "horizontal_bola";
-			}
-			const severity: "high" | "medium" =
-				kind === "horizontal_bola" ? "medium" : "high";
+			if (probe.role === baselineRole || !isSuccessHttp(probe.status) || probe.hasErrorDigest || probe.chunkCount === 0) continue;
+			let kind: AuthDiffAnomalyKind | null = null;
+			if (probe.role === "anon") kind = "unauth_access";
+			else if (spec.expectedAdminOnly || (isAdminLikeRole(baselineRole, adminRoles) && !isAdminLikeRole(probe.role, adminRoles))) kind = "vertical_bfla";
+			else if (hasObjectParam && !anonSucceeded && probe.bodyHash && probe.bodyHash === baselineProbe.bodyHash) kind = "horizontal_bola";
+			if (!kind) continue;
+			const severity: "high" | "medium" = kind === "horizontal_bola" ? "medium" : "high";
 			const summary = `Next.js Server Action ${spec.actionId}（${spec.name}）在角色 ${probe.role} 下越权成功，基线角色 ${baselineRole}。`;
-			findings.push({
-				name: spec.name,
-				actionId: spec.actionId,
-				url: redactedUrl,
-				kind,
-				severity,
-				summary,
-				baselineRole,
-				testedRole: probe.role,
-				probes,
-			});
+			findings.push({ name: spec.name, actionId: spec.actionId, url: redactedUrl, kind, severity, summary, baselineRole, testedRole: probe.role, probes });
 		}
 	}
 
-	return {
-		ok: true,
-		blockedByScope: false,
-		findings,
-		fact: makeProtocolVulnFact(
-			findings,
-			extraSecrets,
-			rootOrVault,
-			"Next.js RSC Server Action ",
-		),
-	};
+	return { ok: true, blockedByScope: false, findings, fact: makeProtocolVulnFact(findings, extraSecrets, bundle.vaultRef ?? rootOrVault, "Next.js RSC Server Action ") };
 }
 
 // ----- gRPC-Web 5 字节头 + Protobuf Wire -----
@@ -1862,10 +1841,9 @@ export function decodeGrpcWebFrames(raw: Uint8Array): GrpcWebFrame[] {
 	const frames: GrpcWebFrame[] = [];
 	let offset = 0;
 	while (offset < raw.length) {
-		if (raw.length - offset < 5) {
-			throw new Error("gRPC-Web 帧头不足 5 字节");
-		}
+		if (raw.length - offset < 5) throw new Error("gRPC-Web 帧头不足 5 字节");
 		const flags = raw[offset];
+		if ((flags & ~0x81) !== 0) throw new Error(`非法 gRPC-Web 帧标志位: 0x${flags.toString(16)}`);
 		const length = readUint32BE(raw, offset + 1);
 		const start = offset + 5;
 		const end = start + length;
@@ -1874,11 +1852,8 @@ export function decodeGrpcWebFrames(raw: Uint8Array): GrpcWebFrame[] {
 		const compressed = (flags & 0x01) !== 0;
 		const isTrailer = (flags & 0x80) !== 0;
 		if (compressed) {
-			try {
-				payload = new Uint8Array(gunzipSync(payload));
-			} catch {
-				// 解压失败时保留原始载荷，交由上层字段解析失败处理。
-			}
+			try { payload = new Uint8Array(gunzipSync(payload)); }
+			catch { throw new Error("gRPC-Web gzip 压缩载荷解压失败"); }
 		}
 		const frame: GrpcWebFrame = { compressed, isTrailer, payload };
 		if (isTrailer) {
@@ -1897,6 +1872,14 @@ export function decodeGrpcWebFrames(raw: Uint8Array): GrpcWebFrame[] {
 		offset = end;
 	}
 	return frames;
+}
+
+function decodeGrpcWebTextBase64(text: string): Uint8Array {
+	const compact = text.replace(/\s+/g, "");
+	if (!compact) return new Uint8Array(0);
+	const blocks = compact.match(/[A-Za-z0-9+/]+={0,2}/g);
+	if (!blocks || blocks.length === 0) return new Uint8Array(0);
+	return concatBytes(blocks.map((block) => base64ToBytes(block)));
 }
 
 export interface GrpcWebMethodSpec {
@@ -2046,148 +2029,62 @@ export async function diffGrpcWebMethodRoles(
 				});
 				httpStatus = res.status;
 				responseHeadersOut = headersToRecord(res.headers);
-				const responseContentType = res.headers.get("content-type") ?? "";
+				const responseContentType = responseHeadersOut["content-type"] ?? "";
 				if (useBase64Text || responseContentType.includes("grpc-web-text")) {
 					const text = await res.text();
 					responseBodyForTraffic = text;
-					try {
-						raw = base64ToBytes(text);
-					} catch {
-						raw = new Uint8Array(0);
-					}
+					try { raw = decodeGrpcWebTextBase64(text); } catch { raw = new Uint8Array(0); }
 				} else {
 					const arrayBuffer = await res.arrayBuffer();
 					raw = new Uint8Array(arrayBuffer);
 					responseBodyForTraffic = bytesToBase64(raw);
 				}
-			} catch {
-				httpStatus = 0;
-			} finally {
-				clearTimeout(timer);
-			}
+			} catch { httpStatus = 0; } finally { clearTimeout(timer); }
 			const durationMs = Date.now() - started;
 			let frames: GrpcWebFrame[] = [];
-			try {
-				frames = decodeGrpcWebFrames(raw);
-			} catch {
-				frames = [];
-			}
+			try { frames = decodeGrpcWebFrames(raw); } catch { frames = []; }
 			let grpcStatus = responseHeadersOut["grpc-status"] ?? "0";
 			for (const frame of frames) {
-				if (frame.isTrailer && frame.trailers?.["grpc-status"] !== undefined) {
-					grpcStatus = frame.trailers["grpc-status"];
-				}
+				if (frame.isTrailer && frame.trailers?.["grpc-status"] !== undefined) grpcStatus = frame.trailers["grpc-status"];
 			}
-			let fieldCount = 0;
-			let firstFields: ProtobufField[] = [];
+			let fieldCount = 0; let firstFields: ProtobufField[] = [];
 			const firstDataFrame = frames.find((frame) => !frame.isTrailer);
 			if (firstDataFrame) {
-				try {
-					firstFields = decodeProtobufFields(firstDataFrame.payload);
-					fieldCount = firstFields.length;
-				} catch {
-					firstFields = [];
-					fieldCount = 0;
-				}
+				try { firstFields = decodeProtobufFields(firstDataFrame.payload); fieldCount = firstFields.length; }
+				catch { firstFields = []; fieldCount = 0; }
 			}
 			const bodyHash = computeBodyHash(raw).bodyHash;
-			const sampleSource =
-				firstFields.length > 0
-					? summarizeProtobufFields(firstFields)
-					: bytesToBase64(raw).slice(0, 240);
-			const sampleSnippet = clipSafeSnippet(sampleSource, {
-				root: bundle.rootDir,
-				vault: bundle.vaultRef,
-				extraSecrets: probeSecrets,
-				maxChars: 240,
-			});
-			probes.push({
-				role,
-				httpStatus,
-				grpcStatus,
-				fieldCount,
-				bodyHash,
-				sampleSnippet,
-			});
-			if (isSuccessHttp(httpStatus) && grpcStatus === "0" && frames.length > 0) {
-				successfulRoles.add(role);
-			}
+			const sampleSource = firstFields.length > 0 ? summarizeProtobufFields(firstFields) : bytesToBase64(raw).slice(0, 240);
+			const sampleSnippet = clipSafeSnippet(sampleSource, { root: bundle.rootDir, vault: bundle.vaultRef, extraSecrets: probeSecrets, maxChars: 240 });
+			probes.push({ role, httpStatus, grpcStatus, fieldCount, bodyHash, sampleSnippet });
+			if (isSuccessHttp(httpStatus) && grpcStatus === "0" && frames.length > 0) successfulRoles.add(role);
 			recordProtocolTraffic(opts?.recorder, {
-				method: "POST",
-				url: spec.url,
-				requestHeaders: redactTrafficHeaders(merged, {
-					root: bundle.rootDir,
-					vault: bundle.vaultRef,
-					extraSecrets: probeSecrets,
-				}),
-				requestBody:
-					redactTrafficBody(requestBodyForTraffic, {
-						root: bundle.rootDir,
-						vault: bundle.vaultRef,
-						extraSecrets: probeSecrets,
-						maxChars: 2000,
-					}) ?? "",
+				method: "POST", url: spec.url,
+				requestHeaders: redactTrafficHeaders(merged, { root: bundle.rootDir, vault: bundle.vaultRef, extraSecrets: probeSecrets }),
+				requestBody: redactTrafficBody(requestBodyForTraffic, { root: bundle.rootDir, vault: bundle.vaultRef, extraSecrets: probeSecrets, maxChars: 2000 }) ?? "",
 				status: httpStatus,
-				responseHeaders: redactTrafficHeaders(responseHeadersOut, {
-					root: bundle.rootDir,
-					vault: bundle.vaultRef,
-					extraSecrets: probeSecrets,
-				}),
-				responseBody:
-					redactTrafficBody(responseBodyForTraffic, {
-						root: bundle.rootDir,
-						vault: bundle.vaultRef,
-						extraSecrets: probeSecrets,
-						maxChars: 2000,
-					}) ?? "",
-				durationMs,
-				tags: ["grpc-web", "auth-diff"],
-				role,
-				note: `gRPC-Web ${spec.name}`,
+				responseHeaders: redactTrafficHeaders(responseHeadersOut, { root: bundle.rootDir, vault: bundle.vaultRef, extraSecrets: probeSecrets }),
+				responseBody: redactTrafficBody(responseBodyForTraffic, { root: bundle.rootDir, vault: bundle.vaultRef, extraSecrets: probeSecrets, maxChars: 2000 }) ?? "",
+				durationMs, tags: ["grpc-web", "auth-diff"], role, note: `gRPC-Web ${spec.name}`,
 			});
 		}
 
 		if (!successfulRoles.has(baselineRole)) continue;
+		const baselineProbe = probes.find((p) => p.role === baselineRole);
+		const anonSucceeded = successfulRoles.has("anon");
+		const hasObjectTarget = isObjectResourcePath(spec.name) || isObjectResourcePath(spec.url) || spec.requestFields.some((f) => typeof f.value === "string" && /(?:id|ord|acc|usr|doc)[_-]?\d+/i.test(f.value));
 		for (const probe of probes) {
-			if (probe.role === baselineRole) continue;
-			if (!successfulRoles.has(probe.role)) continue;
-			let kind: AuthDiffAnomalyKind;
-			if (probe.role === "anon") {
-				kind = "unauth_access";
-			} else if (
-				spec.expectedAdminOnly ||
-				(isAdminLikeRole(baselineRole, adminRoles) &&
-					!isAdminLikeRole(probe.role, adminRoles))
-			) {
-				kind = "vertical_bfla";
-			} else {
-				kind = "horizontal_bola";
-			}
-			const severity: "high" | "medium" =
-				kind === "horizontal_bola" ? "medium" : "high";
+			if (probe.role === baselineRole || !successfulRoles.has(probe.role)) continue;
+			let kind: AuthDiffAnomalyKind | null = null;
+			if (probe.role === "anon") kind = "unauth_access";
+			else if (spec.expectedAdminOnly || (isAdminLikeRole(baselineRole, adminRoles) && !isAdminLikeRole(probe.role, adminRoles))) kind = "vertical_bfla";
+			else if (hasObjectTarget && !anonSucceeded && baselineProbe && probe.bodyHash && probe.bodyHash === baselineProbe.bodyHash) kind = "horizontal_bola";
+			if (!kind) continue;
+			const severity: "high" | "medium" = kind === "horizontal_bola" ? "medium" : "high";
 			const summary = `gRPC-Web 方法 ${spec.name} 在角色 ${probe.role} 下调用成功（grpc-status=0，基线 ${baselineRole}）。`;
-			findings.push({
-				name: spec.name,
-				url: redactedUrl,
-				kind,
-				severity,
-				summary,
-				baselineRole,
-				testedRole: probe.role,
-				probes,
-			});
+			findings.push({ name: spec.name, url: redactedUrl, kind, severity, summary, baselineRole, testedRole: probe.role, probes });
 		}
 	}
 
-	return {
-		ok: true,
-		blockedByScope: false,
-		findings,
-		fact: makeProtocolVulnFact(
-			findings,
-			extraSecrets,
-			rootOrVault,
-			"gRPC-Web ",
-		),
-	};
+	return { ok: true, blockedByScope: false, findings, fact: makeProtocolVulnFact(findings, extraSecrets, bundle.vaultRef ?? rootOrVault, "gRPC-Web ") };
 }

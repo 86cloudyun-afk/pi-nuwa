@@ -730,6 +730,15 @@ export async function runInteractiveAuthPlaybook(
 	const scrub = (text: string): string => scrubWithSet(text, secrets, root);
 	const scrubUrl = (rawUrl: string): string =>
 		scrub(redactTrafficUrl(rawUrl, { root, extraSecrets: Array.from(secrets) }));
+	const enforceNavScope = (candidateUrl: string): void => {
+		if (!/^https?:\/\//i.test(candidateUrl)) return;
+		const navVerdict = checkHttpTargetScope(candidateUrl, "GET", opts.scope, mode, "登录剧本导航/重定向目标");
+		if (!navVerdict.ok) {
+			blockedByScope = true;
+			blockReason = navVerdict.reason;
+			throw new Error(navVerdict.reason);
+		}
+	};
 
 	const registerSecret = (value: string | undefined): void => {
 		if (typeof value !== "string") return;
@@ -782,19 +791,27 @@ export async function runInteractiveAuthPlaybook(
 		}
 	}
 	if (blockedByScope) {
+		if (opts.session && opts.keepSessionOnFailure !== true) {
+			try {
+				await closeCdpSession(opts.session);
+				sessionClosed = true;
+			} catch {
+				sessionClosed = false;
+			}
+		}
 		return {
 			ok: false,
 			role: opts.role,
 			blockedByScope: true,
-			blockReason: scrub(blockReason ?? "登录剧本被授权范围拦截"),
+			blockReason: scrubUrl(blockReason ?? "登录剧本被授权范围拦截"),
 			finalUrl: "",
 			navigationChain: [],
 			steps: [],
 			blockedRequests: [],
 			capturedCredentialSources: [],
-			sessionClosed: false,
+			sessionClosed,
 			vaultSummary: safeVaultSummary(root, scrub),
-			error: scrub(blockReason ?? "登录剧本被授权范围拦截"),
+			error: scrubUrl(blockReason ?? "登录剧本被授权范围拦截"),
 		};
 	}
 
@@ -897,15 +914,33 @@ export async function runInteractiveAuthPlaybook(
 						if (step.waitForNavigation !== false) await waitForNavigation(activeSession, previousUrl, stepTimeout);
 						if (step.settleMs && step.settleMs > 0) await sleep(step.settleMs);
 						const next = await readCurrentUrl(activeSession, previousUrl);
-						pushNavigation(navigationChain, next);
 						for (const oauth of extractUrlTokens(next)) {
 							registerSecret(oauth.value);
 							capturedSources.add(`url:${oauth.key}`);
 						}
+						enforceNavScope(next);
+						pushNavigation(navigationChain, next);
 						break;
 					}
 					case "fillTotp": {
 						registerSecret(step.secret);
+						if (step.secret.trim().toLowerCase().startsWith("otpauth://")) {
+							try {
+								const parsedOtp = parseOtpAuthUri(step.secret);
+								registerSecret(parsedOtp.secret);
+								registerSecret(parsedOtp.secret.toLowerCase());
+							} catch { /* ignore */ }
+						} else {
+							const cleanB32 = step.secret.replace(/[\s-]/g, "");
+							registerSecret(cleanB32);
+							registerSecret(cleanB32.toUpperCase());
+							registerSecret(cleanB32.toLowerCase());
+						}
+						try {
+							const rawBuf = decodeBase32Secret(step.secret);
+							const asciiSecret = rawBuf.toString("utf8");
+							if (/^[\x20-\x7e]{4,}$/.test(asciiSecret)) registerSecret(asciiSecret);
+						} catch { /* ignore */ }
 						const token = generateTotpCode(step.secret, step.totpOptions);
 						registerSecret(token.code);
 						await fillInPage(activeSession, step.selector, token.code, true, stepTimeout);
@@ -917,11 +952,12 @@ export async function runInteractiveAuthPlaybook(
 						if (step.waitForNavigation !== false) await waitForNavigation(activeSession, previousUrl, stepTimeout);
 						if (step.settleMs && step.settleMs > 0) await sleep(step.settleMs);
 						const next = await readCurrentUrl(activeSession, previousUrl);
-						pushNavigation(navigationChain, next);
 						for (const oauth of extractUrlTokens(next)) {
 							registerSecret(oauth.value);
 							capturedSources.add(`url:${oauth.key}`);
 						}
+						enforceNavScope(next);
+						pushNavigation(navigationChain, next);
 						break;
 					}
 					case "captureStorage": {
@@ -942,11 +978,12 @@ export async function runInteractiveAuthPlaybook(
 					}
 				}
 				currentUrl = await readCurrentUrl(activeSession, currentUrl);
-				pushNavigation(navigationChain, currentUrl);
 				for (const oauth of extractUrlTokens(currentUrl)) {
 					registerSecret(oauth.value);
 					capturedSources.add(`url:${oauth.key}`);
 				}
+				enforceNavScope(currentUrl);
+				pushNavigation(navigationChain, currentUrl);
 				stepSummaries.push({ stepIndex: index, action: step.action, target: scrubUrl(target), ok: true, durationMs: Date.now() - startedAt, currentUrl: scrubUrl(currentUrl) });
 			} catch (err) {
 				const message = scrub(rawErrorMessage(err));
@@ -1018,6 +1055,7 @@ export async function runInteractiveAuthPlaybook(
 			headers: Object.keys(roleHeaders).length > 0 ? roleHeaders : undefined,
 			username: opts.username,
 			checkUrl: opts.checkUrl,
+			expiresAt,
 			csrfHeader: csrfHeaderName,
 			csrfCookie: csrfCookieName,
 			updatedAt: new Date().toISOString(),
